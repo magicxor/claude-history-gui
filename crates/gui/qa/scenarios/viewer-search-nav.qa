@@ -1,0 +1,92 @@
+# viewer-search-nav.qa (WP2; DESIGN §9.8, §9.9, §15.3): find-bar typing, live matches, commit,
+# n/N with wrap-around, the hidden-output auto-expand, Esc unwinding one step at a time, and
+# `x` toggling every output of the focused message.
+#
+# Sandbox: tools/qa/new-sandbox.ps1, then crates/gui/tests/fixtures/viewer/prepare-sandbox.ps1.
+# Run (single-file window on the tour):
+#   tools/qa/run-gui.ps1 -Sandbox <sbx> -Exe <qa build> -Scenario crates/gui/qa/scenarios/viewer-search-nav.qa `
+#       -Out <dir> -Shots -ArgsLine '"<sbx>\viewer\markdown-tour.jsonl"'
+
+wait-for viewer.status == ready 20s
+expect focus == viewer
+key t
+wait-for viewer.loading == false 5s
+expect viewer.tool_display == trn
+expect viewer.expanded == 0
+
+# Typing (V-072, V-012): no matches, Ctrl+U clears the query.
+key /
+expect viewer.search.mode == typing
+type "zzz"
+expect viewer.find == "/zzz (no matches)"
+expect viewer.search.count == 0
+key ctrl-u
+expect viewer.find == "/"
+
+# Live matches and the first match's message focused (V-073); scrolling keys go to the input
+# while typing (V-079).
+type "token"
+expect viewer.search.count > 5
+expect viewer.search.current == 1
+expect viewer.nav_active == true
+expect viewer.find contains "/token (1/"
+key pagedown end
+expect viewer.indicator contains "[1/"
+key enter
+expect viewer.search.mode == active
+expect focus == viewer
+
+# n / N wrap (V-074).
+key n
+expect viewer.search.current == 2
+key shift-n
+expect viewer.search.current == 1
+key shift-n
+expect viewer.search.current > 2
+key n
+expect viewer.search.current == 1
+set-theme dark
+shot viewer-search-dark-active
+set-theme light
+shot viewer-search-light-active
+
+# Esc order (V-077): committed search → off; nav → off.
+key escape
+expect viewer.nav_active == false
+expect viewer.search.mode == active
+key escape
+expect viewer.search.mode == off
+expect viewer.search.count == 0
+
+# A match only in the hidden lines of a truncated output expands it (V-078, PD7).
+key /
+type "line_37"
+expect viewer.search.count == 1
+wait-for viewer.loading == false 5s
+expect viewer.expanded == 1
+key enter
+expect viewer.search.mode == active
+shot viewer-search-light-hidden-match
+key escape escape
+expect viewer.search.mode == off
+
+# Typing search → Esc clears it first (V-077).
+key /
+type "refresh"
+key escape
+expect viewer.search.mode == off
+expect focus == viewer
+
+# Message navigation and `x` on the focused message (V-067, V-095).
+key g
+key shift-j shift-j
+expect viewer.nav_focus == 3
+key x
+wait-for viewer.loading == false 5s
+expect viewer.expanded >= 1
+key x
+wait-for viewer.loading == false 5s
+key escape
+expect viewer.nav_active == false
+
+quit 0

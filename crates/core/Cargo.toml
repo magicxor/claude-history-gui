@@ -1,0 +1,55 @@
+[package]
+name = "claude-history-core"
+# Tracks the upstream claude-history version this crate was derived from.
+version = "0.1.76"
+edition.workspace = true
+license = "MIT"
+repository.workspace = true
+description = "UI-agnostic core of claude-history-gui: Claude Code / Pi / OMP history loading, search, semantic search, agent protocol and rendering helpers. Derived from claude-history (https://github.com/raine/claude-history, MIT, Copyright (c) 2024 Raine)."
+readme = "README.md"
+publish = false
+
+[lib]
+name = "claude_history_core"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Same semantics as upstream: load onnxruntime dynamically from the directory
+# of the executable instead of linking the downloaded static ONNX Runtime.
+release-dynamic-ort = ["dep:ort", "fastembed/ort-load-dynamic"]
+# The guard rails of this crate's own unit tests, for other crates' tests:
+# HistoryEnv::from_process_env panics, the default (fastembed) embedders
+# refuse to load, update::check_latest_release panics and the terminal spawn
+# functions return Unsupported. Enabled only from crates/gui
+# [dev-dependencies]; never in a release build.
+hermetic = []
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+bincode.workspace = true
+blake3.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+home.workspace = true
+rayon.workspace = true
+textwrap.workspace = true
+pulldown-cmark.workspace = true
+unicode-width.workspace = true
+syntect.workspace = true
+# Not dev-only: used for atomic cache/transcript writes.
+tempfile.workspace = true
+fastembed.workspace = true
+# Model download into HistoryEnv::semantic_model_dir (see semantic::fastembed).
+hf-hub.workspace = true
+ort = { workspace = true, optional = true }
+# GitHub release check (core::update).
+ureq.workspace = true
+# Format-preserving gui.toml edits (config::save_gui_config_changes). The
+# same version gpui-kit already brings into the GUI's tree.
+toml_edit.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

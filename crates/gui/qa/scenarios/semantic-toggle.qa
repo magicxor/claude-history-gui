@@ -1,0 +1,37 @@
+# WP1 semantic-toggle: Ctrl+T switches Lexical <-> Semantic (FEATURES L-058,
+# S-020, S-023, S-028, L-039). Needs the model: start with
+#   tools/qa/run-gui.ps1 ... -Scenario semantic-toggle.qa --qa-model-dir <dir>
+# (the model downloads into the sandbox cache otherwise; nothing leaves the
+# sandbox).
+#
+# Integrator, Phase C: the scenario waits for the semantic result rows
+# themselves — the model loads from the QA model cache, the sandbox corpus is
+# embedded into the sandbox's own semantic cache, the rows carry semantic
+# scores (`list.semantic_rows`), and Ctrl+S shows the selected row's details.
+wait-loaded 30s
+# The shots are named for the light theme (the system theme otherwise).
+set-theme light
+expect list.mode == lex
+key ctrl-t
+expect list.mode == sem
+type "token refresh"
+wait-for list.status contains "sem" 60s
+# Model load and the first embedding of the corpus (a fresh sandbox has no
+# semantic cache), then the semantic search itself.
+wait-for list.semantic_rows > 0 600s
+wait-for list.searching == false 120s
+expect list.selected_semantic == true
+expect list.status !contains "failed"
+expect list.count > 0
+shot list-semantic-light
+# the details popup works only with a semantic result selected
+key ctrl-s
+wait-for dialog == semantic-details 5s
+wait 300ms
+shot list-semantic-details-light
+key escape
+expect dialog == none
+key ctrl-t
+expect list.mode == lex
+expect list.semantic_rows == 0
+quit 0

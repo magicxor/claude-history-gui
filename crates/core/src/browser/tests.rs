@@ -1,0 +1,1654 @@
+//! Controller tests ported from upstream `tui/app/tests.rs`. Key-handling
+//! tests are re-expressed through the API calls the keys made (`set_query`,
+//! `toggle_*`); tests of the Ctrl+T key binding itself belong to the GUI.
+
+use super::test_helpers::*;
+use super::*;
+use crate::history::Conversation;
+use crate::semantic_worker::{SemanticSearchMessage, SemanticWorkerCommand};
+use chrono::{Local, TimeZone};
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+fn conversation(project: Option<&str>, project_dir: &str, uuid: &str, text: &str) -> Conversation {
+    Conversation {
+        source: crate::history::Source::Claude,
+        session_id: uuid.to_owned(),
+        path: PathBuf::from(format!("/tmp/claude-projects/{project_dir}/{uuid}.jsonl")),
+        index: 0,
+        timestamp: Local.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap(),
+        preview: text.to_string(),
+        preview_first: text.to_string(),
+        preview_last: text.to_string(),
+        full_text: text.to_string(),
+        agent_search_text: String::new(),
+        semantic_route_text: String::new(),
+        semantic_turns: vec![text.to_string()],
+        semantic_turn_ranges: vec![crate::agent::refs::MessageRange::single(1)],
+        search_text_lower: search::normalize_for_search(text),
+        project_name: project.map(str::to_string),
+        project_path: None,
+        cwd: None,
+        message_count: 1,
+        parse_errors: Vec::new(),
+        summary: None,
+        custom_title: None,
+        model: None,
+        total_tokens: 0,
+        duration_minutes: None,
+    }
+}
+
+fn workspace(dir: &str, project_dir_name: &str) -> WorkspaceScope {
+    WorkspaceScope::from_parts(dir, project_dir_name)
+}
+
+#[test]
+fn mixed_sources_are_identified_and_pi_local_filter_uses_header_cwd() {
+    let sandbox = Sandbox::new();
+    let workspace_dir = sandbox.path().join("workspace");
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+    let mut claude = conversation(Some("project"), "-tmp-project", "claude-id", "claude");
+    let mut pi = conversation(Some("project"), "ignored", "pi-id", "pi");
+    pi.source = crate::history::Source::Pi;
+    pi.project_path = Some(workspace_dir.clone());
+    pi.path = PathBuf::from("/tmp/flat-pi-sessions/session.jsonl");
+    claude.project_path = Some(PathBuf::from("/tmp/project"));
+
+    let mut app = app(&sandbox, vec![claude, pi], vec![]);
+    assert!(app.has_multiple_sources());
+    app.workspace_filter = true;
+    app.workspace = Some(WorkspaceScope::new(&workspace_dir).unwrap());
+    let filtered = app.filter_indices(0..app.conversations.len());
+    assert_eq!(filtered, vec![1]);
+}
+
+#[test]
+fn workspace_scope_matches_claude_rows_whatever_the_workspace_spelling() {
+    // A trailing separator or `.` component used to be encoded verbatim
+    // (`C:\proj\` -> `C--proj-`), so the scope hid every Claude row.
+    let sandbox = Sandbox::new();
+    let workspace_dir = sandbox.path().join("workspace");
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+    let encoded = crate::env::workspace_project_dir_name(&workspace_dir);
+    let claude = conversation(Some("workspace"), &encoded, "claude-id", "claude");
+    let other = conversation(Some("other"), "-elsewhere", "other-id", "other");
+    let mut app = app(&sandbox, vec![claude, other], vec![]);
+    app.workspace_filter = true;
+    let sep = std::path::MAIN_SEPARATOR_STR;
+    let dir = workspace_dir.display().to_string();
+    for spelling in [
+        dir.clone(),
+        format!("{dir}{sep}"),
+        format!("{dir}{sep}{sep}"),
+        format!("{dir}{sep}."),
+        format!("{dir}{sep}..{sep}workspace{sep}"),
+    ] {
+        app.workspace = Some(WorkspaceScope::new(&spelling).unwrap());
+        assert_eq!(
+            app.workspace.as_ref().unwrap().project_dir_name(),
+            encoded,
+            "{spelling}"
+        );
+        assert_eq!(app.filter_indices(0..2), vec![0], "{spelling}");
+    }
+}
+
+fn app(sandbox: &Sandbox, conversations: Vec<Conversation>, excluded: Vec<&str>) -> Browser {
+    app_with_options(sandbox, conversations, excluded, ListSearchMode::Lexical)
+}
+
+fn app_with_options(
+    sandbox: &Sandbox,
+    conversations: Vec<Conversation>,
+    excluded: Vec<&str>,
+    default_mode: ListSearchMode,
+) -> Browser {
+    Browser::new(
+        conversations,
+        sandbox
+            .options()
+            .with_exclude_projects(excluded.into_iter().map(str::to_string).collect())
+            .with_default_mode(default_mode),
+    )
+}
+
+fn filtered_projects(app: &Browser) -> Vec<Option<&str>> {
+    app.filtered()
+        .iter()
+        .map(|&idx| app.conversations()[idx].project_name.as_deref())
+        .collect()
+}
+
+fn app_with_semantic_mode(sandbox: &Sandbox, conversations: Vec<Conversation>) -> Browser {
+    app_with_options(sandbox, conversations, vec![], ListSearchMode::Semantic)
+}
+
+fn visible() -> Conversation {
+    conversation(
+        Some("Visible"),
+        "-tmp-visible",
+        "22222222-2222-4222-8222-222222222222",
+        "needle",
+    )
+}
+
+fn loading_app(sandbox: &Sandbox, mode: ListSearchMode) -> Browser {
+    Browser::new_loading(sandbox.options().with_default_mode(mode))
+}
+
+#[test]
+fn default_app_uses_lexical_search_with_semantic_available() {
+    let sandbox = Sandbox::new();
+    let app = app(&sandbox, vec![], vec![]);
+
+    assert_eq!(app.list_search_mode(), ListSearchMode::Lexical);
+    assert!(app.semantic_available());
+    assert_eq!(app.semantic_search.pending_generation, None);
+    assert_eq!(app.semantic_search.error, None);
+    assert!(app.semantic_search.results.is_empty());
+    assert!(app.semantic_search.worker_tx.is_none());
+    assert!(app.semantic_search.worker_rx.is_none());
+}
+
+#[test]
+fn configured_search_default_uses_semantic_mode() {
+    let sandbox = Sandbox::new();
+    let app = app_with_semantic_mode(&sandbox, vec![]);
+
+    assert_eq!(app.list_search_mode(), ListSearchMode::Semantic);
+    assert!(app.semantic_available());
+    assert_eq!(app.semantic_search.pending_generation, None);
+    assert_eq!(app.semantic_error(), None);
+}
+
+#[test]
+fn unavailable_semantic_search_forces_lexical_mode_and_never_starts_the_worker() {
+    let sandbox = Sandbox::new();
+    let options = || {
+        sandbox
+            .options()
+            .with_default_mode(ListSearchMode::Semantic)
+            .with_semantic_available(false)
+    };
+
+    // A configured semantic default does not apply when semantic search is
+    // unavailable, and the mode cannot be switched to semantic.
+    let mut app = Browser::new(vec![visible()], options());
+    assert!(!app.semantic_available());
+    assert_eq!(app.list_search_mode(), ListSearchMode::Lexical);
+    app.toggle_list_search_mode();
+    assert_eq!(app.list_search_mode(), ListSearchMode::Lexical);
+    app.set_list_search_mode(ListSearchMode::Semantic);
+    assert_eq!(app.list_search_mode(), ListSearchMode::Lexical);
+
+    // Queries are lexical and never start the semantic worker.
+    app.set_query("needle");
+    wait_for_search(&mut app);
+    assert_eq!(app.filtered(), &[0]);
+    assert_eq!(app.search_status_text(), "1/1");
+    assert!(app.semantic_search.worker_tx.is_none());
+
+    // Finishing a load does not prewarm the semantic cache either.
+    let mut loading = Browser::new_loading(options());
+    assert_eq!(loading.list_search_mode(), ListSearchMode::Lexical);
+    loading.append_conversations(vec![visible()]);
+    loading.finish_loading();
+    assert!(loading.semantic_search.worker_tx.is_none());
+    assert!(!loading.has_search_work_in_flight());
+
+    // Even if the mode were forced to semantic, no worker is spawned.
+    app.list_search_mode = ListSearchMode::Semantic;
+    app.dispatch_search();
+    app.prewarm_semantic_cache();
+    assert!(app.semantic_search.worker_tx.is_none());
+    assert_eq!(app.semantic_error(), Some("semantic search is unavailable"));
+}
+
+#[test]
+fn semantic_mode_toggle_switches_from_default_lexical() {
+    let sandbox = Sandbox::new();
+    let mut app = app(&sandbox, vec![], vec![]);
+    let generation = app.search_generation;
+
+    app.toggle_list_search_mode();
+
+    assert_eq!(app.list_search_mode(), ListSearchMode::Semantic);
+    assert!(app.search_generation > generation);
+}
+
+#[test]
+fn semantic_mode_toggle_returns_to_lexical_when_enabled() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(&sandbox, vec![]);
+    let generation = app.search_generation;
+
+    app.toggle_list_search_mode();
+
+    assert_eq!(app.list_search_mode(), ListSearchMode::Lexical);
+    assert!(app.search_generation > generation);
+}
+
+#[test]
+fn exclude_projects_filters_browse_list_exactly() {
+    let sandbox = Sandbox::new();
+    let app = app(
+        &sandbox,
+        vec![
+            conversation(
+                Some("Hidden"),
+                "-tmp-hidden",
+                "11111111-1111-4111-8111-111111111111",
+                "needle",
+            ),
+            conversation(
+                Some("Visible"),
+                "-tmp-visible",
+                "22222222-2222-4222-8222-222222222222",
+                "needle",
+            ),
+            conversation(
+                Some("hidden"),
+                "-tmp-lower",
+                "33333333-3333-4333-8333-333333333333",
+                "needle",
+            ),
+        ],
+        vec!["Hidden"],
+    );
+
+    assert_eq!(
+        filtered_projects(&app),
+        vec![Some("Visible"), Some("hidden")]
+    );
+}
+
+#[test]
+fn exclude_projects_filters_worktrees_by_parent_project() {
+    let sandbox = Sandbox::new();
+    let app = app(
+        &sandbox,
+        vec![
+            conversation(
+                Some("claude-history/exclude-projects"),
+                "-tmp-claude-history--worktrees-exclude-projects",
+                "11111111-1111-4111-8111-111111111111",
+                "needle",
+            ),
+            conversation(
+                Some("other/exclude-projects"),
+                "-tmp-other--worktrees-exclude-projects",
+                "22222222-2222-4222-8222-222222222222",
+                "needle",
+            ),
+        ],
+        vec!["claude-history"],
+    );
+
+    assert_eq!(
+        filtered_projects(&app),
+        vec![Some("other/exclude-projects")]
+    );
+}
+
+#[test]
+fn exclude_projects_filters_search_results() {
+    let sandbox = Sandbox::new();
+    let mut app = app(
+        &sandbox,
+        vec![
+            conversation(
+                Some("Hidden"),
+                "-tmp-hidden",
+                "11111111-1111-4111-8111-111111111111",
+                "shared needle",
+            ),
+            conversation(
+                Some("Visible"),
+                "-tmp-visible",
+                "22222222-2222-4222-8222-222222222222",
+                "shared needle",
+            ),
+        ],
+        vec!["Hidden"],
+    );
+
+    app.query = "needle".to_string();
+    app.update_filter();
+
+    assert_eq!(filtered_projects(&app), vec![Some("Visible")]);
+}
+
+#[test]
+fn exclude_projects_apply_before_workspace_filter() {
+    let sandbox = Sandbox::new();
+    let mut app = app(
+        &sandbox,
+        vec![
+            conversation(
+                Some("Hidden"),
+                "-tmp-project--worktrees-a",
+                "11111111-1111-4111-8111-111111111111",
+                "needle",
+            ),
+            conversation(
+                Some("Visible"),
+                "-tmp-project",
+                "22222222-2222-4222-8222-222222222222",
+                "needle",
+            ),
+        ],
+        vec!["Hidden"],
+    );
+    app.workspace_filter = true;
+    app.workspace = Some(workspace("/tmp/project", "-tmp-project"));
+    app.update_filter();
+
+    assert_eq!(filtered_projects(&app), vec![Some("Visible")]);
+}
+
+#[test]
+fn uuid_lookup_bypasses_excluded_projects() {
+    let sandbox = Sandbox::new();
+    let uuid = "11111111-1111-4111-8111-111111111111";
+    let mut app = app(
+        &sandbox,
+        vec![conversation(Some("Hidden"), "-tmp-hidden", uuid, "needle")],
+        vec!["Hidden"],
+    );
+    assert!(app.filtered().is_empty());
+
+    app.query = uuid.to_string();
+    app.update_filter();
+    assert_eq!(filtered_projects(&app), vec![Some("Hidden")]);
+    assert_eq!(
+        app.uuid_lookup(),
+        Some(&UuidLookup::Found {
+            conversation_index: 0,
+            loaded_from_disk: false
+        })
+    );
+
+    app.query.clear();
+    app.update_filter();
+    assert!(app.filtered().is_empty());
+    assert_eq!(app.conversations().len(), 1);
+    assert_eq!(app.searchable.len(), 1);
+    assert_eq!(app.uuid_lookup(), None);
+}
+
+#[test]
+fn uuid_lookup_uses_pi_header_id_instead_of_timestamped_filename() {
+    let sandbox = Sandbox::new();
+    let uuid = "01a016dd-caa0-7ab1-873e-661d81757152";
+    let mut pi = conversation(Some("workmux"), "-tmp-workmux", uuid, "needle");
+    pi.source = crate::history::Source::Pi;
+    pi.path = PathBuf::from(format!(
+        "/tmp/pi-sessions/2026-08-18T21-53-49-216Z_{uuid}.jsonl"
+    ));
+    let mut app = app(&sandbox, vec![pi], vec![]);
+
+    app.query = uuid.to_ascii_uppercase();
+    app.update_filter();
+
+    assert_eq!(filtered_projects(&app), vec![Some("workmux")]);
+}
+
+#[test]
+fn stale_response_with_current_generation_but_old_mode_is_ignored() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(&sandbox, vec![visible()]);
+
+    let (tx, rx) = mpsc::channel();
+    app.search_rx = rx;
+    app.list_search_mode = ListSearchMode::Semantic;
+    app.search_generation = 7;
+    app.filtered.clear();
+    app.selected = None;
+
+    tx.send(SearchResponse {
+        filtered: vec![0],
+        generation: 7,
+        mode: ListSearchMode::Lexical,
+        evidence: HashMap::new(),
+    })
+    .unwrap();
+
+    assert!(!app.poll());
+    assert!(app.filtered().is_empty());
+    assert_eq!(app.selected(), None);
+}
+
+#[test]
+fn semantic_empty_query_preserves_default_browse_behavior() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(&sandbox, vec![visible()]);
+
+    app.query.clear();
+    app.dispatch_search();
+
+    assert_eq!(app.list_search_mode(), ListSearchMode::Semantic);
+    assert_eq!(filtered_projects(&app), vec![Some("Visible")]);
+    assert_eq!(app.semantic_error(), None);
+    assert!(app.semantic_search.worker_tx.is_none());
+    assert!(app.semantic_search.worker_rx.is_none());
+}
+
+#[test]
+fn semantic_effectively_empty_query_preserves_default_browse_behavior() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(&sandbox, vec![visible()]);
+
+    set_query_for_test(&mut app, "\"\"");
+    app.dispatch_search();
+
+    assert_eq!(app.list_search_mode(), ListSearchMode::Semantic);
+    assert_eq!(filtered_projects(&app), vec![Some("Visible")]);
+    assert_eq!(app.semantic_error(), None);
+    assert!(app.semantic_search.worker_tx.is_none());
+    assert!(app.semantic_search.worker_rx.is_none());
+}
+
+#[test]
+fn stale_semantic_response_is_ignored_while_lexical_mode_is_active() {
+    let sandbox = Sandbox::new();
+    let mut app = app(&sandbox, vec![], vec![]);
+    let (_request_tx, request_rx) = mpsc::channel();
+    let (response_tx, response_rx) = mpsc::channel();
+    app.semantic_search.worker_tx = Some(_request_tx);
+    app.semantic_search.worker_rx = Some(response_rx);
+    app.search_generation = 3;
+    app.semantic_search.pending_generation = Some(3);
+    drop(request_rx);
+
+    send_semantic_complete_response(
+        &response_tx,
+        3,
+        vec![0],
+        HashMap::new(),
+        SemanticProgress::Complete,
+    );
+
+    assert!(!app.poll());
+    assert!(app.filtered().is_empty());
+    assert_eq!(app.selected(), None);
+    assert_eq!(app.semantic_search.pending_generation, Some(3));
+}
+
+#[test]
+fn semantic_response_after_mode_toggle_is_ignored() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(&sandbox, vec![visible()]);
+    let (_request_tx, request_rx, response_tx) = connect_semantic_search_channels(&mut app);
+    app.query = "needle".to_string();
+    app.dispatch_search();
+    drop(request_rx);
+    let semantic_generation = app.search_generation;
+
+    app.toggle_list_search_mode();
+    assert_eq!(app.list_search_mode(), ListSearchMode::Lexical);
+    wait_for_search(&mut app);
+    assert_eq!(filtered_projects(&app), vec![Some("Visible")]);
+
+    send_semantic_complete_response(
+        &response_tx,
+        semantic_generation,
+        vec![0],
+        HashMap::from([(0, test_semantic_metadata(0, "stale"))]),
+        SemanticProgress::Complete,
+    );
+
+    assert!(!app.poll());
+    assert_eq!(filtered_projects(&app), vec![Some("Visible")]);
+    assert!(app.semantic_search.results.is_empty());
+    assert_eq!(app.semantic_search.pending_generation, None);
+}
+
+#[test]
+fn current_generation_semantic_response_is_ignored_while_lexical_mode_is_active() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(&sandbox, vec![visible()]);
+    let (_request_tx, request_rx) = mpsc::channel();
+    let (response_tx, response_rx) = mpsc::channel();
+    app.semantic_search.worker_tx = Some(_request_tx);
+    app.semantic_search.worker_rx = Some(response_rx);
+    app.list_search_mode = ListSearchMode::Lexical;
+    app.search_generation = 7;
+    app.filtered = vec![0];
+    app.selected = Some(0);
+    drop(request_rx);
+
+    send_semantic_complete_response(
+        &response_tx,
+        7,
+        Vec::new(),
+        HashMap::from([(0, test_semantic_metadata(0, "stale"))]),
+        SemanticProgress::Complete,
+    );
+
+    assert!(!app.poll());
+    assert_eq!(app.filtered(), &[0]);
+    assert_eq!(app.selected(), Some(0));
+    assert!(app.semantic_search.results.is_empty());
+}
+
+#[test]
+fn stale_semantic_response_with_old_generation_is_ignored() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(&sandbox, vec![visible()]);
+    let (_request_tx, request_rx) = mpsc::channel();
+    let (response_tx, response_rx) = mpsc::channel();
+    app.semantic_search.worker_tx = Some(_request_tx);
+    app.semantic_search.worker_rx = Some(response_rx);
+    app.list_search_mode = ListSearchMode::Semantic;
+    app.search_generation = 3;
+    app.semantic_search.pending_generation = Some(3);
+    app.filtered.clear();
+    app.selected = None;
+    drop(request_rx);
+
+    send_semantic_complete_response(
+        &response_tx,
+        2,
+        vec![0],
+        HashMap::from([(0, test_semantic_metadata(0, "stale"))]),
+        SemanticProgress::Complete,
+    );
+
+    assert!(!app.poll());
+    assert!(app.filtered().is_empty());
+    assert_eq!(app.selected(), None);
+    assert!(app.semantic_search.results.is_empty());
+    assert_eq!(app.semantic_search.pending_generation, Some(3));
+}
+
+fn drain_semantic_commands(
+    rx: &mpsc::Receiver<SemanticWorkerCommand>,
+) -> Vec<SemanticWorkerCommand> {
+    let mut commands = Vec::new();
+    while let Ok(command) = rx.try_recv() {
+        commands.push(command);
+    }
+    commands
+}
+
+fn last_semantic_search(commands: &[SemanticWorkerCommand]) -> Option<(u64, &str, u64, u64, bool)> {
+    commands.iter().rev().find_map(|command| match command {
+        SemanticWorkerCommand::Search {
+            generation,
+            query,
+            corpus_version,
+            scope_version,
+            prewarm,
+        } => Some((
+            *generation,
+            query.raw(),
+            *corpus_version,
+            *scope_version,
+            *prewarm,
+        )),
+        _ => None,
+    })
+}
+
+fn last_semantic_scope(commands: &[SemanticWorkerCommand]) -> Option<(u64, u64, Vec<usize>)> {
+    commands.iter().rev().find_map(|command| match command {
+        SemanticWorkerCommand::UpdateScope {
+            corpus_version,
+            scope_version,
+            indices,
+        } => Some((*corpus_version, *scope_version, indices.as_ref().clone())),
+        _ => None,
+    })
+}
+
+fn app_with_single_visible_conversation_and_semantic_worker(
+    sandbox: &Sandbox,
+) -> (
+    Browser,
+    mpsc::Receiver<SemanticWorkerCommand>,
+    mpsc::Sender<SemanticSearchMessage>,
+) {
+    let mut app = app_with_semantic_mode(sandbox, vec![visible()]);
+    let (request_tx, request_rx, response_tx) = connect_semantic_search_channels(&mut app);
+    drop(request_tx);
+    (app, request_rx, response_tx)
+}
+
+#[test]
+fn semantic_nonempty_query_dispatches_worker_request() {
+    let sandbox = Sandbox::new();
+    let (mut app, request_rx, _response_tx) =
+        app_with_single_visible_conversation_and_semantic_worker(&sandbox);
+
+    app.query = "needle".to_string();
+    app.dispatch_search();
+
+    let commands = drain_semantic_commands(&request_rx);
+    let request = last_semantic_search(&commands).expect("semantic search");
+    assert_eq!(app.list_search_mode(), ListSearchMode::Semantic);
+    assert!(app.semantic_available());
+    assert_eq!(app.semantic_search.pending_generation, Some(request.0));
+    assert_eq!(request.1, "needle");
+    assert!(!request.4);
+    assert!(
+        commands
+            .iter()
+            .any(|command| matches!(command, SemanticWorkerCommand::UpdateCorpus { .. }))
+    );
+    assert_eq!(last_semantic_scope(&commands).unwrap().2, vec![0]);
+    assert_eq!(app.semantic_error(), None);
+}
+
+#[test]
+fn semantic_search_dispatches_lexical_fallback() {
+    let sandbox = Sandbox::new();
+    let (mut app, request_rx, _response_tx) =
+        app_with_single_visible_conversation_and_semantic_worker(&sandbox);
+    let (search_tx, search_rx) = mpsc::channel();
+    app.search_tx = search_tx;
+    app.query = "needle".to_string();
+
+    app.dispatch_search();
+
+    assert!(last_semantic_search(&drain_semantic_commands(&request_rx)).is_some());
+    let SearchCommand {
+        query,
+        generation,
+        mode,
+        conversations,
+        ..
+    } = search_rx
+        .try_recv()
+        .expect("expected lexical fallback search");
+    assert_eq!(query, "needle");
+    assert_eq!(generation, app.search_generation);
+    assert_eq!(mode, ListSearchMode::Semantic);
+    assert!(Arc::ptr_eq(&conversations, &app.corpus_snapshot()));
+}
+
+#[test]
+fn semantic_keypress_dispatches_immediately() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(&sandbox, vec![visible()]);
+    let (request_tx, request_rx) = mpsc::channel();
+    let (_response_tx, response_rx) = mpsc::channel();
+    app.semantic_search.worker_tx = Some(request_tx);
+    app.semantic_search.worker_rx = Some(response_rx);
+    let previous_generation = app.search_generation;
+
+    type_char(&mut app, 'n');
+
+    let commands = drain_semantic_commands(&request_rx);
+    let request = last_semantic_search(&commands).expect("semantic search");
+    assert_eq!(app.query(), "n");
+    assert_eq!(app.search_generation, previous_generation + 1);
+    assert_eq!(app.semantic_search.pending_generation, Some(request.0));
+    assert_eq!(app.semantic_search.pending_status, None);
+    assert_eq!(app.semantic_activity_status_text(), None);
+    assert_eq!(request.1, "n");
+    assert!(!request.4);
+}
+
+#[test]
+fn finish_loading_dispatches_buffered_semantic_query() {
+    let sandbox = Sandbox::new();
+    let mut app = loading_app(&sandbox, ListSearchMode::Semantic);
+    app.append_conversations(vec![visible()]);
+    let (request_tx, request_rx) = mpsc::channel();
+    let (_response_tx, response_rx) = mpsc::channel();
+    app.semantic_search.worker_tx = Some(request_tx);
+    app.semantic_search.worker_rx = Some(response_rx);
+    app.set_query("needle");
+    assert!(drain_semantic_commands(&request_rx).is_empty());
+
+    app.finish_loading();
+
+    let commands = drain_semantic_commands(&request_rx);
+    let request = last_semantic_search(&commands).expect("semantic search");
+    assert_eq!(request.1, "needle");
+    assert!(!request.4);
+    assert_eq!(app.semantic_search.pending_generation, Some(request.0));
+}
+
+#[test]
+fn finish_loading_with_buffered_semantic_query_rebuilds_rows_for_the_sorted_corpus() {
+    // The loading rows index the arrival-order corpus. A semantic query
+    // leaves the rows visible until its results arrive, so finish_loading
+    // must re-derive them after sorting, or the newer excluded row (now at
+    // index 0) is shown and selected.
+    let sandbox = Sandbox::new();
+    let mut app = Browser::new_loading(
+        sandbox
+            .options()
+            .with_exclude_projects(vec!["Hidden".into()])
+            .with_default_mode(ListSearchMode::Semantic),
+    );
+    let mut older = visible();
+    older.timestamp = Local.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap();
+    let mut newer = conversation(
+        Some("Hidden"),
+        "-tmp-hidden",
+        "11111111-1111-4111-8111-111111111111",
+        "needle",
+    );
+    newer.timestamp = Local.with_ymd_and_hms(2026, 5, 2, 12, 0, 0).unwrap();
+    app.append_conversations(vec![older]);
+    app.append_conversations(vec![newer]);
+    assert_eq!(app.filtered(), &[0]);
+    let (request_tx, request_rx, _response_tx) = connect_semantic_search_channels(&mut app);
+    drop(request_tx);
+    app.set_query("needle");
+
+    app.finish_loading();
+
+    assert!(last_semantic_search(&drain_semantic_commands(&request_rx)).is_some());
+    assert_eq!(filtered_projects(&app), vec![Some("Visible")]);
+    assert_eq!(app.filtered(), &[1]);
+    assert_eq!(app.selected(), Some(0));
+    assert_eq!(
+        app.selected_conversation().unwrap().project_name.as_deref(),
+        Some("Visible")
+    );
+}
+
+#[test]
+fn semantic_dispatch_after_loading_keeps_snapshot_aligned() {
+    let sandbox = Sandbox::new();
+    let mut app = loading_app(&sandbox, ListSearchMode::Semantic);
+    let (request_tx, request_rx) = mpsc::channel();
+    let (_response_tx, response_rx) = mpsc::channel();
+    app.semantic_search.worker_tx = Some(request_tx);
+    app.semantic_search.worker_rx = Some(response_rx);
+    app.append_conversations(vec![visible()]);
+    // Nothing is sent to the semantic worker while loading.
+    assert!(drain_semantic_commands(&request_rx).is_empty());
+
+    app.finish_loading();
+
+    let commands = drain_semantic_commands(&request_rx);
+    let corpus = commands
+        .iter()
+        .find_map(|command| match command {
+            SemanticWorkerCommand::UpdateCorpus { conversations, .. } => Some(conversations),
+            _ => None,
+        })
+        .expect("semantic corpus");
+    assert_eq!(corpus[0].semantic_turns, vec!["needle"]);
+    // K1: the worker gets the browser's own corpus, not a copy.
+    assert!(Arc::ptr_eq(corpus, &app.corpus_snapshot()));
+}
+
+#[test]
+fn semantic_keypress_preserves_browse_rows_while_pending() {
+    let sandbox = Sandbox::new();
+    let (mut app, request_rx, _response_tx) =
+        app_with_single_visible_conversation_and_semantic_worker(&sandbox);
+
+    type_char(&mut app, 'n');
+
+    assert!(last_semantic_search(&drain_semantic_commands(&request_rx)).is_some());
+    assert_eq!(filtered_projects(&app), vec![Some("Visible")]);
+    assert_eq!(app.selected(), Some(0));
+}
+
+#[test]
+fn semantic_search_worker_returns_lexical_fallback() {
+    let sandbox = Sandbox::new();
+    let app = app_with_semantic_mode(
+        &sandbox,
+        vec![
+            conversation(
+                Some("Emoji"),
+                "-tmp-emoji",
+                "11111111-1111-4111-8111-111111111111",
+                "emoji picker",
+            ),
+            conversation(
+                Some("Other"),
+                "-tmp-other",
+                "22222222-2222-4222-8222-222222222222",
+                "unrelated",
+            ),
+        ],
+    );
+    let (tx, rx) = spawn_search_worker(None);
+    tx.send(SearchCommand {
+        query: "emoji".to_string(),
+        generation: 7,
+        mode: ListSearchMode::Semantic,
+        conversations: app.corpus_snapshot(),
+        searchable: app.searchable.clone(),
+    })
+    .unwrap();
+
+    let response = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+
+    assert_eq!(response.filtered, vec![0]);
+    assert_eq!(response.generation, 7);
+    assert_eq!(response.mode, ListSearchMode::Semantic);
+}
+
+#[test]
+fn semantic_search_applies_lexical_fallback_while_pending() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(
+        &sandbox,
+        vec![
+            conversation(
+                Some("Emoji"),
+                "-tmp-emoji",
+                "11111111-1111-4111-8111-111111111111",
+                "emoji picker",
+            ),
+            conversation(
+                Some("Other"),
+                "-tmp-other",
+                "22222222-2222-4222-8222-222222222222",
+                "unrelated",
+            ),
+        ],
+    );
+    let (tx, rx) = mpsc::channel();
+    app.search_rx = rx;
+    app.search_generation = 7;
+    app.semantic_search.pending_generation = Some(7);
+    app.semantic_search.results = HashMap::from([(1, test_semantic_metadata(1, "old"))]);
+    app.filtered = vec![1];
+    app.selected = Some(0);
+    tx.send(SearchResponse {
+        filtered: vec![0],
+        generation: 7,
+        mode: ListSearchMode::Semantic,
+        evidence: HashMap::new(),
+    })
+    .unwrap();
+
+    assert!(app.poll());
+    assert_eq!(app.filtered(), &[0]);
+    assert_eq!(app.selected(), Some(0));
+    assert!(app.semantic_search.results.is_empty());
+}
+
+#[test]
+fn empty_lexical_fallback_keeps_results_visible_while_semantic_search_is_pending() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(&sandbox, vec![visible()]);
+    let (tx, rx) = mpsc::channel();
+    app.search_rx = rx;
+    app.search_generation = 7;
+    app.semantic_search.pending_generation = Some(7);
+    app.semantic_search.results = HashMap::from([(0, test_semantic_metadata(0, "old"))]);
+    app.filtered = vec![0];
+    app.selected = Some(0);
+    tx.send(SearchResponse {
+        filtered: Vec::new(),
+        generation: 7,
+        mode: ListSearchMode::Semantic,
+        evidence: HashMap::new(),
+    })
+    .unwrap();
+
+    assert!(!app.poll());
+    assert_eq!(app.filtered(), &[0]);
+    assert_eq!(app.selected(), Some(0));
+    assert!(app.semantic_search.results.contains_key(&0));
+}
+
+#[test]
+fn semantic_search_ignores_lexical_fallback_after_completion() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(&sandbox, vec![visible()]);
+    let (tx, rx) = mpsc::channel();
+    app.search_rx = rx;
+    app.search_generation = 7;
+    app.semantic_search.pending_generation = None;
+    app.filtered = vec![0];
+    app.selected = Some(0);
+    tx.send(SearchResponse {
+        filtered: Vec::new(),
+        generation: 7,
+        mode: ListSearchMode::Semantic,
+        evidence: HashMap::new(),
+    })
+    .unwrap();
+
+    assert!(!app.poll());
+    assert_eq!(app.filtered(), &[0]);
+    assert_eq!(app.selected(), Some(0));
+}
+
+#[test]
+fn semantic_keypress_does_not_clone_full_corpus_on_ui_thread() {
+    let sandbox = Sandbox::new();
+    let conversations = (0..150)
+        .map(|index| {
+            conversation(
+                Some("Visible"),
+                &format!("-tmp-visible-{index}"),
+                &format!("22222222-2222-4222-8222-{index:012}"),
+                "needle",
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut app = app_with_semantic_mode(&sandbox, conversations);
+    let snapshot = app.corpus_snapshot();
+    let (request_tx, request_rx) = mpsc::channel();
+    let (_response_tx, response_rx) = mpsc::channel();
+    app.semantic_search.worker_tx = Some(request_tx);
+    app.semantic_search.worker_rx = Some(response_rx);
+
+    type_char(&mut app, 'n');
+
+    let commands = drain_semantic_commands(&request_rx);
+    let corpus = commands
+        .iter()
+        .find_map(|command| match command {
+            SemanticWorkerCommand::UpdateCorpus { conversations, .. } => Some(conversations),
+            _ => None,
+        })
+        .expect("semantic corpus");
+    assert_eq!(corpus.len(), 150);
+    // K1: the very same corpus, not a per-dispatch copy.
+    assert!(Arc::ptr_eq(corpus, &snapshot));
+    for (index, conversation) in corpus.iter().enumerate() {
+        assert!(Arc::ptr_eq(conversation, &snapshot[index]));
+    }
+    let request = last_semantic_search(&commands).expect("semantic search");
+    assert_eq!(request.1, "n");
+
+    type_char(&mut app, 'e');
+
+    let commands = drain_semantic_commands(&request_rx);
+    assert!(
+        commands
+            .iter()
+            .all(|command| matches!(command, SemanticWorkerCommand::Search { .. }))
+    );
+    let request = last_semantic_search(&commands).expect("semantic search");
+    assert_eq!(request.1, "ne");
+}
+
+#[test]
+fn semantic_mode_prewarms_cache_without_query() {
+    let sandbox = Sandbox::new();
+    let (mut app, request_rx, _response_tx) =
+        app_with_single_visible_conversation_and_semantic_worker(&sandbox);
+    app.invalidate_search_generation();
+
+    app.prewarm_semantic_cache();
+
+    let commands = drain_semantic_commands(&request_rx);
+    let request = last_semantic_search(&commands).expect("semantic prewarm request");
+    assert_eq!(request.1, "");
+    assert!(request.4);
+    assert_eq!(last_semantic_scope(&commands).unwrap().2, vec![0]);
+    assert_eq!(app.semantic_search.pending_generation, Some(request.0));
+}
+
+#[test]
+fn refresh_with_empty_query_in_semantic_mode_prewarms_cache() {
+    // Upstream app.rs:434-438: the third prewarm trigger.
+    let sandbox = Sandbox::new();
+    let (mut app, request_rx, _response_tx) =
+        app_with_single_visible_conversation_and_semantic_worker(&sandbox);
+    drain_semantic_commands(&request_rx);
+    assert!(app.query.trim().is_empty());
+
+    let prepared = Browser::prepare_corpus(
+        app.corpus_snapshot()
+            .iter()
+            .map(|c| (**c).clone())
+            .collect(),
+        true,
+    );
+    app.install_prepared(prepared);
+
+    let commands = drain_semantic_commands(&request_rx);
+    let request = last_semantic_search(&commands).expect("prewarm after refresh");
+    assert_eq!(request.1, "");
+    assert!(request.4);
+    assert_eq!(app.semantic_search.pending_generation, Some(request.0));
+}
+
+#[test]
+fn semantic_request_uses_live_conversations_not_stale_snapshot() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(&sandbox, vec![visible()]);
+    // A snapshot taken by someone else does not pin the browser's corpus.
+    let stale = app.corpus_snapshot();
+    assert_eq!(app.remove_paths(&[stale[0].path.clone()]), 1);
+    app.push_conversation(visible());
+    app.corpus_changed();
+    let (request_tx, request_rx) = mpsc::channel();
+    let (_response_tx, response_rx) = mpsc::channel();
+    app.semantic_search.worker_tx = Some(request_tx);
+    app.semantic_search.worker_rx = Some(response_rx);
+
+    app.query = "needle".to_string();
+    app.dispatch_search();
+
+    let commands = drain_semantic_commands(&request_rx);
+    let corpus = commands
+        .iter()
+        .find_map(|command| match command {
+            SemanticWorkerCommand::UpdateCorpus { conversations, .. } => Some(conversations),
+            _ => None,
+        })
+        .expect("semantic corpus");
+    assert_eq!(corpus.len(), 1);
+    assert_eq!(corpus[0].semantic_turns, vec!["needle"]);
+    assert!(!Arc::ptr_eq(corpus, &stale));
+    assert!(Arc::ptr_eq(corpus, &app.corpus_snapshot()));
+    // The stale snapshot is unchanged.
+    assert_eq!(stale.len(), 1);
+}
+
+#[test]
+fn semantic_query_keeps_existing_metadata_while_pending() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(&sandbox, vec![visible()]);
+    app.list_search_mode = ListSearchMode::Semantic;
+    app.semantic_search.results = HashMap::from([(0, test_semantic_metadata(0, "old"))]);
+    let (request_tx, request_rx) = mpsc::channel();
+    let (_response_tx, response_rx) = mpsc::channel();
+    app.semantic_search.worker_tx = Some(request_tx);
+    app.semantic_search.worker_rx = Some(response_rx);
+
+    app.query = "needle".to_string();
+    app.dispatch_search();
+
+    let commands = drain_semantic_commands(&request_rx);
+    assert!(last_semantic_search(&commands).is_some());
+    assert!(app.semantic_search.results.contains_key(&0));
+}
+
+#[test]
+fn semantic_scope_indices_apply_scope() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_options(
+        &sandbox,
+        vec![
+            conversation(
+                Some("Hidden"),
+                "-tmp-hidden",
+                "11111111-1111-4111-8111-111111111111",
+                "hidden",
+            ),
+            conversation(
+                Some("Visible"),
+                "-tmp-visible",
+                "22222222-2222-4222-8222-222222222222",
+                "visible",
+            ),
+            conversation(
+                Some("Other"),
+                "-tmp-other",
+                "33333333-3333-4333-8333-333333333333",
+                "other",
+            ),
+        ],
+        vec!["Hidden"],
+        ListSearchMode::Semantic,
+    );
+    app.workspace = Some(workspace("/tmp/visible", "-tmp-visible"));
+    app.workspace_filter = true;
+
+    let indices = app.semantic_scope_indices();
+    assert_eq!(indices.as_ref(), &vec![1]);
+}
+
+#[test]
+fn semantic_response_applies_ranked_indices_and_metadata() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(
+        &sandbox,
+        vec![
+            visible(),
+            conversation(
+                Some("Other"),
+                "-tmp-other",
+                "33333333-3333-4333-8333-333333333333",
+                "other",
+            ),
+        ],
+    );
+    let (_request_tx, request_rx) = mpsc::channel();
+    let (response_tx, response_rx) = mpsc::channel();
+    app.semantic_search.worker_tx = Some(_request_tx);
+    app.semantic_search.worker_rx = Some(response_rx);
+    app.list_search_mode = ListSearchMode::Semantic;
+    app.search_generation = 7;
+    app.search_in_flight = true;
+    app.semantic_search.pending_generation = Some(7);
+    app.filtered.clear();
+    app.selected = None;
+    drop(request_rx);
+    let metadata = HashMap::from([(1, test_semantic_metadata(1, "visible preview"))]);
+
+    send_semantic_complete_response(
+        &response_tx,
+        7,
+        vec![1],
+        metadata,
+        SemanticProgress::Complete,
+    );
+
+    assert!(app.poll());
+    assert_eq!(app.filtered(), &[1]);
+    assert_eq!(app.selected(), Some(0));
+    assert_eq!(app.semantic_search.pending_generation, None);
+    assert!(!app.search_in_flight);
+    assert_eq!(
+        app.semantic_search.results[&1].explanation.evidence_preview,
+        "visible preview"
+    );
+    assert_eq!(app.semantic_search.results[&1].score_breakdown.hybrid, 1.0);
+    assert_eq!(
+        app.semantic_result_metadata_for_selection()
+            .map(|metadata| metadata.explanation.evidence_preview.as_str()),
+        Some("visible preview")
+    );
+}
+
+#[test]
+fn semantic_empty_query_clears_error() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(&sandbox, vec![visible()]);
+
+    app.toggle_list_search_mode();
+    app.semantic_search.error = Some("failed".to_string());
+
+    app.query.clear();
+    app.dispatch_search();
+
+    assert_eq!(filtered_projects(&app), vec![Some("Visible")]);
+    assert_eq!(app.semantic_search.error, None);
+}
+
+#[test]
+fn semantic_uuid_query_uses_uuid_lookup_and_clears_unsupported_error() {
+    let sandbox = Sandbox::new();
+    let uuid = "11111111-1111-4111-8111-111111111111";
+    let mut app = app_with_options(
+        &sandbox,
+        vec![conversation(Some("Hidden"), "-tmp-hidden", uuid, "needle")],
+        vec!["Hidden"],
+        ListSearchMode::Semantic,
+    );
+    app.toggle_list_search_mode();
+    app.semantic_search.error = Some("failed".to_string());
+
+    app.query = uuid.to_string();
+    app.dispatch_search();
+
+    assert_eq!(filtered_projects(&app), vec![Some("Hidden")]);
+    assert_eq!(app.semantic_search.error, None);
+    assert!(app.semantic_search.worker_tx.is_none());
+    assert!(app.semantic_search.worker_rx.is_none());
+}
+
+#[test]
+fn semantic_progress_messages_update_activity_status_text() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(&sandbox, vec![visible()]);
+    let (_request_tx, request_rx, response_tx) = connect_semantic_search_channels(&mut app);
+    app.list_search_mode = ListSearchMode::Semantic;
+    app.search_generation = 7;
+    app.semantic_search.pending_generation = Some(7);
+    drop(request_rx);
+
+    send_semantic_progress_response(
+        &response_tx,
+        7,
+        SemanticProgress::Embedding {
+            completed: 1,
+            total: 2,
+        },
+    );
+
+    assert!(app.poll());
+    assert_eq!(app.semantic_status_text(), None);
+    assert_eq!(
+        app.semantic_activity_status_text().as_deref(),
+        Some("sem embedding 50%  1/2 chunks")
+    );
+    assert_eq!(app.semantic_search.pending_generation, Some(7));
+    assert_eq!(
+        app.semantic_progress(),
+        &SemanticProgress::Embedding {
+            completed: 1,
+            total: 2
+        }
+    );
+}
+
+#[test]
+fn clearing_query_preserves_in_flight_prewarm_preparing_status() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(&sandbox, vec![visible()]);
+    app.list_search_mode = ListSearchMode::Semantic;
+    app.search_generation = 10;
+    app.semantic_search.pending_generation = Some(10);
+    app.semantic_search.prewarm_generation = Some(9);
+    app.semantic_search.prewarm_status = Some(SemanticProgress::InitializingModel);
+    app.query = "needle".to_string();
+
+    app.query.clear();
+    app.dispatch_search();
+
+    assert_eq!(
+        app.semantic_activity_status_text().as_deref(),
+        Some("sem preparing embeddings")
+    );
+}
+
+#[test]
+fn clearing_query_preserves_in_flight_prewarm_progress() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(&sandbox, vec![visible()]);
+    app.list_search_mode = ListSearchMode::Semantic;
+    app.search_generation = 10;
+    app.semantic_search.pending_generation = Some(10);
+    app.semantic_search.prewarm_generation = Some(9);
+    app.semantic_search.prewarm_status = Some(SemanticProgress::Embedding {
+        completed: 3,
+        total: 10,
+    });
+    app.query = "needle".to_string();
+
+    app.query.clear();
+    app.dispatch_search();
+
+    assert_eq!(
+        app.semantic_activity_status_text().as_deref(),
+        Some("sem embedding 30%  3/10 chunks")
+    );
+}
+
+#[test]
+fn typing_preserves_query_embedding_activity_until_replacement_reports_progress() {
+    for progress in [
+        SemanticProgress::InitializingModel,
+        SemanticProgress::Embedding {
+            completed: 3,
+            total: 10,
+        },
+    ] {
+        let sandbox = Sandbox::new();
+        let mut app = app_with_semantic_mode(&sandbox, vec![visible()]);
+        let (_request_tx, _request_rx, response_tx) = connect_semantic_search_channels(&mut app);
+        app.semantic_search.prewarm_generation = None;
+        app.semantic_search.prewarm_status = None;
+        set_query_for_test(&mut app, "n");
+        app.dispatch_search();
+        let original_generation = app.search_generation;
+        send_semantic_progress_response(&response_tx, original_generation, progress);
+        assert!(app.poll());
+        let activity = app.semantic_activity_status_text();
+        assert!(activity.is_some());
+
+        for c in ['e', 'e', 'd'] {
+            type_char(&mut app, c);
+            assert_eq!(app.semantic_activity_status_text(), activity);
+        }
+
+        send_semantic_complete_response(
+            &response_tx,
+            original_generation,
+            vec![0],
+            HashMap::new(),
+            SemanticProgress::Complete,
+        );
+        app.poll();
+        assert_eq!(app.semantic_activity_status_text(), activity);
+
+        send_semantic_progress_response(
+            &response_tx,
+            app.search_generation,
+            SemanticProgress::Ranking,
+        );
+        assert!(app.poll());
+        assert_eq!(app.semantic_activity_status_text(), None);
+    }
+}
+
+#[test]
+fn query_ranking_status_does_not_use_activity_bar() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(&sandbox, vec![visible()]);
+    app.list_search_mode = ListSearchMode::Semantic;
+    app.semantic_search.prewarm_generation = None;
+    app.semantic_search.prewarm_status = None;
+    app.semantic_search.pending_generation = Some(10);
+    app.semantic_search.pending_status = Some(SemanticProgress::Ranking);
+
+    assert_eq!(app.semantic_activity_status_text(), None);
+}
+
+#[test]
+fn prewarm_generation_keeps_search_polling_until_completion() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(&sandbox, vec![visible()]);
+    app.list_search_mode = ListSearchMode::Semantic;
+    app.search_generation = 10;
+    app.semantic_search.prewarm_generation = Some(9);
+    app.semantic_search.prewarm_status = Some(SemanticProgress::Embedding {
+        completed: 10,
+        total: 10,
+    });
+
+    assert!(app.has_search_work_in_flight());
+}
+
+#[test]
+fn semantic_query_interrupts_prewarm_and_keeps_activity_until_query_starts() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(&sandbox, vec![visible()]);
+    let (request_tx, _request_rx) = mpsc::channel();
+    let (response_tx, response_rx) = mpsc::channel();
+    app.semantic_search.worker_tx = Some(request_tx);
+    app.semantic_search.worker_rx = Some(response_rx);
+    app.list_search_mode = ListSearchMode::Semantic;
+    app.search_generation = 9;
+    app.semantic_search.prewarm_generation = Some(9);
+    app.semantic_search.prewarm_status = Some(SemanticProgress::Embedding {
+        completed: 3,
+        total: 10,
+    });
+    let cancellation = crate::semantic::types::SemanticCancellationToken::new();
+    let active_cancellation = cancellation.child();
+    app.semantic_search.cancellation = Some(cancellation);
+    app.query = "needle".to_string();
+
+    app.dispatch_search();
+    let real_generation = app.search_generation;
+
+    assert!(active_cancellation.is_cancelled());
+    assert_eq!(app.semantic_search.prewarm_generation, Some(9));
+    assert_eq!(
+        app.semantic_activity_status_text().as_deref(),
+        Some("sem embedding 30%  3/10 chunks")
+    );
+
+    send_semantic_progress_response(&response_tx, real_generation, SemanticProgress::Ranking);
+    assert!(app.poll());
+    assert_eq!(app.semantic_search.prewarm_generation, None);
+    assert_eq!(app.semantic_search.prewarm_status, None);
+
+    send_semantic_complete_response(
+        &response_tx,
+        real_generation,
+        vec![0],
+        HashMap::new(),
+        SemanticProgress::Complete,
+    );
+
+    assert!(app.poll());
+    assert!(!app.has_search_work_in_flight());
+    assert_eq!(app.semantic_activity_status_text(), None);
+}
+
+#[test]
+fn semantic_empty_corpus_status_is_visible_after_completion() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(&sandbox, vec![visible()]);
+    let (_request_tx, request_rx, response_tx) = connect_semantic_search_channels(&mut app);
+    app.list_search_mode = ListSearchMode::Semantic;
+    app.search_generation = 7;
+    app.semantic_search.pending_generation = Some(7);
+    drop(request_rx);
+
+    send_semantic_complete_response(
+        &response_tx,
+        7,
+        Vec::new(),
+        HashMap::new(),
+        SemanticProgress::EmptyCorpus,
+    );
+
+    assert!(app.poll());
+    assert_eq!(app.semantic_status_text().as_deref(), Some("sem no text"));
+    assert_eq!(app.search_status_text(), "sem 0/0 sem no text");
+    assert!(app.filtered().is_empty());
+    assert_eq!(app.selected(), None);
+}
+
+#[test]
+fn lexical_toggle_clears_semantic_error_and_pending_status() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(&sandbox, vec![visible()]);
+    app.list_search_mode = ListSearchMode::Semantic;
+    app.query = "needle".to_string();
+    app.semantic_search.pending_generation = Some(3);
+    app.semantic_search.pending_status = Some(SemanticProgress::Ranking);
+    app.semantic_search.error = Some("failed".to_string());
+
+    app.toggle_list_search_mode();
+    wait_for_search(&mut app);
+
+    assert_eq!(app.list_search_mode(), ListSearchMode::Lexical);
+    assert_eq!(app.semantic_search.pending_generation, None);
+    assert_eq!(app.semantic_search.pending_status, None);
+    assert_eq!(app.semantic_search.error, None);
+    assert_eq!(filtered_projects(&app), vec![Some("Visible")]);
+}
+
+#[test]
+fn workspace_toggle_dispatches_new_semantic_request() {
+    let sandbox = Sandbox::new();
+    let (mut app, request_rx, _response_tx) =
+        app_with_single_visible_conversation_and_semantic_worker(&sandbox);
+    app.workspace = Some(workspace("/tmp/visible", "-tmp-visible"));
+    app.query = "needle".to_string();
+
+    app.toggle_workspace_filter();
+
+    let commands = drain_semantic_commands(&request_rx);
+    assert_eq!(last_semantic_scope(&commands).unwrap().2, vec![0]);
+    assert_eq!(last_semantic_search(&commands).unwrap().1, "needle");
+    assert_eq!(filtered_projects(&app), vec![Some("Visible")]);
+    assert_eq!(app.selected(), Some(0));
+    assert_eq!(app.semantic_error(), None);
+}
+
+#[test]
+fn uuid_dispatch_invalidates_stale_search_response() {
+    let sandbox = Sandbox::new();
+    let uuid = "11111111-1111-4111-8111-111111111111";
+    let mut app = app(
+        &sandbox,
+        vec![
+            conversation(Some("Hidden"), "-tmp-hidden", uuid, "needle"),
+            visible(),
+        ],
+        vec!["Hidden"],
+    );
+
+    let (tx, rx) = mpsc::channel();
+    app.search_rx = rx;
+    app.search_generation = 1;
+    app.search_in_flight = true;
+
+    app.query = uuid.to_string();
+    app.dispatch_search();
+    assert_eq!(filtered_projects(&app), vec![Some("Hidden")]);
+
+    tx.send(SearchResponse {
+        filtered: vec![1],
+        generation: 1,
+        mode: ListSearchMode::Lexical,
+        evidence: HashMap::new(),
+    })
+    .unwrap();
+
+    app.poll();
+    assert_eq!(filtered_projects(&app), vec![Some("Hidden")]);
+}
+
+#[test]
+fn finish_loading_invalidates_stale_loading_search_response() {
+    let sandbox = Sandbox::new();
+    let mut app = loading_app(&sandbox, ListSearchMode::Lexical);
+
+    let (tx, rx) = mpsc::channel();
+    app.search_rx = rx;
+    app.search_generation = 1;
+    app.search_in_flight = true;
+
+    app.append_conversations(vec![visible()]);
+    app.finish_loading();
+    assert_eq!(filtered_projects(&app), vec![Some("Visible")]);
+
+    tx.send(SearchResponse {
+        filtered: vec![],
+        generation: 1,
+        mode: ListSearchMode::Lexical,
+        evidence: HashMap::new(),
+    })
+    .unwrap();
+
+    app.poll();
+    assert_eq!(filtered_projects(&app), vec![Some("Visible")]);
+}
+
+#[test]
+fn workspace_filter_without_project_context_keeps_rows() {
+    let sandbox = Sandbox::new();
+    let mut app = Browser::new_loading(
+        sandbox
+            .options()
+            .with_workspace(None)
+            .with_workspace_filter(true),
+    );
+
+    app.append_conversations(vec![visible()]);
+
+    assert_eq!(filtered_projects(&app), vec![Some("Visible")]);
+    assert!(!app.has_project_context());
+}
+
+#[test]
+fn exclude_projects_filters_incremental_loading() {
+    let sandbox = Sandbox::new();
+    let mut app = Browser::new_loading(
+        sandbox
+            .options()
+            .with_exclude_projects(vec!["Hidden".into()]),
+    );
+
+    app.append_conversations(vec![
+        conversation(
+            Some("Hidden"),
+            "-tmp-hidden",
+            "11111111-1111-4111-8111-111111111111",
+            "needle",
+        ),
+        visible(),
+    ]);
+
+    assert_eq!(filtered_projects(&app), vec![Some("Visible")]);
+    assert_eq!(app.loading_state(), &LoadingState::Loading { loaded: 2 });
+    assert_eq!(app.count_text(), "Loading... 2");
+}
+
+#[test]
+fn empty_exclusions_preserve_browse_results() {
+    let sandbox = Sandbox::new();
+    let app = app(
+        &sandbox,
+        vec![
+            conversation(
+                Some("Hidden"),
+                "-tmp-hidden",
+                "11111111-1111-4111-8111-111111111111",
+                "needle",
+            ),
+            conversation(
+                None,
+                "-tmp-none",
+                "22222222-2222-4222-8222-222222222222",
+                "needle",
+            ),
+        ],
+        vec![],
+    );
+
+    assert_eq!(filtered_projects(&app), vec![Some("Hidden"), None]);
+}
+
+#[test]
+fn project_without_name_is_never_excluded() {
+    let sandbox = Sandbox::new();
+    let app = app(
+        &sandbox,
+        vec![conversation(
+            None,
+            "-tmp-none",
+            "11111111-1111-4111-8111-111111111111",
+            "needle",
+        )],
+        vec![""],
+    );
+
+    assert_eq!(filtered_projects(&app), vec![None]);
+}
+
+#[test]
+fn single_file_mode_has_no_project_exclusions() {
+    let sandbox = Sandbox::new();
+    let app = Browser::new_single_file(
+        sandbox.path().join("hidden.jsonl"),
+        sandbox
+            .options()
+            .with_exclude_projects(vec!["Hidden".into()])
+            .with_default_mode(ListSearchMode::Semantic)
+            .with_workspace_filter(true),
+    );
+
+    assert!(app.excluded_projects.is_empty());
+    assert!(app.is_single_file_mode());
+    assert!(!app.semantic_available());
+    assert_eq!(app.list_search_mode(), ListSearchMode::Lexical);
+    assert!(!app.workspace_filter());
+    // The missing file is reported instead of an empty viewer (addendum D1).
+    assert!(app.single_file_error().is_some());
+    assert!(app.conversations().is_empty());
+}
+
+// --- search-bar status (upstream render_search_bar tests) ---
+
+#[test]
+fn search_bar_status_texts() {
+    let sandbox = Sandbox::new();
+    let mut lexical = app(&sandbox, vec![visible()], vec![]);
+    assert_eq!(lexical.search_status_text(), "1/1");
+    lexical.selected = None;
+    assert_eq!(lexical.search_status_text(), "0/1");
+
+    // Transient semantic progress (ranking, embedding) never shows in the
+    // search bar: only the mode label and the count.
+    for progress in [
+        SemanticProgress::Ranking,
+        SemanticProgress::Embedding {
+            completed: 21,
+            total: 42,
+        },
+    ] {
+        let mut semantic = app_with_semantic_mode(&sandbox, vec![visible()]);
+        let (_request_tx, _request_rx, response_tx) =
+            connect_semantic_search_channels(&mut semantic);
+        set_query_for_test(&mut semantic, "vector query");
+        semantic.search_generation = 7;
+        semantic.semantic_search.pending_generation = Some(7);
+        semantic.semantic_search.prewarm_generation = Some(7);
+        send_semantic_progress_response(&response_tx, 7, progress);
+        semantic.poll();
+        assert_eq!(semantic.search_status_text(), "sem 1/1");
+    }
+
+    let mut failed = app_with_semantic_mode(&sandbox, vec![visible()]);
+    failed.semantic_search.error = Some("model missing".to_string());
+    assert_eq!(failed.search_status_text(), "sem 1/1 sem failed");
+    assert_eq!(failed.semantic_error(), Some("model missing"));
+}

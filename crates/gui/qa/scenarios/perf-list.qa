@@ -1,0 +1,56 @@
+# WP1 perf-list: 20,000 synthetic rows (a sandbox prepared with the
+# synth::corpus layout: 10 projects, 20k single-exchange sessions). Release
+# build, DESIGN 15.8 targets (FEATURES S-037, X-008, X-009, X-010):
+#   * UI-thread time per typed key <= 2 ms (list.ui_busy_max, milliseconds)
+#   * the pane's share of the install at the end of the load <= 16 ms
+#     (list.install_pane_max). The loader's share (list.loader_install_max) is
+#     core's Browser install: reported, not asserted (CCR in the hand-off).
+#   * holding PageDown / Down through the whole list keeps the frame p95 <= 16 ms
+#     (the pane's and the main window's)
+#   * the UUID below is typed (36 keystrokes, each one set_query): the worst
+#     case of a paste; then pasted (one keystroke, `busy.paste` = the whole
+#     UI-thread update of the paste <= 2 ms; integrator, Phase C).
+wait-loaded 180s
+expect list.total > 19000
+timing list.install_pane_max < 16ms
+type "synthetic"
+wait 50ms
+wait-for list.searching == false 10s
+type " conversation 19"
+wait 50ms
+wait-for list.searching == false 10s
+timing list.ui_busy_max < 2ms
+key escape
+# a typed UUID: the disk lookup runs in the background
+type "00000000-1c2d-4e5f-8a9b-0c1d2e3f4a5b"
+wait 500ms
+timing list.ui_busy_max < 2ms
+key escape
+# the same UUID pasted: one change event
+# (judged by the median of three: one sample in twenty carries a UI-thread hiccup outside the handler)
+paste "000003e8-1c2d-4e5f-8a9b-0c1d2e3f4a5b"
+wait-for list.count == 1 10s
+expect list.selected_title == "Synthetic conversation 0"
+key escape
+wait 300ms
+paste "000003e9-1c2d-4e5f-8a9b-0c1d2e3f4a5b"
+wait-for list.count == 1 10s
+key escape
+wait 300ms
+paste "000003ea-1c2d-4e5f-8a9b-0c1d2e3f4a5b"
+wait-for list.count == 1 10s
+timing busy.paste_median < 2ms
+key escape
+# hold PageDown / Down at the key-repeat pace (33 ms per press, X-008): 800
+# pages walk the 20k rows end to end, 300 more presses move one row each. The
+# pane's own build time (list.frame_p95) and the whole main-window frame
+# (window.frame_p95, the last 512 frames: the pane plus the viewer and chrome)
+# must both stay within the 16 ms frame budget.
+wait 300ms
+hold pagedown 800
+hold down 300
+key end
+key home
+timing list.frame_p95 < 16ms
+timing window.frame_p95 < 16ms
+quit 0

@@ -1,0 +1,313 @@
+# cross-pane.qa (WP-I; DESIGN §15.8, §17.10; FEATURES X-038, X-007, L-011, L-098, V-007, X-040,
+# D-011): the panes working together in the real window on 20,000+ rows.
+#
+# Sandbox: a fresh copy of the template home plus the synthetic corpus, release `--features qa`:
+#   tools/qa/new-sandbox.ps1 -Source <template home> -Dest <sbx>
+#   tools/qa/add-synth-corpus.ps1 -Sandbox <sbx> -Count 20000
+#   tools/qa/run-gui.ps1 -Sandbox <sbx> -Exe <qa build> -Scenario crates/gui/qa/scenarios/cross-pane.qa -Out <dir> -Shots
+#
+# X-038 targets — UI-thread time of the whole operation (`busy.*`, milliseconds): the handler and
+# every subscriber, observer and menu refresh it set off, timed around the outermost update that
+# ran it (`globals::UiBusy`):
+#   load end <= 16 ms, refresh end <= 16 ms, rename apply <= 5 ms, delete removal <= 5 ms,
+#   UUID paste <= 2 ms.
+# Refresh, paste, rename and delete run three to five times and are judged by the median
+# (`busy.<span>_median`): about one sample in twenty carries a 14-70 ms hiccup of UI-thread CPU
+# that lies outside every handler of the operation (`busy.<span>_parts` lists the handlers that
+# ran inside it and their times). The maximum (`busy.<span>_max`) and the UI-thread CPU time
+# (`busy.<span>_cpu`; it tells work on the UI thread from the OS running other threads) are
+# reported next to it; the targets are not raised.
+# X-007: idle — no frame for 25 s, under 5 ms of UI time. The window starts right after a run of
+# the list's 30 s ticker (so it holds none; the ticker repaints only when a painted row's time label
+# changes; the frames of the wait for that run, earlier work settling included, are reported:
+# `idle.ticker_*`). A window that input from outside the run reached (the OS activating another
+# window, the mouse crossing this one: the desktop is shared) is reported and measured again, up
+# to three times. The transcript has the focus while idle: a focused text input blinks its caret
+# twice a second (gpui-kit `BlinkCursor`), which is a repaint by design, not polling. A second probe
+# with the search input focused (the default idle state) reports that blink: about 2 frames/s,
+# ~6 ms each at 20k rows; gpui-kit offers no way to stop it.
+# §15.8 working set: <= 400 MB, and within ±10 % after opening 20 conversations in a row (the peak,
+# with the 20k-row load and a Deep search over every transcript, is reported).
+
+wait-loaded 180s
+set-theme light
+expect list.total > 20000
+timing busy.load_end < 16ms
+timing busy.load_end_cpu >= 0
+timing busy.load_end_parts contains ""
+shot cross-pane-list-light
+
+# ----- X-007: idle -----------------------------------------------------------------------------
+key secondary-1
+key f6 f6
+expect focus == viewer
+# The preview of the selected row has landed (its parse and install are not idle work).
+wait-for viewer.loading == false 60s
+wait 2s
+idle 25s
+expect idle.frames == 0
+timing idle.busy_ms < 5ms
+timing idle.busy_cpu_ms >= 0
+# Busy polling (a UI task that wakes without a notify, a polling thread) draws no frame: the CPU
+# time of the whole process over the window is what shows it. Measured baseline: 0.4-1.1 s of CPU
+# over 25 s (one non-UI thread, also present in a small sandbox; cause not attributed), so the bound
+# is 10 % of a core: it catches a poll loop, not a 1 % drift.
+timing idle.process_cpu_ms < 2500ms
+timing idle.ticker_frames >= 0
+timing idle.ticker_frame_ms >= 0
+# The default idle state is the list's search input focused. Its caret blinks (gpui-kit's
+# BlinkCursor, 500 ms, repainting the window; the app cannot stop it): reported, not asserted.
+key secondary-1
+expect focus == list
+wait 1s
+idle 10s
+timing idle.frames_total >= 0
+timing idle.busy_ms >= 0
+timing idle.process_cpu_ms >= 0
+
+# ----- X-038: refresh end, three times (F5 from the transcript, AD8) ----------------------------
+key f5
+wait-for busy.refresh_end_runs == 1 120s
+wait-for list.refreshing == false 30s
+expect toast.last contains "Refreshed conversations"
+timing busy.refresh_end_parts contains ""
+key f5
+wait-for busy.refresh_end_runs == 2 120s
+wait-for list.refreshing == false 30s
+key f5
+wait-for busy.refresh_end_runs == 3 120s
+wait-for list.refreshing == false 30s
+timing busy.refresh_end_median < 16ms
+timing busy.refresh_end_max >= 0
+timing busy.refresh_end_cpu >= 0
+
+# ----- X-038: UUID paste, five times ------------------------------------------------------------
+key secondary-1
+expect focus == list
+paste "000003e9-1c2d-4e5f-8a9b-0c1d2e3f4a5b"
+wait-for list.count == 1 10s
+timing busy.paste_parts contains ""
+key escape
+wait 300ms
+paste "0000040e-1c2d-4e5f-8a9b-0c1d2e3f4a5b"
+wait-for list.count == 1 10s
+key escape
+wait 300ms
+paste "00000433-1c2d-4e5f-8a9b-0c1d2e3f4a5b"
+wait-for list.count == 1 10s
+key escape
+wait 300ms
+paste "00000458-1c2d-4e5f-8a9b-0c1d2e3f4a5b"
+wait-for list.count == 1 10s
+key escape
+wait 300ms
+paste "000004e7-1c2d-4e5f-8a9b-0c1d2e3f4a5b"
+wait-for list.count == 1 10s
+expect list.selected_title == "Synthetic conversation 255"
+timing busy.paste_median < 2ms
+timing busy.paste_max >= 0
+timing busy.paste_cpu >= 0
+
+# ----- L-011: rows clicked by their stem --------------------------------------------------------
+# A double click opens the row in the transcript and moves the focus there (PD2).
+dblclick row:000004e7-1c2d-4e5f-8a9b-0c1d2e3f4a5b
+wait-for viewer.path contains "000004e7" 10s
+wait-for viewer.status == ready 10s
+expect focus == viewer
+key q
+expect focus == list
+# A single click selects and keeps the focus in the search input.
+click row:000004e7-1c2d-4e5f-8a9b-0c1d2e3f4a5b
+expect focus == list
+expect list.selected_title == "Synthetic conversation 255"
+
+# ----- X-038: rename apply, three times; V-007: the open header follows -------------------------
+# Rename and delete run in the whole 20k-row list (no query): the work that scales with the visible
+# rows (the cached scope copy, the row lookup, the selection and filtered rebuild) is what X-038 bounds.
+key escape
+wait-for list.count > 19000 30s
+key down down down
+key enter
+wait-for viewer.status == ready 10s
+expect focus == viewer
+key f2
+wait-for dialog == rename 10s
+key secondary-a
+type "Renamed once"
+click rename:save
+wait-for dialog == none 10s
+wait-for busy.rename_apply_runs == 1 10s
+timing busy.rename_apply_parts contains ""
+expect viewer.header contains "Renamed once"
+key f2
+wait-for dialog == rename 10s
+key secondary-a
+type "Renamed twice"
+click rename:save
+wait-for dialog == none 10s
+wait-for busy.rename_apply_runs == 2 10s
+key f2
+wait-for dialog == rename 10s
+key secondary-a
+type "Renamed across panes"
+click rename:save
+wait-for dialog == none 10s
+wait-for busy.rename_apply_runs == 3 10s
+timing busy.rename_apply_median < 5ms
+timing busy.rename_apply_max >= 0
+timing busy.rename_apply_cpu >= 0
+expect viewer.header contains "Renamed across panes"
+expect list.selected_title == "Renamed across panes"
+expect list.count > 19000
+clear-toasts
+shot cross-pane-renamed-light
+
+# ----- X-038: delete removal, three times (from the transcript) ---------------------------------
+key ctrl-x
+wait-for dialog == delete 10s
+key y
+wait-for dialog == none 10s
+wait-for busy.delete_removal_runs == 1 10s
+timing busy.delete_removal_parts contains ""
+expect viewer.status == empty
+expect toast.last == "Deleted \"Renamed across panes\""
+expect focus == list
+key escape
+key down
+key enter
+wait-for viewer.status == ready 10s
+key ctrl-x
+wait-for dialog == delete 10s
+key y
+wait-for busy.delete_removal_runs == 2 10s
+key escape
+key down
+key enter
+wait-for viewer.status == ready 10s
+key ctrl-x
+wait-for dialog == delete 10s
+key y
+wait-for busy.delete_removal_runs == 3 10s
+timing busy.delete_removal_median < 5ms
+timing busy.delete_removal_max >= 0
+timing busy.delete_removal_cpu >= 0
+expect viewer.status == empty
+expect focus == list
+expect list.count > 19000
+
+# ----- L-098: the list survives a trip to the transcript ----------------------------------------
+key escape
+type "synthetic"
+wait-for list.searching == false 30s
+key down down
+expect list.selected_index == 2
+key enter
+wait-for viewer.status == ready 10s
+expect focus == viewer
+key q
+expect focus == list
+expect list.query == "synthetic"
+expect list.selected_index == 2
+
+# ----- X-040: at 880 px the agent panel takes the list's room and gives it back -----------------
+resize 880 600
+key enter
+wait-for viewer.status == ready 10s
+expect layout.left_collapsed == false
+key o
+wait-for viewer.agent_panel == true 5s
+expect layout.left_collapsed == true
+expect layout.auto_collapsed == true
+clear-toasts
+shot cross-pane-agent-880-light
+set-theme dark
+shot cross-pane-agent-880-dark
+set-theme light
+key o
+wait-for viewer.agent_panel == false 5s
+expect layout.left_collapsed == false
+expect layout.auto_collapsed == false
+resize 1280 820
+
+# ----- D-011 in the real window: a Deep search hit opens at its message --------------------------
+key secondary-2
+expect focus == deep
+type "\"Synthetic conversation 4242: answer 1\""
+key enter
+wait-for deep.hits > 0 120s
+expect deep.first_title == "Synthetic conversation 4242"
+key down
+key ctrl-enter
+wait-for viewer.path contains "0000147a" 10s
+wait-for viewer.status == ready 10s
+expect focus == viewer
+expect viewer.nav_focus == 2
+clear-toasts
+shot cross-pane-deep-hit-light
+set-theme dark
+shot cross-pane-deep-hit-dark
+set-theme light
+
+# ----- §15.8 working set: 20 conversations in a row release the earlier ones ------------------
+# "the" lists the template's real conversations (30 in the scratchpad template, 4 in the committed
+# qa-home corpus of qa.yml, where the last row is reopened); the measured count and the final row
+# index are reported.
+key secondary-1
+key escape
+type "the"
+wait-for list.searching == false 30s
+timing list.count > 0
+key home enter
+wait-for viewer.status == ready 30s
+wait 2s
+mark-memory first
+timing process.working_set_mb < 400
+key q down enter
+wait-for viewer.status == ready 30s
+key q down enter
+wait-for viewer.status == ready 30s
+key q down enter
+wait-for viewer.status == ready 30s
+key q down enter
+wait-for viewer.status == ready 30s
+key q down enter
+wait-for viewer.status == ready 30s
+key q down enter
+wait-for viewer.status == ready 30s
+key q down enter
+wait-for viewer.status == ready 30s
+key q down enter
+wait-for viewer.status == ready 30s
+key q down enter
+wait-for viewer.status == ready 30s
+key q down enter
+wait-for viewer.status == ready 30s
+key q down enter
+wait-for viewer.status == ready 30s
+key q down enter
+wait-for viewer.status == ready 30s
+key q down enter
+wait-for viewer.status == ready 30s
+key q down enter
+wait-for viewer.status == ready 30s
+key q down enter
+wait-for viewer.status == ready 30s
+key q down enter
+wait-for viewer.status == ready 30s
+key q down enter
+wait-for viewer.status == ready 30s
+key q down enter
+wait-for viewer.status == ready 30s
+key q down enter
+wait-for viewer.status == ready 30s
+key q down enter
+wait-for viewer.status == ready 30s
+timing list.selected_index >= 0
+# Back to the first one: the same document open as at the mark.
+key q home enter
+wait-for viewer.status == ready 30s
+wait 2s
+timing memory.first.delta_pct < 10
+timing process.working_set_mb < 400
+timing process.peak_working_set_mb >= 0
+quit 0

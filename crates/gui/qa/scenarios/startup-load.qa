@@ -1,0 +1,26 @@
+# WP1 startup-load: the sandbox corpus streams in, the first row is selected,
+# the footer and the toolbar show their state. Run with tools/qa/run-gui.ps1
+# against a sandbox copy (DESIGN 15.4); shots are reviewed in light and dark
+# (FEATURES L-001, L-002, L-003, L-011, L-013, L-029, L-030, L-032, X-013).
+wait-loaded 30s
+expect list.loaded == true
+expect list.loading == false
+expect list.count > 0
+expect focus == list
+expect list.query == ""
+expect list.mode == lex
+expect list.scope == all
+expect list.time == "Any time"
+# The shots are named for the light theme (the system theme otherwise; integrator, Phase C).
+set-theme light
+shot list-startup-light
+set-theme dark
+shot list-startup-dark
+set-theme light
+# keyboard navigation previews the selected row and keeps the selection visible
+key down down
+expect list.selected_title != ""
+key end
+shot list-end-light
+key home
+quit 0

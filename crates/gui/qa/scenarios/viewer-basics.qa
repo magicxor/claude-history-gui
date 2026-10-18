@@ -1,0 +1,106 @@
+# viewer-basics.qa (WP2; DESIGN §9, §15.3, §15.5): the viewer opens the markdown tour, the
+# toggles cycle (t / T / i) and keep their status texts, message navigation and the scroll keys
+# work, the outline panel slot toggles with `o`, and the screenshots cover code, tables, tool
+# output, thinking and a subagent in light and dark, plus a narrow window (header summary on
+# its own line, the wide table scrolled horizontally).
+#
+# Sandbox: tools/qa/new-sandbox.ps1, then crates/gui/tests/fixtures/viewer/prepare-sandbox.ps1.
+# Run (single-file window on the tour):
+#   tools/qa/run-gui.ps1 -Sandbox <sbx> -Exe <qa build> -Scenario crates/gui/qa/scenarios/viewer-basics.qa `
+#       -Out <dir> -Shots -ArgsLine '"<sbx>\viewer\markdown-tour.jsonl"'
+
+wait-for viewer.status == ready 20s
+expect window.kind == single-file
+expect focus == viewer
+expect viewer.items > 0
+expect viewer.tool_display == sum
+expect viewer.thinking == false
+expect viewer.timing == false
+expect viewer.indicator == "[1/9]"
+
+# Light theme, summary mode: the tour from the top (headings, lists, quote, table, code).
+set-theme light
+shot viewer-basics-light-summary
+
+# t cycles sum → trn → all → sum; T and i toggle (V-010, V-048, V-062).
+key t
+wait-for viewer.loading == false 5s
+expect viewer.tool_display == trn
+key t
+wait-for viewer.loading == false 5s
+expect viewer.tool_display == all
+key t
+wait-for viewer.loading == false 5s
+expect viewer.tool_display == sum
+key shift-t
+wait-for viewer.loading == false 5s
+expect viewer.thinking == true
+key i
+wait-for viewer.loading == false 5s
+expect viewer.timing == true
+key i
+wait-for viewer.loading == false 5s
+expect viewer.timing == false
+
+# Truncated tool output with thinking (light).
+key t
+wait-for viewer.loading == false 5s
+expect viewer.tool_display == trn
+shot viewer-basics-light-truncated
+
+# Message navigation (V-067, V-069, V-070): the first J focuses the second message.
+key shift-j
+expect viewer.nav_active == true
+expect viewer.nav_focus == 2
+key shift-k
+expect viewer.nav_focus == 1
+key shift-k
+expect viewer.nav_focus == 1
+key escape
+expect viewer.nav_active == false
+expect focus == viewer
+
+# Full tool output and the subagent (light), then the end of the transcript.
+key t
+wait-for viewer.loading == false 5s
+expect viewer.tool_display == all
+key pagedown pagedown
+shot viewer-basics-light-full-tools
+key shift-g
+expect viewer.indicator !contains "[1/"
+shot viewer-basics-light-bottom
+key g
+expect viewer.indicator contains "[1/"
+
+# Dark: the same views.
+set-theme dark
+shot viewer-basics-dark-top
+key pagedown pagedown
+shot viewer-basics-dark-full-tools
+key shift-g
+shot viewer-basics-dark-bottom
+key g
+
+# The outline panel slot (V-097): `o` shows and focuses it, `o` again hides it.
+key o
+expect viewer.agent_panel == true
+expect focus == agent
+key o
+expect viewer.agent_panel == false
+expect focus == viewer
+
+# A narrow window: the header summary moves to its own line, the wide table scrolls (V-004,
+# V-018), and truncation follows the new width (V-080).
+key t
+wait-for viewer.loading == false 5s
+expect viewer.tool_display == sum
+set-theme light
+resize 640 760
+wait 400ms
+wait-for viewer.loading == false 5s
+key shift-g
+shot viewer-basics-light-narrow
+set-theme dark
+shot viewer-basics-dark-narrow
+
+quit 0

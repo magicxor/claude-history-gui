@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Claude History
+GenericName=Conversation history browser
+Comment=Browse Claude Code, Pi and OMP conversation history
+Exec=claude-history-gui %f
+TryExec=claude-history-gui
+Icon=claude-history-gui
+Terminal=false
+Categories=Development;Utility;
+Keywords=claude;pi;omp;history;conversation;transcript;jsonl;
+MimeType=application/x-ndjson;application/jsonl;
+StartupWMClass=claude-history-gui
+StartupNotify=true

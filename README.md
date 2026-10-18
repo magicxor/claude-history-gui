@@ -1,1081 +1,393 @@
-# claude-history
+# claude-history-gui
 
-<img src="/meta/screenshot.webp" />
+A cross-platform desktop app (Windows, macOS, Linux) for browsing, searching and resuming your
+**Claude Code, Pi and OMP conversation history**. It is a GUI port of the terminal app
+[claude-history](https://github.com/raine/claude-history) and aims to cover every feature of the original,
+built on [gpui-kit](https://crates.io/crates/gpui-kit) (GPUI) and a UI-agnostic core (`crates/core`).
 
-> [!IMPORTANT]
-> Despite the name, `claude-history` also supports Codex, [Pi](https://pi.dev),
-> and [Oh My Pi](https://omp.sh/).
+![Conversation viewer, dark theme](docs/screenshots/viewer-dark.png)
 
-> _"This is the best thing ever thanks for this project."_ —
-> [@andrewle8](https://github.com/andrewle8)
+## Credits and license
 
-`claude-history` is a history browser for Claude Code, Codex, the [Pi coding
-agent](https://pi.dev), and [Oh My Pi (OMP)](https://omp.sh/). It searches
-conversations recorded in their local project histories with a built-in terminal
-UI, then opens the selected transcript directly in the terminal with scrolling,
-search, and export capabilities.
+* The original **claude-history** is by [Raine](https://github.com/raine/claude-history), MIT licensed.
+  `crates/core` is derived from it (v0.1.76); its license text is in
+  [`crates/core/LICENSE-MIT`](crates/core/LICENSE-MIT) and that crate is distributed under the same MIT terms.
+* The rest of the repository (the GUI crate, tools, docs) is under the repository [`LICENSE`](LICENSE)
+  (the Unlicense).
 
-Run it from a project directory and it discovers matching Claude, Codex, Pi, and
-OMP sessions automatically.
+## Screenshots
 
-[Install](#install) · [Features](#features) · [Usage](#usage) ·
-[Configuration](#configuration) · [Changelog](CHANGELOG.md)
+All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-home`), not real conversations.
 
-<a href="https://aventasks.dev/">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://aventasks.dev/readme/aven-banner-dark.webp">
-    <img src="https://aventasks.dev/readme/aven-banner-light.webp" alt="aven: one task queue for you and your coding agents" width="100%">
-  </picture>
-</a>
-
-<sub>Also from the author of claude-history: <a href="https://aventasks.dev/"><b>aven</b></a>, one
-queue for every project, with a keyboard-driven TUI for you and a CLI for your
-agents.</sub>
+| | |
+|---|---|
+| ![Viewer, light theme](docs/screenshots/viewer-light.png) | ![Search as you type, dark theme](docs/screenshots/list-search-dark.png) |
+| Conversation viewer, light theme | List search with highlighted matches |
+| ![Deep search, light theme](docs/screenshots/deep-search-light.png) | |
+| Deep search (agent protocol) with evidence cards | |
 
 ## Features
 
-- **Claude Code, Pi, and OMP support** across list, lexical and semantic search,
-  agent protocol commands, viewing, export, resume, fork, rename, and delete
-- **Fuzzy search** across all conversations with field-aware relevance scoring,
-  prefix matching, word boundary awareness, and tool output indexing
-- **Conversation viewer** with vim-style scrolling, in-viewer search, message
-  navigation, and markdown rendering
-- **Resume and fork** conversations directly from the TUI with configurable
-  keybindings
-- **Cross-project fork** — fork a conversation from any project into your
-  current working directory, useful when working across git worktrees
-- **Worktree-aware** project filtering for
-  [workmux](https://github.com/raine/workmux) users
-- **Export and copy** conversations or individual messages to clipboard
-- **Configurable** display options, keybindings, and default resume arguments
-- **Searchable history for Claude** through a companion
-  [Claude Code skill](skills/claude-history/SKILL.md) that lets Claude find and
-  read its own past conversations
+**Conversation list**
+* Claude Code, Pi and OMP conversations in one virtualized list, streamed in while loading, with cached parsing.
+* Search as you type. **Lexical** search (with highlighted matches and a literal mode for quoted text) or
+  **semantic** search (local embedding model, downloaded on first use; falls back to lexical while the cache is
+  not ready). Ctrl+T toggles the mode.
+* Scope **All** or **Workspace** (project folder), a workspace picker with recent folders, a time filter
+  (`--since`/`--before` grammar such as `2d`, `1d6h`, `6mo`, `2026-07-20`), excluded projects.
+* Paste a session UUID to jump to that conversation. Preview shows the first or last messages.
+* Row context menu, F5/Ctrl+L refresh, command palette (Ctrl+Shift+P or F10) with every menu command.
 
-## Install
+**Viewer**
+* Native rendering of messages, markdown, tables and syntax-highlighted code; text selection and copy.
+* Tool display modes **Summary / Truncated / Full**, thinking and subagent blocks, timestamps, tool outputs.
+* In-conversation search (`/`, `n`/`N`), message navigation, outline, per-message copy, focus-viewer mode.
+* Single-file mode: open any `.jsonl` transcript (`FILE`, `--render FILE`, File > Open JSONL file).
 
-### Quick install
+**Deep search and the agent protocol**
+* A **Deep search** tab runs every `agent search` option (lexical, semantic, exact, hybrid; flat or grouped
+  results) with evidence cards, open-at-hit and cancel.
+* A viewer **agent panel** with **Outline**, **Within** (search inside one conversation) and **Read** (message
+  ranges). Every result can show the exact text the CLI would print.
+* The same protocol runs headless as `claude-history-gui agent ...`.
+
+**Session actions**
+* **Resume** and **Fork** in a new terminal window (Windows Terminal or console, Terminal.app or osascript,
+  common Linux emulators, or your own template). Resuming into another workspace offers to copy the conversation
+  into that project first.
+* **Rename** (custom title), **Delete** (every copy of the session, with a confirmation that lists the files),
+  **Export** (ledger, plain text, Markdown, raw JSONL), **Copy** (conversation in the same formats, message,
+  path, session ID), reveal in the file manager.
+
+**Tools menu**
+Delete empty transcripts, generate or clear the semantic cache, debug search and semantic debug search, debug
+log, show the projects directory, delete a conversation by session ID, check for updates, Settings.
+
+**Settings and themes**
+* Themes: follow the system, Light or Dark (View > Theme, Settings, palette).
+* A Settings dialog (General, Display, Search, Keys, Resume, Agent) that edits `gui.toml` only; every field shows
+  where its value comes from. Resume, Fork, Rename, Delete and Refresh keys are rebindable.
+* Window layout, workspace and view defaults are remembered between runs.
+
+The full parity checklist with one row per upstream behavior is in [`docs/FEATURES.md`](docs/FEATURES.md).
+
+## Installation
+
+Download the artifact for your system from the GitHub release:
+
+| System | File | Notes |
+|---|---|---|
+| Windows x86_64 | `claude-history-gui-v<version>-windows-x86_64.zip` | unzip and run `claude-history-gui.exe`; the Visual C++ runtime DLLs are inside |
+| macOS (Apple silicon) | `claude-history-gui-v<version>-macos-aarch64.zip` | unzip, then right-click **Claude History.app** > Open the first time (ad-hoc signed, not notarized) |
+| Linux x86_64 | `claude-history-gui-v<version>-linux-x86_64.tar.gz` | needs a Vulkan driver and an X11 or Wayland session; includes a `.desktop` file and icon |
+
+Each file has a `.sha256` next to it. Intel Macs are not built in v1. On Linux, save/open dialogs need the
+xdg-desktop-portal FileChooser (without it Export offers "Export to Downloads").
+
+## Building from source
+
+Requirements: the Rust toolchain pinned in `rust-toolchain.toml` (1.99.0, with rustfmt and clippy; `rustup`
+installs it automatically).
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/raine/claude-history/main/scripts/install.sh | bash
+cargo build -p claude-history-gui --release
 ```
 
-### Prebuilt architectures
+**Windows (MSVC)**
+* MSVC toolchain with the Visual Studio 2022 *Desktop development with C++* workload, the Windows SDK and CMake.
+* The first build needs network access: `ort-sys` downloads the static ONNX Runtime (cached in
+  `%LOCALAPPDATA%\ort.pyke.io`). Never enable `+crt-static` (it fails with LNK2038).
+* `.cargo/config.toml` sets the 8 MiB main-thread stack and `RUST_MIN_STACK` for test threads.
+* DirectML is delay-loaded (`build.rs`), so the exe starts on systems without it. The exe needs the VC++
+  2015-2022 x64 runtime; the release zip ships the four DLLs next to the exe.
+* The release exe is a Windows GUI program that attaches to the parent console when it has output to print
+  (see [Windows console output](#windows-console-output)).
 
-Release archives include Apple Silicon macOS (`darwin-arm64`), Intel macOS
-(`darwin-amd64`), and x86_64 Linux (`linux-amd64`) builds. The macOS releases
-bundle ONNX Runtime, so semantic search needs no separate runtime install.
-
-### Homebrew (macOS/Linux)
+**Linux** (Debian/Ubuntu package names, as used by CI)
 
 ```sh
-brew install raine/claude-history/claude-history
+sudo apt-get install -y gcc g++ clang libfontconfig-dev libwayland-dev libxkbcommon-x11-dev \
+    libx11-xcb-dev libssl-dev libzstd-dev libvulkan1 mesa-vulkan-drivers
 ```
 
-### Cargo
-
-```sh
-cargo install claude-history
-```
-
-## Updating
-
-```sh
-claude-history update
-```
-
-Homebrew users should use `brew upgrade claude-history` instead.
+**macOS (arm64)**: Xcode command line tools. Release builds use `--features release-dynamic-ort` and load the
+bundled ONNX Runtime from `<exe dir>/lib` (the macOS and Linux release jobs download it).
 
 ## Usage
 
-Run the tool from inside the project directory you're interested in:
-
-```sh
-$ claude-history
-```
-
-This opens a terminal UI listing all conversations, sorted by recency. Type to
-search across all transcripts. Each item shows a preview of the conversation.
-Quoted exact matches also show hidden context when the match is not visible in
-the preview.
-
-### Pi coding-agent sessions
-
-Pi sessions work alongside other sources in every history surface. When multiple
-sources have conversations, list rows include fixed-width `CC`, `Pi`, `OMP`, or
-`CX` labels. A single-source list stays uncluttered.
-
-The default Pi root is `~/.pi/agent/sessions`. Its child directories correspond
-to projects. Storage configuration follows Pi's precedence:
-
-1. `PI_CODING_AGENT_SESSION_DIR`
-2. `sessionDir` in `.pi/settings.json` for the current workspace
-3. `sessionDir` in the global `settings.json`
-4. the `sessions` directory under the Pi agent directory
-
-`PI_CODING_AGENT_DIR` selects the Pi agent directory and its global
-`settings.json`. Workspace settings override global settings. An explicit
-session directory or `sessionDir` is treated as a flat directory of JSONL
-files. The default root uses Pi's project subdirectories.
-Tilde paths, relative paths, and symlinked project directories are resolved in
-the same way as Pi.
-
-The browser follows the active branch from the persisted leaf to the root and
-excludes abandoned branches. Pi session versions 1 through 3 are supported in
-memory. Pi control records, including compaction and branch summaries, model and
-thinking changes, labels, and extension state, stay out of the dialogue and
-search index. Custom messages marked for display remain visible, and image data
-is represented by placeholders rather than indexed base64.
-
-Pi actions use Pi's native session interface:
-
-- resume runs `pi --session <path>` in the session working directory
-- fork runs `pi --fork <path>` in the current working directory
-- rename appends a native `session_info` record
-- delete removes only the selected Pi JSONL file
-
-### OMP sessions
-
-OMP sessions use the same append-only conversation tree as Pi, with OMP's
-fixed-width title record and additional control records. The browser follows the
-active branch, excludes abandoned branches, and indexes visible dialogue in the
-same lexical and semantic search corpus as Claude and Pi. Title, mode, service
-tier, credential, reset, and extension control records stay out of dialogue and
-search.
-
-The default OMP root is `~/.omp/agent/sessions`. OMP storage discovery supports:
-
-- `PI_CODING_AGENT_SESSION_DIR` for a flat custom session directory
-- `OMP_PROFILE`, with `PI_PROFILE` as its compatibility fallback
-- `PI_CODING_AGENT_DIR` for the default profile's agent directory
-- `PI_CONFIG_DIR` for the OMP configuration root
-- an initialized `XDG_DATA_HOME/omp` data root
-
-Named profiles use `~/.omp/profiles/<profile>/agent/sessions`, or the
-corresponding initialized XDG profile root. Default roots contain project
-subdirectories. OMP sessions created with a one-off `omp --session-dir` become
-discoverable when that directory is also supplied through
-`PI_CODING_AGENT_SESSION_DIR`.
-
-OMP actions use OMP's native session interface:
-
-- resume runs `omp --resume <path>` in the session working directory
-- fork runs `omp --fork <path>` in the current working directory
-- rename updates OMP's title slot and appends a `title_change` audit record
-- delete removes the selected JSONL file and its sibling artifact directory
-
-Claude resume default arguments apply only to Claude sessions.
-
-### Codex threads
-
-Codex threads are listed with the `CX` label. The Codex home is `$CODEX_HOME`,
-or `~/.codex` when it is unset. Threads come from the rollouts under its
-`sessions` and `archived_sessions` directories, including compressed
-`.jsonl.zst` rollouts. Codex's state database (`state_<n>.sqlite`, in the
-`sqlite_home` of Codex's `config.toml`, else `$CODEX_SQLITE_HOME`, else the
-Codex home) is read, never written, to find each thread's current rollout and
-its name. When a thread was forked from another, the viewer shows the history it
-continues from, followed by a `Fork` marker where the thread's own records
-begin. Search covers only the thread's own dialogue.
-
-Thread titles come from the name set in Codex, else Codex's
-`session_index.jsonl`, else the first user message.
-
-`codex exec` runs and subagent threads are indexed for lexical search but stay
-out of the list and of `agent search`. Press `Ctrl+G` in the list, or start with
-`--all-kinds`, to list them too, tagged `auto` (exec) or `sub` (subagent); the
-status bar shows `^G·all kinds` while they are listed. `agent search
---all-kinds` searches them as well, and `agent read`/`outline` resolve their
-refs either way. They are never embedded, so semantic search does not find
-them.
-
-Codex actions use the Codex CLI with `CODEX_HOME` set to the thread's home:
-
-- resume runs `codex resume <thread-id>` in the thread's working directory
-- fork runs `codex fork <thread-id>` in the same directory
-- delete runs `codex delete --force <thread-id>`, which removes every rollout of
-  the thread
-- rename is not supported
-
-A thread whose current rollout, as recorded by Codex, no longer exists is shown
-read-only, with no actions.
-
-Arguments for every Codex resume and fork go in `[resume.codex]`. For example,
-if your shell aliases `codex` to `codex --yolo`:
-
-```toml
-# ~/.config/claude-history/config.toml
-[resume.codex]
-default_args = ["--yolo"]
-```
-
-This runs `codex --yolo resume <thread-id>`. Claude's `[resume].default_args`
-are not passed to Codex.
-
-### Delete empty transcripts
-
-Use `delete-empty` to find transcript files that have no Claude messages, such as
-sessions that only contain slash commands like `/status` or `/plugin`.
-
-```sh
-claude-history delete-empty
-claude-history delete-empty --local
-claude-history delete-empty --yes
-```
-
-The command prints a dry run by default. Add `--yes` to delete the matching
-JSONL files and their matching session artifact directories.
-
-### Keyboard navigation (List mode)
-
-| Key                     | Action                           |
-| ----------------------- | -------------------------------- |
-| `↑` / `↓`               | Move selection                   |
-| `←` / `→`               | Move cursor in search            |
-| `Ctrl+P` / `Ctrl+N`     | Move selection (vi-style)        |
-| `Ctrl+D` / `Ctrl+U`     | Half page down/up (vim-style)    |
-| `Page Up` / `Page Down` | Jump by page                     |
-| `Home` / `End`          | Jump to first/last               |
-| `Enter`                 | Open conversation viewer         |
-| Mouse wheel             | Scroll the result list           |
-| Mouse click             | Open conversation under cursor   |
-| `Ctrl+O`                | Select and exit (for scripting)  |
-| `Ctrl+W`                | Delete word before cursor        |
-| `Ctrl+R`                | Resume conversation              |
-| `Ctrl+F`                | Fork and resume conversation     |
-| `F2`                    | Rename selected session          |
-| `Ctrl+X`                | Delete conversation              |
-| `Ctrl+L`                | Refresh sessions                 |
-| `Ctrl+G`                | Show / hide exec and subagents   |
-| `Ctrl+V`                | Search only your own messages    |
-| `Tab`                   | Toggle all / workspace scope     |
-| `Ctrl+T`                | Toggle lexical / semantic search |
-| `?`                     | Show keyboard shortcuts          |
-| `Esc`                   | Clear search input, or quit      |
-| `Ctrl+C`                | Quit                             |
-
-### Keyboard navigation (Viewer mode)
-
-| Key            | Action                                             |
-| -------------- | -------------------------------------------------- |
-| `j` / `↓`      | Scroll down                                        |
-| `k` / `↑`      | Scroll up                                          |
-| Mouse wheel    | Scroll the conversation                            |
-| `J` / `]`      | Jump to next message                               |
-| `K` / `[`      | Jump to previous message                           |
-| `d` / `Ctrl+D` | Half page down                                     |
-| `u` / `Ctrl+U` | Half page up                                       |
-| `Page Down`    | Full page down                                     |
-| `Page Up`      | Full page up                                       |
-| `g` / `Home`   | Jump to top                                        |
-| `G` / `End`    | Jump to bottom                                     |
-| `/`            | Start search                                       |
-| `n`            | Next search match                                  |
-| `N`            | Previous search match                              |
-| `t`            | Cycle tools: off/summary/calls/truncated/full      |
-| `T`            | Toggle thinking                                    |
-| `e`            | Export conversation to file                        |
-| `y`            | Copy to clipboard (message if selected, else menu) |
-| `p`            | Show file path                                     |
-| `Y`            | Copy file path to clipboard                        |
-| `I`            | Copy session ID to clipboard                       |
-| `Ctrl+R`       | Resume conversation                                |
-| `Ctrl+F`       | Fork and resume conversation                       |
-| `Ctrl+X`       | Delete conversation                                |
-| `s`            | List the session's subagents and forks             |
-| `P`            | Open the parent session                            |
-| `?`            | Show keyboard shortcuts                            |
-| `q` / `Esc`    | Back to the previous conversation, else the list   |
-| `Ctrl+C`       | Quit                                               |
-
-### Message navigation
-
-Press `J`/`K` or `[`/`]` to enter message navigation mode. A teal `▌` marker
-appears in the gutter showing which message is focused. While in this mode:
-
-- `J` / `]` — jump to next message
-- `K` / `[` — jump to previous message
-- `y` — copy the focused message to clipboard (raw markdown)
-- `Esc` — exit message navigation mode
-
-Searching with `/` also activates message navigation, focusing the message
-containing each match as you move through results with `n`/`N`. The status bar
-shows the current match number and total matches while search is active.
-
-### Remote clipboard
-
-Clipboard actions use OSC 52 in SSH and mosh sessions so copied text reaches the
-terminal client's clipboard. Local sessions use the operating system clipboard.
-The terminal emulator must allow OSC 52 clipboard writes. tmux also requires
-`set-clipboard` to be `on` or `external`.
-
-Set `CLAUDE_HISTORY_CLIPBOARD` to override transport detection:
-
-- `auto` uses OSC 52 for SSH and mosh, and the system clipboard locally
-- `osc52` always sends clipboard text through the terminal
-- `system` always uses the clipboard of the machine running claude-history
-
-The `osc52` override is useful when a persistent tmux server does not retain SSH
-environment variables. Terminal clipboard size limits apply to conversation
-copies.
-
-### Search
-
-Unquoted search matches words flexibly:
-
-- `config` matches `CONFIG`
-- `api key` matches `API_KEY`
-- `auth` matches `authentication` and `authorize`
-- `red` won't match inside `fired`, and `config` won't match inside `AppConfig`
-- a switch between letters and digits starts a word, so `1.2.3` matches `v1.2.3`
-  and `264` matches `h264`
-- multiple words must all match
-
-Identifier-style terms with underscores keep the underscore, so `api_key` matches
-`api_key` but not `api key`.
-
-Use quotes when you need exact text. For example, `"DEPLOYMENT_TOKEN"` matches
-`DEPLOYMENT_TOKEN` but not `deployment token`. Lowercase quoted text ignores
-case, while quoted text with uppercase letters is case-sensitive.
-
-You can mix both styles: `metrics "DEPLOYMENT_TOKEN"` searches for `metrics` as
-usual, but only returns conversations that also contain `DEPLOYMENT_TOKEN`.
-
-Search also includes tool results, not just user and assistant messages. Paste a
-full session UUID to jump directly to that session. Quote the UUID to search for
-it as transcript text instead.
-
-Results are ranked by relevance using field-aware scoring: matches in the
-title, project name, and summary are weighted higher than body text. Within
-equally relevant results, recent conversations rank first.
-
-#### Search only your own messages
-
-Press `Ctrl+V` in the list to match only what you typed: the status bar shows
-`^V·you only`, and a conversation is found only when every word and every
-quoted phrase of the query occurs in your own messages. Assistant replies, tool
-calls and results, injected context such as system reminders and hook output,
-history a Codex thread inherits from the thread it forked, and prompts that
-another conversation wrote for a subagent don't count, and neither do the
-title, summary or project name. Snippets come from your own messages too.
-Pressing `Ctrl+V` again searches everything; the query and selection stay
-either way.
-
-Semantic search ranks whole conversations, so it ignores the toggle and the
-status bar says `you only: not in semantic`. For agents, `claude-history agent
-search --user-only` does the same, returning hits from your own messages only.
-
-### Time filtering
-
-`--since` narrows to recent conversations, `--before` to older ones, and the two
-combine into a range. `--after` is an alias for `--since`, so the two cannot be
-used together. Both the conversation list and `agent search` accept them:
-
-```sh
-claude-history --since 2d
-claude-history agent search "cache invalidation" --since 1w
-claude-history agent search "cache invalidation" --after 2026-07-01 --before 2026-07-20
-```
-
-A value is either a duration back from now or an absolute local time:
-
-| Form | Meaning |
-| --- | --- |
-| `45s` `30m` `3h` `2d` `1w` | seconds, minutes, hours, days, weeks |
-| `6mo` `1y` | calendar months and years |
-| `1d6h` `1mo2w` | components combine |
-| `2026-07-20` | midnight local time |
-| `2026-07-20T14:30` | a time of day, space instead of `T` also accepted |
-
-Long spellings (`30minutes`, `2days`, `6months`) work too, and units are
-case-insensitive. Note that `m` is minutes and `mo` is months, months and years
-follow the calendar rather than 30- or 365-day approximations, and bounds are
-inclusive to the end of the unit written — so `--before 2026-07-20` includes all
-of the 20th.
-
-Filtering happens before ranking, so all four search modes honour it. Claude
-conversation times use transcript modification time. Pi and OMP conversation
-times use the latest user or assistant activity, then the session header
-timestamp, then modification time. This timestamp drives the recency column and
-ranking bonus.
-
-### Semantic search
-
-Semantic search finds conversations by meaning, so `fix flaky reconnect after
-laptop sleep` can find a conversation that never uses those exact words. Results
-blend meaning with keyword matches and show the passage that matched best.
-
-It runs entirely on your machine. The first semantic search downloads the
-embedding model,
-[snowflake-arctic-embed-xs](https://huggingface.co/Snowflake/snowflake-arctic-embed-xs)
-(about 90 MB), to `~/.cache/claude-history/semantic/`.
-
-#### Indexing
-
-Each conversation has to be embedded before semantic search can find it.
-Embedding never blocks you:
-
-- While claude-history is open, new conversations are embedded in the
-  background, newest first, at low priority on half the CPU cores. Startup, the
-  list and keyword search never wait for it.
-- Semantic searches answer right away from the conversations embedded so far.
-  The status bar shows `sem indexing` with progress, and results refresh when it
-  finishes.
-- If nothing embedded matches yet, exact keyword matches are shown instead.
-
-Background embedding only runs while claude-history is open. To embed everything
-at once, using every CPU core, run:
-
-```sh
-claude-history --generate-semantic-cache
-```
-
-Run it again any time; it only embeds what is new. After an upgrade that changes
-the embedding model, the history is re-embedded and the old model is deleted.
-
-Codex exec runs and subagent transcripts are never embedded, so only keyword
-search finds them.
-
-#### Exact text in semantic queries
-
-Quoted text works in semantic mode too: `deployment "DEPLOYMENT_TOKEN"` finds
-conversations about deployment whose matching passage also contains
-`DEPLOYMENT_TOKEN`. A query that is only quoted text, such as
-`"DEPLOYMENT_TOKEN"`, returns exact matches, newest first.
-
-#### Agent search
-
-`claude-history agent search` uses semantic ranking too. It ranks what is
-already embedded and never starts embedding itself, so indexing never slows a
-search down. `agent within` embeds at most 32 missing passages of the one
-conversation it searches. Run `--generate-semantic-cache` first to make sure
-everything is covered. Results show `semantic=` and `lexical=` next to `score=`; see the
-[agent skill](skills/claude-history/SKILL.md) for what each field means.
-
-#### Switching modes
-
-Press `Ctrl+T` in the conversation list to switch between lexical and semantic
-search. To start in semantic mode by default, set:
-
-```toml
-[search]
-mode = "semantic"
-```
-
-The older `[tui] semantic_search = true` setting is still accepted for existing
-configs.
-
-### Background daemon
-
-claude-history usually runs for seconds: open it, find a session, resume. That
-is rarely long enough to embed new conversations, so semantic search falls
-behind. The opt-in daemon keeps the keyword store and the semantic cache up to
-date in the background, so every launch finds them current:
-
-```toml
-[semantic]
-daemon = true
-```
-
-Any launch, of the TUI or of a CLI command, starts the daemon when it is
-enabled and not already running. It needs no launchd or systemd setup. It runs
-detached from the terminal and keeps running when the terminal closes. Only one
-daemon runs per cache directory. It exits by itself when the claude-history
-binary is upgraded or replaced (the next launch starts the new version), after
-three days without a launch, or when the config no longer enables it.
-
-```sh
-claude-history daemon status   # state, backlog, last passes, last error, memory
-claude-history daemon stop     # stop it; the next launch starts it again
-claude-history daemon start    # start it now
-```
-
-How it works:
-
-- **Changes are found by polling, not file watching.** A quick pass stats the
-  project directories and the sessions modified in the last day, plus a
-  session's `subagents/` when the session changes. It runs every 5 minutes. A
-  full pass lists every session file every 20 minutes. Changes are published
-  to the keyword store the same way a launch does, so a launch finds nothing
-  left to do.
-- **Conversations are embedded once quiet.** Agents append to a session all the
-  time while they work, so a changed conversation is embedded once it has gone
-  a minute without writes. A sweep embeds anything else missing, newest first:
-  30 seconds after the daemon starts, every 6 hours, and when the TUI is
-  launched. After an upgrade that changes the embedding model, the sweep
-  re-embeds the history in the background.
-- **The TUI defers to it.** While the daemon runs, the TUI does not embed in
-  the background itself. It picks up what the daemon writes to the cache. A lock
-  in the cache directory keeps the two from ever embedding at the same time.
-
-Resource use: the daemon runs at a low scheduling priority (nice 10, and the
-utility QoS class on macOS). Passes and embedding run in short-lived child
-processes. Embedding uses two inference threads and loads the model only for
-the batch at hand, so the idle daemon holds no model and stays at about 10 MB
-of memory; an embedding process uses 200–400 MB while it runs. With no sessions
-changing, the daemon uses about two seconds of CPU an hour. On battery power, embedding pauses until a charger is connected; set
-`pause_on_battery = false` to keep embedding on battery.
-
-The daemon logs to `~/.cache/claude-history/daemon/daemon.log`, rotated at
-1 MB. Its lock and `status.json` live in the same directory.
-
-### Direct file input
-
-You can open a JSONL conversation file directly, bypassing the conversation
-selection UI:
-
-```sh
-$ claude-history /path/to/conversation.jsonl
-```
-
-All display options work in this mode:
-
-```sh
-$ claude-history --show-tools --show-thinking /path/to/conversation.jsonl
-```
-
-Press `q` or `Esc` to quit when viewing a file directly.
-
-### Conversation viewer
-
-Press `Enter` on a conversation to open the built-in viewer. The viewer displays
-conversations in a ledger-style format with scrolling support.
-
-**Features:**
-
-- **Scrolling**: Navigate with vim-style keys (`j`/`k`), arrow keys, or the
-  mouse wheel
-- **Search**: Press `/` to search within the conversation, then `n`/`N` to
-  navigate matches
-- **Cycle tools**: Press `t` to cycle tool display (off → summary → calls →
-  truncated → full)
-- **Toggle thinking**: Press `T` to show/hide thinking blocks
-- **Show path**: Press `p` to display the conversation file path
-- **Light/dark theme**: Automatically detects terminal background color and
-  applies an appropriate color theme
-
-Press `q` or `Esc` to return to the conversation list, or to the conversation
-you opened this one from.
-
-### CLI reference
-
 ```text
-View Claude conversation history
-
-Usage: claude-history [OPTIONS] [FILE]
-       claude-history [COMMAND]
-
-Commands:
-  agent         Run agent-oriented search and transcript commands
-  delete-empty  Delete transcript files with no Claude messages
-  update        Update claude-history to the latest version
-  daemon        Show or control the background daemon ([semantic] daemon = true)
-
-Arguments:
-  [FILE]  JSONL conversation file to view directly
-
-Options:
-  -t, --show-tools       Show tool calls in the conversation output
-      --no-tools         Hide tool calls from the conversation output
-  -d, --show-dir         Print the conversation directory path and exit
-  -l, --last             Show the last messages in the TUI preview (default)
-      --first            Show the first messages in the TUI preview
-      --show-thinking    Show thinking blocks and subagent internals in the conversation output
-      --hide-thinking    Hide thinking blocks and subagent internals from the conversation output
-  -c, --resume           Resume the selected conversation in Claude Code
-      --fork-session     Fork the session when resuming
-  -p, --show-path        Print the selected conversation file path
-  -i, --show-id          Print the selected conversation session ID
-      --plain            Output plain text without ledger formatting
-      --delete <SESSION_ID>  Delete a session by its UUID and exit
-      --debug-search <QUERY>  Debug search result scoring for a query
-      --debug [<LEVEL>]  Print debug information (optionally filter by level: debug, info, warn, error)
-  -L, --local            Show only conversations from the current workspace directory
-      --all-kinds        List automated (Codex exec) and subagent conversations too
-      --since <WHEN>     Only conversations this recent (duration or date)
-      --after <WHEN>     Alias for --since
-      --before <WHEN>    Only conversations older than this duration or date
-      --pager            Display output through a pager (less)
-      --no-pager         Disable pager output
-      --render <FILE>    Render a JSONL file in ledger format and exit
-      --no-color         Disable colored output
-  -h, --help             Print help
-  -V, --version          Print version
+claude-history-gui [OPTIONS] [FILE]
+claude-history-gui delete-empty [--local|--all] [--yes]
+claude-history-gui update
+claude-history-gui agent <search|within|read|outline> ...
+claude-history-gui help [COMMAND]...
 ```
 
-### Preview modes
+`claude-history-gui --help` prints the authoritative list. Usage errors exit 2, runtime errors exit 1, a
+cancelled picker exits 0.
 
-- `claude-history` shows the last messages in the preview (default)
-- `claude-history --first` flips the preview to the first messages
+| Option | Meaning |
+|---|---|
+| `[FILE]` | open a JSONL transcript in a viewer window |
+| `-w, --workspace <DIR>` | workspace folder (workspace filter, resume and fork) |
+| `-L, --local` | workspace is the current directory; start with the workspace filter on |
+| `--since <WHEN>`, `--after <WHEN>` | only conversations this recent (`2d`, `1d6h`, `6mo`, `2026-07-20`) |
+| `--before <WHEN>` | only conversations older than this |
+| `--first` / `-l, --last` | preview first / last messages (default last) |
+| `-t, --show-tools` / `--no-tools` | start the viewer with tools in full / summarized |
+| `--show-thinking` / `--hide-thinking` | show / hide thinking blocks and subagent internals |
+| `--semantic` / `--lexical` | start the list in semantic / lexical mode |
+| `-p, --show-path` | picker mode: print the selected conversation's path and exit |
+| `-i, --show-id` | picker mode: print its session id and exit |
+| `-c, --resume` | picker mode: resume the selected conversation; `--fork-session` forks instead |
+| `--plain` | picker mode: print plain text instead of ledger formatting |
+| `-d, --show-dir` | print the conversation directory path and exit |
+| `--render <FILE>` | render a JSONL file in ledger format to stdout and exit |
+| `--delete <SESSION_ID>` | open the delete-by-session-ID dialog (asks for confirmation) |
+| `--debug-search <QUERY>` | open the debug search dialog for a query |
+| `--debug [<LEVEL>]` | debug output on stderr (`debug`, `info`, `warn`, `error`) |
+| `--pager`, `--no-pager`, `--no-color` | accepted for compatibility, no effect |
+| `-h, --help`, `-V, --version` | help, version |
 
-### Showing tool calls
+Picker mode (`--show-path`, `--show-id`, `--resume`): the list shows a banner; Ctrl+O or the **Select** button
+prints the choice (or resumes) and exits, Esc on an empty query exits without output. Without those flags,
+Ctrl+O prints the conversation (ledger or, with `--plain`, plain text) when stdout is redirected, and asks
+first when stdout is a terminal.
 
-In the TUI viewer, tool calls default to **summary** mode — showing condensed
-activity like "Searched for 2 patterns, read 1 file" without tool inputs or
-outputs. Press `t` to cycle through modes: off → summary → calls → truncated →
-full. Off mode hides tool calls and results entirely, leaving only the
-conversation text; messages that consist only of tool calls disappear. Calls
-mode lists each tool call on one line, such as `Bash: cargo test`, without
-results. Click a summary row to expand that group into its tool calls and
-results, or a calls row to expand just that call and its result. Truncated mode shows the
-tool header plus the first few body lines with a "(N more lines...)" indicator.
-Click a truncated tool call/result to expand that specific output, and click it
-again to collapse it. Use `--show-tools` (or `-t`) to start in full mode, or
-`--no-tools` to start with tools off.
+`--render FILE` and `--show-dir` print without opening a window when stdout is redirected (otherwise
+`--render` opens a viewer window and `--show-dir` shows a toast). `delete-empty` and `update` open their dialogs;
+`--yes` is ignored because every deletion is confirmed in the UI. Some hidden upstream flags
+(`--semantic-search`, `--debug-semantic-search`, `--generate-semantic-cache`, `--clear-semantic-cache`,
+`--global`) are accepted too.
 
-### Showing thinking blocks and subagent messages
+### Agent subcommand (headless)
 
-Extended thinking models (like Claude Sonnet 4.5) include reasoning steps in
-their output. When Claude uses the Task tool to spawn subagents, the internal
-tool calls and messages within those subagents are also hidden by default. Use
-`--show-thinking` (or press `T` in the TUI) to display both thinking blocks and
-subagent internals. Subagent messages appear dimmed with a `↳` prefix to
-distinguish them from top-level conversation entries.
+`claude-history-gui agent search|within|read|outline ...` speaks the same protocol as the original CLI's
+`claude-history agent ...` (same output and exit codes, no window):
 
-### Subagents and `/btw` forks
+| Command | Arguments | Options |
+|---|---|---|
+| `agent search` | `<QUERY>` | `--top`, `--budget`, `--no-budget`, `--flat`, `--hits-per-conv`, `--all-hits`, `--local`, `--all`, `--mode <lexical\|semantic\|exact\|hybrid>` (or `--lexical`, `--semantic`, `--exact`, `--hybrid`), `--since`, `--after`, `--before` |
+| `agent within` | `<CONVERSATION> <QUERY>` | `--top`, `--budget`, `--no-budget`, mode options |
+| `agent read` | `<REFS>...` (`ch_` handle, UUID or filename, optionally `:mN..mM`) | `--anchor`, `--focus`, `--lines`, `--match`, `--context`, `--budget`, `--no-budget`, `--tools`, `--tool-results`, `--thinking`, `--subagents` |
+| `agent outline` | `<CONVERSATION>` | `--budget`, `--no-budget`, `--tools`, `--tool-results`, `--thinking`, `--subagents` |
 
-Claude Code keeps the full transcript of each subagent, and of each `/btw` side
-question, next to its session, under `<session-id>/subagents/`.
-
-- A `/btw` fork is listed and searched like a conversation of its own, tagged
-  `fork`, with the question you asked as its first message. The `/btw` question
-  is also searchable in the session it was asked in.
-- A subagent transcript stays out of the list and of `agent search`, like Codex
-  subagents: press `Ctrl+G`, or start with `--all-kinds`, to list it, tagged
-  `sub`. `agent read`/`outline` resolve its refs either way, and it is never
-  embedded for semantic search.
-
-The viewer header of a session names its subagents and forks; press `s` to pick
-one and open it. The header of a subagent or fork names the session it came
-from; press `P` to open it. `Esc` returns to the conversation you came from.
-These work for Codex subagent threads too.
-
-Actions on a subagent or fork act on the session it belongs to, or on the
-sidecar alone:
-
-- resume resumes the session it came from
-- delete removes only the sidecar transcript and its metadata
-- fork and rename are not supported
-
-Deleting a session also deletes its subagent transcripts but keeps its `/btw`
-forks, which stay listed on their own.
-
-### Resuming conversations
-
-If you want to continue a conversation, launch `claude-history` with `--resume`
-and it will hand off to `claude --resume <conversation-id>`.
-
-To fork a conversation (creating a new session branching from the original), use
-`--resume --fork-session` or press `Ctrl+F` in the TUI.
-
-Within the same project, this passes `--fork-session` to `claude`, which creates
-a new session ID branching from the original. When forking a conversation from a
-different project, the session files are copied to your CWD's project directory
-and resumed there — the copy continues independently without affecting the
-original.
-
-You can configure default arguments to pass to the `claude` command every time
-you resume a conversation. This is useful if you typically run Claude with
-specific flags (like `--dangerously-skip-permissions`) and want them applied
-automatically when resuming:
-
-```toml
-# ~/.config/claude-history/config.toml
-[resume]
-default_args = ["--dangerously-skip-permissions"]
-```
-
-With this configuration, when you resume a conversation, it will run:
+`claude-history-gui agent <command> --help` lists the exact options. The companion Claude Code skill of the
+original project calls `claude-history agent ...`. **This repository installs nothing** and never writes to
+`.claude/skills`. To let that skill use the GUI binary, make `claude-history` resolve to it yourself:
 
 ```sh
-claude --resume <conversation-id> --dangerously-skip-permissions
+# macOS / Linux (shell profile)
+alias claude-history='claude-history-gui'
+# or a symlink on PATH:  ln -s "$(command -v claude-history-gui)" ~/.local/bin/claude-history
 ```
 
-This provides a cleaner alternative to shell aliases, as the arguments are
-applied specifically when resuming through `claude-history`, without affecting
-how you normally invoke Claude.
-
-For regular resumes, use `claude-history --resume` or press `Ctrl+R` in the TUI.
-Configure `[resume].default_args` for arguments that should apply every time
-`claude-history` resumes a session.
-
-#### Starting agents through a wrapper
-
-Resume and fork run `claude`, `pi`, `omp`, or `codex` from your `PATH`, and
-Codex deletes run `codex`. If you start an agent another way, such as a mise or
-nix wrapper, a script that sets environment variables first, or a binary with a
-different name, set `command` for that agent:
-
-```toml
-# ~/.config/claude-history/config.toml
-[resume]
-command = "my-claude"                     # Claude Code
-
-[resume.pi]
-command = "~/bin/pi-wrapper"
-
-[resume.omp]
-command = ["mise", "exec", "--", "omp"]
-
-[resume.codex]
-command = ["nix", "run", "nixpkgs#codex", "--"]
+```bat
+:: Windows: a claude-history.cmd shim on PATH
+@claude-history-gui.exe %*
 ```
 
-A string is a single program and is never split on spaces. An array is a
-program followed by the arguments that always come first. The program is a name
-looked up on `PATH` or a path to an executable. `~/` is expanded, and a relative
-path is relative to the directory `claude-history` was started in. The agent's
-own arguments follow, so the Claude example runs
-`my-claude --resume <conversation-id>`, and the OMP example runs
-`mise exec -- omp --resume <path>`. Codex's `default_args` come after the
-command and before `resume` or `fork`.
+Semantic modes load the embedding model like the original (downloaded on first use into
+`~/.cache/claude-history-gui/semantic/fastembed`).
 
-If the program cannot be found, `claude-history` reports which program is
-missing and where it was configured instead of starting the agent.
+### Windows console output
 
-`command` must name an executable, not a shell alias or function, because
-`claude-history` starts the agent directly, without a shell. If you use an
-alias or function, put its contents in a script on your `PATH` and set `command`
-to that script:
+The release exe is a Windows GUI program. Started from `cmd.exe` or PowerShell it attaches to the parent console
+to print `--help`, `--version`, errors and the headless commands. `cmd.exe` does not wait for GUI programs, so
+in scripts redirect the output or use `start /wait`:
 
-```sh
-#!/bin/sh
-# ~/bin/my-claude
-export CLAUDE_CONFIG_DIR="$HOME/.claude-work"
-exec claude "$@"
+```bat
+claude-history-gui --help > help.txt
+for /f %i in ('claude-history-gui --show-id') do echo %i
 ```
 
-If another tool needs the selected session ID, use `--show-id` and press
-`Ctrl+O` to select the highlighted conversation. The TUI renders on stderr, and
-only the selected session ID is written to stdout, so command substitution is
-safe:
-
-```sh
-claude --resume "$(claude-history --show-id)"
-```
-
-In the viewer, press `I` to copy the session ID to clipboard.
-
-### Markdown rendering
-
-Claude's responses are rendered with markdown formatting for better terminal
-readability. Use `--plain` to disable rendering and get raw text output.
-
-### Plain output mode
-
-Use `--plain` to output conversations without ledger formatting:
-
-```sh
-$ claude-history --plain
-```
-
-This produces simple `Role: content` output without colors, text wrapping, or
-markdown rendering, suitable for piping to other tools or LLMs:
-
-```
-You: How do I fix this bug?
-
-Claude: Looking at the code, the issue is...
-```
-
-### Pager output
-
-By default, conversation output is piped through a pager (`less -R`) when stdout
-is a terminal. This enables scrolling through long conversations. Use
-`--no-pager` to disable this behavior and print directly to stdout.
-
-The pager respects the `$PAGER` environment variable. If not set, it defaults to
-`less -R` (which preserves ANSI colors).
-
-### Scope: all conversations vs current workspace
-
-By default, `claude-history` shows all conversations from every project, sorted
-by modification time (newest first). Each conversation shows its project path so
-you can identify which project it belongs to.
-
-Press `Tab` to toggle between all conversations and the current workspace only.
-Use `-L`/`--local` to start with the workspace filter active. While it is on,
-the search prompt shows the workspace folder, e.g. `~/code/repo ❯`.
-
-The workspace is the directory `claude-history` runs in. A conversation belongs
-to it when it was started there, or when any working directory it recorded is
-that directory or a folder below it. A session started in `~/code` that moved
-into `~/code/repo` therefore shows up in `~/code/repo`'s scope, and running from
-`~/code` includes sessions from every repo below it. Folders match whole path
-components: `~/code/repo` does not include `~/code/repo-old`. This applies to
-Claude Code, Pi, OMP and Codex sessions, to `Tab` and `-L`, and to
-`agent search --local`.
-
-For [workmux](https://github.com/raine/workmux) users, worktree paths are
-displayed in a compact format: `[project/worktree]` instead of just the worktree
-folder name. The project filter (toggled with `Tab`) is worktree-aware: it
-includes conversations from the main repo and all its worktrees, regardless of
-which one you're currently in. On Windows the match ignores letter case, so
-`C:\Users\Foo\myproject` finds sessions recorded in `C:\Users\Foo\MyProject`.
-
-The `--resume` flag works across projects. It will automatically run Claude in
-the correct project directory for the selected conversation.
-
-### Integration with other scripts
-
-You can integrate `claude-history` into other tools to pass conversation context
-to new Claude Code sessions. This is useful when you want Claude to understand
-what you were working on previously.
-
-For example, a commit message generator script could use the conversation
-history to write more contextual commit messages:
-
-```bash
-# Get conversation history if --context flag is set
-conversation_context=""
-if [ "$include_history" = true ]; then
-    echo "Loading conversation history..."
-    conversation_history=$(claude-history --plain 2>/dev/null)
-    if [ -n "$conversation_history" ]; then
-        conversation_context="
-
-=== START CONVERSATION CONTEXT ===
-$conversation_history
-=== END CONVERSATION CONTEXT ===
-
-"
-    fi
-fi
-
-# Pass to Claude CLI with the conversation context
-prompt="Write a commit message for these changes.
-${conversation_context}
-Staged changes:
-$staged_diff"
-
-claude -p "$prompt"
-```
-
-### Let Claude search its own history
-
-The companion [Claude Code skill](skills/claude-history/SKILL.md) lets Claude
-search and read its own conversation history. Claude can recover prior decisions,
-debugging context, and implementation details without loading whole transcripts
-into its context window.
-
-<img src="/meta/agent-protocol.webp" />
-
-See the skill for setup and usage.
-
-## Configuration
-
-You can set default preferences for display options in
-`~/.config/claude-history/config.toml`. Command-line flags will override these
-settings.
-
-Create the config file:
-
-```sh
-mkdir -p ~/.config/claude-history
-cat > ~/.config/claude-history/config.toml << 'EOF'
-[display]
-# Tool display: true = off, false = full (default: unset = summary)
-# no_tools = false
-
-# Show last messages in TUI preview (default: true)
-# last = true
-
-# Show thinking blocks (default: false)
-show_thinking = false
-
-# Use plain output without ledger formatting (default: false)
-plain = false
-
-# Use pager for output (default: true when stdout is a terminal)
-pager = true
-
-[resume]
-# Command that starts Claude Code (default: "claude")
-# Example: command = ["mise", "exec", "--", "claude"]
-# Default arguments to pass to claude command when resuming
-# Example: default_args = ["--dangerously-skip-permissions"]
-
-[resume.pi]
-# Command that starts Pi (default: "pi")
-# Example: command = "~/bin/pi-wrapper"
-
-[resume.omp]
-# Command that starts OMP (default: "omp")
-# Example: command = "/opt/omp/bin/omp"
-
-[resume.codex]
-# Command that starts Codex (default: "codex")
-# Example: command = "codex-work"
-# Default arguments to pass to codex when resuming or forking a Codex thread
-# Example: default_args = ["--yolo"]
-
-[keys]
-# Customize keybindings (default: ctrl+r, ctrl+f, f2, ctrl+x, ctrl+l, ctrl+g,
-# ctrl+v)
-# Supports ctrl+<key>, alt+<key>, single-character keys, and f1-f12
-# rename = "alt+r"
-# fork = "alt+f"
-# refresh = "ctrl+l"
-
-[search]
-# Search mode used by the conversation list
-mode = "lexical"
-
-[tui]
-# Hide exact project names from TUI browse/search lists
-# exclude_projects = ["project-name", "repo/worktree"]
-
-# Hide recorded working-directory prefixes in the TUI and agent search
-# exclude_paths = ["/tmp/", "/private/tmp/"]
-
-# Deprecated: use [search].mode instead
-semantic_search = false
-
-[semantic]
-# Keep the caches warm in a background daemon that launches start
-# (default: false)
-daemon = false
-
-# Pause the daemon's embedding on battery power (default: true)
-pause_on_battery = true
-
-EOF
-```
-
-### Available options
-
-#### Display options
-
-- `no_tools` (boolean): When `true`, hides tool calls and results; when
-  `false`, shows full tool details. When unset (default), shows tool summaries
-- `last` (boolean): Show last messages instead of first in TUI preview (default:
-  true)
-- `show_thinking` (boolean): Show thinking blocks and subagent internals in
-  conversation output (default: false)
-- `plain` (boolean): Output plain text without ledger formatting (default:
-  false)
-- `pager` (boolean): Pipe output through a pager for scrolling (default: true
-  when stdout is a terminal)
-
-#### Resume options
-
-- `command` (string or array of strings): The program that starts Claude Code,
-  or an array of the program and the arguments placed before Claude's own
-  (default: `"claude"`). Set it under `[resume.pi]`, `[resume.omp]`, or
-  `[resume.codex]` for those agents (defaults: `"pi"`, `"omp"`, `"codex"`). See
-  [Starting agents through a wrapper](#starting-agents-through-a-wrapper).
-- `default_args` (array of strings): Arguments to pass to the `claude` command
-  when resuming conversations. Useful for flags like
-  `--dangerously-skip-permissions` that you want applied every time you resume.
-  Example: `default_args = ["--dangerously-skip-permissions", "--verbose"]`
-- `codex.default_args` (array of strings, set under `[resume.codex]`):
-  Arguments to pass to `codex`, before its `resume` or `fork` subcommand, when
-  resuming or forking Codex threads. Example: `default_args = ["--yolo"]`
-
-#### Key bindings
-
-Customize the keybindings for list actions. Values are key combinations like
-`"ctrl+r"`, `"alt+f"`, or `"f2"`.
-
-- `resume` (string): Resume conversation (default: `"ctrl+r"`)
-- `fork` (string): Fork and resume conversation (default: `"ctrl+f"`)
-- `rename` (string): Rename selected session (default: `"f2"`)
-- `delete` (string): Delete conversation (default: `"ctrl+x"`)
-- `refresh` (string): Refresh sessions from disk (default: `"ctrl+l"`)
-- `all_kinds` (string): Show or hide automated (Codex exec) and subagent
-  conversations (default: `"ctrl+g"`)
-- `user_only` (string): Search only your own messages (default: `"ctrl+v"`)
-
-#### Search options
-
-- `mode` (string): Search mode for the conversation list. Supported values are
-  `lexical` and `semantic` (default: `lexical`).
-
-#### TUI options
-
-- `exclude_projects` (array of strings): Case-sensitive project names to hide
-  from TUI browse/search lists. Match against the project name shown in the
-  leftmost column; a parent entry like `"repo"` also hides displayed worktree
-  rows like `"repo/feature"`. Excluded conversations remain on disk and can
-  still be opened by pasting their full UUID or by passing the JSONL file path
-  directly.
-- `exclude_paths` (array of strings): Hide sessions whose first recorded
-  working directory starts with any listed prefix, in both TUI browse/search
-  lists and `agent search`. Defaults to empty. Matching is literal and
-  case-sensitive (case-insensitive on Windows, where paths differing only in
-  case are the same directory): `"/tmp/"` matches `"/tmp/eval-123"`, but not
-  `"/tmp"` or `"/tmp-other"`; `"/tmp"` matches all three. Paths are not
-  resolved, so deleted directories still match; list both `"/tmp/"` and
-  `"/private/tmp/"` to cover both spellings. No `~`, environment-variable, or
-  glob expansion is performed. Empty entries are ignored, and sessions without a
-  recorded working directory stay visible. Exclusions apply in local and global
-  scope. Transcripts remain on disk and can still be opened by full UUID or file
-  path, or with `agent read`, `agent outline`, and `agent within`.
-- `semantic_search` (boolean): Deprecated compatibility alias. When
-  `[search].mode` is unset, `true` starts list search in semantic mode and
-  `false` starts lexical mode. Press `Ctrl+T` in the TUI to switch modes.
-
-#### Semantic options
-
-- `daemon` (boolean): Keep the keyword store and the semantic cache up to date
-  in a background daemon that any launch starts (default: false). See
-  [Background daemon](#background-daemon).
-- `pause_on_battery` (boolean): Pause the daemon's embedding while the machine
-  runs on battery power (default: true).
-
-### Overriding config
-
-Each display option has opposing flags for explicit override:
-
-- `--no-tools` / `--show-tools`
-- `--last` / `--first`
-- `--hide-thinking` / `--show-thinking`
-- `--plain` (no opposite flag)
-- `--no-pager` / `--pager`
-
-For example, if your config has `no_tools = false` (showing full tool details),
-you can temporarily hide tools with `--no-tools`.
-
-## Custom Claude config directory
-
-If you use the `CLAUDE_CONFIG_DIR` environment variable to store Claude's
-configuration in a non-default location, `claude-history` will respect it
-automatically — no extra flags needed.
-
-## Filtering details
-
-The tool filters out some noisy artifacts before showing conversations, so you
-only see transcripts that are likely to matter for your recent work.
-
-- Skips the "Warmup / I'm Claude Code…" exchanges that are sometimes injected
-  without user interaction
-- Skips conversations that only contain the `/clear` terminal command
+## Keyboard shortcuts
+
+Generated from the keymap tables in `crates/gui/src/keymap.rs`. "Ctrl" is Cmd on macOS where the key is written
+`Ctrl/Cmd`. F1 (or `?` when not typing) shows the live list in the app; the keys are also in the menus and the
+command palette.
+
+**Application**
+
+| Keys | Action |
+|---|---|
+| Ctrl/Cmd+Q | Quit |
+| Ctrl/Cmd+W | Close window (single-file window only); Alt+F4 closes the active window (Windows/Linux) |
+| Ctrl/Cmd+, | Settings |
+| F1, `?` (viewer, deep search, agent panel) | Keyboard shortcuts |
+| Ctrl/Cmd+Shift+P, F10 | Command palette |
+| F6 / Shift+F6 | Next / previous region |
+| Ctrl/Cmd+Shift+O | Open JSONL file |
+| Ctrl/Cmd+Shift+W | Choose workspace |
+| Ctrl/Cmd+1 / 2 / 3 | Focus conversations / deep search / viewer |
+| Ctrl/Cmd+Shift+F | Find in all conversations (deep search) |
+| Ctrl/Cmd+Shift+B | Focus viewer mode (hide or show the list) |
+| F5 | Refresh |
+| Ctrl/Cmd+C | Copy (input selection, else viewer text selection) |
+| Ctrl/Cmd+A | Select all transcript text (viewer) |
+| Ctrl+S | Semantic result details |
+| Ctrl/Cmd+Shift+R | Reveal in file manager |
+| Ctrl/Cmd+Shift+I | Search within conversation (agent panel) |
+| Ctrl/Cmd+Shift+M | Read range (agent panel) |
+| Ctrl/Cmd+Shift+L | Debug log |
+
+**Conversation list**
+
+| Keys | Action |
+|---|---|
+| Up / Down, Ctrl+P / Ctrl+N | Previous / next conversation |
+| PageUp / PageDown, Ctrl+D | Page up / page down, half page down |
+| Home / End | First / last |
+| Enter | Open (focus the viewer) |
+| Ctrl+O | Select and exit (picker) or print and exit |
+| Esc | Clear the query (picker mode with an empty query: exit) |
+| Tab | Toggle scope All / Workspace (needs a workspace) |
+| Ctrl+T | Toggle Lexical / Semantic |
+| Shift+F10, Menu | Row context menu |
+| Ctrl+R / Ctrl+F / F2 / Ctrl+X / Ctrl+L | Resume / Fork / Rename / Delete / Refresh (rebindable) |
+| Ctrl+E, Ctrl+B, Ctrl+F, Alt+B, Alt+F, Ctrl+K, Ctrl+U, Ctrl+W | Emacs-style editing in the search field (Ctrl+F moves right unless Fork is on Ctrl+F) |
+
+**Viewer**
+
+| Keys | Action |
+|---|---|
+| j / Down, k / Up | Scroll line down / up |
+| d / Ctrl+D, u / Ctrl+U | Half page down / up |
+| PageDown / PageUp | Page down / up |
+| g / Home, Shift+G / End | Top / bottom |
+| Shift+J or `]`, Shift+K or `[` | Next / previous message |
+| `/` | Find in conversation; Enter commits, Esc cancels, Ctrl+U clears |
+| n / Shift+N, F3 / Shift+F3 (Cmd+G / Cmd+Shift+G on macOS) | Next / previous match |
+| t | Cycle tool display (Summary, Truncated, Full) |
+| Shift+T | Toggle thinking and subagents |
+| i | Toggle timestamps |
+| x | Toggle tool outputs |
+| e | Export |
+| y | Copy the focused message, else the copy menu |
+| Shift+Y / Shift+I | Copy path / session ID |
+| p | Show file path |
+| o | Outline |
+| Esc | Unwind: clear search, leave message navigation, then back to the list |
+| q | Back to the list |
+| Ctrl+R / Ctrl+F / F2 / Ctrl+X / Ctrl+L | Resume / Fork / Rename / Delete / Refresh (rebindable; not in single-file windows) |
+
+**Deep search, agent panel and dialogs**
+
+| Keys | Action |
+|---|---|
+| Enter | Run the search (query field) |
+| Down / Up | Next / previous hit (results) |
+| Enter, Ctrl/Cmd+Enter | Open the hit (Ctrl/Cmd+Enter also focuses the viewer) |
+| Esc | Cancel a running search, clear the query, then return to Conversations |
+| Down or j / Up or k, Enter | Agent panel rows: move, reveal |
+| Esc | Agent panel: clear input, cancel, focus transcript |
+| y / n | Confirm / cancel in destructive confirmations (Enter does not confirm) |
+| 1 - 4, j / k, Enter, Esc | Export menu: pick a format |
+| Ctrl+U | Clear the rename field |
+
+The five rebindable keys come from `[keys]` in `gui.toml` or `config.toml` (syntax such as `ctrl+r`,
+`f2`). Ctrl+C, Ctrl+V, Ctrl+A, Ctrl+Z, Ctrl+Y and Ctrl+W are rejected as reserved for clipboard and editing.
+Ctrl+W deletes a word in text fields and never closes a window.
+
+## Configuration and data
+
+| File or directory | Purpose |
+|---|---|
+| `~/.config/claude-history/config.toml` | the original CLI's settings; **read only** here, shared with the CLI |
+| `~/.config/claude-history/gui.toml` | the GUI's settings: a `[gui]` table plus overrides of `[display]`, `[resume]`, `[keys]`, `[tui]`, `[search]`, `[agent]`; written only by the Settings dialog (changed keys only, comments kept) |
+| `~/.local/state/claude-history-gui/state.json` | window bounds, pane widths, last workspace and recent folders, view defaults |
+| `~/.local/state/claude-history-gui/debug.log` | debug log |
+| `~/.cache/claude-history-gui/` | conversation caches and the semantic cache and embedding model |
+
+On Windows `~` is `%USERPROFILE%`. The effective value of a setting is: command-line flag, then `gui.toml`, then
+`config.toml`, then (when `[gui] restore_session` is on) the remembered value, then the default. The time filter
+is not remembered. An invalid file shows a dialog naming it (Quit / Continue with defaults / Retry / Open file).
+
+`[gui]` keys in `gui.toml`: `theme` (`system`, `light`, `dark`), `terminal` (`auto`, `wt`, `cmd`, `terminal`,
+`osascript`, a Linux emulator name, or a template with `{cwd}`, `{args}`, `{cmd}`), `claude_path`, `pi_path`,
+`omp_path`, `default_workspace`, `restore_session`.
+
+**Environment variables**
+* `CLAUDE_CONFIG_DIR`: Claude data directory (must be absolute; default `~/.claude`).
+* `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`, `PI_PROFILE`: Pi session locations.
+* `OMP_PROFILE`: OMP profile; `XDG_DATA_HOME` is honored for Pi/OMP data.
+  Relative values resolve against the directory the app was started in.
+* `TERMINAL`: preferred terminal emulator on Linux. `PATH`/`PATHEXT` locate `claude`, `pi` and `omp`.
+* Development only: `CHG_ALLOW_REAL_HOME`, `CHG_ALLOW_REAL_LAUNCH` (see below).
+
+## Safety
+
+The app reads your Claude Code, Pi and OMP history and writes to it only through these actions, each of which
+names the conversation and asks for confirmation:
+
+* **Rename**: writes the custom title into the conversation.
+* **Delete**: removes the session's files from disk (every copy across projects, and the Pi/OMP artifacts
+  folder); the dialog lists them and cannot be undone. Delete by session ID uses the same plan.
+* **Delete empty transcripts**: Claude Code transcripts with no messages, listed first; files modified in the
+  last 10 minutes are excluded by default. Pi and OMP conversations are never touched.
+* **Cross-project copy** for Resume/Fork into another workspace: copies the session into that project's folder
+  in `~/.claude/projects`, listing every file and any existing target that would be overwritten.
+
+Export asks before replacing an existing file. Resume and Fork only open a terminal running `claude`, `pi` or
+`omp`. `config.toml` is never written; the GUI keeps its own settings, state and caches in separate files.
 
 ## Development
 
-The repository includes `just` recipes:
+Workspace layout (`Cargo.toml` members):
+
+* `crates/core` (`claude-history-core`): loading, parsing, search, semantic index, agent protocol, resume
+  planning, export, settings and the command-line parser; no GUI dependencies. See
+  [`crates/core/README.md`](crates/core/README.md).
+* `crates/gui` (`claude-history-gui`): the gpui-kit application (library plus a thin binary), including the QA
+  scenario runner behind the `qa` feature.
+* `docs/`: [`DESIGN.md`](docs/DESIGN.md) (authoritative spec) and [`FEATURES.md`](docs/FEATURES.md) (parity
+  rows), see [`docs/README.md`](docs/README.md). `packaging/` holds the per-OS release assets, `tools/` the CI
+  scripts and QA helpers.
 
 ```sh
-$ just check
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy -p claude-history-gui --all-targets --features qa -- -D warnings
+cargo test -p claude-history-core                    # hermetic: no network, no real home
+cargo test -p claude-history-core --features hermetic
+cargo test -p claude-history-gui
 ```
 
-This runs `cargo fmt`, `cargo clippy --fix`, `cargo test`, and `cargo build`.
-GitHub Actions verifies Nix builds on Linux and macOS for pull requests and main,
-and on Linux for release tags.
+Tests never touch your real data: core's `HistoryEnv::from_process_env` panics under test, semantic tests use
+fake embedders, and terminal launching is tested on the commands it would spawn.
 
-For isolated ARM64 Linux TUI verification, the repository can build, deploy,
-seed, and launch the current working tree in a CuaBot sandbox. See
-[`CUA_SANDBOX.md`](CUA_SANDBOX.md).
+### The sandbox gate
 
-## Related projects
+Debug builds and `--features qa` builds refuse to start (exit 3, `Refusing to run: ...`) unless the home
+directory is a QA sandbox: it contains a `.qa-sandbox` marker, is not your real profile directory, and every data
+path variable stays inside it. Set `CHG_ALLOW_REAL_HOME=1` to use your real history in a debug build (qa builds
+never skip the gate). Debug builds also refuse to start a real `claude`, `pi` or `omp` from Resume unless
+`CHG_ALLOW_REAL_LAUNCH=1`, or `[gui] claude_path/pi_path/omp_path` point at a harmless program inside the sandbox.
 
-- [workmux](https://github.com/raine/workmux) — Git worktrees + tmux windows for
-  parallel AI agent workflows
-- [git-surgeon](https://github.com/raine/git-surgeon) — Non-interactive
-  hunk-level git staging for AI agents
-- [consult-llm](https://github.com/raine/consult-llm) — Consult other AI models
-  from your agent workflow
-- [tmux-file-picker](https://github.com/raine/tmux-file-picker) — Pop up fzf in
-  tmux to quickly insert file paths, perfect for AI coding assistants
-- [tmux-agent-usage](https://github.com/raine/tmux-agent-usage) — Display AI agent
-  rate limit usage in your tmux status bar
+```powershell
+tools\qa\new-sandbox.ps1 -Source crates\gui\tests\fixtures\qa-home -Dest $env:TEMP\chg-sbx
+tools\qa\run-gui.ps1 -Sandbox $env:TEMP\chg-sbx -Exe target\debug\claude-history-gui.exe
+```
+
+### QA scenarios
+
+`cargo build -p claude-history-gui --features qa --release`, then
+
+```powershell
+tools\qa\run-gui.ps1 -Sandbox $env:TEMP\chg-sbx -Exe target\release\claude-history-gui.exe `
+    -Scenario crates\gui\qa\scenarios\smoke.qa -Out $env:TEMP\qa-out -Shots
+```
+
+The in-process runner drives the app (keys, actions, clicks on `qa_id` elements) with every side effect
+recorded; it injects no OS input. `report.txt` / `report.json` land in `-Out`; `-Shots` starts
+`tools\qa\qa-shot-watch.ps1` for `shot NAME` steps. The scenario language is documented in
+`crates/gui/src/qa/dsl.rs`; the scenarios live in `crates/gui/qa/scenarios/`.
+
+### CI and releases
+
+* `.github/workflows/ci.yml`: format, the safety lint, clippy (also with `qa`), core tests (also `hermetic`), GUI
+  tests and a release build on Windows, macOS and Linux.
+* `.github/workflows/release.yml`: tag `v<version>` (must equal `crates/gui/Cargo.toml`) or a manual run builds
+  the three artifacts after CI; `dry_run` (the default for manual runs) uploads workflow artifacts without a
+  release. Release notes come from the `## v<version>` section of `CHANGELOG.md`.
+* `.github/workflows/qa.yml`: manual, runs every scenario on a Windows runner.

@@ -1,0 +1,3 @@
+{"type":"summary","summary":"Rate limit errors","leafUuid":"leaf-00000000-0000-4000-8000-000000000004"}
+{"type":"user","sessionId":"00000000-0000-4000-8000-000000000004","cwd":"C:\\sbx\\api","timestamp":"2026-09-08T10:00:00Z","message":{"role":"user","content":"Which endpoints are rate limited?"}}
+{"type":"assistant","sessionId":"00000000-0000-4000-8000-000000000004","cwd":"C:\\sbx\\api","timestamp":"2026-09-08T10:01:00Z","message":{"role":"assistant","model":"claude-opus-4-5","content":[{"type":"text","text":"These:\n\n| Endpoint | Limit |\n|---|---|\n| /login | 10/min |\n| /refresh | 60/min |"}],"usage":{"input_tokens":120,"output_tokens":340}}}

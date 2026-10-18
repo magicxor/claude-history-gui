@@ -1,0 +1,62 @@
+[package]
+name = "claude-history-gui"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Desktop browser for Claude Code, Pi and OMP conversation history (gpui-kit GUI on claude-history-core)."
+publish = false
+build = "build.rs"
+
+# The GUI is a library plus a thin binary (DESIGN §3): public library items
+# are not dead code while parallel work packages leave consumers unmerged.
+[lib]
+name = "claude_history_gui"
+path = "src/lib.rs"
+# Doc tests would run outside the test harness's environment redirect
+# (test_support, DESIGN §15.2); examples in docs are `no_run`/`ignore` anyway.
+doctest = false
+
+[[bin]]
+name = "claude-history-gui"
+path = "src/main.rs"
+
+[features]
+default = []
+# In-process QA scenario runner (DESIGN §15.3). Never in release artifacts.
+qa = []
+# macOS/Linux release builds load the bundled ONNX Runtime from <exe dir>/lib.
+release-dynamic-ort = ["claude-history-core/release-dynamic-ort"]
+
+# Complete dependency list (DESIGN §16.1): work packages add crates only
+# through the integrator.
+[dependencies]
+claude-history-core = { path = "../core" }
+gpui-kit.workspace = true            # default features (component, assets); syntax highlighting via core (syntect)
+async-channel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+pulldown-cmark.workspace = true
+unicode-width.workspace = true
+home.workspace = true                # qa/gate.rs only (safety-lint allow-listed)
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true                # isatty/fstat, execvp, getpwuid_r, geteuid
+
+[build-dependencies]
+embed-resource.workspace = true
+
+[dev-dependencies]
+# Core's guard rails for test builds (DESIGN §15.2, K13): from_process_env
+# panics, the fastembed embedders refuse, the update check panics and the
+# terminal spawn functions return Unsupported. Dev-dependency features reach
+# only builds of test/example targets (resolver 3), never `cargo build` or a
+# release binary.
+claude-history-core = { path = "../core", features = ["hermetic"] }
+gpui-kit = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
+ctor.workspace = true

@@ -1,0 +1,28 @@
+# picker.qa (WP3): Ctrl+O in picker mode and the no-stdout answer
+# (FEATURES A-046, A-050, A-063). Output goes to RecordingServices.
+#
+# Run on a FRESH COPY of the sandbox in picker mode:
+#   tools/qa/run-gui.ps1 -Sandbox <sandbox> -Exe <qa build> -ArgsLine "--show-path" `
+#       -Scenario crates/gui/qa/scenarios/picker.qa -Out <dir> [-Shots]
+# picker-exit.qa covers the printed line end to end (--qa-real-console).
+wait-loaded 30s
+expect dialog == none
+shot picker-banner
+
+# No stdout (a desktop launch): an info toast, the picker stays open.
+set-stdout none
+key ctrl-o
+expect toast.last contains "Nothing to print to"
+expect dialog == none
+expect list.loaded == true
+expect stdout == ""
+
+# Nothing is selected by a query without matches: Ctrl+O does nothing.
+type "zzzzqqqq"
+wait 300ms
+expect list.count == 0
+key ctrl-o
+expect list.loaded == true
+key escape
+expect list.query == ""
+quit 0

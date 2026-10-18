@@ -1,0 +1,4 @@
+{"type":"summary","summary":"Malformed line","leafUuid":"leaf-00000000-0000-4000-8000-00000000005b"}
+{this is not json
+{"type":"user","sessionId":"00000000-0000-4000-8000-00000000005b","cwd":"C:\\sbx\\api","timestamp":"2026-09-14T10:00:00Z","message":{"role":"user","content":"One good question."}}
+{"type":"assistant","sessionId":"00000000-0000-4000-8000-00000000005b","cwd":"C:\\sbx\\api","timestamp":"2026-09-14T10:01:00Z","message":{"role":"assistant","model":"claude-opus-4-5","content":[{"type":"text","text":"One good answer."}],"usage":{"input_tokens":120,"output_tokens":340}}}

@@ -1,0 +1,30 @@
+# smoke.qa (WP7, X-027): the app starts on the QA sandbox, the in-process runner drives it, and
+# the app quits cleanly. Only probes every build answers are used, so later work packages
+# extend their own scenarios instead of this one.
+#
+#   tools/qa/run-gui.ps1 -Sandbox <sandbox> -Exe <qa build> -Scenario crates/gui/qa/scenarios/smoke.qa -Out <dir> [-Shots]
+
+wait-loaded 30s
+expect dialog == none
+expect focus != dialog
+
+# Theme switching works and is observable.
+set-theme dark
+expect theme == dark
+shot smoke-dark
+set-theme light
+expect theme == light
+shot smoke-light
+set-theme system
+expect theme == system
+
+# The recording services answer (no real console, clipboard or terminal is touched).
+set-stdout none
+expect calls.terminal.count == 0
+
+# The window can be resized and keeps working.
+resize 1100 700
+wait 200ms
+expect dialog == none
+
+quit 0

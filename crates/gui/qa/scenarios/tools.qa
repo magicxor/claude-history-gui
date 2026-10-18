@@ -1,0 +1,114 @@
+# tools.qa (WP5; DESIGN §5.10-§5.18, §15.3): every Tools item is reachable from the
+# palette and opens its dialog; nothing is deleted, generated or cleared (the dialogs are
+# opened and dismissed; Clear is answered with `n`). The update check uses the recording
+# services (no network): the dialog shows `Update error: ...`.
+#
+# Sandbox: a FRESH COPY of the scratchpad sandbox (tools/qa/new-sandbox.ps1). Run:
+#   tools/qa/run-gui.ps1 -Sandbox <sbx> -Exe <qa build> -Scenario crates/gui/qa/scenarios/tools.qa `
+#       -Out <dir> -Shots
+wait-loaded 15s
+
+# Debug log (also reached by the viewer's Show debug log / parse-error badge).
+key secondary-shift-p
+type "debug log"
+key enter
+expect dialog == debug-log
+shot tools-debug-log
+key escape
+expect dialog == none
+
+# Delete empty transcripts: the scan lists the candidates, Close dismisses without deleting.
+key secondary-shift-p
+type "delete empty"
+key enter
+expect dialog == delete-empty
+wait 800ms
+shot tools-delete-empty
+key escape
+expect dialog == none
+
+# Generate semantic cache: opens idle (never auto-started); Esc closes it.
+key secondary-shift-p
+type "generate semantic"
+key enter
+expect dialog == generate-semantic-cache
+shot tools-generate-cache
+key escape
+expect dialog == none
+
+# Clear semantic cache asks first; `n` cancels and the cache stays.
+key secondary-shift-p
+type "clear semantic"
+key enter
+expect dialog == clear-semantic-cache
+shot tools-clear-cache
+key n
+expect dialog == none
+
+# Debug search.
+key secondary-shift-p
+type "debug search"
+key enter
+expect dialog == debug-search
+wait 800ms
+type "token"
+key enter
+wait 800ms
+shot tools-debug-search
+key escape
+expect dialog == none
+
+# Semantic debug search (opens; no run, the model is not needed).
+key secondary-shift-p
+type "semantic debug"
+key enter
+expect dialog == semantic-debug
+shot tools-semantic-debug
+key escape
+expect dialog == none
+
+# Delete by session ID: an unknown id is reported, nothing is deleted.
+key secondary-shift-p
+type "delete conversation by"
+key enter
+expect dialog == delete-by-id
+type "bad/id"
+key enter
+wait 500ms
+shot tools-delete-by-id
+key escape
+expect dialog == none
+
+# Show projects directory needs a workspace (T-016): without one the palette
+# lists it muted and Enter on it runs nothing (the palette stays open).
+key secondary-shift-p
+type "projects directory"
+key enter
+expect dialog == palette
+expect toast.last !contains "Projects directory"
+shot tools-projects-dir-disabled
+# The first Esc clears the typed filter, the second closes the palette.
+key escape escape
+expect dialog == none
+
+# Check for updates (recording services: no network).
+key secondary-shift-p
+type "check for updates"
+key enter
+expect dialog == updates
+wait 500ms
+shot tools-updates
+key escape
+expect dialog == none
+
+# About.
+key secondary-shift-p
+type "about"
+key enter
+expect dialog == about
+shot tools-about
+key escape
+expect dialog == none
+expect calls.terminal.count == 0
+quit 0
+

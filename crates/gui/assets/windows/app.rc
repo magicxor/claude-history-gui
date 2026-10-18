@@ -1,0 +1,42 @@
+// Windows resources of claude-history-gui.exe: the icon (id 1, so Explorer, the
+// taskbar and the title bar use it) and the version information.
+// Compiled by build.rs with embed-resource; no manifest (GPUI embeds its own).
+// VERSION_MAJOR/MINOR/PATCH and VERSION_STR come from Cargo through build.rs.
+
+#ifndef VERSION_MAJOR
+#define VERSION_MAJOR 0
+#define VERSION_MINOR 0
+#define VERSION_PATCH 0
+#define VERSION_STR "0.0.0"
+#endif
+
+1 ICON "../app.ico"
+
+1 VERSIONINFO
+FILEVERSION VERSION_MAJOR,VERSION_MINOR,VERSION_PATCH,0
+PRODUCTVERSION VERSION_MAJOR,VERSION_MINOR,VERSION_PATCH,0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "claude-history-gui contributors\0"
+            VALUE "FileDescription", "Claude History - browser for Claude Code, Pi and OMP conversation history\0"
+            VALUE "FileVersion", VERSION_STR "\0"
+            VALUE "InternalName", "claude-history-gui\0"
+            VALUE "LegalCopyright", "Unlicense; core derived from claude-history (MIT)\0"
+            VALUE "OriginalFilename", "claude-history-gui.exe\0"
+            VALUE "ProductName", "Claude History\0"
+            VALUE "ProductVersion", VERSION_STR "\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

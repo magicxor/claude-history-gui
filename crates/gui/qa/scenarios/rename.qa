@@ -1,0 +1,53 @@
+# rename.qa (WP3): the Rename dialog from the list and from the viewer, the
+# keys of its input, the save and Esc (FEATURES A-017, A-018, A-019, A-020, A-028).
+#
+# Run on a FRESH COPY of the sandbox (tools/qa/new-sandbox.ps1): it writes the
+# renamed conversation's transcript.
+#   tools/qa/run-gui.ps1 -Sandbox <sandbox> -Exe <qa build> -Scenario crates/gui/qa/scenarios/rename.qa -Out <dir> [-Shots]
+# Probe `dialog` is the open dialog's id (`rename`); QA ids: rename:input, rename:save, rename:cancel.
+wait-loaded 30s
+expect dialog == none
+
+# F2 on the selected row opens the dialog for it.
+key f2
+expect dialog == rename
+shot rename-dialog
+
+# Ctrl+U clears, the new title is typed, Esc closes without writing.
+key ctrl-u
+type "Discarded title"
+key escape
+expect dialog == none
+expect list.selected_title !contains "Discarded title"
+
+# Save with Enter: the row title changes in place and there is no toast.
+key f2
+expect dialog == rename
+key ctrl-u
+type "QA renamed title"
+shot rename-typed
+key enter
+wait-for dialog == none 5s
+expect list.selected_title contains "QA renamed title"
+expect list.loaded == true
+
+# The viewer's Rename (F2 in the viewer) renames the viewer's conversation.
+key enter
+wait-for viewer.items > 0 10s
+key f2
+expect dialog == rename
+key ctrl-u
+type "QA viewer rename"
+click rename:save
+wait-for dialog == none 5s
+key escape
+expect list.selected_title contains "QA viewer rename"
+
+# An empty title is allowed (it clears the custom title); the dialog closes.
+key f2
+expect dialog == rename
+key ctrl-u
+key enter
+wait-for dialog == none 5s
+expect list.selected_title !contains "QA viewer rename"
+quit 0
