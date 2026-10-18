@@ -1,0 +1,54 @@
+# palette.qa (WP6): the command palette (C-057, X-025): opened with the
+# shortcut and F10, filtered by typing, dispatching to the element that had
+# focus, restoring that focus.
+wait-loaded 15s
+
+key f10
+expect dialog == palette
+shot palette-open
+key escape
+expect dialog == none
+
+# A Help item opens its dialog; the palette is gone.
+key secondary-shift-p
+type "shortcuts"
+key enter
+expect dialog == shortcuts
+shot palette-shortcuts-dialog
+key escape
+expect dialog == none
+
+# Open a conversation, then toggle Show thinking through the palette: the
+# viewer (focused before the palette opened) handles it and keeps the focus.
+key down
+key enter
+wait-for viewer.items > 0 5s
+expect focus == viewer
+key secondary-shift-p
+type "show thinking"
+key enter
+expect viewer.thinking == true
+expect focus == viewer
+key secondary-shift-p
+type "show thinking"
+key enter
+expect viewer.thinking == false
+expect focus == viewer
+
+# The same item from the list: the list is the stored focus, the routing
+# fallback sends the viewer action to the viewer.
+key escape
+expect focus == list
+key secondary-shift-p
+type "show thinking"
+key enter
+expect viewer.thinking == true
+expect focus == list
+
+# Every Tools item is reachable from the palette.
+key secondary-shift-p
+type "debug log"
+key enter
+expect dialog != none
+key escape
+quit 0

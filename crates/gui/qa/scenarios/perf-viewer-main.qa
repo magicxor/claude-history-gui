@@ -1,0 +1,66 @@
+# perf-viewer-main.qa (DESIGN §15.8, V-094): the viewer's frame time in the MAIN window, where the
+# transcript shares the window with the 20,000-row list (perf-viewer.qa measures the viewer alone in
+# a single-file window). Release `--features qa` build.
+#
+# Sandbox: a fresh copy of the template home, the synthetic corpus, the viewer fixtures, and the
+# 3k-message perf transcript as a list row (UUID ffffffff-1c2d-4e5f-8a9b-0c1d2e3f4a5b):
+#   tools/qa/new-sandbox.ps1 -Source <template home> -Dest <sbx>
+#   tools/qa/add-synth-corpus.ps1 -Sandbox <sbx> -Count 20000
+#   crates/gui/tests/fixtures/viewer/prepare-sandbox.ps1 -Sandbox <sbx>
+#   tools/qa/add-perf-session.ps1 -Sandbox <sbx> -Source <sbx>\viewer\perf-3k.jsonl
+# Run:
+#   tools/qa/run-gui.ps1 -Sandbox <sbx> -Exe <release qa build> -Scenario crates/gui/qa/scenarios/perf-viewer-main.qa -Out <dir>
+#
+# Regression gate for the viewer's frame time in the shared window: render() start to paint end of
+# the viewer, which in the main window spans the layout and paint of the whole window (the 20k-row
+# list, the text-selection layer), not the viewer alone. Measured on the Windows dev machine in five
+# runs (UI-thread CPU time ~ wall time, so it is real work, not load): idle median of nine re-renders
+# 7.4-8.7 ms (single-file window: ~2 ms). That median is the gate (< 12 ms, ~1.4x the worst run): it
+# catches a regression, it is not the 16.7 ms frame budget (the idle frame uses half of it; the open
+# item in DESIGN §17.11 stays). The page-through (60 pages, last 100 frames) is reported, not asserted:
+# on the shared desktop it varied too much to gate (avg 10.4-16.3 ms, p95 14.0-40.7 ms over five runs;
+# one scheduler hiccup decides a p95). Medians judge, never one sampled frame.
+
+wait-loaded 180s
+expect list.total > 20000
+paste "ffffffff-1c2d-4e5f-8a9b-0c1d2e3f4a5b"
+wait-for list.count == 1 10s
+key enter
+wait-for viewer.status == ready 60s
+expect viewer.messages > 2999
+expect focus == viewer
+wait 1500ms
+
+# Idle frames: nine re-renders with nothing changed (SetToolsSummary while already Summary only notifies).
+expect viewer.tool_display == sum
+action history::SetToolsSummary
+wait 150ms
+action history::SetToolsSummary
+wait 150ms
+action history::SetToolsSummary
+wait 150ms
+action history::SetToolsSummary
+wait 150ms
+action history::SetToolsSummary
+wait 150ms
+action history::SetToolsSummary
+wait 150ms
+action history::SetToolsSummary
+wait 150ms
+action history::SetToolsSummary
+wait 150ms
+action history::SetToolsSummary
+wait 150ms
+timing viewer.frame_median_9 < 12ms
+timing viewer.frame_cpu_median_9 >= 0
+
+# Page-through: 60 pages, one frame each (reported).
+key pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown
+key pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown
+key pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown
+key pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown
+key pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown
+key pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown
+timing viewer.frame_avg_100 >= 0
+timing viewer.frame_p95_100 >= 0
+quit 0

@@ -1,0 +1,10 @@
+# The default 1 MiB main-thread stack on Windows MSVC is too small for some
+# deep recursion (markdown layout, serde of large transcripts, tests) and for
+# GPUI's deep element trees.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:8000000"]
+
+[env]
+# libtest runs every test on its own thread; give those threads the same
+# 8 MiB the main thread gets (DESIGN §14.4).
+RUST_MIN_STACK = "8388608"

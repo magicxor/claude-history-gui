@@ -1,0 +1,62 @@
+# export-copy.qa (WP3): the Export and Copy menus, the save prompt (answers
+# come from the scenario), the extension and Replace prompt, the clipboard
+# copies and Show path (FEATURES A-034, A-035, A-038, A-039, A-041, A-042,
+# A-043, A-044, V-083, X-003).
+#
+# Run on a FRESH COPY of the sandbox. The exports are written relative to the
+# sandbox (the process working directory):
+#   tools/qa/run-gui.ps1 -Sandbox <sandbox> -Exe <qa build> -Scenario crates/gui/qa/scenarios/export-copy.qa -Out <dir> [-Shots]
+wait-loaded 30s
+key enter
+wait-for viewer.items > 0 10s
+expect focus == viewer
+
+# The Export menu: Esc asks for nothing; 3 asks for a Markdown name.
+key e
+expect dialog == export-menu
+shot export-menu
+key escape
+expect dialog == none
+expect calls.prompt_save.count == 0
+answer-save qa-export-x
+key e
+key 3
+wait-for calls.prompt_save.count == 1 5s
+wait-for toast.last contains "Exported to" 5s
+expect toast.last contains "qa-export-x.md"
+
+# The same name again: the extension is appended, so Replace is asked.
+answer-save qa-export-x
+key e
+key 3
+expect dialog == export-replace
+shot export-replace
+key enter
+wait 300ms
+expect dialog == export-replace
+key y
+wait-for dialog == none 5s
+expect toast.last contains "Exported to"
+
+# Copy to clipboard: y opens the menu, 2 copies the Plain text.
+key y
+expect dialog == copy-menu
+key 2
+wait-for clipboard contains "You:" 5s
+expect toast.last == "Copied to clipboard"
+
+# Path, session ID and Show path.
+key shift-y
+expect toast.last == "Path copied to clipboard"
+expect clipboard contains ".jsonl"
+key shift-i
+expect toast.last == "Session ID copied to clipboard"
+key p
+expect toast.last contains ".jsonl"
+
+# A message: navigate to one and copy it (the first one may be a tool group,
+# which has no text: either answer is a message toast).
+key shift-j
+key y
+expect toast.last contains "essage"
+quit 0

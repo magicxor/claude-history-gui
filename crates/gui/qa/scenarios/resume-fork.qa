@@ -1,0 +1,52 @@
+# resume-fork.qa (WP3): Fork into a workspace asks to copy the conversation
+# (§5.8); an existing copy turns the confirmation into the overwrite warning
+# (danger button, Enter ignored); confirming records one terminal command
+# (FEATURES A-002, A-005, A-009, A-013, X-003). Terminals are only recorded.
+#
+# Run on a FRESH COPY of the sandbox, with the sandbox folder as the workspace
+# (an existing folder that is not the conversation's project) so a fork always
+# copies; the first listed conversation must be a Claude one:
+#   tools/qa/run-gui.ps1 -Sandbox <sandbox> -Exe <qa build> -ArgsLine "--workspace <sandbox>" `
+#       -Scenario crates/gui/qa/scenarios/resume-fork.qa -Out <dir> [-Shots]
+# (settings-keys.qa covers Resume on the rebound key.)
+wait-loaded 30s
+expect dialog == none
+expect calls.terminal.count == 0
+
+# The copy confirmation; Esc cancels it and nothing runs.
+key ctrl-f
+expect dialog == copy-to-workspace
+shot copy-to-workspace
+key escape
+expect dialog == none
+expect calls.terminal.count == 0
+
+# Enter confirms (no overwrite yet): copied, then one terminal command without --fork-session.
+key ctrl-f
+expect dialog == copy-to-workspace
+key enter
+wait-for calls.terminal.count == 1 10s
+expect dialog == none
+expect toast.last contains "Opened"
+expect calls.terminal.last contains "--resume"
+expect calls.terminal.last !contains "--fork-session"
+
+# The copy exists now: the dialog warns, Enter is ignored, n cancels.
+key ctrl-f
+expect dialog == copy-to-workspace
+shot copy-overwrite
+key enter
+wait 300ms
+expect dialog == copy-to-workspace
+expect calls.terminal.count == 1
+key n
+expect dialog == none
+expect calls.terminal.count == 1
+
+# y confirms the overwrite.
+key ctrl-f
+expect dialog == copy-to-workspace
+key shift-y
+wait-for calls.terminal.count == 2 10s
+expect dialog == none
+quit 0

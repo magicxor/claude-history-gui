@@ -1,0 +1,60 @@
+# settings-keys.qa (WP6): the Settings dialog, saving to gui.toml and live
+# key rebinding (C-033, C-034, C-027, C-028, L-063).
+#
+# Run on a FRESH COPY of the sandbox (tools/qa/new-sandbox.ps1 -WithWorkspace, so
+# the first row is a conversation whose project folder exists and the rebound
+# Resume key reaches a recorded terminal launch): the scenario writes the copy's
+# gui.toml. Probes: `dialog` is the id of the open dialog
+# (`settings`, `shortcuts`, `palette`, or `none`); QA element ids of the dialog
+# are `settings:page:<Page>`, `settings:input:<section>.<key>` (e.g. keys.resume), `settings:save`,
+# `settings:cancel`.
+wait-loaded 15s
+expect dialog == none
+
+# Open with the shortcut, go to the Keys page.
+key secondary-,
+expect dialog == settings
+shot settings-general
+click settings:page:Keys
+shot settings-keys
+
+# An invalid key shows the core message and blocks Save (see the screenshot).
+click settings:input:keys.resume
+key secondary-a
+type "hyper+x"
+shot settings-keys-invalid
+click settings:save
+expect dialog == settings
+
+# A valid key: Resume on alt+r.
+click settings:input:keys.resume
+key secondary-a
+type "alt+r"
+shot settings-keys-valid
+click settings:save
+expect toast.last contains "Settings saved to"
+expect dialog == none
+
+# The new binding resumes the selected conversation (recorded terminal call);
+# the old one no longer does.
+set-stdout terminal
+key alt-r
+wait 800ms
+expect calls.terminal.count == 1
+key ctrl-r
+wait 800ms
+expect calls.terminal.count == 1
+
+# F5 (a static row) still refreshes after the rebinding.
+key f5
+wait-for list.loading == false 15s
+
+# Cancel discards.
+key secondary-,
+click settings:page:Keys
+click settings:input:keys.fork
+key secondary-a
+type "ctrl+g"
+click settings:cancel
+expect dialog == none
+quit 0

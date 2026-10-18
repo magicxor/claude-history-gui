@@ -1,49 +1,92 @@
-[package]
-name = "claude-history"
-version = "0.1.79"
+[workspace]
+resolver = "3"
+# Explicit member list (DESIGN §3): the UI-agnostic core and the GUI.
+members = ["crates/core", "crates/gui"]
+
+[workspace.package]
 edition = "2024"
-description = "Fuzzy-search Claude Code conversation history from the terminal."
-readme = "README.md"
-license = "MIT"
-repository = "https://github.com/raine/claude-history"
-homepage = "https://github.com/raine/claude-history"
-keywords = ["claude", "claude-code", "fzf", "cli", "history"]
-categories = ["command-line-utilities"]
+# Repository default (see LICENSE). crates/core is derived from the MIT
+# licensed claude-history and declares `license = "MIT"` itself.
+license = "Unlicense"
+repository = "https://github.com/magicxor/claude-history-gui"
 
-[features]
-release-dynamic-ort = ["ort/load-dynamic", "fastembed/ort-load-dynamic"]
-
-[dependencies]
+[workspace.dependencies]
+# Versions follow upstream claude-history v0.1.76 (Cargo.toml); the copied
+# Cargo.lock keeps the resolved versions identical to the upstream tree,
+# except where gpui-kit 0.7.3's tree requires a newer minimum of a package
+# core shares (recorded when the GUI crate was added): memchr 2.8.3,
+# regex-automata 0.4.18, futures-* 0.3.34, serde_spanned 1.1.2,
+# toml_parser 1.1.5, toml_writer 1.1.3, js-sys/web-sys 0.3.106,
+# wasm-bindgen 0.2.129 (+ -macro, -macro-support, -shared) and
+# wasm-bindgen-futures 0.4.79. Every other shared package keeps upstream's
+# version (`cargo update -p <name> --precise <upstream version>`).
 serde = { version = "1.0", features = ["derive"] }
-serde_json = { version = "1.0", features = ["raw_value"] }
-bincode = "1.3"
+serde_json = "1.0"
+bincode = "1.3" # cache format: do not bump to 2.x
 blake3 = "1.8"
-colored = "3.0"
-clap = { version = "4.5", features = ["derive"] }
 chrono = "0.4"
 thiserror = "2.0"
 toml = "0.9"
 home = "0.5"
 rayon = "1.10"
-ratatui = "0.30"
-crossterm = { version = "0.29", features = ["osc52"] }
 textwrap = "0.16"
 pulldown-cmark = "0.13"
 unicode-width = "0.2"
-arboard = "3.4"
 syntect = { version = "5.2", default-features = false, features = ["default-fancy"] }
-terminal-light = "1.0"
 tempfile = "3"
-indicatif = "0.17"
-fastembed = { version = "6.0", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
-ort = { version = "=2.0.0-rc.13", default-features = false }
-bytemuck = { version = "1.25.2", features = ["derive"] }
-memmap2 = "0.9"
-fst = "0.4"
-memchr = "2"
-icu_normalizer = { version = "2", default-features = false, features = ["compiled_data"] }
-zstd = "0.13"
-rusqlite = { version = "0.40", features = ["bundled"] }
+# Pinned for parity with the upstream lock file. tokenizers default features
+# stay OFF (fastembed disables them), which avoids the esaxx-rs static CRT
+# mismatch on Windows MSVC.
+fastembed = { version = "=6.0.2", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic"] }
+# Used directly (same version and features fastembed's hf-hub-rustls-tls
+# resolves, so it adds no crates) to fetch the model into the HistoryEnv
+# model dir without fastembed's HF_HOME / HF_ENDPOINT / real-home token reads.
+hf-hub = { version = "=0.5.0", default-features = false, features = ["ureq", "rustls-tls"] }
+# Update check (HTTPS with rustls). Already in the tree through fastembed's
+# hf-hub, so it adds no crates.
+ureq = { version = "3.3", default-features = false, features = ["rustls"] }
 
-[target.'cfg(unix)'.dependencies]
+# GUI crate (DESIGN §16.1). gpui-kit is pinned exactly: the GUI relies on
+# gpui-base text-selection internals verified against 0.7.3 (DESIGN §19).
+gpui-kit = "=0.7.3"
+async-channel = "2"
+# Used by core for the comment-preserving gui.toml save (K12); the same
+# version is already in gpui-kit's tree.
+toml_edit = "0.25.17"
+# Dev only (test env redirect, DESIGN §15.2); 1.0.x is already in gpui-kit's tree.
+ctor = "1.0"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_Shell",
+    "Win32_System_Com",
+] }
 libc = "0.2"
+embed-resource = "3"
+
+# Optimize the GUI engine even in debug builds (gpui-kit installation notes):
+# an unoptimized GPUI makes every debug run and gpui test sluggish. Only crates
+# present in Cargo.lock are listed (a name outside the graph is a cargo warning).
+[profile.dev.package]
+gpui-pre = { opt-level = 3 }
+gpui-pre-platform = { opt-level = 3 }
+gpui-pre-windows = { opt-level = 3 }
+gpui-pre-macos = { opt-level = 3 }
+gpui-pre-linux = { opt-level = 3 }
+gpui-pre-wgpu = { opt-level = 3 }
+gpui-base = { opt-level = 3 }
+gpui-component = { opt-level = 3 }
+gpui-kit = { opt-level = 3 }
+gpui-kit-assets = { opt-level = 3 }
+rustybuzz = { opt-level = 3 }
+taffy = { opt-level = 3 }
+ttf-parser = { opt-level = 3 }
+resvg = { opt-level = 3 }
+syntect = { opt-level = 3 }
+
+[profile.release]
+codegen-units = 4

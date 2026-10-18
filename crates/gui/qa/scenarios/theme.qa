@@ -1,0 +1,53 @@
+# theme.qa (WP6): light and dark themes across the list, the viewer and the
+# dialogs, switched through the runner and through View → Theme (C-035, X-019,
+# X-039). Screenshots are reviewed per DESIGN §15.5 in both themes.
+wait-loaded 15s
+
+set-theme dark
+expect theme == dark
+shot theme-dark-list
+
+action history::SetThemeLight
+expect theme == light
+shot theme-light-list
+
+# A conversation in the viewer, both themes.
+key down
+key enter
+wait-for viewer.items > 0 5s
+shot theme-light-viewer
+action history::SetThemeDark
+expect theme == dark
+shot theme-dark-viewer
+
+# Dialogs in the dark theme, then the light one.
+key secondary-,
+expect dialog == settings
+shot theme-dark-settings
+key escape
+key f1
+expect dialog == shortcuts
+shot theme-dark-shortcuts
+key escape
+key f10
+expect dialog == palette
+shot theme-dark-palette
+key escape
+
+set-theme light
+key secondary-,
+shot theme-light-settings
+key escape
+key f1
+shot theme-light-shortcuts
+key escape
+key f10
+shot theme-light-palette
+key escape
+
+# System follows the OS; the choice is saved in gui.toml (checked by the
+# G tests), so end on an explicit theme.
+action history::SetThemeSystem
+action history::SetThemeLight
+expect theme == light
+quit 0

@@ -1,0 +1,11 @@
+# picker-exit.qa (WP3): Ctrl+O prints and exits. The scenario ends with the
+# quit the action performs, so the report is not written; the evidence is the
+# exit code and the child's stdout (FEATURES A-046, A-050, A-051, A-058).
+#
+#   tools/qa/run-gui.ps1 -Sandbox <sandbox> -Exe <qa build> -ArgsLine "--show-path --qa-real-console" `
+#       -Scenario crates/gui/qa/scenarios/picker-exit.qa -Out <dir> -StdoutFile <out.txt>
+# Expected: exit code 0 and <out.txt> holds exactly one line, the selected transcript's path.
+# Without --show-path (plain `--qa-real-console`) the file holds the Ledger export instead.
+wait-loaded 30s
+key ctrl-o
+wait 2s

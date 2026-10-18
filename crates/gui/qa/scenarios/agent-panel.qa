@@ -1,0 +1,90 @@
+# agent-panel.qa (WP4; FEATURES D-001, D-019…D-024, D-029, D-034, X-044; DESIGN §5.4, §11.14): the
+# viewer's agent panel — Outline (`o`), Within and Read — for the conversation in the viewer, the
+# panel's own keys (j/k/Enter in the row list, Esc back to the transcript) and the agent text view.
+#
+# Corpus: crates/gui/tests/fixtures/qa-home ("Token refresh retry" has four messages mentioning a
+# retry; it is also in a copy of the scratchpad sandbox that has the corpus merged in).
+#
+#   tools/qa/new-sandbox.ps1 -Source <corpus> -Dest <sandbox>
+#   tools/qa/run-gui.ps1 -Sandbox <sandbox> -Exe <qa build> -Scenario crates/gui/qa/scenarios/agent-panel.qa -Out <dir> -Shots
+#
+# The probes of the panel are `deep.agent.*` (the main window forwards them through the Deep search
+# probe until the window root routes `agent.*`).
+
+wait-loaded 30s
+set-theme light
+# The pane layout is remembered between runs: start on the Conversations tab.
+key ctrl-1
+expect focus == list
+expect dialog == none
+
+# Open "Token refresh retry" in the viewer.
+type "Token refresh retry"
+wait-for list.selected_title contains "Token refresh retry" 15s
+key enter
+wait-for viewer.items > 0 15s
+expect focus == viewer
+expect viewer.agent_panel == false
+
+# `o` opens the panel on Outline: the conversation's ref resolves and the messages are listed.
+key o
+expect viewer.agent_panel == true
+expect focus == agent
+expect deep.agent.tab == outline
+wait-for deep.agent.key == known 15s
+wait-for deep.agent.rows > 0 15s
+expect deep.agent.set contains "Token refresh retry"
+expect deep.agent.summary contains "visible messages"
+expect deep.agent.error == ""
+shot agent-outline-light
+set-theme dark
+shot agent-outline-dark
+set-theme light
+
+# j / k move the outline selection, they never reach the transcript (X-044).
+key j
+expect deep.agent.selected == 1
+key k
+expect deep.agent.selected == 0
+expect focus == agent
+# Enter shows the selected message in the viewer.
+key enter
+expect focus == viewer
+
+# Search within this conversation.
+action history::SearchWithinConversation
+expect deep.agent.tab == within
+expect focus == agent
+type "retry"
+key enter
+wait-for deep.agent.summary contains "hits" 20s
+expect deep.agent.error == ""
+expect deep.agent.rows > 0
+expect deep.agent.stale == false
+shot agent-within-light
+
+# Read the whole conversation (an empty Refs field is the viewer's conversation).
+action history::ReadRange
+expect deep.agent.tab == read
+expect focus == agent
+key enter
+wait-for deep.agent.rows > 0 20s
+expect deep.agent.error == ""
+shot agent-read-light
+
+# The agent text view shows exactly the CLI output.
+action history::ToggleAgentText
+expect deep.agent.text_shown == true
+expect deep.agent.text contains "protocol agent-read"
+shot agent-text-light
+action history::ToggleAgentText
+expect deep.agent.text_shown == false
+
+# Esc with nothing to clear goes back to the transcript; the panel stays open. `o` closes it.
+key escape
+expect focus == viewer
+expect viewer.agent_panel == true
+key o
+expect viewer.agent_panel == false
+
+quit 0

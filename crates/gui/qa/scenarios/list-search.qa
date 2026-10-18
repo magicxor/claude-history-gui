@@ -1,0 +1,36 @@
+# WP1 list-search: typing filters on a worker thread, highlights and the
+# literal context line appear, Esc clears, the scope toggles, the row menu is
+# built (clicks and the row menu are covered by the G tests; FEATURES L-012, L-024, L-027, L-028, L-031,
+# L-052, L-053, L-054, L-056, L-078, S-004, S-005, S-009).
+wait-loaded 30s
+# The shots are named for the light theme (the system theme otherwise; integrator, Phase C).
+set-theme light
+type "token"
+wait 50ms
+wait-for list.searching == false 5s
+expect list.query == "token"
+shot list-search-light
+key escape
+expect list.query == ""
+# a quoted literal switches to the four-line rows
+type "\"refresh\""
+wait 300ms
+shot list-literal-light
+key escape
+# no matches
+type "zzzzqqqq"
+wait 300ms
+expect list.count == 0
+shot list-no-match-light
+key escape
+# the scope toggle needs a workspace; without one Tab leaves the search input
+key tab
+key shift-tab
+# paging by the visible rows
+key pagedown
+key pageup
+key ctrl-d
+key home
+set-theme dark
+shot list-search-dark
+quit 0

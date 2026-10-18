@@ -1,0 +1,401 @@
+//! Core tests named by the FEATURES.md rows owned by WP-C that no earlier
+//! test covered exactly (row id in each test name): history loading,
+//! caching, parsing rules and Pi/OMP specifics. Every file lives in a
+//! temporary directory.
+
+use super::*;
+use crate::history::cache;
+use serde_json::json;
+use std::io::Write;
+use std::path::Path;
+use std::time::{Duration, SystemTime};
+
+fn write_lines(path: &Path, lines: &[serde_json::Value]) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let text = lines
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    std::fs::write(path, text).unwrap();
+}
+
+fn user(text: &str, timestamp: &str) -> serde_json::Value {
+    json!({"type": "user", "timestamp": timestamp, "message": {"role": "user", "content": text}})
+}
+
+fn assistant(text: &str, timestamp: &str) -> serde_json::Value {
+    json!({
+        "type": "assistant",
+        "timestamp": timestamp,
+        "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}
+    })
+}
+
+fn set_mtime(path: &Path, time: SystemTime) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(time)
+        .unwrap();
+}
+
+#[test]
+fn l008_project_cache_hits_invalidates_keeps_negative_entries_and_rewrites_atomically() {
+    let home = tempfile::tempdir().unwrap();
+    let env = HistoryEnv::sandbox(home.path());
+    let project = env.claude_projects_root().unwrap().join("-work-p");
+    let listed = project.join("11111111-1111-4111-8111-111111111111.jsonl");
+    let empty = project.join("22222222-2222-4222-8222-222222222222.jsonl");
+    write_lines(
+        &listed,
+        &[
+            user("original question", "2024-01-01T00:00:00Z"),
+            assistant("answer", "2024-01-01T00:01:00Z"),
+        ],
+    );
+    // Parses to nothing: a negative entry.
+    write_lines(
+        &empty,
+        &[json!({"type": "summary", "summary": "only metadata"})],
+    );
+    let fixed = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    set_mtime(&listed, fixed);
+    set_mtime(&empty, fixed);
+
+    let first = load_conversations(&env, &project, true, "-work-p", None).unwrap();
+    assert_eq!(first.len(), 1);
+    let entries = cache::read_project_cache(&env, "-work-p").expect("cache written");
+    assert_eq!(entries.len(), 2);
+    let empty_name = empty.file_name().unwrap().to_str().unwrap();
+    assert!(entries[empty_name].is_empty, "negative entry");
+    let listed_name = listed.file_name().unwrap().to_str().unwrap();
+    assert!(!entries[listed_name].is_empty);
+
+    // A hit is served from the cache (prove it with a marked entry whose
+    // size and mtime still match the file).
+    let mut marked = entries.clone();
+    marked.get_mut(listed_name).unwrap().preview_last = "FROM CACHE".to_string();
+    cache::write_project_cache(&env, "-work-p", marked);
+    let hit = load_conversations(&env, &project, true, "-work-p", None).unwrap();
+    assert_eq!(hit[0].preview, "FROM CACHE");
+
+    // A different size invalidates the entry.
+    write_lines(
+        &listed,
+        &[
+            user("edited question that is longer", "2024-01-01T00:00:00Z"),
+            assistant("answer", "2024-01-01T00:01:00Z"),
+        ],
+    );
+    set_mtime(&listed, fixed);
+    let resized = load_conversations(&env, &project, true, "-work-p", None).unwrap();
+    assert!(
+        resized[0].preview.contains("edited question"),
+        "{}",
+        resized[0].preview
+    );
+
+    // A different mtime (same size) invalidates it too.
+    let mut marked = cache::read_project_cache(&env, "-work-p").unwrap();
+    marked.get_mut(listed_name).unwrap().preview_last = "STALE".to_string();
+    cache::write_project_cache(&env, "-work-p", marked);
+    set_mtime(&listed, fixed + Duration::from_secs(60));
+    let touched = load_conversations(&env, &project, true, "-work-p", None).unwrap();
+    assert!(touched[0].preview.contains("edited question"));
+
+    // The rewrite is atomic: a corrupt cache file is replaced whole, and no
+    // temporary file is left next to it.
+    let cache_file = cache::cache_path_for_project(&env, "-work-p").unwrap();
+    std::fs::write(&cache_file, b"garbage").unwrap();
+    assert!(cache::read_project_cache(&env, "-work-p").is_none());
+    load_conversations(&env, &project, true, "-work-p", None).unwrap();
+    assert_eq!(cache::read_project_cache(&env, "-work-p").unwrap().len(), 2);
+    let leftovers = std::fs::read_dir(cache_file.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(leftovers, vec!["-work-p.bin".to_string()]);
+}
+
+#[test]
+fn l092_transcripts_without_listable_parts_parse_to_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let clear_only = dir.path().join("clear.jsonl");
+    write_lines(
+        &clear_only,
+        &[
+            user(
+                "Caveat: The messages below were generated by the user while running local commands. DO NOT respond.",
+                "2024-01-01T00:00:00Z",
+            ),
+            user(
+                "<command-name>/clear</command-name><command-message>clear</command-message>",
+                "2024-01-01T00:00:01Z",
+            ),
+            user(
+                "<local-command-stdout></local-command-stdout>",
+                "2024-01-01T00:00:02Z",
+            ),
+        ],
+    );
+    assert!(
+        process_conversation_file(clear_only, None, None)
+            .unwrap()
+            .is_none()
+    );
+
+    // Only metadata (no searchable or preview part).
+    let metadata = dir.path().join("metadata.jsonl");
+    write_lines(
+        &metadata,
+        &[
+            json!({"type": "summary", "summary": "s"}),
+            json!({"type": "custom-title", "customTitle": "t"}),
+        ],
+    );
+    assert!(
+        process_conversation_file(metadata, None, None)
+            .unwrap()
+            .is_none()
+    );
+
+    // Only the Warmup exchange.
+    let warmup = dir.path().join("warmup.jsonl");
+    write_lines(
+        &warmup,
+        &[
+            user("Warmup", "2024-01-01T00:00:00Z"),
+            assistant("Ready", "2024-01-01T00:00:01Z"),
+        ],
+    );
+    assert!(
+        process_conversation_file(warmup, None, None)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn l093_row_timestamps_follow_the_mtime_or_the_latest_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_650_000_000);
+
+    // Claude: the file's modification time, whatever the records say.
+    let claude = dir.path().join("claude.jsonl");
+    write_lines(&claude, &[user("hello", "2030-01-01T00:00:00Z")]);
+    let conversation = process_conversation_file(claude, Some(mtime), None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(conversation.timestamp.timestamp(), 1_650_000_000);
+
+    // Pi: the latest user/assistant record.
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v1.jsonl");
+    let pi = process_conversation_file(fixture.clone(), Some(mtime), None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        pi.timestamp.to_utc().to_rfc3339(),
+        "2024-01-01T00:02:00+00:00"
+    );
+
+    // ... else the header timestamp ...
+    let header_only = dir.path().join("pi-header.jsonl");
+    let mut file = std::fs::File::create(&header_only).unwrap();
+    writeln!(
+        file,
+        r#"{{"type":"session","id":"h","timestamp":"2024-05-05T05:05:05.000Z","cwd":"/tmp/p"}}"#
+    )
+    .unwrap();
+    writeln!(
+        file,
+        r#"{{"type":"message","message":{{"role":"user","content":"untimed question"}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        file,
+        r#"{{"type":"message","message":{{"role":"assistant","content":[{{"type":"text","text":"untimed answer"}}]}}}}"#
+    )
+    .unwrap();
+    drop(file);
+    let pi = process_conversation_file(header_only.clone(), Some(mtime), None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        pi.timestamp.to_utc().to_rfc3339(),
+        "2024-05-05T05:05:05+00:00"
+    );
+
+    // ... else the modification time.
+    let text = std::fs::read_to_string(&header_only)
+        .unwrap()
+        .replace("2024-05-05T05:05:05.000Z", "not a time");
+    std::fs::write(&header_only, text).unwrap();
+    let pi = process_conversation_file(header_only, Some(mtime), None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(pi.timestamp.timestamp(), 1_650_000_000);
+}
+
+#[test]
+fn l096_message_count_and_duration_in_minutes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("count.jsonl");
+    write_lines(
+        &path,
+        &[
+            user("first", "2024-01-01T00:00:00Z"),
+            assistant("reply", "2024-01-01T00:10:00Z"),
+            user("second", "2024-01-01T01:30:30Z"),
+        ],
+    );
+    let conversation = process_conversation_file(path, None, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(conversation.message_count, 3);
+    assert_eq!(conversation.duration_minutes, Some(90));
+
+    // Less than a minute counts as no duration.
+    let short = dir.path().join("short.jsonl");
+    write_lines(
+        &short,
+        &[
+            user("first", "2024-01-01T00:00:00Z"),
+            assistant("reply", "2024-01-01T00:00:30Z"),
+        ],
+    );
+    let conversation = process_conversation_file(short, None, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(conversation.message_count, 2);
+    assert_eq!(conversation.duration_minutes, None);
+}
+
+#[test]
+fn x012_searchable_text_is_never_truncated() {
+    // Upstream removed its 256K-character cap (F6).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("long.jsonl");
+    let filler = "lorem ipsum ".repeat(40_000);
+    write_lines(
+        &path,
+        &[
+            user(&format!("{filler} closingneedle"), "2024-01-01T00:00:00Z"),
+            assistant("ok", "2024-01-01T00:00:01Z"),
+        ],
+    );
+    let conversation = process_conversation_file(path, None, None)
+        .unwrap()
+        .unwrap();
+    assert!(conversation.full_text.len() > 400_000);
+    assert!(conversation.full_text.contains("closingneedle"));
+    assert!(conversation.search_text_lower.contains("closingneedle"));
+    let conversations = vec![conversation];
+    let searchable = crate::search::precompute_search_text(&conversations);
+    assert_eq!(
+        crate::search::search(
+            &conversations,
+            &searchable,
+            "closingneedle",
+            chrono::Local::now()
+        ),
+        vec![0]
+    );
+}
+
+#[test]
+fn x034_thinking_without_signature_drops_the_line_and_subagent_files_are_not_read() {
+    let home = tempfile::tempdir().unwrap();
+    let env = HistoryEnv::sandbox(home.path());
+    let project = env.claude_projects_root().unwrap().join("-work-x");
+    let uuid = "33333333-3333-4333-8333-333333333333";
+    let main = project.join(format!("{uuid}.jsonl"));
+    write_lines(
+        &main,
+        &[
+            user("visible question", "2024-01-01T00:00:00Z"),
+            // A thinking block without `signature` fails the whole line.
+            json!({
+                "type": "assistant",
+                "timestamp": "2024-01-01T00:00:01Z",
+                "message": {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "unsigned"},
+                    {"type": "text", "text": "DROPPEDLINE answer"}
+                ]}
+            }),
+            assistant("kept answer", "2024-01-01T00:00:02Z"),
+            // Inline subagent entries are the only subagent source.
+            json!({
+                "type": "assistant",
+                "timestamp": "2024-01-01T00:00:03Z",
+                "parent_tool_use_id": "toolu_1",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "INLINESUB text"}]}
+            }),
+        ],
+    );
+    // Neither agent-*.jsonl files nor <uuid>/subagents/*.jsonl are read.
+    write_lines(
+        &project.join("agent-abc.jsonl"),
+        &[user("AGENTFILE question", "2024-01-01T00:00:00Z")],
+    );
+    write_lines(
+        &project.join(uuid).join("subagents").join("agent-x.jsonl"),
+        &[user("SUBAGENTFILE question", "2024-01-01T00:00:00Z")],
+    );
+
+    let conversations = load_conversations(&env, &project, true, "-work-x", None).unwrap();
+    assert_eq!(conversations.len(), 1, "agent-*.jsonl is not listed");
+    let conversation = &conversations[0];
+    assert!(!conversation.full_text.contains("DROPPEDLINE"));
+    assert!(conversation.full_text.contains("kept answer"));
+    assert_eq!(conversation.parse_errors.len(), 1);
+    assert_eq!(conversation.parse_errors[0].line_number, 2);
+    let everything = format!(
+        "{} {}",
+        conversation.full_text, conversation.agent_search_text
+    );
+    assert!(!everything.contains("AGENTFILE") && !everything.contains("SUBAGENTFILE"));
+    assert!(everything.contains("INLINESUB"));
+}
+
+#[test]
+fn x035_pi_and_omp_tool_errors_keep_the_error_prefix() {
+    // Claude tool results have no error flag; Pi/OMP `isError` results
+    // read like any result with an `Error: ` prefix (ADD D2).
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl");
+    let conversation = process_conversation_file(fixture.clone(), None, None)
+        .unwrap()
+        .unwrap();
+    assert!(
+        conversation
+            .full_text
+            .contains("Error: tool output searchable"),
+        "{}",
+        conversation.full_text
+    );
+    let viewer = crate::view::ViewerModel::open(
+        &fixture,
+        crate::view::ViewPrefs {
+            tool_display: crate::view::ToolDisplayMode::Full,
+            show_thinking: false,
+            show_timing: false,
+        },
+    )
+    .unwrap();
+    let results = viewer
+        .document()
+        .messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match &block.kind {
+            crate::view::DocBlockKind::ToolResult(result) => Some(result.text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        results
+            .iter()
+            .any(|text| text.starts_with("Error: tool output searchable")),
+        "{results:?}"
+    );
+}

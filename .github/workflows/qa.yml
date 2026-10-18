@@ -1,0 +1,109 @@
+name: QA scenarios
+
+# DESIGN sections 15.3-15.4, 16.2. Manual dispatch on a Windows runner: builds the app with the
+# in-process QA runner (feature `qa`, release), copies the synthetic corpus
+# crates/gui/tests/fixtures/qa-home into a fresh sandbox home and runs every scenario in
+# crates/gui/qa/scenarios/*.qa against it. No OS input is injected; screenshot steps are
+# reported as SKIP (no watcher on the runner). Semantic scenarios (semantic-*.qa) need a
+# pre-downloaded model (--qa-model-dir) and are skipped here.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_MIN_STACK: "8388608"
+
+jobs:
+  qa:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Toolchain (rust-toolchain.toml)
+        shell: bash
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: qa
+      - name: Cache the ONNX Runtime download
+        uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/ort.pyke.io
+          key: ort-Windows-${{ hashFiles('Cargo.lock') }}
+      - name: Build with the QA runner
+        run: cargo build -p claude-history-gui --release --features qa --locked
+      - name: Run every scenario
+        shell: pwsh
+        run: |
+          $failed = @()
+          $exe = (Resolve-Path 'target/release/claude-history-gui.exe').Path
+          New-Item -ItemType Directory -Force -Path qa-out | Out-Null
+          # Per-scenario sandbox preparation and arguments ({0} = the sandbox), as the
+          # scenario headers describe them: the viewer scenarios open the markdown tour
+          # (or the perf transcript) in a single-file window; perf-list needs 20k rows.
+          $tour = '"{0}\viewer\markdown-tour.jsonl"'
+          $plan = @{
+            'viewer-basics'     = @{ Prepare = 'viewer-noperf'; Args = $tour }
+            'viewer-search-nav' = @{ Prepare = 'viewer-noperf'; Args = $tour }
+            'single-file'       = @{ Prepare = 'viewer-noperf'; Args = $tour }
+            'perf-viewer'       = @{ Prepare = 'viewer'; Args = '--show-tools "{0}\viewer\perf-10k.jsonl"' }
+            'perf-list'         = @{ Prepare = 'synth'; Args = '' }
+            # V-094: the viewer's frame time in the main window (20k rows + the 3k perf transcript as a row).
+            'perf-viewer-main'  = @{ Prepare = 'synth-perf'; Args = ''; Timeout = 600 }
+            # WP3: a fork into the sandbox folder always copies; picker mode; the
+            # printed line of Ctrl+O goes to the real stdout (checked below).
+            'resume-fork'       = @{ Prepare = ''; Args = '--workspace "{0}"' }
+            # The rebound Resume key must reach a recorded terminal launch: it needs a listed
+            # conversation whose project folder exists on the runner (new-sandbox -WithWorkspace).
+            'settings-keys'     = @{ Prepare = 'workspace'; Args = '' }
+            'picker'            = @{ Prepare = ''; Args = '--show-path' }
+            'picker-exit'       = @{ Prepare = ''; Args = '--show-path --qa-real-console'; Stdout = $true }
+            # WP-I: the panes together on 20k rows (X-038 timings, X-007 idle).
+            'cross-pane'        = @{ Prepare = 'synth'; Args = ''; Timeout = 900 }
+          }
+          foreach ($scenario in Get-ChildItem crates/gui/qa/scenarios -Filter *.qa) {
+            if ($scenario.Name -like 'semantic-*') { Write-Output "skip $($scenario.Name) (needs a model)"; continue }
+            $name = $scenario.BaseName
+            $sandbox = Join-Path $env:RUNNER_TEMP "chg-sbx-$name"
+            $step = $plan[$name]
+            $sbx = @{ Source = 'crates/gui/tests/fixtures/qa-home'; Dest = $sandbox; Force = $true }
+            if ($step -and $step.Prepare -eq 'workspace') { $sbx.WithWorkspace = $true }
+            ./tools/qa/new-sandbox.ps1 @sbx | Out-Null
+            $argsLine = ''
+            if ($step) {
+              switch ($step.Prepare) {
+                'viewer' { ./crates/gui/tests/fixtures/viewer/prepare-sandbox.ps1 -Sandbox $sandbox | Out-Null }
+                'viewer-noperf' { ./crates/gui/tests/fixtures/viewer/prepare-sandbox.ps1 -Sandbox $sandbox -NoPerf | Out-Null }
+                'synth' { ./tools/qa/add-synth-corpus.ps1 -Sandbox $sandbox -Count 20000 | Out-Null }
+                'synth-perf' {
+                  ./tools/qa/add-synth-corpus.ps1 -Sandbox $sandbox -Count 20000 | Out-Null
+                  ./crates/gui/tests/fixtures/viewer/prepare-sandbox.ps1 -Sandbox $sandbox | Out-Null
+                  ./tools/qa/add-perf-session.ps1 -Sandbox $sandbox -Source (Join-Path $sandbox 'viewer\perf-3k.jsonl') | Out-Null
+                }
+              }
+              $argsLine = $step.Args -f $sandbox
+            }
+            $out = Join-Path (Resolve-Path qa-out) $name
+            $timeout = if ($step -and $step.Timeout) { $step.Timeout } else { 240 }
+            $run = @{ Sandbox = $sandbox; Exe = $exe; Scenario = $scenario.FullName; Out = $out; ArgsLine = $argsLine; TimeoutSec = $timeout }
+            if ($step -and $step.Stdout) { $run.StdoutFile = Join-Path $out 'stdout.txt' }
+            ./tools/qa/run-gui.ps1 @run
+            if ($LASTEXITCODE -ne 0) { $failed += $name; continue }
+            if ($run.StdoutFile) {
+              # picker-exit quits through the action (no report): its evidence is
+              # exactly one printed line, an existing transcript path.
+              $lines = @(Get-Content -LiteralPath $run.StdoutFile | Where-Object { $_ -ne '' })
+              if ($lines.Count -ne 1 -or -not ($lines[0] -like '*.jsonl') -or -not (Test-Path -LiteralPath $lines[0])) {
+                Write-Output "$name printed: $($lines -join ' | ')"
+                $failed += $name
+              }
+            }
+          }
+          if ($failed.Count -gt 0) { throw "Scenarios failed: $($failed -join ', ')" }
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: qa-out
+          path: qa-out

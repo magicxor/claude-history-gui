@@ -1,0 +1,129 @@
+name: CI
+
+# DESIGN section 16.2. Also called by release.yml (workflow_call) before any
+# release artifact is built.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  # libtest threads get the same 8 MiB stack as the main thread (.cargo/config.toml
+  # sets it too; the variable keeps `cargo test` right when the config is not read).
+  RUST_MIN_STACK: "8388608"
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Toolchain (rust-toolchain.toml)
+        shell: bash
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc g++ clang libfontconfig-dev libwayland-dev \
+            libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libvulkan1 \
+            mesa-vulkan-drivers xvfb xterm
+
+      # A failed step still saves the compiled dependencies: a red run must not
+      # leave the next one to rebuild everything (the GUI tree is large).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      # ort-sys downloads the static ONNX Runtime on first use (the default
+      # build links the downloaded static library on every OS): keep it between runs.
+      - name: Cache the ONNX Runtime download
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/ort.pyke.io
+            ~/AppData/Local/ort.pyke.io
+            ~/Library/Caches/ort.pyke.io
+          key: ort-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Safety lint
+        shell: bash
+        run: |
+          bash tools/ci/safety-lint.sh --self-test
+          bash tools/ci/safety-lint.sh
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Clippy (qa feature)
+        run: cargo clippy -p claude-history-gui --all-targets --features qa --locked -- -D warnings
+
+      - name: Check (release-dynamic-ort)
+        run: cargo check -p claude-history-gui --features release-dynamic-ort --locked
+
+      # S-032: the bundled-library search (beside the exe, lib/, versioned and .dylib names) and the
+      # missing-library error text, on every OS.
+      - name: Core tests (release-dynamic-ort)
+        run: cargo test -p claude-history-core --features release-dynamic-ort --locked --lib semantic::fastembed
+
+      - name: Core tests
+        run: cargo test -p claude-history-core --locked
+
+      - name: Core tests (hermetic)
+        run: cargo test -p claude-history-core --features hermetic --locked
+
+      - name: GUI tests
+        run: cargo test -p claude-history-gui --locked
+
+      - name: GUI tests (qa feature)
+        run: cargo test -p claude-history-gui --features qa --locked
+
+      - name: Build (release)
+        run: cargo build -p claude-history-gui --release --locked
+
+      # A-051 / C-017: a normal launch of the windows-subsystem release exe neither allocates nor
+      # attaches a console, and --help / --version reach a redirect in every shape (stdout only,
+      # 2>&1, a pipe; stdout only used to lose the output when stderr was the parent console).
+      - name: Windows console behaviour of the release exe
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./tools/ci/check-console.ps1 -Exe target/release/claude-history-gui.exe
+
+      - name: Windows delay-load check
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./tools/ci/check-delayload.ps1 -Exe target/release/claude-history-gui.exe
+
+      # Optional smoke of core's terminal launchers (K17); it opens a real terminal.
+      - name: Terminal smoke (Linux, xterm)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          marker="$RUNNER_TEMP/terminal-smoke-marker"
+          rm -f "$marker"
+          xvfb-run -a cargo run -p claude-history-core --example terminal_smoke --locked -- "$marker" xterm 30
+
+      - name: Terminal smoke (Windows, console launcher)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $marker = Join-Path $env:RUNNER_TEMP 'terminal-smoke-marker'
+          Remove-Item -ErrorAction SilentlyContinue $marker
+          cargo run -p claude-history-core --example terminal_smoke --locked -- $marker cmd 30

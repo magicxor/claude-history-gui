@@ -1,0 +1,46 @@
+# delete.qa (WP3): the delete confirmation names the target, Enter is ignored,
+# y/Y confirm, n/Esc cancel; a deletion clears the viewer and returns the focus
+# to the list (FEATURES L-037, A-025, A-027, A-030, X-003).
+#
+# Run on a FRESH COPY of the sandbox: it deletes the first listed conversation
+# (and, for a cross-project fork, every copy of it).
+#   tools/qa/run-gui.ps1 -Sandbox <sandbox> -Exe <qa build> -Scenario crates/gui/qa/scenarios/delete.qa -Out <dir> [-Shots]
+wait-loaded 30s
+expect dialog == none
+
+# Cancelling keys leave everything as it was.
+key ctrl-x
+expect dialog == delete
+shot delete-confirm
+key n
+expect dialog == none
+key ctrl-x
+expect dialog == delete
+key escape
+expect dialog == none
+
+# Enter never confirms.
+key ctrl-x
+expect dialog == delete
+key enter
+wait 300ms
+expect dialog == delete
+expect list.loaded == true
+
+# Y deletes: the toast names the conversation, the dialog is gone.
+key shift-y
+wait-for dialog == none 10s
+expect toast.last contains "Deleted"
+expect list.loaded == true
+
+# From the viewer: the viewer is cleared and the focus returns to the list.
+key enter
+wait-for viewer.items > 0 10s
+key ctrl-x
+expect dialog == delete
+key y
+wait-for dialog == none 10s
+expect viewer.path == ""
+expect focus == list
+expect toast.last contains "Deleted"
+quit 0

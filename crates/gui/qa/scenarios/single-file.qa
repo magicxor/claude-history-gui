@@ -1,0 +1,47 @@
+# single-file.qa (WP2; PD14, DESIGN §5.5, §11.12, §15.3): `claude-history-gui FILE` opens a
+# single-file window with only the viewer (the title bar names the file), the header comes from
+# the file, Resume / Fork / Rename / Delete do nothing there (no dialog, no terminal), the status bar
+# says `q close`, and the toggles work as in the main window.
+#
+# Sandbox: tools/qa/new-sandbox.ps1, then crates/gui/tests/fixtures/viewer/prepare-sandbox.ps1.
+# Run:
+#   tools/qa/run-gui.ps1 -Sandbox <sbx> -Exe <qa build> -Scenario crates/gui/qa/scenarios/single-file.qa `
+#       -Out <dir> -Shots -ArgsLine '"<sbx>\viewer\markdown-tour.jsonl"'
+# The error views (`File not found: …`, `Not a file: …`, `… contains no conversation messages`)
+# are G tests (V-091); `q` / Esc closing the window ends the process, so the scenario quits
+# instead (G test v090_s033_single_file_window_restrictions covers the close).
+
+wait-for viewer.status == ready 20s
+expect window.kind == single-file
+expect viewer.path contains "markdown-tour.jsonl"
+expect focus == viewer
+expect dialog == none
+
+# No session actions in a single-file window (V-090).
+set-stdout none
+key ctrl-r
+expect dialog == none
+key ctrl-f
+expect dialog == none
+key ctrl-x
+expect dialog == none
+key f2
+expect dialog == none
+expect calls.terminal.count == 0
+expect focus == viewer
+
+# The viewer works as usual.
+key t
+wait-for viewer.loading == false 5s
+expect viewer.tool_display == trn
+key shift-j
+expect viewer.nav_focus == 2
+key escape
+expect viewer.nav_active == false
+
+set-theme light
+shot single-file-light
+set-theme dark
+shot single-file-dark
+
+quit 0

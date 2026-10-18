@@ -1,0 +1,96 @@
+# perf-viewer.qa (WP2; DESIGN §15.8, V-094): the synthetic 10k-message transcript with 20 tool
+# outputs of 5,000 lines, opened in Full mode (`--show-tools`), in a release `--features qa`
+# build. Probes (ViewerPane::qa_probe): first content (open → installed), install UI time,
+# frame times (render() start → paint end of the viewer, last 100 frames for the page-through),
+# toggle UI time (handler + install), first search (lazy index build + matches).
+#
+# Sandbox: tools/qa/new-sandbox.ps1, then crates/gui/tests/fixtures/viewer/prepare-sandbox.ps1
+# (writes viewer\perf-10k.jsonl and viewer\perf-3k.jsonl).
+# Run:
+#   tools/qa/run-gui.ps1 -Sandbox <sbx> -Exe <release qa build> -Scenario crates/gui/qa/scenarios/perf-viewer.qa `
+#       -Out <dir> -ArgsLine '--show-tools "<sbx>\viewer\perf-10k.jsonl"'
+# The 3k run uses the same scenario with viewer\perf-3k.jsonl; its target is frame_p95_100 ≤ 16 ms,
+# which this scenario asserts for both. Working set (§15.8, ≤ 400 MB): the process's own working
+# set and its peak (`process.*`, integrator, Phase C); tools/qa/run-gui.ps1 also prints the peak
+# the OS reports when the process ends.
+
+wait-for viewer.status == ready 30s
+expect viewer.tool_display == all
+expect viewer.messages > 2999
+timing viewer.first_content_ms < 3500ms
+timing viewer.install_ms < 50ms
+timing process.working_set_mb < 400
+wait 1500ms
+
+# Idle frames: nine re-renders with nothing changed (SetToolsFull while already Full only
+# notifies), judged by their median — one scheduler hiccup does not decide it; the target stays
+# 3 ms (integrator, Phase C: a single sampled frame failed in 8 of 22 Phase-B samples).
+action history::SetToolsFull
+wait 150ms
+action history::SetToolsFull
+wait 150ms
+action history::SetToolsFull
+wait 150ms
+action history::SetToolsFull
+wait 150ms
+action history::SetToolsFull
+wait 150ms
+action history::SetToolsFull
+wait 150ms
+action history::SetToolsFull
+wait 150ms
+action history::SetToolsFull
+wait 150ms
+action history::SetToolsFull
+wait 150ms
+timing viewer.frame_median_9 < 3ms
+# Reported: the same frames' UI-thread CPU time (wall well above it means the desktop was busy).
+timing viewer.frame_cpu_median_9 >= 0
+
+# Page-through: 120 pages, one frame each (the last 100 frames are measured).
+key pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown
+key pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown
+key pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown
+key pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown
+key pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown
+key pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown
+key pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown
+key pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown
+key pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown
+key pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown
+key pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown
+key pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown pagedown
+timing viewer.frame_avg_100 < 12ms
+timing viewer.frame_p95_100 < 16ms
+timing viewer.frame_cpu_avg_100 >= 0
+timing viewer.frame_cpu_p95_100 >= 0
+expect viewer.indicator !contains "[1/"
+
+# Toggles keep the anchor and stay within 60 ms of UI time (handler + install; install alone 50 ms).
+key t
+wait-for viewer.loading == false 10s
+timing viewer.toggle_ms < 60ms
+timing viewer.install_ms < 50ms
+timing viewer.toggle_total_ms < 60ms
+key shift-t
+wait-for viewer.loading == false 10s
+timing viewer.toggle_ms < 60ms
+timing viewer.install_ms < 50ms
+timing viewer.toggle_total_ms < 60ms
+key t t
+wait-for viewer.loading == false 10s
+expect viewer.tool_display == all
+
+# First search on the whole transcript (lazy search texts + matches).
+key /
+type "l"
+timing viewer.search_ms < 60ms
+type "ine 4999"
+timing viewer.search_ms < 60ms
+key escape
+expect viewer.search.mode == off
+
+wait 3s
+timing process.working_set_mb < 400
+timing process.peak_working_set_mb < 400
+quit 0

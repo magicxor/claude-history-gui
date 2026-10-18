@@ -1,0 +1,86 @@
+# deep-search.qa (WP4; FEATURES D-001, D-009, D-026, X-044; DESIGN §5.4, §11.14, §15.3): the Deep
+# search tab runs a lexical agent search, shows compact group cards with evidence, the stats footer
+# and the exact agent text; a hit opens in the viewer (Enter keeps the focus here, Ctrl+Enter moves it
+# to the transcript); a query without hits says so.
+#
+# Corpus: crates/gui/tests/fixtures/qa-home (or a copy of the scratchpad sandbox with it merged in):
+# "Worktree cleanup" is the only conversation that mentions stale worktrees.
+#
+#   tools/qa/new-sandbox.ps1 -Source <corpus> -Dest <sandbox>
+#   tools/qa/run-gui.ps1 -Sandbox <sandbox> -Exe <qa build> -Scenario crates/gui/qa/scenarios/deep-search.qa -Out <dir> -Shots
+#
+# Semantic and hybrid results, the uncached banner, cancellation and the semantic gate need a fake
+# embedder: they are G tests (semantic-toggle.qa already covers the real model for the list).
+
+wait-loaded 30s
+set-theme light
+# The pane layout is remembered between runs: start on the Conversations tab.
+key ctrl-1
+expect focus == list
+expect dialog == none
+
+# Open the Deep search tab (Ctrl+2): the query takes the focus; the tab starts empty.
+key ctrl-2
+expect focus == deep
+expect deep.hits == 0
+expect deep.options == false
+shot deep-empty-light
+
+# A lexical search: groups, hits and the stats footer.
+type "stale worktrees"
+key enter
+wait-for deep.hits > 0 20s
+expect deep.status == ""
+expect deep.error == ""
+expect deep.first_title == "Worktree cleanup"
+expect deep.groups >= 1
+expect deep.stats contains "groups"
+expect deep.stats contains "shortlisted"
+expect deep.mode_badge == lexical
+shot deep-results-light
+set-theme dark
+shot deep-results-dark
+set-theme light
+
+# The Options disclosure opens and is remembered by the pane.
+click deep:options
+expect deep.options == true
+shot deep-options-light
+click deep:options
+expect deep.options == false
+
+# Show agent text output: exactly what `claude-history agent search` prints.
+action history::ToggleAgentText
+expect deep.text_shown == true
+expect deep.text contains "protocol agent-search"
+expect deep.text contains "conversation rank=1"
+expect deep.text contains "read ref=ch_"
+shot deep-agent-text-light
+action history::ToggleAgentText
+expect deep.text_shown == false
+
+# Down moves from the query into the results; Enter opens the hit in the viewer and the focus stays.
+key down
+expect deep.selected == 0
+key enter
+wait-for viewer.path contains "000000000006" 10s
+expect focus == deep
+expect viewer.items > 0
+# Ctrl+Enter opens it and moves the focus to the transcript.
+key ctrl-enter
+expect focus == viewer
+shot deep-hit-opened-light
+
+# Back to Deep search: Esc clears the query, a query without hits says so.
+key ctrl-2
+expect focus == deep
+key escape
+expect deep.query == ""
+type "zzzzqqqqxxxx"
+key enter
+wait-for deep.running == false 20s
+expect deep.hits == 0
+expect deep.error == ""
+shot deep-no-hits-light
+
+quit 0

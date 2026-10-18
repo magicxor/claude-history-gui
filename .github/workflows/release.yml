@@ -1,346 +1,246 @@
 name: Release
 
+# DESIGN section 16.3. A tag `v<version>` builds the three artifacts and publishes a release;
+# a manual run (workflow_dispatch) with `dry_run: true` (the default) builds and uploads the
+# artifacts to the workflow run only and creates no release.
 on:
-  workflow_dispatch:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and upload workflow artifacts only (no GitHub release)
+        type: boolean
+        default: true
 
 permissions:
   contents: write
 
 env:
-  BIN_NAME: claude-history
+  CARGO_TERM_COLOR: always
   ORT_VERSION: 1.24.2
-  ORT_SOURCE_COMMIT: 058787ceead760166e3c50a0a4cba8a833a6f53f
 
 jobs:
-  nix:
-    runs-on: ubuntu-latest
+  # Job 0: the whole CI matrix must pass before anything is built for release.
+  ci:
+    uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
-    steps:
-      - uses: actions/checkout@v5
-      - uses: cachix/install-nix-action@v31
-      - name: Build Nix package
-        run: nix build --no-link --print-build-logs
 
-  build:
-    needs: nix
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-15
-            target: aarch64-apple-darwin
-            platform: darwin-arm64
-            ort_source: false
-            use_cross: false
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            platform: darwin-amd64
-            ort_source: true
-            use_cross: false
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            platform: linux-amd64
-            ort_source: false
-            use_cross: false
-    runs-on: ${{ matrix.os }}
-    env:
-      ORT_SOURCE: ${{ matrix.ort_source }}
-      PLATFORM: ${{ matrix.platform }}
+  version:
+    needs: ci
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - name: Install cross
-        if: matrix.use_cross
-        uses: taiki-e/install-action@cross
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-      - name: Download ONNX Runtime
-        if: ${{ !matrix.ort_source }}
+      - id: read
+        shell: bash
         run: |
           set -euo pipefail
-          case "$PLATFORM" in
-            darwin-arm64)
-              ort_platform="osx-arm64"
-              ort_sha256="0af4fa503e8ea285245b47ee42d0a7461b8156a81270857da0c1d4ecf858abde"
-              ;;
-            linux-amd64)
-              ort_platform="linux-x64"
-              ort_sha256="43725474ba5663642e17684717946693850e2005efbd724ac72da278fead25e6"
-              ;;
-            *)
-              echo "Unsupported official ONNX Runtime platform: $PLATFORM" >&2
+          version="$(sed -n 's/^version *= *"\(.*\)"/\1/p' crates/gui/Cargo.toml | head -n 1)"
+          test -n "$version"
+          echo "Cargo version: $version"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            tag="${GITHUB_REF_NAME#v}"
+            if [[ "$tag" != "$version" ]]; then
+              echo "The tag ${GITHUB_REF_NAME} does not match crates/gui/Cargo.toml version $version" >&2
               exit 1
-              ;;
-          esac
-          ort_url="https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-${ort_platform}-${ORT_VERSION}.tgz"
-          curl --fail --location --retry 3 --retry-all-errors \
-            --connect-timeout 20 --max-time 600 \
+            fi
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Toolchain (rust-toolchain.toml)
+        shell: bash
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-windows
+      - name: Cache the ONNX Runtime download
+        uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/ort.pyke.io
+          key: ort-Windows-${{ hashFiles('Cargo.lock') }}
+      - name: Build
+        run: cargo build -p claude-history-gui --release --locked
+      - name: DirectML must be delay-loaded
+        shell: pwsh
+        run: ./tools/ci/check-delayload.ps1 -Exe target/release/claude-history-gui.exe
+      - name: Package
+        shell: pwsh
+        run: ./packaging/windows/make-zip.ps1 -Exe target/release/claude-history-gui.exe -Version $env:VERSION -OutDir dist
+      - name: Verify the zip
+        shell: pwsh
+        run: |
+          $zip = "dist/claude-history-gui-v$env:VERSION-windows-x86_64.zip"
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $names = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip)).Entries.Name
+          foreach ($want in 'claude-history-gui.exe', 'MSVCP140.dll', 'MSVCP140_1.dll', 'VCRUNTIME140.dll', 'VCRUNTIME140_1.dll', 'README.txt', 'LICENSE', 'LICENSE-MIT') {
+            if ($names -notcontains $want) { throw "$want is missing from $zip" }
+          }
+          Expand-Archive -Path $zip -DestinationPath unzipped
+          ./tools/ci/check-console.ps1 -Exe unzipped/claude-history-gui.exe
+      - uses: actions/upload-artifact@v5
+        with:
+          name: windows-x86_64
+          path: |
+            dist/*.zip
+            dist/*.sha256
+
+  macos:
+    needs: version
+    runs-on: macos-15
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+    steps:
+      - uses: actions/checkout@v5
+      - name: Toolchain (rust-toolchain.toml)
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-macos-arm64
+      - name: Download ONNX Runtime
+        run: |
+          set -euo pipefail
+          ort_sha256="0af4fa503e8ea285245b47ee42d0a7461b8156a81270857da0c1d4ecf858abde"
+          ort_url="https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-osx-arm64-${ORT_VERSION}.tgz"
+          curl --fail --location --retry 3 --retry-all-errors --connect-timeout 20 --max-time 600 \
             --output onnxruntime.tgz "$ort_url"
           printf '%s  %s\n' "$ort_sha256" onnxruntime.tgz | shasum -a 256 --check -
           mkdir -p onnxruntime
           tar -xzf onnxruntime.tgz -C onnxruntime --strip-components=1
-      - name: Cache source-built ONNX Runtime
-        if: ${{ matrix.ort_source }}
-        uses: actions/cache@v4
-        with:
-          path: onnxruntime-cache
-          # The exact source, target, and build identity are part of the key.
-          key: ort-${{ matrix.os }}-${{ matrix.target }}-${{ env.ORT_VERSION }}-${{ env.ORT_SOURCE_COMMIT }}-release-shared-cpu
-      - name: Build source-pinned ONNX Runtime
-        if: ${{ matrix.ort_source }}
-        run: |
-          set -euo pipefail
-          ort_cache="$GITHUB_WORKSPACE/onnxruntime-cache"
-          ort_library="$ort_cache/lib/libonnxruntime.${ORT_VERSION}.dylib"
-          cache_valid=false
-          if [[ -f "$ort_library" && -L "$ort_cache/lib/libonnxruntime.dylib" ]]; then
-            if file "$ort_library" | grep -Eq 'Mach-O.*x86_64'; then
-              cache_valid=true
-            fi
-          fi
-
-          if [[ "$cache_valid" != true ]]; then
-            rm -rf "$GITHUB_WORKSPACE/onnxruntime-build" "$ort_cache" onnxruntime-source
-            git clone --depth 1 --branch "v${ORT_VERSION}" --recurse-submodules \
-              https://github.com/microsoft/onnxruntime.git onnxruntime-source
-            source_commit="$(git -C onnxruntime-source rev-parse HEAD)"
-            test "$source_commit" = "$ORT_SOURCE_COMMIT"
-
-            python3 onnxruntime-source/tools/ci_build/build.py \
-              --build_dir "$GITHUB_WORKSPACE/onnxruntime-build" \
-              --config Release \
-              --update --build \
-              --build_shared_lib \
-              --compile_no_warning_as_error \
-              --skip_tests \
-              --skip_submodule_sync \
-              --parallel 3 \
-              --osx_arch x86_64 \
-              --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF \
-                FETCHCONTENT_TRY_FIND_PACKAGE_MODE=NEVER
-
-            built_library="$GITHUB_WORKSPACE/onnxruntime-build/Release/libonnxruntime.${ORT_VERSION}.dylib"
-            test -f "$built_library"
-            mkdir -p "$ort_cache/lib"
-            cp -p "$built_library" "$ort_library"
-            ln -s "libonnxruntime.${ORT_VERSION}.dylib" "$ort_cache/lib/libonnxruntime.dylib"
-          fi
-
-          test -f "$ort_library"
-          test -L "$ort_cache/lib/libonnxruntime.dylib"
-          file "$ort_library" | grep -Eq 'Mach-O.*x86_64'
       - name: Build
+        run: cargo build -p claude-history-gui --release --locked --target aarch64-apple-darwin --features release-dynamic-ort
+      - name: Package (.app, ad-hoc signed)
+        run: |
+          bash packaging/macos/make-app.sh \
+            target/aarch64-apple-darwin/release/claude-history-gui onnxruntime "$VERSION" dist
+      - name: Verify the bundle
         run: |
           set -euo pipefail
-          build_args=(--release --locked --target ${{ matrix.target }} --features release-dynamic-ort)
-          if [ "${{ matrix.use_cross }}" == "true" ]; then
-            cross build "${build_args[@]}"
-          else
-            cargo build "${build_args[@]}"
-          fi
-      - name: Package
-        run: |
-          set -euo pipefail
-          bin="target/${{ matrix.target }}/release/${BIN_NAME}"
-          package="package"
-          test -x "$bin"
-          rm -rf "$package"
-          mkdir -p "$package/lib"
-          cp "$bin" "$package/"
-
-          if [[ "$ORT_SOURCE" == "true" ]]; then
-            runtime_dir="$GITHUB_WORKSPACE/onnxruntime-cache/lib"
-          else
-            runtime_dir="$GITHUB_WORKSPACE/onnxruntime/lib"
-          fi
-          find "$runtime_dir" -maxdepth 1 \( -type f -o -type l \) \
-            -name 'libonnxruntime*' -exec cp -P {} "$package/lib/" \;
-
-          if [[ "$PLATFORM" == darwin-* ]]; then
-            runtime_files=("libonnxruntime.dylib" "libonnxruntime.${ORT_VERSION}.dylib")
-          else
-            runtime_files=("libonnxruntime.so" "libonnxruntime.so.${ORT_VERSION}")
-          fi
-          for runtime_file in "${runtime_files[@]}"; do
-            test -f "$package/lib/$runtime_file"
-          done
-
-          # Only strip on Linux to avoid corrupting macOS code signatures.
-          if [[ "${{ runner.os }}" == "Linux" ]]; then
-            strip "$package/${BIN_NAME}"
-          fi
-          archive="${BIN_NAME}-${{ matrix.platform }}.tar.gz"
-          tar -C "$package" -czf "$archive" .
-          shasum -a 256 "$archive" > "${BIN_NAME}-${{ matrix.platform }}.sha256"
-      - name: Smoke test packaged semantic inference
-        run: |
-          set -euo pipefail
-          smoke_root="$(mktemp -d)"
-          trap 'rm -rf "$smoke_root"' EXIT
-          workspace="$smoke_root/workspace"
-          config="$smoke_root/config"
-          cache_home="$smoke_root/home"
-          mkdir -p "$workspace" "$cache_home" "$config"
-          workspace="$(cd "$workspace" && pwd -P)"
-          project_dir="$(printf '%s' "$workspace" | sed 's/[^A-Za-z0-9-]/-/g')"
-          mkdir -p "$config/projects/$project_dir"
-          cat > "$config/projects/$project_dir/12345678-1234-1234-1234-123456789abc.jsonl" << EOF
-          {"type":"user","timestamp":"2024-01-01T00:00:00Z","cwd":"$workspace","message":{"role":"user","content":"How should release compatibility be verified?"}}
-          {"type":"assistant","timestamp":"2024-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"text","text":"Release compatibility should be verified with packaged semantic inference."}]}}
-          EOF
-
-          if [[ "$PLATFORM" == darwin-* ]]; then
-            runtime="$GITHUB_WORKSPACE/package/lib/libonnxruntime.dylib"
-          else
-            runtime="$GITHUB_WORKSPACE/package/lib/libonnxruntime.so"
-          fi
-          test -f "$runtime"
-          output="$(
-            cd "$workspace"
-            HOME="$cache_home" \
-              CLAUDE_CONFIG_DIR="$config" \
-              ORT_DYLIB_PATH="$runtime" \
-              "$GITHUB_WORKSPACE/package/${BIN_NAME}" \
-              --semantic-search "release compatibility" --semantic-top 1 --local 2>&1
-          )"
-          printf '%s\n' "$output"
-          grep -F 'Semantic search: searching' <<<"$output"
-          grep -F 'Release compatibility should be verified' <<<"$output"
+          rm -rf unzipped && mkdir unzipped
+          ditto -x -k "dist/claude-history-gui-v${VERSION}-macos-aarch64.zip" unzipped
+          app="unzipped/Claude History.app"
+          codesign --verify --deep --strict "$app"
+          ls "$app"/Contents/MacOS/lib/libonnxruntime*.dylib
+          test -f "$app/Contents/Resources/app.icns"
+          plutil -lint "$app/Contents/Info.plist"
+          "$app/Contents/MacOS/claude-history-gui" --version
+          # Really load the bundled dylib (ort::init_from), not just start the binary.
+          out="$(CLAUDE_HISTORY_GUI_ORT_SELFTEST=1 "$app/Contents/MacOS/claude-history-gui")"
+          test "$out" = "onnxruntime ok"
       - uses: actions/upload-artifact@v5
         with:
-          name: ${{ matrix.platform }}
+          name: macos-aarch64
           path: |
-            ${{ env.BIN_NAME }}-${{ matrix.platform }}.tar.gz
-            ${{ env.BIN_NAME }}-${{ matrix.platform }}.sha256
+            dist/*.zip
+            dist/*.sha256
 
-  release:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+  linux:
+    needs: version
+    runs-on: ubuntu-22.04
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/checkout@v5
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc g++ clang libfontconfig-dev libwayland-dev \
+            libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libvulkan1 mesa-vulkan-drivers
+      - uses: Swatinem/rust-cache@v2
         with:
-          merge-multiple: true
-      - name: Verify all release artifacts
+          key: release-linux-x64
+      - name: Download ONNX Runtime
         run: |
           set -euo pipefail
-          platforms=(darwin-arm64 darwin-amd64 linux-amd64)
-          for platform in "${platforms[@]}"; do
-            archive="${BIN_NAME}-${platform}.tar.gz"
-            checksum="${BIN_NAME}-${platform}.sha256"
-            test -s "$archive"
-            test -s "$checksum"
-            shasum -a 256 --check "$checksum"
+          ort_sha256="43725474ba5663642e17684717946693850e2005efbd724ac72da278fead25e6"
+          ort_url="https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz"
+          curl --fail --location --retry 3 --retry-all-errors --connect-timeout 20 --max-time 600 \
+            --output onnxruntime.tgz "$ort_url"
+          printf '%s  %s\n' "$ort_sha256" onnxruntime.tgz | sha256sum --check -
+          mkdir -p onnxruntime
+          tar -xzf onnxruntime.tgz -C onnxruntime --strip-components=1
+      - name: Build
+        run: cargo build -p claude-history-gui --release --locked --features release-dynamic-ort
+      - name: Package
+        run: bash packaging/linux/make-tarball.sh target/release/claude-history-gui onnxruntime "$VERSION" dist
+      - name: Verify the tarball
+        run: |
+          set -euo pipefail
+          archive="dist/claude-history-gui-v${VERSION}-linux-x86_64.tar.gz"
+          listing="$(tar -tzf "$archive")"
+          for want in claude-history-gui claude-history-gui.desktop claude-history-gui.png lib/libonnxruntime.so LICENSE LICENSE-MIT; do
+            grep -q "/${want}\$" <<<"$listing" || { echo "$want is missing from $archive" >&2; exit 1; }
           done
+          grep -q '/lib/libonnxruntime\.so\.' <<<"$listing"
+          mkdir unpacked && tar -xzf "$archive" -C unpacked
+          "unpacked/claude-history-gui-v${VERSION}-linux-x86_64/claude-history-gui" --version
+          # Really load the bundled library (ort::init_from), not just start the binary.
+          out="$(CLAUDE_HISTORY_GUI_ORT_SELFTEST=1 "unpacked/claude-history-gui-v${VERSION}-linux-x86_64/claude-history-gui")"
+          test "$out" = "onnxruntime ok"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: linux-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  # Intel macOS is not built in v1: ort-sys ships no static ONNX Runtime for x86_64-apple-darwin
+  # and the macos-13 image is retired. A follow-up may copy upstream's macos-15-intel source-build job.
+
+  publish:
+    # A dry run (workflow_dispatch with dry_run) stops after the builds above.
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run)
+    needs: [version, windows, macos, linux]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Verify the three artifacts
+        run: |
+          set -euo pipefail
+          cd artifacts
+          for artifact in \
+            "claude-history-gui-v${VERSION}-windows-x86_64.zip" \
+            "claude-history-gui-v${VERSION}-macos-aarch64.zip" \
+            "claude-history-gui-v${VERSION}-linux-x86_64.tar.gz"; do
+            test -s "$artifact"
+            test -s "$artifact.sha256"
+            sha256sum --check "$artifact.sha256"
+          done
+      - name: Release notes from CHANGELOG.md
+        run: |
+          set -euo pipefail
+          awk -v v="v${VERSION}" '
+            $0 ~ "^## " v "([ ]|$)" { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md || { echo "CHANGELOG.md has no '## v${VERSION}' section" >&2; exit 1; }
+          cat release-notes.md
       - uses: softprops/action-gh-release@v2
         with:
-          token: ${{ secrets.RELEASE_TOKEN }}
-          generate_release_notes: true
+          tag_name: v${{ needs.version.outputs.version }}
+          body_path: release-notes.md
           files: |
-            *.tar.gz
-            *.sha256
-
-  publish-crates:
-    needs: release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Publish to crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          set -euo pipefail
-          CARGO_VERSION=$(cargo metadata --no-deps --format-version=1 \
-            | jq -r --arg name "$BIN_NAME" '.packages[] | select(.name==$name) | .version')
-          TAG="${GITHUB_REF_NAME#v}"
-          if [ "$TAG" != "$CARGO_VERSION" ]; then
-            echo "Tag $TAG does not match Cargo.toml version $CARGO_VERSION" >&2
-            exit 1
-          fi
-
-          if out=$(cargo publish --locked 2>&1); then
-            printf '%s\n' "$out"
-          elif printf '%s\n' "$out" | grep -q "already exists"; then
-            echo "$BIN_NAME $CARGO_VERSION already published, skipping"
-          else
-            printf '%s\n' "$out" >&2
-            exit 1
-          fi
-
-  update-tap:
-    needs: release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v5
-        with:
-          merge-multiple: true
-      - uses: actions/checkout@v5
-        with:
-          repository: raine/homebrew-claude-history
-          token: ${{ secrets.RELEASE_TOKEN }}
-          path: tap
-      - name: Generate formula and push to tap
-        env:
-          VERSION: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          VERSION="${VERSION#v}"
-          SHA_MAC_ARM=$(awk '{print $1}' claude-history-darwin-arm64.sha256)
-          SHA_MAC_AMD=$(awk '{print $1}' claude-history-darwin-amd64.sha256)
-          SHA_LINUX=$(awk '{print $1}' claude-history-linux-amd64.sha256)
-
-          cat > tap/Formula/claude-history.rb << EOF
-          class ClaudeHistory < Formula
-            desc "Fuzzy-search Claude Code conversation history from the terminal"
-            homepage "https://github.com/raine/claude-history"
-            version "${VERSION}"
-            license "MIT"
-
-            on_macos do
-              if Hardware::CPU.arm?
-                url "https://github.com/raine/claude-history/releases/download/v${VERSION}/claude-history-darwin-arm64.tar.gz"
-                sha256 "${SHA_MAC_ARM}"
-              else
-                url "https://github.com/raine/claude-history/releases/download/v${VERSION}/claude-history-darwin-amd64.tar.gz"
-                sha256 "${SHA_MAC_AMD}"
-              end
-            end
-
-            on_linux do
-              url "https://github.com/raine/claude-history/releases/download/v${VERSION}/claude-history-linux-amd64.tar.gz"
-              sha256 "${SHA_LINUX}"
-            end
-
-            def install
-              bin.install "claude-history"
-              lib.install Dir["lib/*"]
-              bin.install_symlink lib/"libonnxruntime.dylib" if OS.mac?
-              bin.install_symlink lib/"libonnxruntime.so" if OS.linux?
-            end
-
-            test do
-              assert_match version.to_s, shell_output("\#{bin}/claude-history --version")
-            end
-          end
-          EOF
-          sed -i 's/^          //' tap/Formula/claude-history.rb
-
-          cd tap
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/claude-history.rb
-          git commit -m "claude-history ${VERSION}"
-          git pull --rebase
-          git push
+            artifacts/*.zip
+            artifacts/*.tar.gz
+            artifacts/*.sha256
