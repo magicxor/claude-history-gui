@@ -4,7 +4,7 @@ name: CI
 # release artifact is built.
 on:
   push:
-    branches: [master]
+    branches: [main]
   pull_request:
   workflow_call:
 
@@ -42,7 +42,11 @@ jobs:
             libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libvulkan1 \
             mesa-vulkan-drivers xvfb xterm
 
+      # A failed step still saves the compiled dependencies: a red run must not
+      # leave the next one to rebuild everything (the GUI tree is large).
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       # ort-sys downloads the static ONNX Runtime on first use (the default
       # build links the downloaded static library on every OS): keep it between runs.

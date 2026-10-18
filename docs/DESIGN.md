@@ -3073,11 +3073,11 @@ ctor.workspace = true
 ```
 
 ### 16.2 CI (`.github/workflows/ci.yml`, WP7)
-* Triggers: push to master, pull requests; also `workflow_call` (used by release.yml).
+* Triggers: push to main, pull requests; also `workflow_call` (used by release.yml).
 * Matrix `os: [windows-latest, macos-latest, ubuntu-latest]`, `fail-fast: false`. Toolchain from
   `rust-toolchain.toml`. Linux: `sudo apt-get install -y gcc g++ clang libfontconfig-dev libwayland-dev
   libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libvulkan1 mesa-vulkan-drivers xvfb xterm`.
-  `Swatinem/rust-cache@v2`; cache the ORT download dir per OS.
+  `Swatinem/rust-cache@v2` (`cache-on-failure: true`); cache the ORT download dir per OS.
 * Steps (all with `--locked`):
   1. `cargo fmt --all --check`
   2. `bash tools/ci/safety-lint.sh` — fails when, outside the allow-listed files: `from_process_env` (allowed:
