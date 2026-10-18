@@ -477,13 +477,17 @@ pub fn open_single_file_with_args(
     handle
 }
 
-/// Wait (real time, ≤ 30 s) until the list finished loading.
-pub async fn wait_loaded(cx: &mut TestAppContext, ws: &Entity<Workspace>) {
+/// Wait (real time, ≤ 30 s) until the list finished loading and its loader
+/// stopped (no later poll changes the selection behind the test's back).
+pub fn wait_loaded(cx: &mut TestAppContext, ws: &Entity<Workspace>) {
     cx.executor().allow_parking();
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         cx.run_until_parked();
-        let loading = cx.read(|cx| ws.read(cx).list().read(cx).is_loading());
+        let loading = cx.read(|cx| {
+            let list = ws.read(cx).list().read(cx);
+            list.is_loading() || list.loader().is_running()
+        });
         if !loading {
             return;
         }
