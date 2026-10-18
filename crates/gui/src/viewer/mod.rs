@@ -341,8 +341,13 @@ impl ViewerPane {
         let list = ListState::new(0, ListAlignment::Top, px(LIST_OVERDRAW_PX))
             .with_uniform_item_height(rem * ITEM_HEIGHT_HINT_REM);
         let weak = cx.entity().downgrade();
+        // gpui calls this inside the list state's `borrow_mut` (a wheel scroll), so
+        // `after_scroll` (which reads the list) runs once that borrow is released.
         list.set_scroll_handler(move |_, _, cx| {
-            weak.update(cx, |this, cx| this.after_scroll(cx)).ok();
+            let weak = weak.clone();
+            cx.defer(move |cx| {
+                weak.update(cx, |this, cx| this.after_scroll(cx)).ok();
+            });
         });
         let subscriptions = vec![
             cx.on_focus_in(&viewer_focus, window, |_, window, cx| {

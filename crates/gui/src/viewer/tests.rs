@@ -2086,6 +2086,36 @@ mod gui {
         assert!(expected.unwrap() > 1);
     }
 
+    /// V-068 by the mouse wheel: the list calls its scroll handler while its
+    /// state is borrowed, so the re-sync must not read the list from there
+    /// (`RefCell already mutably borrowed` aborted the app).
+    #[gpui_kit::test]
+    fn v068_wheel_scrolling_resyncs_navigation(cx: &mut TestAppContext) {
+        let world = TestWorld::new();
+        let (handle, viewer, _) = open_viewer(cx, &world, &long_conversation(40), &[]);
+        keys(cx, handle, &viewer, "shift-j");
+        let at = text_position(cx, handle, &viewer, 0, 0, 0);
+        cx.update_window(handle, |_, window, cx| {
+            window.dispatch_event(
+                gpui_kit::ScrollWheelEvent {
+                    position: point(at.x + px(20.), at.y + px(4.)),
+                    delta: gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-1500.))),
+                    modifiers: Modifiers::default(),
+                    touch_phase: gpui_kit::TouchPhase::Moved,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let top = top_item(cx, &viewer);
+        let expected = read(cx, &viewer, |v| v.items().unwrap()[top].nav_position);
+        assert_eq!(read(cx, &viewer, |v| v.nav().focused()), expected);
+        assert!(expected.unwrap() > 1);
+    }
+
     /// V-079: scroll keys do nothing while typing in the find bar.
     #[gpui_kit::test]
     fn v079_scroll_keys(cx: &mut TestAppContext) {
