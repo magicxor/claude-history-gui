@@ -70,10 +70,15 @@ pub fn write_gui_config(world: &TestWorld, gui_extra: &str, extra: &str) {
     let pi = fake_program(world, "pi");
     let omp = fake_program(world, "omp");
     // Linux detects a terminal emulator on PATH and the test world's PATH has
-    // none (Windows and macOS always have a launcher): name one so a resume
-    // reaches the recorded terminal call. Nothing is spawned.
-    let terminal = if cfg!(target_os = "linux") && !gui_extra.contains("terminal") {
+    // none: name one so a resume reaches the recorded terminal call. macOS
+    // always detects two (Terminal.app, then osascript): name the first, so a
+    // launch is one call there too, as on Windows. Nothing is spawned.
+    let terminal = if gui_extra.contains("terminal") {
+        ""
+    } else if cfg!(target_os = "linux") {
         "terminal = \"xterm\"\n"
+    } else if cfg!(target_os = "macos") {
+        "terminal = \"terminal\"\n"
     } else {
         ""
     };
@@ -290,12 +295,17 @@ impl OpsFixture {
         cx.run_until_parked();
     }
 
-    /// Every recorded terminal command's display string.
+    /// Every recorded terminal command's display string; for a launch through
+    /// a script (macOS Terminal.app: `open -a Terminal <fresh path>`) the
+    /// script, which holds the command line.
     pub fn terminal_commands(&self) -> Vec<String> {
         self.recording
             .terminal_commands()
             .iter()
-            .map(|command| command.display())
+            .map(|command| match &command.script {
+                Some(script) => script.contents.clone(),
+                None => command.display(),
+            })
             .collect()
     }
 

@@ -1050,7 +1050,7 @@ mod gui {
     };
     use crate::services::ServiceCall;
     use crate::test_support::fixtures_viewer::*;
-    use crate::test_support::{TestWorld, open_single_file, recording};
+    use crate::test_support::{TestWorld, kbd, open_single_file, recording};
     use crate::viewer::items::ItemKind;
     use crate::viewer::{PARTIAL_COPY_TOAST, ViewerPane, ViewerPaneEvent, failed_to_open, status};
 
@@ -1544,7 +1544,10 @@ mod gui {
                 viewer.read(cx).status_hint_texts(window)
             })
             .unwrap();
-        assert_eq!(hints, ["n next  N prev  1/3  Esc clear"]);
+        assert_eq!(
+            hints,
+            [format!("n next  N prev  1/3  {} clear", kbd("escape"))]
+        );
     }
 
     /// V-012: the find bar text.
@@ -2245,7 +2248,13 @@ mod gui {
         assert_eq!(top_item(cx, &viewer), 0, "visible matches never scroll");
         keys(cx, handle, &viewer, "shift-n");
         assert_eq!(current(cx), 2, "N from 1/3 goes to 3/3");
-        keys(cx, handle, &viewer, "f3");
+        // The desktop alias of `n`: F3, on macOS Cmd+G.
+        let next_alias = if cfg!(target_os = "macos") {
+            "cmd-g"
+        } else {
+            "f3"
+        };
+        keys(cx, handle, &viewer, next_alias);
         assert_eq!(current(cx), 0);
     }
 
@@ -2447,7 +2456,7 @@ mod gui {
             start + point(px(1.), px(4.)),
             end + point(px(1.), px(4.)),
         );
-        keys(cx, handle, &viewer, "ctrl-c");
+        keys(cx, handle, &viewer, "secondary-c");
         let copied = recording(cx).clipboard().unwrap_or_default();
         assert!(copied.contains("Message 1 body."), "{copied:?}");
         assert!(copied.contains("Message 2"), "{copied:?}");
@@ -2466,7 +2475,7 @@ mod gui {
         draw(cx, handle);
         draw(cx, handle);
         recording(cx).set_clipboard(None);
-        keys(cx, handle, &viewer, "ctrl-c");
+        keys(cx, handle, &viewer, "secondary-c");
         let toast = cx.read(last_toast).to_string();
         assert_eq!(toast, PARTIAL_COPY_TOAST);
         let copied = recording(cx).clipboard().unwrap_or_default();
@@ -2480,10 +2489,10 @@ mod gui {
     fn v088_select_all_then_copy_takes_the_whole_transcript(cx: &mut TestAppContext) {
         let world = TestWorld::new();
         let (handle, viewer, _) = open_viewer(cx, &world, &long_conversation(60), &[]);
-        keys(cx, handle, &viewer, "ctrl-a");
+        keys(cx, handle, &viewer, "secondary-a");
         assert!(read(cx, &viewer, |v| v.select_all), "Ctrl+A selects all");
         draw(cx, handle);
-        keys(cx, handle, &viewer, "ctrl-c");
+        keys(cx, handle, &viewer, "secondary-c");
         let copied = recording(cx).clipboard().unwrap_or_default();
         assert!(copied.contains("Message 1 body."), "{copied:?}");
         assert!(
@@ -2498,7 +2507,7 @@ mod gui {
         keys(cx, handle, &viewer, "escape");
         assert!(!read(cx, &viewer, |v| v.select_all));
         // A drag replaces it.
-        keys(cx, handle, &viewer, "ctrl-a");
+        keys(cx, handle, &viewer, "secondary-a");
         draw(cx, handle);
         let start = text_position(cx, handle, &viewer, 0, 0, 0);
         let end = text_position(cx, handle, &viewer, 0, 0, 7);
@@ -2511,7 +2520,7 @@ mod gui {
         draw(cx, handle);
         assert!(!read(cx, &viewer, |v| v.select_all), "a drag ends it");
         recording(cx).set_clipboard(None);
-        keys(cx, handle, &viewer, "ctrl-c");
+        keys(cx, handle, &viewer, "secondary-c");
         let copied = recording(cx).clipboard().unwrap_or_default();
         assert!(copied.len() < 40, "only the dragged text: {copied:?}");
         // The Edit menu's Select All dispatches the same action.

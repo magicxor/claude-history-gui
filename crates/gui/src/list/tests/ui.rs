@@ -19,7 +19,7 @@ use crate::list::toolbar::{NO_WORKSPACE_TOOLTIP, WORKSPACE_TOOLTIP};
 use crate::list::workspace_picker::IS_DIR_CALLS;
 use crate::model::RowMenuItem;
 use crate::test_support::fixtures_list::{ListFixture, SessionSpec, listed_corpus};
-use crate::test_support::{TestWorld, recording, synth};
+use crate::test_support::{TestWorld, kbd, recording, synth};
 use crate::widgets::time_range::{LastTimeRangeForm, TimeRangeChoice, open_custom_range_dialog};
 
 fn footer(f: &ListFixture, cx: &mut TestAppContext) -> FooterModel {
@@ -83,8 +83,8 @@ fn footer_hints_follow_the_keymap_and_the_focus(cx: &mut TestAppContext) {
     };
     let model = wide(&f, cx);
     assert_eq!(
-        chip(&model, ChipKind::Resume).as_deref(),
-        Some("Ctrl+R resume")
+        chip(&model, ChipKind::Resume),
+        Some(format!("{} resume", kbd("ctrl-r")))
     );
     assert!(model.chips.iter().all(|chip| !chip.dimmed));
     assert!(
@@ -107,8 +107,8 @@ fn footer_hints_follow_the_keymap_and_the_focus(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let model = wide(&f, cx);
     assert_eq!(
-        chip(&model, ChipKind::Resume).as_deref(),
-        Some("Alt+R resume")
+        chip(&model, ChipKind::Resume),
+        Some(format!("{} resume", kbd("alt-r")))
     );
 
     // 18rem: only the highest priority chips plus help remain.
@@ -241,11 +241,11 @@ fn the_row_menu_keeps_its_captured_target(cx: &mut TestAppContext) {
     ] {
         assert!(labels.iter().any(|l| l == label), "{label} in {labels:?}");
     }
-    assert_eq!(model.shortcut("Open"), Some("Enter"));
-    assert_eq!(model.shortcut("Resume"), Some("Ctrl+R"));
-    assert_eq!(model.shortcut("Fork"), Some("Ctrl+F"));
+    assert_eq!(model.shortcut("Open"), Some(kbd("enter").as_str()));
+    assert_eq!(model.shortcut("Resume"), Some(kbd("ctrl-r").as_str()));
+    assert_eq!(model.shortcut("Fork"), Some(kbd("ctrl-f").as_str()));
     assert_eq!(model.shortcut("Rename…"), Some("F2"));
-    assert_eq!(model.shortcut("Delete…"), Some("Ctrl+X"));
+    assert_eq!(model.shortcut("Delete…"), Some(kbd("ctrl-x").as_str()));
     let MenuEntry::Submenu { entries, .. } = model.item("Copy to clipboard").unwrap() else {
         panic!("Copy to clipboard is a submenu");
     };

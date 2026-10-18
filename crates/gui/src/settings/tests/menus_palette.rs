@@ -17,7 +17,7 @@ use crate::list::ListPaneEvent;
 use crate::menus;
 use crate::model::ConversationTarget;
 use crate::palette;
-use crate::test_support::{TestWorld, activate, open_main, open_single_file, synth};
+use crate::test_support::{TestWorld, activate, kbd, open_main, open_single_file, synth};
 
 fn render(cx: &mut TestAppContext, handle: AnyWindowHandle) {
     use gpui_kit::test::TestWindowExt as _;
@@ -363,8 +363,8 @@ fn the_palette_lists_every_leaf_and_dispatches_to_the_stored_focus(cx: &mut Test
     // Live shortcuts: Resume has none at the probe (list keys are not on its
     // path); app-wide shortcuts are context-free or `Workspace`-scoped.
     assert_eq!(
-        entry("File", "Quit").shortcut_label().as_deref(),
-        Some("Ctrl+Q")
+        entry("File", "Quit").shortcut_label(),
+        Some(kbd("secondary-q"))
     );
     assert_eq!(entry("Session", "Resume").shortcut, None);
 

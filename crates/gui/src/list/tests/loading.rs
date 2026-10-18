@@ -411,7 +411,7 @@ fn uuid_jump_loads_from_disk_in_the_background(cx: &mut TestAppContext) {
 
     recording(cx).set_clipboard(Some(synth::uuid(70)));
     // Paste without parking: the lookup is pending right after the paste.
-    cx.dispatch_keystroke(f.handle, gpui_kit::Keystroke::parse("ctrl-v").unwrap());
+    cx.dispatch_keystroke(f.handle, gpui_kit::Keystroke::parse("secondary-v").unwrap());
     assert!(
         matches!(
             f.read(cx, |list, _| list.uuid_lookup().cloned()),

@@ -21,7 +21,7 @@ use crate::keymap;
 use crate::list::ListPaneEvent;
 use crate::menus;
 use crate::model::{ConversationTarget, LeftTab};
-use crate::test_support::{TestWorld, open_main, redirect_root};
+use crate::test_support::{TestWorld, kbd, open_main, redirect_root};
 
 /// The viewer of a single-file window.
 fn single_file_viewer(
@@ -134,7 +134,7 @@ fn static_keymap_installs_without_panic(cx: &mut TestAppContext) {
         );
         let resume = keymap::binding_labels(&crate::actions::Resume, keymap::CTX_LIST, cx);
         assert_eq!(resume.len(), 1, "{resume:?}");
-        assert!(resume[0].to_lowercase().contains('r') && resume[0].to_lowercase().contains("alt"));
+        assert_eq!(resume[0].as_ref(), kbd("alt-r"));
     });
 }
 

@@ -14,7 +14,7 @@ use gpui_kit::{Action, App, KeyContext, Keystroke, TestAppContext};
 use crate::actions::*;
 use crate::globals::last_toast;
 use crate::keymap;
-use crate::test_support::{TestWorld, open_main};
+use crate::test_support::{TestWorld, kbd, open_main};
 use gpui_kit::base::actions::{Cancel, Confirm, SelectDown, SelectUp};
 
 const MAC: bool = cfg!(target_os = "macos");
@@ -502,7 +502,7 @@ fn live_rebinding_keeps_the_static_rows(cx: &mut TestAppContext) {
     let before = cx.update(|cx| keymap::binding_labels(&Resume, LIST, cx));
     assert_eq!(
         before.iter().map(|l| l.as_ref()).collect::<Vec<_>>(),
-        ["Ctrl+R"]
+        [kbd("ctrl-r").as_str()]
     );
     rebind(cx, chords("f2", "ctrl+l", "ctrl+f", "alt+r", "ctrl+x"));
     cx.update(|cx| {
@@ -524,7 +524,7 @@ fn live_rebinding_keeps_the_static_rows(cx: &mut TestAppContext) {
         let labels = keymap::binding_labels(&Resume, LIST, cx);
         assert_eq!(
             labels.iter().map(|l| l.as_ref()).collect::<Vec<_>>(),
-            ["Alt+R"]
+            [kbd("alt-r").as_str()]
         );
         // Every static row of the table is still bound.
         let still_bound = |binding: &gpui_kit::KeyBinding| {
@@ -552,7 +552,7 @@ fn live_rebinding_keeps_the_static_rows(cx: &mut TestAppContext) {
         let labels = keymap::binding_labels(&Resume, LIST, cx);
         assert_eq!(
             labels.iter().map(|l| l.as_ref()).collect::<Vec<_>>(),
-            ["Ctrl+R"]
+            [kbd("ctrl-r").as_str()]
         );
         let count = cx
             .key_bindings()
@@ -618,7 +618,7 @@ fn hints_follow_the_live_keymap(cx: &mut TestAppContext) {
         let refresh = keymap::binding_labels(&Refresh, "Workspace ConversationList", cx);
         assert!(refresh.iter().any(|l| l.as_ref() == "F5"), "{refresh:?}");
         assert!(
-            refresh.iter().any(|l| l.as_ref() == "Ctrl+L"),
+            refresh.iter().any(|l| l.as_ref() == kbd("ctrl-l")),
             "{refresh:?}"
         );
     });

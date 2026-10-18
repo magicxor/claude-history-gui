@@ -65,7 +65,7 @@ fn perf_20k_rows(cx: &mut TestAppContext) {
     // A pasted UUID: pending lookup, no disk on the UI thread.
     crate::test_support::recording(cx).set_clipboard(Some(synth::uuid(1_007)));
     f.press(cx, "escape");
-    f.press(cx, "ctrl-v");
+    f.press(cx, "secondary-v");
     f.wait_idle(cx);
     let paste = probe(&f, cx, "list.ui_busy_max");
     eprintln!("paste: slowest key/paste handler {paste:.3} ms");

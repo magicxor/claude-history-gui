@@ -539,7 +539,7 @@ fn legacy_semantic_search_key_is_the_search_mode_source() {
 #[test]
 fn key_warnings_cover_app_wide_viewer_and_list_search_rows() {
     let cfg = ConfigFile::default();
-    for (key, needle) in [
+    let mut cases = vec![
         ("f1", "in the window"),
         ("f6", "in the window"),
         ("f10", "in the window"),
@@ -547,7 +547,13 @@ fn key_warnings_cover_app_wide_viewer_and_list_search_rows() {
         ("f3", "in the viewer"),
         ("ctrl+k", "in the list search"),
         ("ctrl+u", "in the list search"),
-    ] {
+    ];
+    // macOS binds Next match to Cmd+G instead of F3, and a user binding has no
+    // Cmd modifier: nothing in the viewer's own context can be replaced there.
+    if cfg!(target_os = "macos") {
+        cases.retain(|(key, _)| *key != "f3");
+    }
+    for (key, needle) in cases {
         let mut draft = SettingsDraft::new(&GuiConfigFile::default());
         keys_page::apply_key_text(&mut draft, &cfg, KeyAction::Rename, key).unwrap();
         let warnings = keys_page::warnings(&draft, &cfg);

@@ -317,7 +317,7 @@ fn v103_ctrl_c_in_the_list_copies_the_transcript_selection(cx: &mut TestAppConte
     .unwrap();
     cx.run_until_parked();
     // The selection exists (Ctrl+C in the transcript copies it).
-    cx.simulate_keystrokes(handle, "ctrl-c");
+    cx.simulate_keystrokes(handle, "secondary-c");
     cx.run_until_parked();
     let in_viewer = recording(cx).clipboard().unwrap_or_default();
     assert!(
@@ -336,7 +336,7 @@ fn v103_ctrl_c_in_the_list_copies_the_transcript_selection(cx: &mut TestAppConte
     assert_eq!(shown_path(cx, &ws), Some(shown.clone()));
 
     recording(cx).set_clipboard(None);
-    cx.simulate_keystrokes(handle, "ctrl-c");
+    cx.simulate_keystrokes(handle, "secondary-c");
     cx.run_until_parked();
     let copied = recording(cx).clipboard().unwrap_or_default();
     assert!(copied.contains("question 1"), "{copied:?}");
@@ -347,7 +347,7 @@ fn v103_ctrl_c_in_the_list_copies_the_transcript_selection(cx: &mut TestAppConte
     );
     // With text selected in the search input, Ctrl+C copies that instead.
     f.list.type_text(cx, "login");
-    cx.simulate_keystrokes(handle, "ctrl-a ctrl-c");
+    cx.simulate_keystrokes(handle, "secondary-a secondary-c");
     cx.run_until_parked();
     assert_eq!(recording(cx).clipboard().as_deref(), Some("login"));
     // A click on a row: the search input keeps (takes) the focus and the

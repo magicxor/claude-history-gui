@@ -137,7 +137,9 @@ fn setup() -> Setup {
     }
 }
 
-fn run(answers: Vec<Result<Option<i32>, String>>) -> (LaunchOutcome, Vec<String>) {
+/// One launch through the candidates: the outcome, the launcher name of every
+/// spawn and its program (macOS names both of its launchers `Terminal`).
+fn run(answers: Vec<Result<Option<i32>, String>>) -> (LaunchOutcome, Vec<String>, Vec<OsString>) {
     let setup = setup();
     let scripted = Arc::new(ScriptedServices {
         answers: Mutex::new(answers.into()),
@@ -154,26 +156,33 @@ fn run(answers: Vec<Result<Option<i32>, String>>) -> (LaunchOutcome, Vec<String>
     };
     let outcome = spawn_through_candidates(&setup.env, setup.spec.clone(), &options, &services);
     let launchers = scripted.launchers.lock().unwrap().clone();
-    (outcome, launchers)
+    let programs = scripted
+        .commands
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|command| command.program.clone())
+        .collect();
+    (outcome, launchers, programs)
 }
 
 #[test]
 fn a_spawn_error_tries_the_next_candidate() {
-    let (outcome, launchers) = run(vec![Err("first is broken".to_string()), Ok(None)]);
+    let (outcome, launchers, programs) = run(vec![Err("first is broken".to_string()), Ok(None)]);
     assert!(launchers.len() >= 2, "{launchers:?}");
     match outcome {
         LaunchOutcome::Started { launcher } => assert_eq!(launcher, launchers[1]),
         other => panic!("{other:?}"),
     }
     assert_ne!(
-        launchers[0], launchers[1],
+        programs[0], programs[1],
         "two different launchers were tried"
     );
 }
 
 #[test]
 fn an_early_nonzero_exit_is_final() {
-    let (outcome, launchers) = run(vec![Ok(Some(3)), Ok(None)]);
+    let (outcome, launchers, _) = run(vec![Ok(Some(3)), Ok(None)]);
     assert_eq!(launchers.len(), 1, "no retry after a launcher that ran");
     match outcome {
         LaunchOutcome::Exited { launcher, code } => {
@@ -186,7 +195,7 @@ fn an_early_nonzero_exit_is_final() {
 
 #[test]
 fn an_early_zero_exit_counts_as_started() {
-    let (outcome, launchers) = run(vec![Ok(Some(0))]);
+    let (outcome, launchers, _) = run(vec![Ok(Some(0))]);
     assert_eq!(launchers.len(), 1);
     assert!(
         matches!(outcome, LaunchOutcome::Started { .. }),
@@ -196,7 +205,7 @@ fn an_early_zero_exit_counts_as_started() {
 
 #[test]
 fn every_candidate_failing_reports_the_last_error() {
-    let (outcome, launchers) = run(vec![Err("a".to_string()), Err("last".to_string())]);
+    let (outcome, launchers, _) = run(vec![Err("a".to_string()), Err("last".to_string())]);
     assert!(launchers.len() >= 2);
     match outcome {
         LaunchOutcome::Failed(message) => {

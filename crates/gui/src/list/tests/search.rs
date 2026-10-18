@@ -174,7 +174,7 @@ fn paste_inserts_text_once(cx: &mut TestAppContext) {
         .unwrap();
     let long = "x".repeat(5_000);
     recording(cx).set_clipboard(Some(long));
-    f.press(cx, "ctrl-v");
+    f.press(cx, "secondary-v");
     let after = f
         .read(cx, |list, cx| list.qa_probe("list.query_calls", cx))
         .unwrap();
@@ -507,8 +507,8 @@ fn ctrl_c_copies_and_never_quits(cx: &mut TestAppContext) {
     let world = corpus(3);
     let f = ListFixture::open_loaded(cx, &world, &[]);
     f.type_text(cx, "abc");
-    f.press(cx, "ctrl-a");
-    f.press(cx, "ctrl-c");
+    f.press(cx, "secondary-a");
+    f.press(cx, "secondary-c");
     assert_eq!(recording(cx).clipboard().as_deref(), Some("abc"));
     assert_eq!(cx.read(exit::quit_requested), None);
 }
@@ -539,8 +539,14 @@ fn emacs_editing_keys_work_in_the_search_input(cx: &mut TestAppContext) {
     let world = corpus(4);
     let f = ListFixture::open_loaded(cx, &world, &[]);
     f.type_text(cx, "foo bar");
-    f.press(cx, "ctrl-left");
-    assert_eq!(cursor(&f, cx), 4, "ctrl-left from the end of `foo bar`");
+    // Word left: Ctrl+Left, on macOS Alt+Left (gpui-kit's Input bindings).
+    let word_left = if cfg!(target_os = "macos") {
+        "alt-left"
+    } else {
+        "ctrl-left"
+    };
+    f.press(cx, word_left);
+    assert_eq!(cursor(&f, cx), 4, "{word_left} from the end of `foo bar`");
     f.press(cx, "left");
     assert_eq!(cursor(&f, cx), 3);
     f.press(cx, "escape");

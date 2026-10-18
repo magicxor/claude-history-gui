@@ -504,6 +504,13 @@ pub fn recording(cx: &TestAppContext) -> Arc<RecordingServices> {
     })
 }
 
+/// The platform label of a keystroke as the keymap and the hints show it
+/// (`ctrl-r` → `Ctrl+R`, on macOS `⌃R`; `secondary-q` → `Ctrl+Q` / `⌘Q`).
+pub fn kbd(keystroke: &str) -> String {
+    let keystroke = gpui_kit::Keystroke::parse(keystroke).expect("a valid keystroke");
+    gpui_kit::component::kbd::Kbd::format(&keystroke)
+}
+
 // ---------------------------------------------------------------------------
 // Synthetic data
 // ---------------------------------------------------------------------------

@@ -19,7 +19,7 @@ use crate::model::{KeyAction, OpenPathsOptions, SettingsPage};
 use crate::services::ServiceCall;
 use crate::settings::draft::{Field, Value};
 use crate::settings::{self, SettingsDialog, current_dialog};
-use crate::test_support::{TestWorld, global_lock, open_main, recording};
+use crate::test_support::{TestWorld, global_lock, kbd, open_main, recording};
 
 fn render(cx: &mut TestAppContext, handle: AnyWindowHandle) {
     use gpui_kit::test::TestWindowExt as _;
@@ -329,7 +329,7 @@ fn saved_key_bindings_apply_live(cx: &mut TestAppContext) {
         let labels = keymap::binding_labels(&Resume, ctx, cx);
         assert_eq!(
             labels.iter().map(|l| l.as_ref()).collect::<Vec<_>>(),
-            ["Alt+R"]
+            [kbd("alt-r").as_str()]
         );
         assert_eq!(
             app_state(cx).settings.keys.resume,
@@ -562,7 +562,7 @@ fn typing_into_a_field_updates_the_draft(cx: &mut TestAppContext) {
     );
     assert!(dialog.read_with(cx, |d, _| d.can_save()));
     // Replace the text with an invalid key.
-    cx.simulate_keystrokes(handle, "ctrl-a");
+    cx.simulate_keystrokes(handle, "secondary-a");
     cx.simulate_input(handle, "hyper+x");
     cx.run_until_parked();
     assert_eq!(
