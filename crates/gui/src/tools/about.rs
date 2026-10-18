@@ -197,8 +197,8 @@ mod tests {
 
     #[test]
     fn versions_are_read_from_the_manifests() {
-        assert_eq!(gui_version(), "0.1.0");
+        assert_eq!(gui_version(), "0.1.1");
         assert_eq!(core_version(), "0.1.76");
-        assert_eq!(version_line(), "Claude History GUI 0.1.0 (core 0.1.76)");
+        assert_eq!(version_line(), "Claude History GUI 0.1.1 (core 0.1.76)");
     }
 }
