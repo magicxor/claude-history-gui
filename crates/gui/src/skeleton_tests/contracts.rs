@@ -20,7 +20,7 @@ use crate::keymap;
 use crate::list::ListPaneEvent;
 use crate::model::{AgentTab, ConversationTarget, LeftTab, PaneFocus, RowMenuItem};
 use crate::services::Services;
-use crate::test_support::{TestWorld, open_main, open_single_file, recording};
+use crate::test_support::{TestWorld, open_main, open_single_file, recording, wait_loaded};
 use crate::workspace::routing::{self, SessionRoute};
 
 fn render(cx: &mut TestAppContext, handle: AnyWindowHandle) {
@@ -40,6 +40,10 @@ fn a_list_action_flushes_the_pending_preview_first(cx: &mut TestAppContext) {
     let first = super::claude_session(&world);
     let second = super::second_session(&world);
     let (handle, ws) = open_main(cx, &world, &[]);
+    // A poll of a still-running load emits the list's selection (rows in
+    // arrival order: maybe the conversation shown below), which would drop
+    // the pending preview mid-test.
+    wait_loaded(cx, &ws);
     let list = cx.read(|cx| ws.read(cx).list().clone());
     // The viewer shows the first conversation; the selection moves on.
     list.update(cx, |_, cx| {

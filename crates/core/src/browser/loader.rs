@@ -402,6 +402,12 @@ impl HistoryLoader {
                         rx: spawn_preparation(job, self.options.waker.clone()),
                         ending,
                     });
+                    // Installed by a later poll (the waker fires when the
+                    // preparation is done), never by this one: a poll that
+                    // appended batches always leaves the browser loading.
+                    result.preparing = true;
+                    self.active = Some(active);
+                    return result;
                 }
             }
         }
