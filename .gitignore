@@ -26,3 +26,5 @@ qa-out/
 .vscode/
 .DS_Store
 Thumbs.db
+
+.serena/
