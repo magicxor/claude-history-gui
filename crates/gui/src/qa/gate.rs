@@ -180,8 +180,10 @@ pub fn check(inputs: &GateInputs) -> Result<(), String> {
     Ok(())
 }
 
-/// Canonical form of `path`: the file system's when it exists, else a
-/// lexically normalized absolute path.
+/// Canonical form of `path`: the file system's when it exists, else the
+/// lexically normalized path with its longest existing ancestor canonicalized,
+/// so a missing path still resolves the links and Windows 8.3 short names
+/// (`C:\Users\RUNNER~1`, macOS `/var` → `/private/var`) above it like the home does.
 fn canonical(path: &Path) -> PathBuf {
     if let Ok(path) = std::fs::canonicalize(path) {
         return strip_verbatim(path);
@@ -194,6 +196,12 @@ fn canonical(path: &Path) -> PathBuf {
             }
             Component::CurDir => {}
             other => out.push(other.as_os_str()),
+        }
+    }
+    for ancestor in out.ancestors().skip(1) {
+        if let (Ok(base), Ok(rest)) = (std::fs::canonicalize(ancestor), out.strip_prefix(ancestor))
+        {
+            return strip_verbatim(base).join(rest);
         }
     }
     out
@@ -348,6 +356,25 @@ mod tests {
         assert!(check(&gate).unwrap_err().contains("CLAUDE_CONFIG_DIR"));
         gate.path_vars = vec![("XDG_DATA_HOME", Some(OsString::from("relative/dir")))];
         assert!(check(&gate).unwrap_err().contains("relative"));
+    }
+
+    /// A missing directory under a home spelled through a link (as `RUNNER~1`
+    /// or macOS `/var` spell the temp folder) is still inside the home.
+    #[test]
+    fn a_missing_path_variable_under_a_linked_home_is_inside() {
+        let home = sandbox();
+        let links = tempfile::tempdir().unwrap();
+        let alias = links.path().join("home");
+        if !make_dir_link(home.path(), &alias) {
+            eprintln!("skipped: cannot create a directory link here");
+            return;
+        }
+        let mut gate = inputs(&alias);
+        gate.path_vars = vec![(
+            "CLAUDE_CONFIG_DIR",
+            Some(alias.join(".claude").into_os_string()),
+        )];
+        assert_eq!(check(&gate), Ok(()));
     }
 
     #[test]

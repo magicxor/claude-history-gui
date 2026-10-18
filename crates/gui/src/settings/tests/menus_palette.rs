@@ -474,6 +474,7 @@ fn settings_and_quit_are_in_the_palette(cx: &mut TestAppContext) {
 }
 
 /// Every action leaf of the installed tree: (name, disabled).
+#[cfg(not(target_os = "macos"))]
 fn installed_disabled(cx: &mut TestAppContext) -> Vec<(String, bool)> {
     fn walk(items: &[OwnedMenuItem], out: &mut Vec<(String, bool)>) {
         for item in items {
