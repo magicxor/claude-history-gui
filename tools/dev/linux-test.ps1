@@ -21,8 +21,10 @@
   stays behind in containers or anonymous volumes, so the Docker disk grows only by these volumes.
   A worktree's new target volume is seeded from claude-history-gui-target-main (compiled
   dependencies only, timestamps kept): its first build compiles only the workspace crates. The
-  paths are the same in every container, so the seed is reused as is. Build in the main checkout
-  once to create the seed; a seed from an older main checkout is slower, never wrong.
+  paths are the same in every container, so the seed is reused as is. Concurrent runs for the same
+  checkout wait until its volume is ready, and a copy that was killed halfway is redone. Build in
+  the main checkout once to create the seed; a seed from an older main checkout is slower, never
+  wrong.
   CARGO_BUILD_JOBS is passed through when set.
 
   Permanent, never deleted by this script: claude-history-gui-target-main (the seed of every
@@ -88,12 +90,13 @@ $isMain = [string]::Equals($root.TrimEnd('\'), $main.TrimEnd('\'), [StringCompar
 if ($isMain) {
     $checkout = 'main'
 } else {
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    $hash = -join ($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($root.ToLowerInvariant())) | Select-Object -First 4 | ForEach-Object { $_.ToString('x2') })
     $leaf = ((Split-Path -Leaf $root).ToLowerInvariant() -replace '[^a-z0-9_.-]', '-')
-    $checkout = "$leaf-$hash"
+    $checkout = "$leaf-$(Get-PathHash $root)"
 }
 $volume = "$prefix-target-$checkout"
+
+# Exists only while a volume is being seeded: left behind, it marks a copy that was killed halfway.
+function Get-SeedMarker([string]$Name) { Join-Path $env:LOCALAPPDATA "$prefix-dev\$Name.seeding" }
 
 if ($gc) {
     foreach ($name in (Invoke-Utf8 { docker volume ls -q --filter "label=$prefix.worktree" })) {
@@ -101,13 +104,20 @@ if ($gc) {
         $path = Invoke-Utf8 { docker volume inspect --format "{{ index .Labels `"$prefix.worktree`" }}" $name }
         if ($path -and -not (Test-Path -LiteralPath $path)) {
             docker volume rm $name *> $null
-            if ($LASTEXITCODE -eq 0) { Write-Host "Removed $name ($path no longer exists)." } else { Write-Warning "$name is in use; kept." }
+            if ($LASTEXITCODE -eq 0) {
+                Remove-Item -LiteralPath (Get-SeedMarker $name) -ErrorAction SilentlyContinue
+                Write-Host "Removed $name ($path no longer exists)."
+            } else { Write-Warning "$name is in use; kept." }
         }
     }
 }
 if ($drop) {
     if ($isMain) { Write-Warning "$volume is the seed of every worktree volume and is kept; --drop-volume is for worktrees." }
-    elseif (Test-Volume $volume) { Invoke-Docker volume rm $volume | Out-Null; Write-Host "Removed $volume." }
+    elseif (Test-Volume $volume) {
+        Invoke-Docker volume rm $volume | Out-Null
+        Remove-Item -LiteralPath (Get-SeedMarker $volume) -ErrorAction SilentlyContinue
+        Write-Host "Removed $volume."
+    }
     else { Write-Host "$volume does not exist." }
 }
 if (-not ($update -or $cargoArgs.Count)) { exit 0 }
@@ -154,23 +164,38 @@ if (-not $cargoArgs.Count) { exit 0 }
 $runId = Get-Random -Maximum 1000000
 
 # This checkout's target volume; a new worktree volume starts as a copy of the main one without
-# the workspace crates, incremental/ and examples/.
-if (-not (Test-Volume $volume)) {
-    Invoke-Docker volume create --label "$prefix.worktree=$root" $volume | Out-Null
-    if (-not $isMain -and (Test-Volume $mainVolume)) {
-        Write-Host "Seeding $volume from $mainVolume..."
-        # pipefail: a failed read (e.g. "file changed as we read it" while the main checkout builds)
-        # fails the seed even when the extraction succeeds.
-        $copy = "set -o pipefail; tar -C /from --exclude=./debug/incremental --exclude=./debug/examples " +
-            "--exclude='*claude_history*' --exclude='*claude-history*' -cf - . | tar -C /target -xf -"
-        docker run --rm --name "$prefix-seed-$checkout-$runId" --label "$prefix.dev=1" `
-            --mount "type=volume,src=$mainVolume,dst=/from,readonly" `
-            --mount "type=volume,src=$volume,dst=/target" $image bash -c $copy
-        if ($LASTEXITCODE -ne 0) {
-            # A partial seed would never be redone (the volume exists): remove it.
-            $code = $LASTEXITCODE
-            docker volume rm $volume *> $null
-            throw "Seeding $volume failed with exit code $code; the volume was removed, run the script again."
+# the workspace crates, incremental/ and examples/. The lock makes a concurrent run for the same
+# checkout wait until the volume is ready instead of building in a half-copied one; the marker
+# makes the next run redo a copy that was killed halfway (an existing volume is otherwise taken
+# as ready).
+Invoke-Locked "$volume-seed" {
+    $marker = Get-SeedMarker $volume
+    if ((Test-Path -LiteralPath $marker) -and (Test-Volume $volume)) {
+        Write-Host "The last seeding of $volume was interrupted; seeding it again."
+        # The copy of the killed run may still be going.
+        docker ps -aq --filter "name=$prefix-seed-$checkout-" | ForEach-Object { docker rm -f $_ *> $null }
+        docker volume rm $volume *> $null
+        if ($LASTEXITCODE -ne 0) { throw "$volume is in use by a running build; run the script again when it has finished." }
+    }
+    if (-not (Test-Volume $volume)) {
+        Invoke-Docker volume create --label "$prefix.worktree=$root" $volume | Out-Null
+        if (-not $isMain -and (Test-Volume $mainVolume)) {
+            Write-Host "Seeding $volume from $mainVolume..."
+            New-Item -ItemType File -Force -Path $marker | Out-Null
+            # pipefail: a failed read (e.g. "file changed as we read it" while the main checkout
+            # builds) fails the seed even when the extraction succeeds.
+            $copy = "set -o pipefail; tar -C /from --exclude=./debug/incremental --exclude=./debug/examples " +
+                "--exclude='*claude_history*' --exclude='*claude-history*' -cf - . | tar -C /target -xf -"
+            docker run --rm --name "$prefix-seed-$checkout-$runId" --label "$prefix.dev=1" `
+                --mount "type=volume,src=$mainVolume,dst=/from,readonly" `
+                --mount "type=volume,src=$volume,dst=/target" $image bash -c $copy
+            if ($LASTEXITCODE -ne 0) {
+                $code = $LASTEXITCODE
+                docker volume rm $volume *> $null
+                if ($LASTEXITCODE -eq 0) { Remove-Item -LiteralPath $marker }
+                throw "Seeding $volume failed with exit code $code; run the script again to redo it."
+            }
+            Remove-Item -LiteralPath $marker
         }
     }
 }
