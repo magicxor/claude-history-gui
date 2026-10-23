@@ -28,7 +28,11 @@
 #>
 #Requires -Version 7.3
 $ErrorActionPreference = 'Stop'
-. (Join-Path $PSScriptRoot 'common.ps1')
+# Native commands: exit codes are checked explicitly (robocopy's success codes are 1-7), whatever
+# the calling session set.
+$PSNativeCommandUseErrorActionPreference = $false
+$PSNativeCommandArgumentPassing = 'Windows'
+Import-Module (Join-Path $PSScriptRoot 'common.psm1') -Force -DisableNameChecking
 
 $root = Get-CheckoutRoot
 $main = Get-MainCheckout $root
@@ -50,29 +54,43 @@ if (-not (Test-Path -LiteralPath $source)) {
 $targetDir = Join-Path $root 'target'
 $dest = Join-Path $targetDir 'debug'
 $done = Join-Path $targetDir '.seeded'
+$seedMarker = Join-Path $targetDir '.seeding'
 $watch = [System.Diagnostics.Stopwatch]::StartNew()
 $seeded = Invoke-Seed -Name "'$dest'" `
     -LockPath (Join-Path (Get-StateDir $root) "seed-target-$(Get-PathHash $root).lock") `
-    -Marker (Join-Path $targetDir '.seeding') `
+    -Marker $seedMarker `
     -Exists { Test-Path -LiteralPath $done } `
     -Remove {
-        # The robocopy of a killed run may still be copying: stop it. The files it left need no
-        # cleanup: the next copy takes every file whose size or time differs, a cut-off one too.
-        Get-CimInstance Win32_Process -Filter "Name = 'Robocopy.exe'" |
-            Where-Object { $_.CommandLine -and $_.CommandLine.Contains($dest) } |
-            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        # The robocopy of a killed run may still be copying: stop it, identified by the process id
+        # and start time that the marker records (never a robocopy this script did not start). The
+        # files it left need no cleanup: the next copy takes every file whose size or time differs,
+        # a cut-off one too.
+        $recorded = Get-Content -LiteralPath $seedMarker -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($recorded -match '^(\d+):(\d+)$') {
+            $copier = Get-Process -Id ([int]$Matches[1]) -ErrorAction SilentlyContinue
+            if ($copier -and $copier.StartTime.ToFileTimeUtc() -eq [long]$Matches[2]) {
+                Stop-Process -Id $copier.Id -Force
+                $copier.WaitForExit()
+            }
+        }
     } `
     -Create {
         $names = @(Get-WorkspaceOutputNames $root)
-        $files = foreach ($n in $names) { $n; "$n-*"; "$n.*"; "lib$n-*"; "lib$n.*" }
-        $dirs = foreach ($n in $names) { "$n-*" }
+        $excludeFiles = foreach ($n in $names) { $n; "$n-*"; "$n.*"; "lib$n-*"; "lib$n.*" }
+        $excludeDirs = foreach ($n in $names) { "$n-*" }
+        # /COPY:DAT and /DCOPY:DAT keep the timestamps. incremental\ and examples\ by full path, so
+        # that a folder of the same name inside a build script's OUT_DIR is still copied.
+        $arguments = @($source, $dest, '/E', '/COPY:DAT', '/DCOPY:DAT', '/MT:16', '/R:1', '/W:1', '/NFL', '/NDL', '/NJH', '/NP',
+            '/XD', (Join-Path $source 'incremental'), (Join-Path $source 'examples')) + $excludeDirs +
+            @('/XF', '.cargo-*lock', '*.pdb', 'build-script-*.exe') + $excludeFiles
         Invoke-CargoLocked @($source, $dest) {
-            # /COPY:DAT and /DCOPY:DAT keep the timestamps. incremental\ and examples\ by full path,
-            # so that a folder of the same name inside a build script's OUT_DIR is still copied.
-            robocopy $source $dest /E /COPY:DAT /DCOPY:DAT /MT:16 /R:1 /W:1 /NFL /NDL /NJH /NP `
-                /XD (Join-Path $source 'incremental') (Join-Path $source 'examples') @dirs `
-                /XF '.cargo-*lock' '*.pdb' 'build-script-*.exe' @files
-            if ($LASTEXITCODE -ge 8) { throw "robocopy failed with exit code $LASTEXITCODE; run the script again." }
+            # A process of its own, so that its id and start time can go into the marker.
+            $start = [System.Diagnostics.ProcessStartInfo]::new('robocopy.exe')
+            foreach ($argument in $arguments) { $start.ArgumentList.Add($argument) }
+            $copier = [System.Diagnostics.Process]::Start($start)
+            Set-Content -LiteralPath $seedMarker -Value "$($copier.Id):$($copier.StartTime.ToFileTimeUtc())"
+            $copier.WaitForExit()
+            if ($copier.ExitCode -ge 8) { throw "robocopy failed with exit code $($copier.ExitCode); run the script again." }
         }
         New-Item -ItemType File -Force -Path $done | Out-Null
     }

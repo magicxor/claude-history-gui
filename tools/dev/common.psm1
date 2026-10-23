@@ -1,11 +1,15 @@
 #Requires -Version 7.3
-# Shared by the tools/dev scripts (dot-sourced). PowerShell 7.3 or later: Windows PowerShell 5.1
+# Shared by the tools/dev scripts (Import-Module). PowerShell 7.3 or later: Windows PowerShell 5.1
 # turns docker's stderr into terminating errors under ErrorActionPreference Stop, and before 7.3
 # double quotes inside native arguments (docker --format templates) are dropped.
-
-# Native-command behavior the scripts rely on, whatever the calling session set: a non-zero exit
-# code is checked by the scripts themselves (robocopy's success codes are 1-7), and arguments are
-# passed as on a default Windows pwsh.
+#
+# A module, not a dot-sourced script: a script block that a script passes in (Invoke-Seed's
+# callbacks, Invoke-Locked's and Invoke-CargoLocked's bodies) runs in the script's own variables,
+# so the helpers' parameters and locals cannot shadow the script's (a $dirs in a callback once
+# resolved to Invoke-CargoLocked's -Dirs). The scripts set the same preferences for themselves.
+$ErrorActionPreference = 'Stop'
+# Native-command behavior the helpers rely on, whatever the calling session set: a non-zero exit
+# code is checked explicitly, and arguments are passed as on a default Windows pwsh.
 $PSNativeCommandUseErrorActionPreference = $false
 $PSNativeCommandArgumentPassing = 'Windows'
 

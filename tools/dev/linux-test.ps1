@@ -74,7 +74,10 @@
 #>
 #Requires -Version 7.3
 $ErrorActionPreference = 'Stop'
-. (Join-Path $PSScriptRoot 'common.ps1')
+# Native commands: exit codes are checked explicitly, whatever the calling session set.
+$PSNativeCommandUseErrorActionPreference = $false
+$PSNativeCommandArgumentPassing = 'Windows'
+Import-Module (Join-Path $PSScriptRoot 'common.psm1') -Force -DisableNameChecking
 
 # The arguments as given. PowerShell splits one that starts with '-' at its first ':' (its
 # -Name:Value syntax), so --skip=a::b would reach cargo as '--skip=a' ':b'. Under pwsh -File the
