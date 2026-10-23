@@ -51,7 +51,7 @@ leave nothing behind.
   old tags after a toolchain bump go with `tools/dev/linux-test.ps1 --prune-images`, only while no
   other agent is starting a Linux build), and the main checkout's `target/` (the seed of every
   worktree's Windows build). Losing them costs a cold build and the downloads again. A worktree's
-  own volume `claude-history-gui-target-<folder>-<hash>` goes only through
+  own volume `claude-history-gui-target-wt-<folder>-<hash>` goes only through
   `tools/dev/linux-test.ps1 --drop-volume` or `--gc` (see [Linux](#linux-docker)).
 
 ## Worktrees and orchestration
