@@ -11,7 +11,8 @@
   in a throw-away container (--rm) named claude-history-gui-cargo-<checkout>-<random>:
 
     /work                               this checkout (bind mount)
-    /target (CARGO_TARGET_DIR)          volume claude-history-gui-target-main for the main checkout,
+    /target (CARGO_TARGET_DIR)          volume claude-history-gui-target-main-<hash> for the main
+                                        checkout (one per clone of the repository),
                                         claude-history-gui-target-<folder>-<hash> for a worktree
     CARGO_HOME (registry, git, and      shared volume claude-history-gui-cargo-home: one volume, so
     the locks that guard them)          concurrent containers share cargo's cache locks
@@ -20,18 +21,18 @@
   Everything this script creates is named claude-history-gui-* and labelled claude-history-gui.dev
   (image, containers) or claude-history-gui.worktree=<checkout path> (target volumes). Nothing
   stays behind in containers or anonymous volumes, so the Docker disk grows only by these volumes.
-  A worktree's new target volume is seeded from claude-history-gui-target-main (compiled
-  dependencies only, timestamps kept): its first build compiles only the workspace crates. The
-  paths are the same in every container, so the seed is reused as is. Concurrent runs for the same
-  checkout wait until its volume is ready, and a copy that was killed halfway is redone. Build in
-  the main checkout once to create the seed; a seed from an older main checkout is slower, never
-  wrong.
+  A worktree's new target volume is seeded from its clone's main volume (compiled dependencies
+  only, timestamps kept): its first build compiles only the workspace crates. The paths are the
+  same in every container, so the seed is reused as is. Concurrent runs for the same checkout wait
+  until its volume is ready, and a copy that was killed halfway is redone (the marker of a running
+  copy is in .git\claude-history-gui-dev). Build in the main checkout once to create the seed; a
+  seed from an older main checkout is slower, never wrong.
   CARGO_BUILD_JOBS is passed through when set.
 
-  Permanent, never deleted by this script: claude-history-gui-target-main (the seed of every
-  worktree volume) and the shared caches claude-history-gui-cargo-home and -ort-cache. Losing
-  them costs a cold build and the downloads again. The image is rebuilt automatically when it is
-  missing.
+  Permanent: the main volume of every existing clone (the seed of its worktree volumes) and the
+  shared caches claude-history-gui-cargo-home and -ort-cache, which this script never deletes.
+  Losing them costs a cold build and the downloads again. The image is rebuilt automatically when
+  it is missing.
 
   Options (before the cargo arguments):
     --update        pull the newest rust:1-trixie, rebuild this checkout's image and remove the
@@ -39,8 +40,8 @@
                     of a session); alone, it runs no cargo command
     --drop-volume   delete this worktree's target volume (when the worktree is done); refused in
                     the main checkout
-    --gc            delete the target volumes of worktrees that no longer exist (never the main
-                    checkout's, even if the repo folder was moved)
+    --gc            delete the target volumes of worktrees and clones that no longer exist at
+                    their path (this clone's main volume is always kept), and stale seed markers
 
   From a PowerShell prompt, quote the separator before clippy or test-binary arguments ('--'):
   PowerShell drops a bare -- when it calls a script; pwsh -File passes it on.
@@ -52,6 +53,7 @@
 .EXAMPLE
   pwsh -NoProfile -File tools/dev/linux-test.ps1 --update
 #>
+#Requires -Version 7.3
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'common.ps1')
 
@@ -72,8 +74,7 @@ if (-not ($update -or $drop -or $gc -or $cargoArgs.Count)) { throw 'Nothing to d
 # user's own images, containers and volumes.
 $prefix = 'claude-history-gui'
 $repository = "$prefix-linux-dev"
-$mainVolume = "$prefix-target-main"
-$root = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
+$root = Get-CheckoutRoot
 
 function Invoke-Docker {
     docker @args
@@ -85,20 +86,24 @@ function Test-Volume([string]$Name) {
     $LASTEXITCODE -eq 0
 }
 
-# This checkout's name in the volume and container names: main for the main checkout (first
-# `git worktree list` entry), otherwise the folder name plus a hash of the full path.
+# This checkout's name in the volume and container names: main-<hash of its path> for the main
+# checkout (first `git worktree list` entry; the hash keeps two clones of the repository apart),
+# otherwise the folder name plus a hash of the full path.
 $main = Get-MainCheckout $root
-$isMain = [string]::Equals($root.TrimEnd('\'), $main.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)
+$isMain = Test-SamePath $root $main
+$mainVolume = "$prefix-target-main-$(Get-PathHash $main)"
 if ($isMain) {
-    $checkout = 'main'
+    $checkout = "main-$(Get-PathHash $main)"
 } else {
     $leaf = ((Split-Path -Leaf $root).ToLowerInvariant() -replace '[^a-z0-9_.-]', '-')
     $checkout = "$leaf-$(Get-PathHash $root)"
 }
 $volume = "$prefix-target-$checkout"
 
-# Exists only while a volume is being seeded: left behind, it marks a copy that was killed halfway.
-function Get-SeedMarker([string]$Name) { Join-Path $env:LOCALAPPDATA "$prefix-dev\$Name.seeding" }
+# Seed markers live in this clone's .git: a marker exists only while a volume is being seeded, so
+# one left behind marks a copy that was killed halfway.
+$stateDir = Join-Path (Get-GitCommonDir $root) "$prefix-dev"
+function Get-SeedMarker([string]$Name) { Join-Path $stateDir "$Name.seeding" }
 
 if ($gc) {
     foreach ($name in (Invoke-Utf8 { docker volume ls -q --filter "label=$prefix.worktree" })) {
@@ -112,6 +117,9 @@ if ($gc) {
             } else { Write-Warning "$name is in use; kept." }
         }
     }
+    # Markers of volumes that were removed some other way.
+    Get-ChildItem -LiteralPath $stateDir -Filter '*.seeding' -ErrorAction SilentlyContinue |
+        Where-Object { -not (Test-Volume $_.BaseName) } | Remove-Item
 }
 if ($drop) {
     if ($isMain) { Write-Warning "$volume is the seed of every worktree volume and is kept; --drop-volume is for worktrees." }
@@ -124,8 +132,7 @@ if ($drop) {
 }
 if (-not ($update -or $cargoArgs.Count)) { exit 0 }
 
-# The image. Rebuilt only when the base image (with --update) or the toolchain changes; otherwise
-# every layer comes from the build cache.
+# The image: built when its tag is missing, rebuilt from the newest base image with --update.
 $toolchainFile = Get-Content -Raw -LiteralPath (Join-Path $root 'rust-toolchain.toml')
 if (-not ($toolchainFile -match '(?m)^channel\s*=\s*"([^"]+)"')) { throw 'rust-toolchain.toml has no channel.' }
 $toolchain = $Matches[1]
@@ -160,12 +167,15 @@ $image = "${repository}:$toolchain-$(Get-ShortHash "$dockerfile`n$components")"
 # Without provenance attestations (they carry build timestamps) a cached rebuild yields the same
 # image ID, so the tag does not move on every run.
 $build = @('build', '--provenance=false', '-t', $image, '--build-arg', "TOOLCHAIN=$toolchain", '--build-arg', "COMPONENTS=$components")
+# The tag pins the toolchain and the image definition, so an existing tag needs no build.
+docker image inspect $image *> $null
 if ($update) {
     $dockerfile | docker @build --pull - | Out-Host
-} else {
+    if ($LASTEXITCODE -ne 0) { throw "docker build failed with exit code $LASTEXITCODE." }
+} elseif ($LASTEXITCODE -ne 0) {
     $dockerfile | docker @build -q - | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "docker build failed with exit code $LASTEXITCODE." }
 }
-if ($LASTEXITCODE -ne 0) { throw "docker build failed with exit code $LASTEXITCODE." }
 if ($update) {
     # The image this rebuild replaced, then the images of other toolchains or image definitions
     # (old tags after a bump): a checkout that still uses one rebuilds it from the build cache, and
@@ -197,10 +207,13 @@ Invoke-Locked "$volume-seed" {
         if ($LASTEXITCODE -ne 0) { throw "$volume is in use by a running build; run the script again when it has finished." }
     }
     if (-not (Test-Volume $volume)) {
+        $seed = -not $isMain -and (Test-Volume $mainVolume)
+        # The marker comes before the volume: a run killed in between must not leave an empty
+        # volume that the next run takes as ready.
+        if ($seed) { New-Item -ItemType File -Force -Path $marker | Out-Null }
         Invoke-Docker volume create --label "$prefix.worktree=$root" $volume | Out-Null
-        if (-not $isMain -and (Test-Volume $mainVolume)) {
+        if ($seed) {
             Write-Host "Seeding $volume from $mainVolume..."
-            New-Item -ItemType File -Force -Path $marker | Out-Null
             # pipefail: a failed read (e.g. "file changed as we read it" while the main checkout
             # builds) fails the seed even when the extraction succeeds.
             $copy = "set -o pipefail; tar -C /from --exclude=./debug/incremental --exclude=./debug/examples " +

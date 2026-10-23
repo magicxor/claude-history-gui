@@ -21,17 +21,18 @@
 .EXAMPLE
   pwsh -NoProfile -File tools/dev/seed-target.ps1
 #>
+#Requires -Version 7.3
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'common.ps1')
 
-$root = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
+$root = Get-CheckoutRoot
 $main = Get-MainCheckout $root
 
 if ($env:CARGO_TARGET_DIR) {
     Write-Host "CARGO_TARGET_DIR is set ($env:CARGO_TARGET_DIR); this worktree does not use target\. Nothing to do."
     exit 0
 }
-if ([string]::Equals($root.TrimEnd('\'), $main.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) {
+if (Test-SamePath $root $main) {
     Write-Host "'$root' is the main checkout. Nothing to do."
     exit 0
 }

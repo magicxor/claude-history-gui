@@ -45,11 +45,13 @@ leave nothing behind.
   and volume you created that is certainly no longer needed. Remove only your own: never run
   `docker system prune`, `docker image prune -a` or `docker volume prune`, which also delete the
   user's objects and the permanent volumes below.
-* **Permanent, never delete:** the volumes `claude-history-gui-target-main` (the seed of every
-  worktree's Linux build), `claude-history-gui-cargo-home`, `claude-history-gui-ort-cache`, the
-  image `claude-history-gui-linux-dev` (one tag per toolchain; `--update` removes unused old tags),
-  and the main checkout's `target/` (the seed of every worktree's Windows build). Losing them costs a cold build and the downloads again. A worktree's own volume `claude-history-gui-target-<folder>-<hash>` goes only
-  through `tools/dev/linux-test.ps1 --drop-volume` or `--gc` (see [Linux](#linux-docker)).
+* **Permanent, never delete:** the volumes `claude-history-gui-target-main-<hash>` (one per clone of
+  the repository, the seed of its worktrees' Linux builds), `claude-history-gui-cargo-home`,
+  `claude-history-gui-ort-cache`, the image `claude-history-gui-linux-dev` (one tag per toolchain;
+  `--update` removes unused old tags), and the main checkout's `target/` (the seed of every
+  worktree's Windows build). Losing them costs a cold build and the downloads again. A worktree's
+  own volume `claude-history-gui-target-<folder>-<hash>` goes only through
+  `tools/dev/linux-test.ps1 --drop-volume` or `--gc` (see [Linux](#linux-docker)).
 
 ## Worktrees and orchestration
 
