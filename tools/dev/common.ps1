@@ -3,6 +3,12 @@
 # turns docker's stderr into terminating errors under ErrorActionPreference Stop, and before 7.3
 # double quotes inside native arguments (docker --format templates) are dropped.
 
+# Native-command behavior the scripts rely on, whatever the calling session set: a non-zero exit
+# code is checked by the scripts themselves (robocopy's success codes are 1-7), and arguments are
+# passed as on a default Windows pwsh.
+$PSNativeCommandUseErrorActionPreference = $false
+$PSNativeCommandArgumentPassing = 'Windows'
+
 # git and docker print UTF-8. Decode their output as such: with the console code page a non-ASCII
 # path comes back garbled (the main checkout is not recognized, --gc takes a live worktree for a
 # deleted one).
@@ -16,11 +22,20 @@ function Invoke-Utf8([scriptblock]$Command) {
     }
 }
 
+# The Win32 error code of an exception from a .NET call (32 sharing violation, 33 lock violation).
+function Get-Win32Code([System.Exception]$Exception) {
+    while ($Exception -is [System.Management.Automation.MethodInvocationException] -and $Exception.InnerException) {
+        $Exception = $Exception.InnerException
+    }
+    $Exception.HResult -band 0xFFFF
+}
+
 # Runs $Body while holding an exclusive lock on the file $Path, so that concurrent runs for the same
 # checkout wait for each other. A file, not a named mutex: an elevated and a normal process can both
-# open it, and Windows releases the lock when its process dies. The wait is a loop of short sleeps,
-# so Ctrl+C stops a waiting run. The lock cannot tell that a holder was killed halfway: callers mark
-# half-done work themselves (Invoke-Seed).
+# open it, and Windows releases the lock when its process dies. Only "in use" means busy; any other
+# error stops the run. The wait is a loop of short sleeps, so Ctrl+C stops a waiting run. The lock
+# cannot tell that a holder was killed halfway: callers mark half-done work themselves
+# (Invoke-Seed).
 function Invoke-Locked([string]$Path, [scriptblock]$Body) {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
     $lock = $null
@@ -28,7 +43,8 @@ function Invoke-Locked([string]$Path, [scriptblock]$Body) {
     while (-not $lock) {
         try {
             $lock = [System.IO.File]::Open($Path, 'OpenOrCreate', 'ReadWrite', 'None')
-        } catch [System.IO.IOException] {
+        } catch {
+            if ((Get-Win32Code $_.Exception) -ne 32) { throw }
             if (-not $announced) {
                 Write-Host "Waiting for another run to finish preparing ($(Split-Path -Leaf $Path))..."
                 $announced = $true
@@ -39,23 +55,64 @@ function Invoke-Locked([string]$Path, [scriptblock]$Body) {
     try { & $Body } finally { $lock.Dispose() }
 }
 
+# Runs $Body while holding cargo's own locks (.cargo-build-lock and .cargo-artifact-lock, cargo 1.99)
+# of each target profile directory in $Dirs, so that no cargo build writes there meanwhile: cargo
+# waits with "Blocking waiting for file lock on build directory". Byte-range locks like cargo's own.
+# The locks are taken without waiting and all dropped again when one is busy, so this never holds
+# one lock while waiting for another that a cargo process holds.
+function Invoke-CargoLocked([string[]]$Dirs, [scriptblock]$Body) {
+    $paths = foreach ($dir in $Dirs) { foreach ($name in '.cargo-build-lock', '.cargo-artifact-lock') { Join-Path $dir $name } }
+    $held = [System.Collections.Generic.List[System.IO.FileStream]]::new()
+    $release = {
+        foreach ($stream in $held) { $stream.Unlock(0, [long]::MaxValue); $stream.Dispose() }
+        $held.Clear()
+    }
+    $announced = $false
+    try {
+        while ($true) {
+            $busy = $false
+            foreach ($path in $paths) {
+                New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
+                $stream = [System.IO.File]::Open($path, 'OpenOrCreate', 'ReadWrite', 'ReadWrite, Delete')
+                try {
+                    $stream.Lock(0, [long]::MaxValue)
+                    $held.Add($stream)
+                } catch {
+                    $stream.Dispose()
+                    if ((Get-Win32Code $_.Exception) -ne 33) { throw }
+                    $busy = $true
+                    break
+                }
+            }
+            if (-not $busy) { break }
+            & $release
+            if (-not $announced) {
+                Write-Host "Waiting for cargo to finish building in $($Dirs -join ' and ')..."
+                $announced = $true
+            }
+            Start-Sleep -Milliseconds 500
+        }
+        & $Body
+    } finally {
+        & $release
+    }
+}
+
 # Prepares a build cache that starts as a copy (a worktree's target\ or a Docker volume), safe
 # against concurrent runs and against a run killed halfway. Under the lock $LockPath:
-#   * a marker left at $Marker means the last copy was killed halfway: the half-filled cache is
-#     removed (& $Remove) and the marker with it;
-#   * if the cache is missing (& $Exists), the marker is written first (a run killed right after
-#     creating the cache must not leave one that looks ready), & $Create creates and fills it, and
-#     the marker is removed; if $Create fails, the half-filled cache and the marker go too.
+#   * a marker left at $Marker means the last copy was killed halfway: & $Remove clears what it
+#     left (the half-filled cache, or whatever the caller needs to undo), and the marker goes;
+#   * if the cache is not there yet (& $Exists), the marker is written first (a run killed right
+#     after creating the cache must not leave one that looks ready), & $Create creates and fills
+#     it, and the marker is removed; if $Create fails, & $Remove runs and the marker goes too.
 # Returns $true when it created the cache, $false when the cache was there already.
 function Invoke-Seed {
     param([string]$Name, [string]$LockPath, [string]$Marker,
         [scriptblock]$Exists, [scriptblock]$Remove, [scriptblock]$Create)
     Invoke-Locked $LockPath {
         if (Test-Path -LiteralPath $Marker) {
-            if (& $Exists) {
-                Write-Host "The last seeding of $Name was interrupted; seeding it again."
-                & $Remove | Out-Host
-            }
+            Write-Host "The last seeding of $Name was interrupted; seeding it again."
+            & $Remove | Out-Host
             Remove-Item -LiteralPath $Marker -ErrorAction SilentlyContinue
         }
         if (& $Exists) { return $false }
@@ -64,9 +121,9 @@ function Invoke-Seed {
             & $Create | Out-Host
         } catch {
             $failure = $_
-            # When the cache cannot be removed, the marker stays and the next run tries again.
+            # When the cleanup fails too, the marker stays and the next run tries again.
             try {
-                if (& $Exists) { & $Remove | Out-Host }
+                & $Remove | Out-Host
                 Remove-Item -LiteralPath $Marker -ErrorAction SilentlyContinue
             } catch { }
             throw $failure
@@ -121,10 +178,15 @@ function Get-StateDir([string]$Root) {
     Join-Path ([System.IO.Path]::GetFullPath($dir)) 'claude-history-gui-dev'
 }
 
-# File-name patterns of the workspace's own build output (its packages and their targets, with '-'
-# and '_'), which a seed leaves out: cargo rebuilds them anyway. Build scripts are not included:
-# every dependency's compiled build script is named build_script_build too.
-function Get-WorkspaceOutputPatterns([string]$Root) {
+# The names of this repository's own build output, with '-' and '_': the workspace members and
+# their targets (`cargo metadata --no-deps`), and every other path package (a Cargo.lock entry
+# without a source: an in-tree crate pulled in by [patch] or a path dependency). A seed must leave
+# them out, and not only to save space: a copied artifact of a path package keeps its name, and
+# cargo would reuse it as fresh although this checkout's sources differ. Build scripts are not
+# included (every dependency's compiled build script is named build_script_build too), nor a name
+# that equals one of cargo's own directories. (Full metadata would need the manifests of every
+# platform's dependencies, which are not downloaded.)
+function Get-WorkspaceOutputNames([string]$Root) {
     $json = Invoke-Utf8 { cargo metadata --manifest-path (Join-Path $Root 'Cargo.toml') --format-version 1 --no-deps --offline 2>$null }
     if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed in '$Root'." }
     $names = foreach ($package in (($json -join "`n") | ConvertFrom-Json).packages) {
@@ -133,6 +195,10 @@ function Get-WorkspaceOutputPatterns([string]$Root) {
             if ($target.kind -notcontains 'custom-build') { $target.name }
         }
     }
-    $names = $names | ForEach-Object { $_; $_ -replace '-', '_' } | Sort-Object -Unique
-    foreach ($n in $names) { $n; "$n-*"; "$n.*"; "lib$n-*"; "lib$n.*" }
+    $lock = Get-Content -Raw -LiteralPath (Join-Path $Root 'Cargo.lock')
+    $names = @($names) + @(foreach ($entry in ($lock -split '\[\[package\]\]')) {
+            if ($entry -notmatch '(?m)^source = ' -and $entry -match '(?m)^name = "([^"]+)"') { $Matches[1] }
+        })
+    $names | ForEach-Object { $_; $_ -replace '-', '_' } | Sort-Object -Unique |
+        Where-Object { $_ -notin 'build', 'deps', '.fingerprint', 'incremental', 'examples', 'native', 'tmp' }
 }
