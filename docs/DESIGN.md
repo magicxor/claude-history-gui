@@ -377,6 +377,7 @@ claude-history-gui/ (Cargo workspace, resolver 3, edition 2024)
   .github/workflows/{ci.yml, qa.yml, release.yml}
   packaging/{macos,linux,windows}/...
   tools/{qa,ci}/*
+  tools/dev/*          (agent worktrees: seed-target.ps1, linux-test.ps1 for Linux builds in Docker; AGENTS.md)
 ```
 
 The GUI crate is a **library plus a thin binary** **[FLAG: refined from bin-only]**: public items of the library are
@@ -1071,7 +1072,7 @@ Cargo.toml (root), Cargo.lock, .cargo/config.toml, rust-toolchain.toml   WP0 →
 crates/core/**                                core workflow → WP-C → WP-C2 (CCR batches, §4.4)
 crates/gui/
   Cargo.toml                      WP0 → integrator   (complete dependency list in WP0, §16.1)
-  build.rs                        WP0 → WP7          (WP0: DirectML delay-load; WP7: icon resource)
+  build.rs                        WP0 → WP7          (WP0: DirectML delay-load; WP7: icon resource; later: /STACK, §14.4)
   assets/                         WP7                icons (app.ico, app.icns, app.png 512), windows/app.rc
   src/
     main.rs                       WP0 → WP7   windows_subsystem attr; parse args; headless print paths; calls lib::run
@@ -2722,7 +2723,7 @@ line).
   `.cargo/config.toml`, which cargo also merges into worktrees nested in the main checkout (doubled array values,
   or a failed merge of an array with a string). `.cargo/config.toml` keeps `[env] RUST_MIN_STACK = "8388608"`
   (libtest threads).
-* `build.rs` (bins only, target_env msvc): `cargo:rustc-link-arg-bins=/DELAYLOAD:DirectML.dll`,
+* `crates/gui/build.rs`, besides `/STACK` above (bins only, target_env msvc): `cargo:rustc-link-arg-bins=/DELAYLOAD:DirectML.dll`,
   `cargo:rustc-link-arg-bins=delayimp.lib` (verified spike-platform); embed `assets/windows/app.rc` (`1 ICON
   "app.ico"` + VERSIONINFO) with `embed-resource = "3"`, `manifest_optional()`, **no manifest** (GPUI embeds one).
 * The static ONNX Runtime (`ort-download-binaries`) is downloaded by `ort-sys` at build time (CI caches
@@ -3178,7 +3179,8 @@ avoid it (e.g. `PlatformServices::spawn_terminal` returns `Result<Option<i32>, S
 Files and content:
 1. Root `Cargo.toml` (members + workspace deps + profiles, §16.1; `toml_edit` is added by WP-C to the core manifest
    only), `rust-toolchain.toml`, `.cargo/config.toml` `[env]`, `crates/gui/Cargo.toml` (§16.1), `crates/gui/build.rs`
-   (Windows MSVC DirectML delay-load only).
+   (Windows MSVC DirectML delay-load only, as WP0 built it; it later also sets `/STACK`, §14.4, as does
+   `crates/core/build.rs`).
 2. `src/main.rs` (minimal: parse with `core::settings::parse_launch_args`, Help/Version/errors to the console via the
    `ops/console.rs` stub, `HistoryEnv::from_process_env()` + `env_path_base` left `None` until K16 lands,
    `claude_history_gui::run`), `src/lib.rs` (module tree, `run`, `run_with_services`). Integrated state: the
