@@ -18,6 +18,16 @@ leave nothing behind.
   synthetic data only: no real conversations, project folder names or the local user name. Run the
   app only against a QA sandbox (README: [The sandbox gate](README.md#the-sandbox-gate)).
 
+## Git Bash on Windows
+
+* Git Bash rewrites arguments that look like POSIX paths when it starts a Windows program: a
+  container path such as `/target` given to `docker` arrives as `C:/Program Files/Git/target`.
+  `MSYS_NO_PATHCONV=1` turns that off, but then a `/c/...` path given to a Windows program is not
+  converted either and means `C:\c\...` (a `git worktree add /c/git/...` once created
+  `C:\c\git\...`). Set it only as the prefix of the one command that passes container paths
+  (`MSYS_NO_PATHCONV=1 docker run ...`), never `export` it, and give Windows programs `C:/...`
+  paths. `tools/dev/linux-test.ps1` runs in PowerShell, which converts nothing.
+
 ## Temporary files and Docker objects
 
 * Temporary files go only into your own scratchpad directory (the one your instructions name; without
