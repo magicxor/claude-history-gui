@@ -24,11 +24,18 @@
   once to create the seed; a seed from an older main checkout is slower, never wrong.
   CARGO_BUILD_JOBS is passed through when set.
 
+  Permanent, never deleted by this script: claude-history-gui-target-main (the seed of every
+  worktree volume) and the shared caches claude-history-gui-cargo-registry, -cargo-git and
+  -ort-cache. Losing them costs a cold build and the downloads again. The image is rebuilt
+  automatically when it is missing.
+
   Options (before the cargo arguments):
     --update        pull the newest rust:1-trixie, rebuild the image and remove the old one
                     (once at the start of a session); alone, it runs no cargo command
-    --drop-volume   delete this checkout's target volume (when the worktree is done)
-    --gc            delete the target volumes of worktrees that no longer exist
+    --drop-volume   delete this worktree's target volume (when the worktree is done); refused in
+                    the main checkout
+    --gc            delete the target volumes of worktrees that no longer exist (never the main
+                    checkout's, even if the repo folder was moved)
 
   From a PowerShell prompt, quote the separator before clippy or test-binary arguments ('--'):
   PowerShell drops a bare -- when it calls a script; pwsh -File passes it on.
@@ -90,6 +97,7 @@ $volume = "$prefix-target-$checkout"
 
 if ($gc) {
     foreach ($name in (docker volume ls -q --filter "label=$prefix.worktree")) {
+        if ($name -eq $mainVolume) { continue }
         $path = docker volume inspect --format "{{ index .Labels `"$prefix.worktree`" }}" $name
         if ($path -and -not (Test-Path -LiteralPath $path)) {
             docker volume rm $name *> $null
@@ -98,7 +106,8 @@ if ($gc) {
     }
 }
 if ($drop) {
-    if (Test-Volume $volume) { Invoke-Docker volume rm $volume | Out-Null; Write-Host "Removed $volume." }
+    if ($isMain) { Write-Warning "$volume is the seed of every worktree volume and is kept; --drop-volume is for worktrees." }
+    elseif (Test-Volume $volume) { Invoke-Docker volume rm $volume | Out-Null; Write-Host "Removed $volume." }
     else { Write-Host "$volume does not exist." }
 }
 if (-not ($update -or $cargoArgs.Count)) { exit 0 }

@@ -34,9 +34,13 @@ leave nothing behind.
 * At the end of the work, once the task is completely done, remove every temporary container, image
   and volume you created that is certainly no longer needed. Remove only your own: never run
   `docker system prune`, `docker image prune -a` or `docker volume prune`, which also delete the
-  user's. The image and volumes of `tools/dev/linux-test.ps1` (`claude-history-gui-linux-dev`,
-  `claude-history-gui-target-*`, `-cargo-*`, `-ort-cache`) are not temporary; see
-  [Linux](#linux-docker) for when they go.
+  user's objects and the permanent volumes below.
+* **Permanent, never delete:** the volumes `claude-history-gui-target-main` (the seed of every
+  worktree's Linux build), `claude-history-gui-cargo-registry`, `claude-history-gui-cargo-git`,
+  `claude-history-gui-ort-cache`, the image `claude-history-gui-linux-dev`, and the main checkout's
+  `target/` (the seed of every worktree's Windows build). Losing them costs a cold build and the
+  downloads again. A worktree's own volume `claude-history-gui-target-<folder>-<hash>` goes only
+  through `tools/dev/linux-test.ps1 --drop-volume` or `--gc` (see [Linux](#linux-docker)).
 
 ## Worktrees and orchestration
 
@@ -73,8 +77,8 @@ after an edit takes about 15 s.
   `--features release-dynamic-ort` builds the workspace crates again. Use them only when the change
   touches that code (the QA runner, core's hermetic guards, the bundled ONNX Runtime loader); CI runs
   the whole matrix.
-* Do not run `cargo clean`, and do not build with `--release` (perf QA scenarios are the only
-  exception, see below).
+* Do not run `cargo clean` (in the main checkout it would also delete every worktree's seed), and
+  do not build with `--release` (perf QA scenarios are the only exception, see below).
 * **gpui unit tests do not catch everything:** test-platform windows behave differently (the app once
   crashed on every launch with all tests green). After changes to startup, windows, menus, actions or
   focus, also run a QA scenario against the real app (README:
@@ -109,8 +113,8 @@ permissions, or the dependencies (`Cargo.toml`, `Cargo.lock`).
   `pwsh -NoProfile -File tools/dev/linux-test.ps1 clippy --workspace --all-targets --locked -- -D warnings`.
   A worktree's first Linux build starts from a copy of the main checkout's compiled dependencies.
 * **When the worktree is done:** `pwsh -NoProfile -File tools/dev/linux-test.ps1 --drop-volume`
-  deletes its target volume (`--gc` deletes the volumes of all worktrees that no longer exist). The
-  image, the main checkout's volume and the shared caches stay.
+  deletes its target volume (`--gc` deletes the volumes of all worktrees that no longer exist). Both
+  keep the permanent volumes; in the main checkout `--drop-volume` does nothing.
 
 ## gpui-kit pitfalls (verified on 0.7.3, Windows)
 
