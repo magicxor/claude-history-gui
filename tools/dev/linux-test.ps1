@@ -3,11 +3,12 @@
   Runs cargo on Linux (Docker) for this checkout, with all build state in named volumes.
 
 .DESCRIPTION
-  Builds or reuses the local image claude-history-gui-linux-dev: rust:1-trixie with the Linux
-  packages of .github/workflows/ci.yml and the toolchain of rust-toolchain.toml, running as the
-  non-root user dev (uid 1000), so the permission tests of test_support::fault run as on CI instead
-  of skipping as root. Then runs `cargo <arguments>` in a throw-away container (--rm) named
-  claude-history-gui-cargo-<checkout>-<random>:
+  Builds or reuses the local image claude-history-gui-linux-dev:<toolchain>-<hash>: rust:1-trixie
+  with the Linux packages of .github/workflows/ci.yml and the toolchain of rust-toolchain.toml,
+  running as the non-root user dev (uid 1000), so the permission tests of test_support::fault run
+  as on CI instead of skipping as root. The tag differs per toolchain and image definition, so
+  checkouts on different toolchains never run each other's image. Then runs `cargo <arguments>`
+  in a throw-away container (--rm) named claude-history-gui-cargo-<checkout>-<random>:
 
     /work                               this checkout (bind mount)
     /target (CARGO_TARGET_DIR)          volume claude-history-gui-target-main for the main checkout,
@@ -33,8 +34,9 @@
   missing.
 
   Options (before the cargo arguments):
-    --update        pull the newest rust:1-trixie, rebuild the image and remove the old one
-                    (once at the start of a session); alone, it runs no cargo command
+    --update        pull the newest rust:1-trixie, rebuild this checkout's image and remove the
+                    image it replaced and the unused images of other toolchains (once at the start
+                    of a session); alone, it runs no cargo command
     --drop-volume   delete this worktree's target volume (when the worktree is done); refused in
                     the main checkout
     --gc            delete the target volumes of worktrees that no longer exist (never the main
@@ -69,7 +71,7 @@ if (-not ($update -or $drop -or $gc -or $cargoArgs.Count)) { throw 'Nothing to d
 # Every Docker object of this script starts with this prefix, so it cannot be mistaken for the
 # user's own images, containers and volumes.
 $prefix = 'claude-history-gui'
-$image = "$prefix-linux-dev"
+$repository = "$prefix-linux-dev"
 $mainVolume = "$prefix-target-main"
 $root = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 
@@ -151,14 +153,31 @@ RUN useradd -m -u 1000 dev \
 ENV CARGO_HOME=/home/dev/.cargo
 USER dev
 '@
-$build = @('build', '-t', $image, '--build-arg', "TOOLCHAIN=$toolchain", '--build-arg', "COMPONENTS=$components")
+# One tag per toolchain and image definition: checkouts on different toolchains (a branch that
+# bumps rust-toolchain.toml) build different tags, so a run never starts another checkout's image,
+# which would lack its toolchain (and dev cannot install one into the root-owned rustup home).
+$image = "${repository}:$toolchain-$(Get-ShortHash "$dockerfile`n$components")"
+# Without provenance attestations (they carry build timestamps) a cached rebuild yields the same
+# image ID, so the tag does not move on every run.
+$build = @('build', '--provenance=false', '-t', $image, '--build-arg', "TOOLCHAIN=$toolchain", '--build-arg', "COMPONENTS=$components")
 if ($update) {
     $dockerfile | docker @build --pull - | Out-Host
 } else {
     $dockerfile | docker @build -q - | Out-Null
 }
 if ($LASTEXITCODE -ne 0) { throw "docker build failed with exit code $LASTEXITCODE." }
-if ($update) { docker image prune -f --filter "label=$prefix.dev=1" | Out-Host }
+if ($update) {
+    # The image this rebuild replaced, then the images of other toolchains or image definitions
+    # (old tags after a bump): a checkout that still uses one rebuilds it from the build cache, and
+    # docker rmi refuses an image a container uses.
+    docker image prune -f --filter "label=$prefix.dev=1" | Out-Host
+    foreach ($other in (docker image ls $repository --format '{{.Repository}}:{{.Tag}}')) {
+        if ($other -ne $image) {
+            docker rmi $other *> $null
+            if ($LASTEXITCODE -eq 0) { Write-Host "Removed $other." }
+        }
+    }
+}
 if (-not $cargoArgs.Count) { exit 0 }
 
 $runId = Get-Random -Maximum 1000000
@@ -186,7 +205,7 @@ Invoke-Locked "$volume-seed" {
             # builds) fails the seed even when the extraction succeeds.
             $copy = "set -o pipefail; tar -C /from --exclude=./debug/incremental --exclude=./debug/examples " +
                 "--exclude='*claude_history*' --exclude='*claude-history*' -cf - . | tar -C /target -xf -"
-            docker run --rm --name "$prefix-seed-$checkout-$runId" --label "$prefix.dev=1" `
+            docker run --rm --pull never --name "$prefix-seed-$checkout-$runId" --label "$prefix.dev=1" `
                 --mount "type=volume,src=$mainVolume,dst=/from,readonly" `
                 --mount "type=volume,src=$volume,dst=/target" $image bash -c $copy
             if ($LASTEXITCODE -ne 0) {
@@ -200,7 +219,10 @@ Invoke-Locked "$volume-seed" {
     }
 }
 
-$run = @('run', '--rm', '--init', '--name', "$prefix-cargo-$checkout-$runId", '--label', "$prefix.dev=1",
+# --pull never: a local image only (it is never on a registry). In the moment between the build
+# above and this start, --update from a checkout on another toolchain may remove it; the run then
+# fails with "No such image" and succeeds when repeated.
+$run = @('run', '--rm', '--init', '--pull', 'never', '--name', "$prefix-cargo-$checkout-$runId", '--label', "$prefix.dev=1",
     '-w', '/work',
     '--mount', "type=bind,src=$root,dst=/work",
     '--mount', "type=volume,src=$volume,dst=/target",

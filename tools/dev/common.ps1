@@ -32,11 +32,14 @@ function Invoke-Locked([string]$Name, [scriptblock]$Body) {
     }
 }
 
-# A short stable hash of a checkout path, for names that must differ per checkout.
-function Get-PathHash([string]$Path) {
+# A short stable hash (8 hex digits) of $Text, for names that must differ with it.
+function Get-ShortHash([string]$Text) {
     $sha = [System.Security.Cryptography.SHA256]::Create()
-    -join ($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Path.ToLowerInvariant())) | Select-Object -First 4 | ForEach-Object { $_.ToString('x2') })
+    -join ($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Text)) | Select-Object -First 4 | ForEach-Object { $_.ToString('x2') })
 }
+
+# The same for a checkout path (Windows paths are case-insensitive).
+function Get-PathHash([string]$Path) { Get-ShortHash $Path.ToLowerInvariant() }
 
 # The main checkout of the repository that contains $Root: the first entry of `git worktree list`.
 function Get-MainCheckout([string]$Root) {
