@@ -255,7 +255,9 @@ RUN useradd -m -u 1000 dev \
  && chown -R dev:dev /home/dev/.cargo /home/dev/.cache
 ENV CARGO_HOME=/home/dev/.cargo
 USER dev
-'@
+'@ -replace "`r`n", "`n"
+# (LF: a checkout with core.autocrlf=true has CRLF here-strings, which break the RUN line
+# continuations and would give the same image another tag.)
 # One tag per rust-toolchain.toml and image definition: checkouts on different toolchains (a branch
 # that bumps rust-toolchain.toml) build different tags, so a run never starts another checkout's
 # image, which would lack its toolchain (and dev cannot install one into the root-owned rustup
@@ -335,7 +337,7 @@ while :; do
     sleep 0.5
 done
 tar -C /from --format=posix "$@" -cf - ./debug | tar -C /target -xf -
-'@
+'@ -replace "`r`n", "`n"   # LF: bash fails on 'do\r' from a core.autocrlf=true checkout
         # --init with TINI_KILL_PROCESS_GROUP: Ctrl+C reaches the tars, not only bash.
         docker run --rm --init -e TINI_KILL_PROCESS_GROUP=1 --pull never --name "$prefix-seed-$checkout-$runId" `
             --label "$prefix.dev=1" --label "$prefix.owner=$owner" `

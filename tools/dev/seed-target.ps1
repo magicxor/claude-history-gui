@@ -13,7 +13,8 @@
 
   The copy runs under cargo's own build locks of both directories: a build in the main checkout
   cannot change the source halfway, and a cargo in this worktree (rust-analyzer started by an
-  editor or a language-server tool, for one) waits for the copy. A target\ that such a cargo has
+  editor or a language-server tool, for one) waits for the copy. robocopy is tied to the pwsh that
+  holds the locks (a job object), so it stops when that pwsh is killed. A target\ that such a cargo has
   already created is filled in as well; target\.seeded marks a finished seed. A second run waits
   for the first one's copy (lock file in .git\claude-history-gui-dev), and a copy that was killed
   halfway is redone (target\.seeding exists only while it runs).
@@ -84,10 +85,10 @@ $seeded = Invoke-Seed -Name "'$dest'" `
             '/XD', (Join-Path $source 'incremental'), (Join-Path $source 'examples')) + $excludeDirs +
             @('/XF', '.cargo-*lock', '*.pdb', 'build-script-*.exe') + $excludeFiles
         Invoke-CargoLocked @($source, $dest) {
-            # A process of its own, so that its id and start time can go into the marker.
-            $start = [System.Diagnostics.ProcessStartInfo]::new('robocopy.exe')
-            foreach ($argument in $arguments) { $start.ArgumentList.Add($argument) }
-            $copier = [System.Diagnostics.Process]::Start($start)
+            # Tied to this pwsh, which holds cargo's locks: if it is killed, robocopy stops with it
+            # instead of copying on without the locks. Its id and start time go into the marker
+            # for the redo, should it survive anyway.
+            $copier = Start-TiedProcess 'robocopy.exe' $arguments
             Set-Content -LiteralPath $seedMarker -Value "$($copier.Id):$($copier.StartTime.ToFileTimeUtc())"
             $copier.WaitForExit()
             if ($copier.ExitCode -ge 8) { throw "robocopy failed with exit code $($copier.ExitCode); run the script again." }

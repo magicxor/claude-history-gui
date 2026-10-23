@@ -102,6 +102,67 @@ function Invoke-CargoLocked([string[]]$Dirs, [scriptblock]$Body) {
     }
 }
 
+# Starts $File with $Arguments as a process tied to this pwsh: it runs in a Windows job object that
+# kills its processes when the job's last handle closes, and only this pwsh holds that handle. So
+# when this pwsh exits or is killed, the process stops with it, at the moment the locks this pwsh
+# holds are released (a robocopy of a seed must not keep copying once cargo's locks are gone).
+function Start-TiedProcess([string]$File, [string[]]$Arguments) {
+    if (-not ('ClaudeHistoryGuiDev.KillOnCloseJob' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+namespace ClaudeHistoryGuiDev {
+    public static class KillOnCloseJob {
+        [StructLayout(LayoutKind.Sequential)]
+        struct BasicLimit {
+            public long PerProcessUserTimeLimit, PerJobUserTimeLimit;
+            public uint LimitFlags;
+            public UIntPtr MinimumWorkingSetSize, MaximumWorkingSetSize;
+            public uint ActiveProcessLimit;
+            public UIntPtr Affinity;
+            public uint PriorityClass, SchedulingClass;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        struct IoCounters { public ulong Reads, Writes, Others, ReadBytes, WriteBytes, OtherBytes; }
+        [StructLayout(LayoutKind.Sequential)]
+        struct ExtendedLimit {
+            public BasicLimit Basic;
+            public IoCounters Io;
+            public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
+        }
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref ExtendedLimit info, int length);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+
+        // The handle is never closed: it goes when this process ends, and the job kills its processes.
+        public static void Tie(IntPtr process) {
+            IntPtr job = CreateJobObject(IntPtr.Zero, null);
+            if (job == IntPtr.Zero) throw new Win32Exception();
+            var info = new ExtendedLimit();
+            info.Basic.LimitFlags = 0x2000; // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if (!SetInformationJobObject(job, 9, ref info, Marshal.SizeOf(typeof(ExtendedLimit)))) throw new Win32Exception();
+            if (!AssignProcessToJobObject(job, process)) throw new Win32Exception();
+        }
+    }
+}
+'@
+    }
+    $start = [System.Diagnostics.ProcessStartInfo]::new($File)
+    foreach ($argument in $Arguments) { $start.ArgumentList.Add($argument) }
+    $process = [System.Diagnostics.Process]::Start($start)
+    try {
+        [ClaudeHistoryGuiDev.KillOnCloseJob]::Tie($process.Handle)
+    } catch {
+        $process.Kill()
+        throw "Could not tie $File to this pwsh (job object): $($_.Exception.Message)"
+    }
+    $process
+}
+
 # Prepares a build cache that starts as a copy (a worktree's target\ or a Docker volume), safe
 # against concurrent runs and against a run killed halfway. Under the lock $LockPath:
 #   * a marker left at $Marker means the last copy was killed halfway: & $Remove clears what it
