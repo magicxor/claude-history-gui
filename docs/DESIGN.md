@@ -2991,6 +2991,10 @@ ctor = "1.0"                      # dev only; 1.0.x is already in gpui-kit's tre
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading", "Win32_Security", "Win32_Storage_FileSystem", "Win32_UI_Shell", "Win32_System_Com"] }
 libc = "0.2"
 embed-resource = "3"
+[profile.dev]
+debug = "line-tables-only"        # file:line in panics and backtraces; the release profile is unaffected
+[profile.dev.package."*"]
+debug = false                     # no debug info for dependencies
 [profile.dev.package]
 gpui-pre = { opt-level = 3 }
 gpui-pre-platform = { opt-level = 3 }

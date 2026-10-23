@@ -342,7 +342,8 @@ Workspace layout (`Cargo.toml` members):
   scenario runner behind the `qa` feature.
 * `docs/`: [`DESIGN.md`](docs/DESIGN.md) (authoritative spec) and [`FEATURES.md`](docs/FEATURES.md) (parity
   rows), see [`docs/README.md`](docs/README.md). `packaging/` holds the per-OS release assets, `tools/` the CI
-  scripts and QA helpers.
+  scripts, QA helpers and development helpers (`tools/dev`: seeding a worktree's build, Linux builds in
+  Docker; see [`AGENTS.md`](AGENTS.md)).
 
 ```sh
 cargo fmt --all --check
