@@ -36,8 +36,13 @@
 
   Options (before the cargo arguments):
     --update        pull the newest rust:1-trixie, rebuild this checkout's image and remove the
-                    image it replaced and the unused images of other toolchains (once at the start
-                    of a session); alone, it runs no cargo command
+                    image it replaced (once at the start of a session); alone, it runs no cargo
+                    command
+    --prune-images  remove the images of other toolchains or image definitions (old tags after a
+                    bump) that no container uses. Only while no other checkout is starting a Linux
+                    build: a run that has checked its tag but not yet started its container would
+                    fail with "No such image". A checkout that still needs a removed tag rebuilds
+                    it from the build cache.
     --drop-volume   delete this worktree's target volume (when the worktree is done); refused in
                     the main checkout
     --gc            delete the target volumes of worktrees and clones that no longer exist at
@@ -57,18 +62,21 @@
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'common.ps1')
 
-$update = $false; $drop = $false; $gc = $false
+$update = $false; $pruneImages = $false; $drop = $false; $gc = $false
 $rest = @($args)
-while ($rest.Count -gt 0 -and $rest[0] -in '--update', '--drop-volume', '--gc') {
+while ($rest.Count -gt 0 -and $rest[0] -in '--update', '--prune-images', '--drop-volume', '--gc') {
     switch ($rest[0]) {
         '--update' { $update = $true }
+        '--prune-images' { $pruneImages = $true }
         '--drop-volume' { $drop = $true }
         '--gc' { $gc = $true }
     }
     $rest = @($rest | Select-Object -Skip 1)
 }
 $cargoArgs = $rest
-if (-not ($update -or $drop -or $gc -or $cargoArgs.Count)) { throw 'Nothing to do: pass cargo arguments or --update / --drop-volume / --gc (see Get-Help).' }
+if (-not ($update -or $pruneImages -or $drop -or $gc -or $cargoArgs.Count)) {
+    throw 'Nothing to do: pass cargo arguments or --update / --prune-images / --drop-volume / --gc (see Get-Help).'
+}
 
 # Every Docker object of this script starts with this prefix, so it cannot be mistaken for the
 # user's own images, containers and volumes.
@@ -130,7 +138,7 @@ if ($drop) {
     }
     else { Write-Host "$volume does not exist." }
 }
-if (-not ($update -or $cargoArgs.Count)) { exit 0 }
+if (-not ($update -or $pruneImages -or $cargoArgs.Count)) { exit 0 }
 
 # The image: built when its tag is missing, rebuilt from the newest base image with --update.
 $toolchainFile = Get-Content -Raw -LiteralPath (Join-Path $root 'rust-toolchain.toml')
@@ -167,24 +175,27 @@ $image = "${repository}:$toolchain-$(Get-ShortHash "$dockerfile`n$components")"
 # Without provenance attestations (they carry build timestamps) a cached rebuild yields the same
 # image ID, so the tag does not move on every run.
 $build = @('build', '--provenance=false', '-t', $image, '--build-arg', "TOOLCHAIN=$toolchain", '--build-arg', "COMPONENTS=$components")
-# The tag pins the toolchain and the image definition, so an existing tag needs no build.
-docker image inspect $image *> $null
-if ($update) {
-    $dockerfile | docker @build --pull - | Out-Host
-    if ($LASTEXITCODE -ne 0) { throw "docker build failed with exit code $LASTEXITCODE." }
-} elseif ($LASTEXITCODE -ne 0) {
-    $dockerfile | docker @build -q - | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "docker build failed with exit code $LASTEXITCODE." }
+if ($update -or $cargoArgs.Count) {
+    # The tag pins the toolchain and the image definition, so an existing tag needs no build.
+    docker image inspect $image *> $null
+    if ($update) {
+        $dockerfile | docker @build --pull - | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw "docker build failed with exit code $LASTEXITCODE." }
+        # The image this rebuild replaced, now without a tag. Safe while other runs go on: they
+        # start their containers by tag, which already names the new image.
+        docker image prune -f --filter "label=$prefix.dev=1" | Out-Host
+    } elseif ($LASTEXITCODE -ne 0) {
+        $dockerfile | docker @build -q - | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "docker build failed with exit code $LASTEXITCODE." }
+    }
 }
-if ($update) {
-    # The image this rebuild replaced, then the images of other toolchains or image definitions
-    # (old tags after a bump): a checkout that still uses one rebuilds it from the build cache, and
-    # docker rmi refuses an image a container uses.
-    docker image prune -f --filter "label=$prefix.dev=1" | Out-Host
+if ($pruneImages) {
+    # Tags of other configurations. Not part of --update: another checkout's run may have checked
+    # its tag and not yet started its container (docker only protects images that containers use).
     foreach ($other in (docker image ls $repository --format '{{.Repository}}:{{.Tag}}')) {
         if ($other -ne $image) {
             docker rmi $other *> $null
-            if ($LASTEXITCODE -eq 0) { Write-Host "Removed $other." }
+            if ($LASTEXITCODE -eq 0) { Write-Host "Removed $other." } else { Write-Host "Kept $other (a container uses it)." }
         }
     }
 }
@@ -232,9 +243,8 @@ Invoke-Locked "$volume-seed" {
     }
 }
 
-# --pull never: a local image only (it is never on a registry). In the moment between the build
-# above and this start, --update from a checkout on another toolchain may remove it; the run then
-# fails with "No such image" and succeeds when repeated.
+# --pull never: a local image only (it is never on a registry); if --prune-images removed it after
+# the check above, the run fails with "No such image" instead of trying a registry.
 $run = @('run', '--rm', '--init', '--pull', 'never', '--name', "$prefix-cargo-$checkout-$runId", '--label', "$prefix.dev=1",
     '-w', '/work',
     '--mount', "type=bind,src=$root,dst=/work",

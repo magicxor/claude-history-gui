@@ -56,10 +56,12 @@ function Test-SamePath([string]$A, [string]$B) {
 # The checkout these scripts belong to (tools/dev/../..).
 function Get-CheckoutRoot { [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..')) }
 
-# The main checkout of the repository that contains $Root: the first entry of `git worktree list`.
+# The main checkout of the repository that contains $Root: the first entry of `git worktree list`
+# (-z: NUL-terminated fields, whose paths git never quotes or escapes).
 function Get-MainCheckout([string]$Root) {
-    $worktrees = @(Invoke-Utf8 { git -C $Root worktree list --porcelain })
-    if ($LASTEXITCODE -ne 0 -or -not ($worktrees[0] -match '^worktree (.+)$')) { throw "git worktree list failed in '$Root'." }
+    $output = Invoke-Utf8 { git -C $Root worktree list --porcelain -z }
+    $first = (@($output) -join "`n") -split "`0" | Select-Object -First 1
+    if ($LASTEXITCODE -ne 0 -or -not ($first -match '^worktree (.+)$')) { throw "git worktree list failed in '$Root'." }
     [System.IO.Path]::GetFullPath($Matches[1])
 }
 
