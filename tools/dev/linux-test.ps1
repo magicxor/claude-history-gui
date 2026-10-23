@@ -12,8 +12,9 @@
     /work                               this checkout (bind mount)
     /target (CARGO_TARGET_DIR)          volume claude-history-gui-target-main for the main checkout,
                                         claude-history-gui-target-<folder>-<hash> for a worktree
-    cargo registry and git, the ONNX    shared volumes claude-history-gui-cargo-registry,
-    Runtime download (ort-sys)          claude-history-gui-cargo-git, claude-history-gui-ort-cache
+    CARGO_HOME (registry, git, and      shared volume claude-history-gui-cargo-home: one volume, so
+    the locks that guard them)          concurrent containers share cargo's cache locks
+    the ONNX Runtime download (ort-sys) shared volume claude-history-gui-ort-cache
 
   Everything this script creates is named claude-history-gui-* and labelled claude-history-gui.dev
   (image, containers) or claude-history-gui.worktree=<checkout path> (target volumes). Nothing
@@ -25,9 +26,9 @@
   CARGO_BUILD_JOBS is passed through when set.
 
   Permanent, never deleted by this script: claude-history-gui-target-main (the seed of every
-  worktree volume) and the shared caches claude-history-gui-cargo-registry, -cargo-git and
-  -ort-cache. Losing them costs a cold build and the downloads again. The image is rebuilt
-  automatically when it is missing.
+  worktree volume) and the shared caches claude-history-gui-cargo-home and -ort-cache. Losing
+  them costs a cold build and the downloads again. The image is rebuilt automatically when it is
+  missing.
 
   Options (before the cargo arguments):
     --update        pull the newest rust:1-trixie, rebuild the image and remove the old one
@@ -48,6 +49,7 @@
   pwsh -NoProfile -File tools/dev/linux-test.ps1 --update
 #>
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'common.ps1')
 
 $update = $false; $drop = $false; $gc = $false
 $rest = @($args)
@@ -81,9 +83,7 @@ function Test-Volume([string]$Name) {
 
 # This checkout's name in the volume and container names: main for the main checkout (first
 # `git worktree list` entry), otherwise the folder name plus a hash of the full path.
-$worktrees = @(git -C $root worktree list --porcelain)
-if ($LASTEXITCODE -ne 0 -or -not ($worktrees[0] -match '^worktree (.+)$')) { throw "git worktree list failed in '$root'." }
-$main = [System.IO.Path]::GetFullPath($Matches[1])
+$main = Get-MainCheckout $root
 $isMain = [string]::Equals($root.TrimEnd('\'), $main.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)
 if ($isMain) {
     $checkout = 'main'
@@ -96,9 +96,9 @@ if ($isMain) {
 $volume = "$prefix-target-$checkout"
 
 if ($gc) {
-    foreach ($name in (docker volume ls -q --filter "label=$prefix.worktree")) {
+    foreach ($name in (Invoke-Utf8 { docker volume ls -q --filter "label=$prefix.worktree" })) {
         if ($name -eq $mainVolume) { continue }
-        $path = docker volume inspect --format "{{ index .Labels `"$prefix.worktree`" }}" $name
+        $path = Invoke-Utf8 { docker volume inspect --format "{{ index .Labels `"$prefix.worktree`" }}" $name }
         if ($path -and -not (Test-Path -LiteralPath $path)) {
             docker volume rm $name *> $null
             if ($LASTEXITCODE -eq 0) { Write-Host "Removed $name ($path no longer exists)." } else { Write-Warning "$name is in use; kept." }
@@ -132,11 +132,13 @@ ARG TOOLCHAIN
 ARG COMPONENTS
 RUN rustup toolchain install "$TOOLCHAIN" --profile minimal ${COMPONENTS:+--component "$COMPONENTS"} \
  && rustup default "$TOOLCHAIN"
-# Mount points owned by dev: a new named volume takes over the owner of its mount point.
+# Mount points owned by dev: a new named volume takes over the owner of its mount point. CARGO_HOME
+# moves out of /usr/local/cargo (whose bin/ keeps the rustup proxies on PATH) into its own volume.
 RUN useradd -m -u 1000 dev \
- && mkdir -p /target /usr/local/cargo/registry /usr/local/cargo/git /home/dev/.cache/ort.pyke.io \
- && chown dev:dev /target /usr/local/cargo /usr/local/cargo/registry /usr/local/cargo/git \
- && chown -R dev:dev /home/dev/.cache
+ && mkdir -p /target /home/dev/.cargo /home/dev/.cache/ort.pyke.io \
+ && chown dev:dev /target \
+ && chown -R dev:dev /home/dev/.cargo /home/dev/.cache
+ENV CARGO_HOME=/home/dev/.cargo
 USER dev
 '@
 $build = @('build', '-t', $image, '--build-arg', "TOOLCHAIN=$toolchain", '--build-arg', "COMPONENTS=$components")
@@ -157,11 +159,19 @@ if (-not (Test-Volume $volume)) {
     Invoke-Docker volume create --label "$prefix.worktree=$root" $volume | Out-Null
     if (-not $isMain -and (Test-Volume $mainVolume)) {
         Write-Host "Seeding $volume from $mainVolume..."
-        $copy = "tar -C /from --exclude=./debug/incremental --exclude=./debug/examples " +
+        # pipefail: a failed read (e.g. "file changed as we read it" while the main checkout builds)
+        # fails the seed even when the extraction succeeds.
+        $copy = "set -o pipefail; tar -C /from --exclude=./debug/incremental --exclude=./debug/examples " +
             "--exclude='*claude_history*' --exclude='*claude-history*' -cf - . | tar -C /target -xf -"
-        Invoke-Docker run --rm --name "$prefix-seed-$checkout-$runId" --label "$prefix.dev=1" `
+        docker run --rm --name "$prefix-seed-$checkout-$runId" --label "$prefix.dev=1" `
             --mount "type=volume,src=$mainVolume,dst=/from,readonly" `
-            --mount "type=volume,src=$volume,dst=/target" $image sh -c $copy
+            --mount "type=volume,src=$volume,dst=/target" $image bash -c $copy
+        if ($LASTEXITCODE -ne 0) {
+            # A partial seed would never be redone (the volume exists): remove it.
+            $code = $LASTEXITCODE
+            docker volume rm $volume *> $null
+            throw "Seeding $volume failed with exit code $code; the volume was removed, run the script again."
+        }
     }
 }
 
@@ -169,8 +179,7 @@ $run = @('run', '--rm', '--init', '--name', "$prefix-cargo-$checkout-$runId", '-
     '-w', '/work',
     '--mount', "type=bind,src=$root,dst=/work",
     '--mount', "type=volume,src=$volume,dst=/target",
-    '--mount', "type=volume,src=$prefix-cargo-registry,dst=/usr/local/cargo/registry",
-    '--mount', "type=volume,src=$prefix-cargo-git,dst=/usr/local/cargo/git",
+    '--mount', "type=volume,src=$prefix-cargo-home,dst=/home/dev/.cargo",
     '--mount', "type=volume,src=$prefix-ort-cache,dst=/home/dev/.cache/ort.pyke.io",
     '-e', 'CARGO_TARGET_DIR=/target', '-e', 'RUST_BACKTRACE=1')
 if ($env:CARGO_BUILD_JOBS) { $run += @('-e', "CARGO_BUILD_JOBS=$env:CARGO_BUILD_JOBS") }

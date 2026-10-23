@@ -20,11 +20,10 @@
   pwsh -NoProfile -File tools/dev/seed-target.ps1
 #>
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'common.ps1')
 
 $root = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
-$worktrees = @(git -C $root worktree list --porcelain)
-if ($LASTEXITCODE -ne 0 -or -not ($worktrees[0] -match '^worktree (.+)$')) { throw "git worktree list failed in '$root'." }
-$main = [System.IO.Path]::GetFullPath($Matches[1])
+$main = Get-MainCheckout $root
 
 if ($env:CARGO_TARGET_DIR) {
     Write-Host "CARGO_TARGET_DIR is set ($env:CARGO_TARGET_DIR); this worktree does not use target\. Nothing to do."
@@ -53,6 +52,11 @@ $watch = [System.Diagnostics.Stopwatch]::StartNew()
 robocopy $source $dest /E /COPY:DAT /DCOPY:DAT /MT:16 /R:1 /W:1 /NFL /NDL /NJH /NP `
     /XD (Join-Path $source 'incremental') (Join-Path $source 'examples') 'claude-history-*' `
     /XF '*claude_history*' '*claude-history*' '.cargo-lock'
-if ($LASTEXITCODE -ge 8) { throw "robocopy failed with exit code $LASTEXITCODE." }
+if ($LASTEXITCODE -ge 8) {
+    # A partial seed would make every later run skip seeding ("already exists"): remove it.
+    $code = $LASTEXITCODE
+    Remove-Item -LiteralPath $targetDir -Recurse -Force
+    throw "robocopy failed with exit code $code; '$targetDir' was removed, run the script again."
+}
 Write-Host ("Seeded '{0}' from '{1}' in {2:N0} s. The next build compiles only the workspace crates." -f $dest, $source, $watch.Elapsed.TotalSeconds)
 exit 0
