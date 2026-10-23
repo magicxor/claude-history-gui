@@ -26,7 +26,8 @@ leave nothing behind.
   converted either and means `C:\c\...` (a `git worktree add /c/git/...` once created
   `C:\c\git\...`). Set it only as the prefix of the one command that passes container paths
   (`MSYS_NO_PATHCONV=1 docker run ...`), never `export` it, and give Windows programs `C:/...`
-  paths. `tools/dev/linux-test.ps1` runs in PowerShell, which converts nothing.
+  paths. `pwsh` is a Windows program too: a container path among the arguments of
+  `pwsh -File tools/dev/linux-test.ps1` (`--manifest-path /work/...`) needs the same prefix.
 
 ## Temporary files and Docker objects
 
@@ -47,9 +48,9 @@ leave nothing behind.
   user's objects and the permanent volumes below.
 * **Permanent, never delete:** the volumes `claude-history-gui-target-main-<hash>` (one per clone of
   the repository, the seed of its worktrees' Linux builds), `claude-history-gui-cargo-home`,
-  `claude-history-gui-ort-cache`, the image `claude-history-gui-linux-dev` (one tag per toolchain;
-  old tags after a toolchain bump go with `tools/dev/linux-test.ps1 --prune-images`, only while no
-  other agent is starting a Linux build), and the main checkout's `target/` (the seed of every
+  `claude-history-gui-ort-cache`, the image `claude-history-gui-linux-dev` (one tag per toolchain
+  and image definition; `tools/dev/linux-test.ps1 --prune-images` removes all other tags, only while
+  no other agent is starting a Linux build), and the main checkout's `target/` (the seed of every
   worktree's Windows build). Losing them costs a cold build and the downloads again. A worktree's
   own volume `claude-history-gui-target-wt-<folder>-<hash>` goes only through
   `tools/dev/linux-test.ps1 --drop-volume` or `--gc` (see [Linux](#linux-docker)).
@@ -75,9 +76,10 @@ after an edit takes about 15 s.
 
 * **Fresh worktree:** before the first cargo command, run
   `pwsh -NoProfile -File tools/dev/seed-target.ps1`. It copies the main checkout's compiled
-  dependencies into this worktree's `target/`, so only the two workspace crates are compiled. Never
-  point several worktrees at one `CARGO_TARGET_DIR`: cargo's build lock serializes them (and
-  `cargo test` holds it while the tests run).
+  dependencies into this worktree's `target/`, so only the two workspace crates are compiled. It
+  also fills a `target/` that rust-analyzer (an editor, a language-server tool) has created already,
+  and a cargo started meanwhile waits for the copy. Never point several worktrees at one
+  `CARGO_TARGET_DIR`: cargo's build lock serializes their builds.
 * **While editing,** use `cargo check` or `cargo clippy` (for example
   `cargo clippy -p claude-history-gui --all-targets`): no code generation, no linking. Their output
   is not reused by `cargo test`, so run the tests once the change is done, not after every edit.
@@ -102,8 +104,9 @@ after an edit takes about 15 s.
   measured in release builds and in a quiet window: ask the user for one.
 * Before finishing: `cargo fmt --all` and
   `cargo clippy --workspace --all-targets --locked -- -D warnings` (CI denies warnings).
-* Dev and test builds carry line tables only (panics and backtraces still show file:line) and no
-  debug info for dependencies; the release profile is unchanged.
+* Dev and test builds carry line tables only for the workspace crates (their frames in panics and
+  backtraces still show file:line) and no debug info for dependencies; the release profile is
+  unchanged.
 
 ## Linux (Docker)
 
@@ -113,10 +116,12 @@ platform-specific code: `cfg(unix)` / `cfg(windows)` / `cfg(target_os = ...)` bl
 `services`, `single_file`, `globals`, `workspace`, `test_support`, `qa/gate`), `libc` calls, file
 permissions, or the dependencies (`Cargo.toml`, `Cargo.lock`).
 
-* Build on Linux only through `tools/dev/linux-test.ps1`. It keeps the target directory, the cargo
-  registry and the ONNX Runtime download in named Docker volumes and leaves no containers behind.
-  Never `docker run` a Rust image with the build inside the container: every such target directory
-  stays in the Docker disk (it once grew to 600 GB).
+* Build on Linux only through `tools/dev/linux-test.ps1`, always as `pwsh -NoProfile -File ...` (from
+  a PowerShell session, an argument such as `--skip=a::b` is split at its `:`). It keeps the target
+  directory, the cargo registry and the ONNX Runtime download in named Docker volumes, and the
+  container of a run that was killed (a tool timeout) is removed by the next run. Never `docker run`
+  a Rust image with the build inside the container: every such target directory stays in the Docker
+  disk (it once grew to 600 GB).
 * **At the start of the session,** before the first Linux build:
   `pwsh -NoProfile -File tools/dev/linux-test.ps1 --update` (pulls the newest `rust:1-trixie` and
   rebuilds the dev image).
@@ -125,8 +130,8 @@ permissions, or the dependencies (`Cargo.toml`, `Cargo.lock`).
   `pwsh -NoProfile -File tools/dev/linux-test.ps1 clippy --workspace --all-targets --locked -- -D warnings`.
   A worktree's first Linux build starts from a copy of the main checkout's compiled dependencies.
 * **When the worktree is done:** `pwsh -NoProfile -File tools/dev/linux-test.ps1 --drop-volume`
-  deletes its target volume (`--gc` deletes the volumes of all worktrees that no longer exist). Both
-  keep the permanent volumes; in the main checkout `--drop-volume` does nothing.
+  deletes its target volume (`--gc` deletes the volumes of this clone's worktrees that no longer
+  exist). Both keep the permanent volumes; in the main checkout `--drop-volume` does nothing.
 
 ## gpui-kit pitfalls (verified on 0.7.3, Windows)
 

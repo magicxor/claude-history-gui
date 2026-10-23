@@ -12,8 +12,9 @@
 //! `DirectML.dll` even though only the CPU execution provider is used.
 //! Delay-loading it means the DLL is resolved only if DirectML is ever used,
 //! so the app starts on systems without it (verified in spike-platform).
-//! The delay-load arguments apply to binaries only (`rustc-link-arg-bins`),
-//! never to test executables.
+//! The delay-load arguments apply to binary targets only
+//! (`rustc-link-arg-bins`): the app and the bin's own unit-test harness, not
+//! the library's test executables.
 //!
 //! Windows: `assets/windows/app.rc` (icon + version information) is compiled
 //! with `embed-resource` and linked into the `claude-history-gui` binary
