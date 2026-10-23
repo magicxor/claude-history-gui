@@ -97,7 +97,8 @@ cargo build -p claude-history-gui --release
 * MSVC toolchain with the Visual Studio 2022 *Desktop development with C++* workload, the Windows SDK and CMake.
 * The first build needs network access: `ort-sys` downloads the static ONNX Runtime (cached in
   `%LOCALAPPDATA%\ort.pyke.io`). Never enable `+crt-static` (it fails with LNK2038).
-* `.cargo/config.toml` sets the 8 MiB main-thread stack and `RUST_MIN_STACK` for test threads.
+* The build scripts of both crates set the 8 MiB main-thread stack (`/STACK`), and `.cargo/config.toml` sets
+  `RUST_MIN_STACK` for test threads.
 * DirectML is delay-loaded (`build.rs`), so the exe starts on systems without it. The exe needs the VC++
   2015-2022 x64 runtime; the release zip ships the four DLLs next to the exe.
 * The release exe is a Windows GUI program that attaches to the parent console when it has output to print

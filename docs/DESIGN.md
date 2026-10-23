@@ -372,7 +372,7 @@ claude-history-gui/ (Cargo workspace, resolver 3, edition 2024)
   crates/core   package claude-history-core  lib claude_history_core   (UI-agnostic, no gpui; features: release-dynamic-ort, hermetic)
   crates/gui    package claude-history-gui   lib claude_history_gui (src/lib.rs, all modules)
                                              bin claude-history-gui (src/main.rs, thin: args → lib::run)
-  .cargo/config.toml   (/STACK:8000000 for x86_64-pc-windows-msvc; [env] RUST_MIN_STACK = "8388608")
+  .cargo/config.toml   ([env] RUST_MIN_STACK = "8388608"; /STACK:8000000 comes from both build.rs files)
   rust-toolchain.toml  (channel = "1.99.0", components rustfmt, clippy)
   .github/workflows/{ci.yml, qa.yml, release.yml}
   packaging/{macos,linux,windows}/...
@@ -2717,7 +2717,11 @@ line).
 
 ### 14.4 Windows specifics
 * `#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]` in main.rs.
-* `.cargo/config.toml` `/STACK:8000000` (present; keep) and `[env] RUST_MIN_STACK = "8388608"` (libtest threads).
+* `/STACK:8000000` for every executable of both crates (test harnesses and examples included):
+  `cargo:rustc-link-arg` from `crates/core/build.rs` and `crates/gui/build.rs` (target_env msvc), not rustflags in
+  `.cargo/config.toml`, which cargo also merges into worktrees nested in the main checkout (doubled array values,
+  or a failed merge of an array with a string). `.cargo/config.toml` keeps `[env] RUST_MIN_STACK = "8388608"`
+  (libtest threads).
 * `build.rs` (bins only, target_env msvc): `cargo:rustc-link-arg-bins=/DELAYLOAD:DirectML.dll`,
   `cargo:rustc-link-arg-bins=delayimp.lib` (verified spike-platform); embed `assets/windows/app.rc` (`1 ICON
   "app.ico"` + VERSIONINFO) with `embed-resource = "3"`, `manifest_optional()`, **no manifest** (GPUI embeds one).
@@ -3021,8 +3025,8 @@ regex-automata 0.4.18, futures-* 0.3.34, serde_spanned 1.1.2, toml_parser 1.1.5,
 js-sys/web-sys 0.3.106, wasm-bindgen 0.2.129 (+ -macro, -macro-support, -shared), wasm-bindgen-futures 0.4.79;
 recorded in the root `Cargo.toml`); every other shared package keeps upstream's version (`cargo update -p <name>
 --precise <upstream version>`). `rust-toolchain.toml`: `channel = "1.99.0"`,
-`components = ["rustfmt", "clippy"]`. `.cargo/config.toml`: existing `/STACK:8000000` plus `[env] RUST_MIN_STACK =
-"8388608"`.
+`components = ["rustfmt", "clippy"]`. `.cargo/config.toml`: `[env] RUST_MIN_STACK = "8388608"`; `/STACK:8000000`
+comes from the build scripts (§14.4).
 
 `crates/gui/Cargo.toml` (WP0; complete dependency list — WPs must not add crates without the integrator):
 ```toml
@@ -3130,7 +3134,7 @@ ctor.workspace = true
 
 ### 16.4 Windows build notes (README section, WP7)
 MSVC toolchain + VS 2022 C++ workload + Windows SDK + CMake; network on first build (ort-sys static ONNX Runtime
-download); `.cargo/config.toml` stack size; debug builds show a console and run the sandbox gate (set
+download); 8 MB main-thread stack (build scripts); debug builds show a console and run the sandbox gate (set
 `CHG_ALLOW_REAL_HOME=1` to use your real history); the exe needs the VC++ runtime (bundled in the release zip);
 DirectML is delay-loaded.
 
