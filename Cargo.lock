@@ -940,6 +940,7 @@ dependencies = [
  "hf-hub",
  "home",
  "libc",
+ "memchr",
  "memmap2",
  "ort",
  "pulldown-cmark",
