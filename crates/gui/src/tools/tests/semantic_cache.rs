@@ -347,7 +347,7 @@ fn clear_drops_the_model_and_keeps_the_lock(cx: &mut TestAppContext) {
     let dir = world.env.semantic_cache_dir().expect("semantic dir");
     std::fs::create_dir_all(dir.join("fastembed")).unwrap();
     std::fs::write(dir.join("fastembed").join("model.bin"), "model").unwrap();
-    std::fs::write(dir.join("embeddings-v1.bin"), "cache").unwrap();
+    std::fs::write(dir.join("embeddings-v2.bin"), "cache").unwrap();
     std::fs::write(dir.join("embeddings.lock"), "").unwrap();
 
     cx.update_window(handle, |_, window, cx| {
@@ -366,7 +366,7 @@ fn clear_drops_the_model_and_keeps_the_lock(cx: &mut TestAppContext) {
         dir.join("embeddings.lock").exists(),
         "embeddings.lock stays"
     );
-    assert!(!dir.join("embeddings-v1.bin").exists());
+    assert!(!dir.join("embeddings-v2.bin").exists());
     assert!(!dir.join("fastembed").exists());
     assert!(cx.read(SemanticGate::is_open));
 
@@ -387,7 +387,7 @@ fn clear_is_refused_while_the_gate_is_held(cx: &mut TestAppContext) {
     let (world, _control, _f, handle) = setup(cx, &[], 6);
     let dir = world.env.semantic_cache_dir().expect("semantic dir");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("embeddings-v1.bin"), "cache").unwrap();
+    std::fs::write(dir.join("embeddings-v2.bin"), "cache").unwrap();
     assert!(cx.update(|cx| SemanticGate::enter_exclusive(SemanticOp::Generate, cx)));
     cx.update_window(handle, |_, window, cx| {
         open_clear_semantic_cache(window, cx)
@@ -396,6 +396,6 @@ fn clear_is_refused_while_the_gate_is_held(cx: &mut TestAppContext) {
     settle(cx, handle);
     cx.simulate_keystrokes(handle, "y");
     cx.run_until_parked();
-    assert!(dir.join("embeddings-v1.bin").exists());
+    assert!(dir.join("embeddings-v2.bin").exists());
     cx.update(SemanticGate::leave);
 }

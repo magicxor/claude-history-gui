@@ -29,6 +29,10 @@ Release notes are taken from the `## v<version>` section of this file by the rel
   memory with a large history. Rename and delete become available moments after the first rows appear; a deleted
   conversation disappears at once. Changing the time filter no longer reads the history again. Semantic search reads
   the full conversations the first time it is used ("sem loading conversations").
+- Semantic search and Deep search use less memory and start faster: the embedding cache is now a memory-mapped file
+  that is read in place instead of being loaded into memory by each search. The existing cache is converted once
+  on the first semantic search after the update. The list, Deep search and another running instance of the
+  app no longer overwrite each other's newly computed embeddings when they save the cache.
 
 ## v0.1.1
 

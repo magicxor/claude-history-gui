@@ -37,8 +37,8 @@ use crate::semantic::index::{
 use crate::semantic::output::{format_hit, truncate};
 use crate::semantic::rank::rank_chunks;
 use crate::semantic::types::{
-    CACHE_SCHEMA_VERSION, ChunkConfig, EmbeddingCache, MODEL_NAME, SemanticCancellationToken,
-    SemanticChunkSource, SemanticHit,
+    ChunkConfig, EmbeddingCache, MODEL_NAME, SemanticCancellationToken, SemanticChunkSource,
+    SemanticHit,
 };
 use crate::time_filter::TimeFilter;
 use std::collections::{HashMap, HashSet};
@@ -450,14 +450,20 @@ pub fn clear_semantic_cache(env: &HistoryEnv) -> Result<ClearReport> {
     Ok(ClearReport::new(removed, dir))
 }
 
-/// Remove only the embedding cache file, keeping the downloaded model.
+/// Remove only the embedding cache, keeping the downloaded model: the matrix
+/// and an `embeddings-v1.bin` not converted yet (which a later read would
+/// otherwise convert back into a matrix).
 pub fn clear_embedding_cache(env: &HistoryEnv) -> Result<ClearReport> {
     let file = env.embedding_cache_file();
     let Some(path) = file.clone() else {
         return Ok(ClearReport::new(false, None));
     };
     ensure_own_namespace(env, &path)?;
-    if !path.exists() {
+    let files = std::iter::once(path.clone())
+        .chain(crate::semantic::cache::legacy_cache_path(&path))
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    if files.is_empty() {
         return Ok(ClearReport::new(false, file));
     }
     // Same single-writer lock as every cache write (K6).
@@ -476,7 +482,13 @@ pub fn clear_embedding_cache(env: &HistoryEnv) -> Result<ClearReport> {
         ),
         None => None,
     };
-    std::fs::remove_file(&path)?;
+    for path in files {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
     Ok(ClearReport::new(true, file))
 }
 
@@ -1050,21 +1062,30 @@ pub fn semantic_debug_report(
 // status
 // ---------------------------------------------------------------------------
 
-/// State of the embedding cache file.
+/// State of the embedding cache file: the matrix (`embeddings-v2.bin`) or,
+/// when there is none, the file earlier versions kept (`embeddings-v1.bin`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CacheFileState {
     /// No cache location (no home directory) or no file.
     Missing,
     /// The file exists but cannot be read or decoded.
     Unreadable(String),
-    /// Written for another schema, model or chunking: it is ignored and
-    /// replaced on the next save.
-    Incompatible { schema_version: u32, model: String },
+    /// Written for another schema, model or chunking: it is ignored (a
+    /// matrix is replaced on the next save, an old file is never converted).
+    Incompatible,
     /// A usable cache.
     Ready {
         entries: usize,
         protected_entries: usize,
         /// Entries over the 50 000-entry capacity are pruned on load.
+        over_capacity: bool,
+    },
+    /// A usable cache in the earlier format, converted into the matrix the
+    /// next time semantic search reads it.
+    Legacy {
+        entries: usize,
+        protected_entries: usize,
+        /// Entries over the 50 000-entry capacity are pruned on conversion.
         over_capacity: bool,
     },
 }
@@ -1089,6 +1110,10 @@ pub struct SemanticCoverage {
 pub struct SemanticStatus {
     /// `<cache root>/semantic` (emptied by [`clear_semantic_cache`]).
     pub semantic_dir: Option<PathBuf>,
+    /// The file [`SemanticStatus::cache`] describes: the matrix
+    /// ([`HistoryEnv::embedding_cache_file`]), or `embeddings-v1.bin` beside
+    /// it in the [`CacheFileState::Legacy`] state and when only that file is
+    /// there.
     pub cache_file: Option<PathBuf>,
     pub cache_file_size: Option<u64>,
     pub cache: CacheFileState,
@@ -1116,46 +1141,83 @@ fn dir_size(path: &Path) -> u64 {
         .sum()
 }
 
-/// Read the cache without pruning or rewriting it.
-fn inspect_cache_file(path: Option<&Path>) -> (CacheFileState, Option<EmbeddingCache>) {
-    let Some(path) = path.filter(|path| path.exists()) else {
-        return (CacheFileState::Missing, None);
-    };
-    let data = match std::fs::read(path) {
-        Ok(data) => data,
-        Err(error) => return (CacheFileState::Unreadable(error.to_string()), None),
-    };
-    let cache = match bincode::deserialize::<EmbeddingCache>(&data) {
-        Ok(cache) => cache,
-        Err(error) => return (CacheFileState::Unreadable(error.to_string()), None),
-    };
+/// What [`inspect_cache_file`] found.
+struct CacheInspection {
+    state: CacheFileState,
+    cache: Option<EmbeddingCache>,
+    /// The file the state describes: the matrix, or the earlier format's
+    /// file when only that exists.
+    file: Option<PathBuf>,
+}
+
+/// Read the cache without converting, pruning or rewriting it.
+fn inspect_cache_file(path: Option<&Path>) -> CacheInspection {
+    use crate::semantic::cache::{inspect_legacy, inspect_matrix, legacy_cache_path};
     let config = ChunkConfig::default();
-    let compatible = cache.schema_version == CACHE_SCHEMA_VERSION
-        && cache.model == MODEL_NAME
-        && cache.chunk_target_chars == config.target_chars
-        && cache.chunk_overlap_chars == config.overlap_chars
-        && cache.chunk_context_turns == config.context_turns;
-    if !compatible {
-        return (
-            CacheFileState::Incompatible {
-                schema_version: cache.schema_version,
-                model: cache.model.clone(),
-            },
-            None,
-        );
+    let missing = |file| CacheInspection {
+        state: CacheFileState::Missing,
+        cache: None,
+        file,
+    };
+    let Some(path) = path else {
+        return missing(None);
+    };
+    if path.exists() {
+        return inspection(inspect_matrix(path, config), false, path.to_path_buf());
     }
-    (
+    match legacy_cache_path(path).filter(|legacy| legacy.exists()) {
+        Some(legacy) => inspection(inspect_legacy(&legacy, config), true, legacy),
+        None => missing(Some(path.to_path_buf())),
+    }
+}
+
+fn inspection(
+    result: std::result::Result<Option<EmbeddingCache>, String>,
+    legacy: bool,
+    file: PathBuf,
+) -> CacheInspection {
+    let cache = match result {
+        Err(error) => {
+            return CacheInspection {
+                state: CacheFileState::Unreadable(error),
+                cache: None,
+                file: Some(file),
+            };
+        }
+        Ok(None) => {
+            return CacheInspection {
+                state: CacheFileState::Incompatible,
+                cache: None,
+                file: Some(file),
+            };
+        }
+        Ok(Some(cache)) => cache,
+    };
+    let entries = cache.entries.len();
+    let protected_entries = cache
+        .entries
+        .values()
+        .filter(|entry| entry.protected)
+        .count();
+    let over_capacity = entries > MAX_CACHE_ENTRIES;
+    let state = if legacy {
+        CacheFileState::Legacy {
+            entries,
+            protected_entries,
+            over_capacity,
+        }
+    } else {
         CacheFileState::Ready {
-            entries: cache.entries.len(),
-            protected_entries: cache
-                .entries
-                .values()
-                .filter(|entry| entry.protected)
-                .count(),
-            over_capacity: cache.entries.len() > MAX_CACHE_ENTRIES,
-        },
-        Some(cache),
-    )
+            entries,
+            protected_entries,
+            over_capacity,
+        }
+    };
+    CacheInspection {
+        state,
+        cache: Some(cache),
+        file: Some(file),
+    }
 }
 
 /// Cache, model and (optionally) corpus coverage statistics. Read-only:
@@ -1165,12 +1227,15 @@ pub fn semantic_status(
     conversations: Option<&[Conversation]>,
     workspace: Option<&WorkspaceScope>,
 ) -> SemanticStatus {
-    let cache_file = env.embedding_cache_file();
+    let CacheInspection {
+        state: cache_state,
+        cache,
+        file: cache_file,
+    } = inspect_cache_file(env.embedding_cache_file().as_deref());
     let cache_file_size = cache_file
         .as_deref()
         .and_then(|path| std::fs::metadata(path).ok())
         .map(|metadata| metadata.len());
-    let (cache_state, cache) = inspect_cache_file(cache_file.as_deref());
     let model_dir = env.semantic_model_dir();
     let model_downloaded = model_dir
         .as_deref()
@@ -1609,7 +1674,7 @@ mod tests {
                     chunk_index: 0,
                     text: conversation.semantic_turns[0].clone(),
                     message_range: crate::agent::refs::MessageRange::single(1),
-                    embedding: vec![1.0, 0.0],
+                    embedding: vec![1.0, 0.0].into(),
                 },
             )
             .collect::<Vec<_>>();
@@ -1906,21 +1971,70 @@ mod tests {
             semantic_status(&env, None, None).cache,
             CacheFileState::Unreadable(_)
         ));
-        let mut old = crate::semantic::cache::empty_embedding_cache(ChunkConfig::default());
-        old.schema_version = CACHE_SCHEMA_VERSION - 1;
-        std::fs::write(&path, bincode::serialize(&old).unwrap()).unwrap();
+        // A matrix written with other chunk settings.
+        use crate::semantic::matrix::{EmbeddingKey, EmbeddingMatrix, MatrixRow, MatrixSettings};
+        let vector = [1.0, 0.0];
+        EmbeddingMatrix::write(
+            &path,
+            MatrixSettings {
+                model_hash: 1,
+                chunk_target_chars: 1,
+                chunk_overlap_chars: 0,
+                chunk_context_turns: 0,
+                _pad: 0,
+            },
+            0,
+            2,
+            vec![MatrixRow {
+                key: EmbeddingKey::of("alpha"),
+                last_used: 0,
+                protected: false,
+                vector: &vector,
+            }],
+        )
+        .unwrap();
+        let written = std::fs::read(&path).unwrap();
+        let status = semantic_status(&env, None, None);
+        assert_eq!(status.cache, CacheFileState::Incompatible);
+        assert_eq!(status.cache_file.as_ref(), Some(&path));
+        assert_eq!(status.cache_file_size, Some(written.len() as u64));
+        // Status never rewrites the file.
+        assert_eq!(std::fs::read(&path).unwrap(), written);
+
+        // Only the earlier format's file: reported, never converted.
+        std::fs::remove_file(&path).unwrap();
+        let legacy = path.with_file_name(crate::env::LEGACY_EMBEDDING_CACHE_FILE_NAME);
+        let old = crate::semantic::cache::legacy_cache_bytes(
+            crate::semantic::types::CACHE_SCHEMA_VERSION - 1,
+            &["alpha"],
+        );
+        std::fs::write(&legacy, &old).unwrap();
+        let status = semantic_status(&env, None, None);
+        assert_eq!(status.cache, CacheFileState::Incompatible);
+        assert_eq!(status.cache_file.as_ref(), Some(&legacy));
+        let current = crate::semantic::cache::legacy_cache_bytes(
+            crate::semantic::types::CACHE_SCHEMA_VERSION,
+            &["alpha", "beta"],
+        );
+        std::fs::write(&legacy, &current).unwrap();
+        let status = semantic_status(&env, None, None);
         assert_eq!(
-            semantic_status(&env, None, None).cache,
-            CacheFileState::Incompatible {
-                schema_version: CACHE_SCHEMA_VERSION - 1,
-                model: MODEL_NAME.to_string()
+            status.cache,
+            CacheFileState::Legacy {
+                entries: 2,
+                protected_entries: 2,
+                over_capacity: false
             }
         );
-        // Status never rewrites the file.
-        assert_eq!(
-            std::fs::read(&path).unwrap(),
-            bincode::serialize(&old).unwrap()
-        );
+        assert_eq!(status.cache_file_size, Some(current.len() as u64));
+        assert_eq!(std::fs::read(&legacy).unwrap(), current);
+        assert!(!path.exists(), "status never converts the old file");
+        std::fs::write(&legacy, b"garbage").unwrap();
+        assert!(matches!(
+            semantic_status(&env, None, None).cache,
+            CacheFileState::Unreadable(_)
+        ));
+        std::fs::remove_file(&legacy).unwrap();
 
         let model = env.semantic_model_dir().unwrap();
         std::fs::create_dir_all(model.join("models--x")).unwrap();
@@ -1940,15 +2054,23 @@ mod tests {
         let path = env.embedding_cache_file().unwrap();
         std::fs::create_dir_all(env.semantic_model_dir().unwrap()).unwrap();
         std::fs::write(&path, b"x").unwrap();
+        // An old-format file not converted yet goes too: a later read would
+        // convert it back into a matrix.
+        let legacy = path.with_file_name(crate::env::LEGACY_EMBEDDING_CACHE_FILE_NAME);
+        std::fs::write(&legacy, b"y").unwrap();
 
         let report = clear_embedding_cache(&env).unwrap();
         assert!(report.removed);
         assert!(!path.exists());
+        assert!(!legacy.exists());
         assert!(env.semantic_model_dir().unwrap().exists());
         assert_eq!(
             clear_embedding_cache(&env).unwrap().message,
             "Semantic cache is already empty."
         );
+        std::fs::write(&legacy, b"y").unwrap();
+        assert!(clear_embedding_cache(&env).unwrap().removed);
+        assert!(!legacy.exists());
 
         let report = clear_semantic_cache(&env).unwrap();
         assert!(report.removed);

@@ -40,8 +40,12 @@ pub const CONFIG_DIR_NAME: &str = "claude-history";
 pub const CLI_CONFIG_FILE_NAME: &str = "config.toml";
 /// File name of the GUI's own config file.
 pub const GUI_CONFIG_FILE_NAME: &str = "gui.toml";
-/// File name of the semantic embedding cache inside the semantic cache dir.
-pub const EMBEDDING_CACHE_FILE_NAME: &str = "embeddings-v1.bin";
+/// File name of the semantic embedding cache (the memory-mapped matrix,
+/// upstream 8919a76) inside the semantic cache dir.
+pub const EMBEDDING_CACHE_FILE_NAME: &str = "embeddings-v2.bin";
+/// File name of the embedding cache earlier versions kept (a bincode map)
+/// inside the semantic cache dir; converted into the matrix once.
+pub const LEGACY_EMBEDDING_CACHE_FILE_NAME: &str = "embeddings-v1.bin";
 /// Directory name of the fastembed model cache inside the semantic cache dir.
 pub const MODEL_DIR_NAME: &str = "fastembed";
 
@@ -297,7 +301,9 @@ impl HistoryEnv {
         self.cache_root().map(|root| root.join("semantic"))
     }
 
-    /// The semantic embedding cache file (`<semantic dir>/embeddings-v1.bin`).
+    /// The semantic embedding cache file (`<semantic dir>/embeddings-v2.bin`,
+    /// a memory-mapped matrix; an `embeddings-v1.bin` beside it is converted
+    /// once, [`crate::semantic::cache::read_embedding_cache`]).
     pub fn embedding_cache_file(&self) -> Option<PathBuf> {
         self.semantic_cache_dir()
             .map(|dir| dir.join(EMBEDDING_CACHE_FILE_NAME))
@@ -633,7 +639,7 @@ mod tests {
         );
         assert_eq!(
             env.embedding_cache_file().unwrap(),
-            cache.join("semantic").join("embeddings-v1.bin")
+            cache.join("semantic").join("embeddings-v2.bin")
         );
         assert_eq!(
             env.semantic_model_dir().unwrap(),
