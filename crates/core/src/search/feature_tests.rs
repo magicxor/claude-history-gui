@@ -35,7 +35,7 @@ fn s001_parsed_query_predicates() {
 
 fn searchable(title: &str, summary: &str, project: &str, body: &str) -> SearchableConversation {
     SearchableConversation {
-        text_lower: format!("{body} {project}"),
+        body_lower: body.into(),
         title_lower: title.to_string(),
         summary_lower: summary.to_string(),
         project_lower: project.to_string(),
@@ -48,7 +48,7 @@ fn s013_score_uses_upstream_field_weights_adjacency_and_freshness() {
     let now = Local::now();
     let ln2 = 2f64.ln();
     let s = searchable("alpha", "alpha", "alpha", "alpha");
-    let debug = score_text_debug(&s, "alpha", &["alpha"], &[], now, now).unwrap();
+    let debug = score_text_debug(&s, &["alpha"], &[], now, now).unwrap();
     let weights = debug
         .fields
         .iter()
@@ -73,22 +73,14 @@ fn s013_score_uses_upstream_field_weights_adjacency_and_freshness() {
 
     // Term frequency saturates at 10 matches: ln(11).
     let body = "alpha ".repeat(25);
-    let debug = score_text_debug(
-        &searchable("", "", "", &body),
-        &body,
-        &["alpha"],
-        &[],
-        now,
-        now,
-    )
-    .unwrap();
+    let debug =
+        score_text_debug(&searchable("", "", "", &body), &["alpha"], &[], now, now).unwrap();
     assert!((debug.fields[0].tf_score - 11f64.ln()).abs() < 1e-9);
 
     // Adjacent query words add weight × 2 per adjacent occurrence (≤ 3).
     let pairs = vec!["cache warming".to_string()];
     let debug = score_text_debug(
         &searchable("", "", "", "cache warming"),
-        "cache warming",
         &["cache", "warming"],
         &pairs,
         now,
@@ -100,7 +92,6 @@ fn s013_score_uses_upstream_field_weights_adjacency_and_freshness() {
     // Freshness halves every 7 days: 2 · 2^(−age/7).
     let week_old = score_text_debug(
         &searchable("", "", "", "alpha"),
-        "alpha",
         &["alpha"],
         &[],
         now - Duration::days(7),

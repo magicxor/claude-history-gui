@@ -7,7 +7,7 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 - First rows appear sooner with large Pi or OMP histories: Claude, Pi and OMP conversations load at the same time
   and stream into the list in small batches, and the list keeps drawing while they arrive. Unchanged Pi and OMP
   caches are no longer rewritten on every start, and empty Pi/OMP files are no longer parsed again each time.
-- Lower memory use: conversation text is shared instead of copied.
+- Lower memory use: conversation text is shared instead of copied, and search no longer keeps a second copy of it.
 
 ## v0.1.1
 
