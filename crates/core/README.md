@@ -81,7 +81,9 @@ only run by CI smoke jobs.
 The ignored `store::search::tests::real_corpus_oracle` compares index search with the in-memory search on a
 QA sandbox's history: set `CHG_SEARCH_CORPUS_HOME` to a sandbox made with `tools/qa/new-sandbox.ps1` (the
 `.qa-sandbox` marker is required) and run `cargo test --release -p claude-history-core --lib
-store::search::tests::real_corpus_oracle -- --ignored --nocapture`.
+store::search::tests::real_corpus_oracle -- --ignored --nocapture`. The ignored `real_corpus_query_latency` in the same
+module times index queries (first page, complete ordering, text reads) against the in-memory search on the same
+sandbox; run it like the oracle with `-- --ignored --nocapture --test-threads=1` on a quiet machine.
 
 Tests are hermetic:
 
