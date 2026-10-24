@@ -3,17 +3,19 @@
 //! newest first, before any batch arrives; Resume, Fork and Ctrl+O work on
 //! them, Rename and Delete wait for the load; a query runs on the snapshot's
 //! index before the load ends; the loaded corpus replaces the cards keeping
-//! the selection, and the initial load writes the snapshot with its index.
+//! the selection, and the initial load starts a reconcile pass that brings
+//! the snapshot and its index up to date with the session files (e905169).
 //!
 //! Snapshots are off in tests (`app::init_for_test`); each test here turns
-//! them on before opening the window and joins the write before its world
+//! them on before opening the window and joins the pass before its world
 //! goes.
 
 use std::path::PathBuf;
-use std::time::SystemTime;
 
 use claude_history_core::maintenance::load_sorted_conversations;
-use claude_history_core::store::{self, Publish};
+use claude_history_core::store;
+use claude_history_core::store::card::Fingerprint;
+use claude_history_core::store::generation::{self, Doc, Publish, PublishLock, Update};
 use claude_history_core::time_filter::TimeFilter;
 use gpui_kit::AppContext as _;
 use gpui_kit::TestAppContext;
@@ -29,7 +31,9 @@ use crate::test_support::{TestWorld, recording};
 
 /// Publish the store snapshot of the world's corpus with every card titled
 /// `Card <n>` (newest first), so card rows are told apart from loaded rows.
-/// Returns the card paths, newest first.
+/// The fingerprints are unknown, so the reconcile pass after the load parses
+/// every session again and replaces the cards. Returns the card paths,
+/// newest first.
 fn publish_cards(world: &TestWorld) -> Vec<PathBuf> {
     let mut conversations =
         load_sorted_conversations(&world.env, true, None, &TimeFilter::default())
@@ -39,11 +43,28 @@ fn publish_cards(world: &TestWorld) -> Vec<PathBuf> {
     }
     let root = store::default_root(&world.env).expect("a store root in the sandbox");
     assert!(root.starts_with(world.home()), "{root:?}");
-    let lock = store::PublishLock::try_acquire(&root)
+    let lock = PublishLock::try_acquire(&root)
         .expect("open the lock")
         .expect("take the lock");
-    store::write_snapshot(&lock, &conversations, SystemTime::now()).expect("write the snapshot");
-    conversations.into_iter().map(|c| c.path).collect()
+    let paths = conversations.iter().map(|c| c.path.clone()).collect();
+    let docs = conversations
+        .into_iter()
+        .map(|conversation| Doc::New {
+            conversation: Box::new(conversation),
+            fingerprint: Fingerprint::default(),
+        })
+        .collect();
+    let (publish, _) = generation::publish_update(
+        &lock,
+        Update {
+            base: None,
+            docs,
+            ignored: Vec::new(),
+        },
+    )
+    .expect("write the snapshot");
+    assert!(matches!(publish, Publish::Published(_)), "{publish:?}");
+    paths
 }
 
 /// Open the main window with snapshots on and the poll loop paused (nothing
@@ -314,8 +335,9 @@ fn a_query_typed_over_cards_runs_on_the_snapshot_index(cx: &mut TestAppContext) 
             .is_some()),
         "the loaded corpus keeps an index"
     );
-    // The cards' titles differ from the loaded ones: a new generation is
-    // written and swapped in, and the query runs on it again.
+    // The cards' titles differ from the parsed ones: the reconcile pass
+    // publishes a new generation, which is swapped in, and the query runs on
+    // it again.
     assert_eq!(
         f.list.update(cx, |list, _| list.finish_snapshot_write()),
         Some(Publish::Published("g000002".to_string()))
@@ -361,8 +383,9 @@ fn the_swap_keeps_the_selected_session(cx: &mut TestAppContext) {
 }
 
 /// L-099, L-001: without a snapshot the rows stream in as before; the
-/// complete initial load then writes the first generation, and a second
-/// window over the same corpus writes nothing new.
+/// reconcile pass after the complete initial load then publishes the first
+/// generation, and a second window over the same session files writes
+/// nothing new.
 #[gpui_kit::test]
 fn the_initial_load_writes_the_snapshot(cx: &mut TestAppContext) {
     let world = TestWorld::new();
@@ -390,8 +413,8 @@ fn the_initial_load_writes_the_snapshot(cx: &mut TestAppContext) {
         "the generation carries its text and index"
     );
 
-    // A second window over the same corpus loads the same rows and writes
-    // nothing new.
+    // A second window over the same session files loads the same rows and
+    // writes nothing new.
     let again = ListFixture::open(cx, &world, &[]);
     again.wait_loaded(cx);
     assert_eq!(

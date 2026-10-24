@@ -16,21 +16,29 @@
 //!   `.pi/settings.json`). Upstream returned `None` under
 //!   `cfg(test)`; here tests are kept off the user's cache by
 //!   [`HistoryEnv::sandbox`] and temporary roots instead.
-//! * **Shared corpus.** [`write_snapshot`], [`snapshot_is_current`],
-//!   [`Snapshot::locate`] and [`generation::Corpus::new`] accept any slice of
-//!   `Borrow<Conversation>`, so the browser's `Arc<Conversation>` corpus is
-//!   written and located without copying. The written bytes are the same.
-//! * **Cancellable build.** The GUI builds generations in its own process
-//!   (upstream: a detached `--publish-snapshot` child that outlived the TUI),
-//!   so quitting must not wait for a build: [`write_snapshot_cancellable`],
-//!   [`generation::publish_locked_cancellable`] and
-//!   [`lexindex::build_cancellable`] give up soon after a flag is set,
-//!   remove their `gNNN.tmp` and publish nothing. [`write_snapshot`],
-//!   [`generation::publish_locked`] and [`lexindex::build`] are the same code never
+//! * **Shared corpus.** [`Snapshot::locate`] and [`Snapshot::covers`]
+//!   accept any slice of `Borrow<Conversation>`, so the browser's
+//!   `Arc<Conversation>` corpus is located without copying.
+//! * **Sources from the env.** [`reconcile::Sources::from_env`] takes the
+//!   [`HistoryEnv`] (the Claude projects root and the Pi/OMP session roots
+//!   the history loader reads) instead of the process environment.
+//! * **In-process, cancellable reconcile.** The GUI runs the reconcile pass
+//!   on a thread of its own process (`browser::HistoryLoader`; upstream: a
+//!   detached `--reconcile` child that outlived the TUI), so quitting must
+//!   not wait for a pass: [`reconcile::reconcile_cancellable`],
+//!   [`generation::publish_update_cancellable`],
+//!   [`generation::compact_cancellable`], [`lexindex::build_cancellable`] and
+//!   [`lexindex::merge_cancellable`] give up soon after a flag is set,
+//!   remove the `gNNN.tmp` they staged and publish nothing more (the
+//!   generations a pass published before stay). [`reconcile::reconcile`],
+//!   [`generation::publish_update`], [`generation::compact`],
+//!   [`lexindex::build`] and [`lexindex::merge`] are the same code never
 //!   cancelled, and write the same bytes as upstream.
 //! * **Windows tests.** `lexindex`'s corrupt-file test drops its open index
 //!   (three live maps) before it rewrites and truncates the index files,
-//!   which Windows refuses for a mapped file. The code is upstream's.
+//!   which Windows refuses for a mapped file, and `reconcile`'s removed-files
+//!   test allows the variable only its Unix permission check reads. The code
+//!   is upstream's.
 //! * **Real-corpus oracle.** The ignored `search` oracle test reads the QA
 //!   sandbox named by `CHG_SEARCH_CORPUS_HOME` (it must contain
 //!   `.qa-sandbox`) through [`HistoryEnv::sandbox`], never the process home,
@@ -41,17 +49,25 @@
 //! handle maps (POSIX semantics), so collection behaves as on Unix and an
 //! open map stays readable; only writing or truncating a mapped file fails
 //! (`ERROR_USER_MAPPED_FILE`), and published files (manifest, text segments,
-//! index) are never written again. On a file system without POSIX semantics,
-//! removing a generation that a reader still maps fails silently, like every
-//! collection error, and a later publish removes it once the map is dropped.
+//! index segments) are never written again. NTFS hard-links the unchanged
+//! segments a delta generation shares with its predecessor, also while they
+//! are mapped; elsewhere they are copied, as upstream falls back. Without
+//! file ids off Unix, a session file reached through two paths (a junction)
+//! gets a card under each, as upstream (the history loader keeps one, by
+//! canonical path). On a file system
+//! without POSIX semantics, removing a generation that a reader still maps
+//! fails silently, like every collection error, and a later publish removes
+//! it once the map is dropped.
 
 pub mod card;
 pub mod generation;
 pub mod lexindex;
+pub mod reconcile;
 pub mod search;
+pub mod segments;
 pub mod text;
 
-pub use generation::{Generation, ProjectView, Publish, PublishLock};
+pub use generation::{Generation, ProjectView};
 
 use crate::env::HistoryEnv;
 use crate::history::Conversation;
@@ -61,7 +77,6 @@ use std::borrow::{Borrow, Cow};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
 
 /// Store root: `v3/roots-<hash>/` beside the other caches. The cache dir is
 /// namespaced by `CLAUDE_CONFIG_DIR` ([`HistoryEnv::history_cache_base_dir`]),
@@ -232,7 +247,7 @@ fn in_time(time: &TimeFilter, row: &card::CardRow) -> bool {
 /// A generation's cards, suffix index and text, ready for lexical search.
 pub struct SearchIndex {
     cards: Snapshot,
-    index: lexindex::LexIndex,
+    index: segments::IndexSet,
     text: text::TextSegments,
     docs: search::SearchDocs,
 }
@@ -277,66 +292,8 @@ impl search::TextSource for SearchIndex {
     }
 }
 
-/// Whether `CURRENT` under `root` already holds `conversations` (the
-/// complete corpus, loaded starting at `loaded_since`) with its index, so
-/// `write_snapshot` would write nothing.
-pub fn snapshot_is_current<C: Borrow<Conversation>>(
-    root: &Path,
-    conversations: &[C],
-    loaded_since: SystemTime,
-) -> bool {
-    generation::is_current(root, &corpus(conversations, loaded_since))
-}
-
-/// Writes a generation for `conversations` (the complete corpus, loaded
-/// starting at `loaded_since`) into the root of `lock` unless `CURRENT`
-/// already matches it.
-pub fn write_snapshot<C: Borrow<Conversation>>(
-    lock: &PublishLock,
-    conversations: &[C],
-    loaded_since: SystemTime,
-) -> std::io::Result<Publish> {
-    generation::publish_locked(lock, &corpus(conversations, loaded_since))
-}
-
-/// [`write_snapshot`] that gives up soon after `cancelled()` returns true
-/// (fork; see [`generation::publish_locked_cancellable`]), also while it reads the
-/// files' fingerprints. A build given up publishes nothing and returns an
-/// [`std::io::ErrorKind::Interrupted`] error.
-pub fn write_snapshot_cancellable<C: Borrow<Conversation>>(
-    lock: &PublishLock,
-    conversations: &[C],
-    loaded_since: SystemTime,
-    cancelled: &(dyn Fn() -> bool + Sync),
-) -> std::io::Result<Publish> {
-    let mut fingerprints = Vec::with_capacity(conversations.len());
-    for conversation in conversations {
-        if cancelled() {
-            return Err(generation::cancelled_build());
-        }
-        fingerprints.push(generation::fingerprint(
-            &conversation.borrow().path,
-            loaded_since,
-        ));
-    }
-    let corpus = generation::Corpus::new(conversations, fingerprints);
-    generation::publish_locked_cancellable(lock, &corpus, cancelled)
-}
-
-fn corpus<C: Borrow<Conversation>>(
-    conversations: &[C],
-    loaded_since: SystemTime,
-) -> generation::Corpus<'_> {
-    let fingerprints = conversations
-        .iter()
-        .map(|conversation| generation::fingerprint(&conversation.borrow().path, loaded_since))
-        .collect();
-    generation::Corpus::new(conversations, fingerprints)
-}
-
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::card::Fingerprint;
     use crate::history::{Conversation, Source};
     use chrono::{Local, TimeZone};
     use std::path::{Path, PathBuf};
@@ -383,20 +340,15 @@ pub(crate) mod test_support {
             duration_minutes: None,
         }
     }
-
-    pub(crate) fn unknown_fingerprints(count: usize) -> Vec<Fingerprint> {
-        vec![Fingerprint::default(); count]
-    }
 }
 
-/// Fork-only: the env-derived root and the `Borrow<Conversation>` writer and
-/// locator.
+/// Fork-only: the env-derived root and sources, and the cards a pass over
+/// them writes for what the history loader loads.
 #[cfg(test)]
 mod tests {
-    use super::test_support::conversation;
     use super::*;
+    use std::fs;
     use std::sync::Arc;
-    use std::time::Duration;
 
     #[test]
     fn snapshot_namespace_follows_pi_and_omp_roots() {
@@ -434,67 +386,81 @@ mod tests {
     }
 
     #[test]
-    fn shared_corpus_writes_the_same_snapshot_under_the_sandbox_root() {
+    fn a_pass_over_the_env_sources_covers_what_the_loader_loads() {
         let home = tempfile::tempdir().unwrap();
         let env = HistoryEnv::sandbox(home.path());
         let root = default_root(&env).unwrap();
-        assert!(root.starts_with(home.path()));
+        assert!(root.starts_with(home.path()), "{root:?}");
 
-        // Real files under the sandbox, so the fingerprints (size, mtime of
-        // files older than `since`) are non-default and nothing outside the
-        // sandbox is read.
-        let project_dir = home.path().join("-Users-me-app");
-        std::fs::create_dir_all(&project_dir).unwrap();
-        let paths: Vec<PathBuf> = (0..3)
-            .map(|i| {
-                let path = project_dir.join(format!("{i}.jsonl"));
-                std::fs::write(
-                    &path,
-                    format!(
-                        "{{\"n\":{i}}}
+        let projects = env.claude_projects_root().unwrap();
+        let work = home.path().join("work");
+        for (project, name, text) in [
+            ("-tmp-work", "a.jsonl", "alpha words"),
+            ("-tmp-other", "b.jsonl", "beta words"),
+        ] {
+            let dir = projects.join(project);
+            fs::create_dir_all(&dir).unwrap();
+            let line = serde_json::json!({
+                "type": "user",
+                "timestamp": "2024-01-01T00:00:00Z",
+                "cwd": work,
+                "message": {"role": "user", "content": text}
+            });
+            fs::write(
+                dir.join(name),
+                format!(
+                    "{line}
 "
-                    )
-                    .repeat(i + 1),
-                )
-                .unwrap();
-                path
-            })
-            .collect();
-        let shared: Vec<Arc<Conversation>> = paths
-            .iter()
-            .enumerate()
-            .map(|(i, path)| Arc::new(conversation(path.to_str().unwrap(), i as i64 * 1000)))
-            .collect();
-        let since = SystemTime::now() + Duration::from_secs(60);
-        let lock = PublishLock::try_acquire(&root).unwrap().unwrap();
-        assert!(matches!(
-            write_snapshot(&lock, &shared, since).unwrap(),
-            Publish::Published(_)
-        ));
-        let owned: Vec<Conversation> = shared.iter().map(|c| (**c).clone()).collect();
-        assert!(snapshot_is_current(&root, &shared, since));
-        assert!(snapshot_is_current(&root, &owned, since));
-        assert_eq!(
-            write_snapshot(&lock, &owned, since).unwrap(),
-            Publish::Unchanged
-        );
+                ),
+            )
+            .unwrap();
+        }
+        let pi = crate::history::pi_loader::session_root(&env).unwrap();
+        assert!(pi.path.starts_with(home.path()), "{pi:?}");
+        let pi_dir = pi.path.join("--tmp-pi--");
+        fs::create_dir_all(&pi_dir).unwrap();
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v1.jsonl"),
+            pi_dir.join("one.jsonl"),
+        )
+        .unwrap();
 
-        let snapshot = Snapshot::open(&root, false, TimeFilter::default()).unwrap();
-        let cards: Vec<_> = snapshot
-            .head(2, |_| true)
-            .into_iter()
-            .map(|doc| snapshot.card(doc))
-            .collect();
-        let listed: Vec<_> = cards.iter().map(|c| (c.index, c.path.clone())).collect();
-        assert_eq!(listed, vec![(0, paths[2].clone()), (1, paths[1].clone()),]);
+        let sources = reconcile::Sources::from_env(&env);
+        assert_eq!(sources.claude.as_deref(), Some(projects.as_path()));
+        let outcome = reconcile::reconcile(&root, &sources).unwrap();
         assert!(
-            snapshot
-                .head(10, |project| project.name != Some("app"))
-                .is_empty()
+            matches!(outcome.publish, generation::Publish::Published(_)),
+            "{outcome:?}"
         );
-        // The shared corpus is located without copying, newest card first.
-        assert_eq!(snapshot.locate(&shared), vec![Some(2), Some(1), Some(0)]);
-        let index = SearchIndex::open(snapshot).expect("the index was written");
-        assert_eq!(index.text(0), "full text");
+        assert_eq!((outcome.scanned, outcome.parsed), (3, 3));
+
+        let loaded: Vec<Arc<Conversation>> =
+            crate::history::load_all_conversations(&env, true, None)
+                .unwrap()
+                .into_iter()
+                .map(Arc::new)
+                .collect();
+        assert_eq!(loaded.len(), 3);
+        let snapshot = Snapshot::open(&root, true, TimeFilter::default()).unwrap();
+        let located = snapshot.locate(&loaded);
+        assert!(located.iter().all(Option::is_some), "{located:?}");
+        assert!(snapshot.covers(&loaded, &located));
+        for (doc, position) in located.iter().enumerate() {
+            let card = snapshot.card(doc as u32);
+            let conversation = &loaded[position.unwrap()];
+            assert_eq!(card.source, conversation.source);
+            assert_eq!(card.session_id, conversation.session_id);
+            assert_eq!(card.project_path, conversation.project_path);
+            assert_eq!(card.project_name, conversation.project_name);
+            assert_eq!(card.preview, conversation.preview);
+        }
+        let index = SearchIndex::open(snapshot).expect("the pass wrote the index");
+        let alpha = (0..3)
+            .find(|&doc| index.text(doc).contains("alpha words"))
+            .expect("the text of a.jsonl");
+        assert_eq!(
+            index.cards().card(alpha).path,
+            projects.join("-tmp-work").join("a.jsonl")
+        );
     }
 }

@@ -30,8 +30,8 @@ All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-h
 
 **Conversation list**
 * Claude Code, Pi and OMP conversations in one virtualized list: the newest ones are shown at once from an on-disk
-  snapshot of the last complete load, the rest is read in the background (streamed in on the first run), with
-  cached parsing.
+  snapshot (kept up to date in the background after each complete load, reading only the conversation files that
+  changed), the rest is read in the background (streamed in on the first run), with cached parsing.
 * Search as you type. **Lexical** search (with highlighted matches and a literal mode for quoted text) or
   **semantic** search (local embedding model, downloaded on first use; falls back to lexical while the cache is
   not ready). Ctrl+T toggles the mode.

@@ -17,14 +17,14 @@
 //!   title and summary) and mapping its cards to the loaded conversations
 //!   are O(corpus): [`super::HistoryLoader`] opens the index on an
 //!   `index-open` thread, the corpus preparation of the load locates the
-//!   cards in the loaded corpus, and the `snapshot-writer` thread opens and
-//!   locates the generation it wrote. Upstream did all three on the TUI
-//!   thread. The cards a query returns are built by the lexical worker
+//!   cards in the loaded corpus, and the `store-reconcile` thread opens and
+//!   locates the generation its pass left current. Upstream did all three
+//!   on the TUI thread. The cards a query returns are built by the lexical worker
 //!   ([`super::search_state::IndexScope::cards`]); the browser only appends
 //!   them.
 //! * **Stale index after the load.** Upstream keeps the startup index
-//!   until its detached builder's generation is swapped in. Here the
-//!   builder dies with the loader, so a quit before it ends would repeat
+//!   until its detached reconcile process's generation is swapped in. Here
+//!   the pass dies with the loader, so a quit before it ends would repeat
 //!   the stale index every session: when the cards do not cover the loaded
 //!   corpus (a conversation without a card, or a different timestamp), the
 //!   preparation drops the index and queries run in memory.
@@ -32,10 +32,12 @@
 //!   (core allows both and replays them on the loaded corpus, K1; the GUI
 //!   offers neither while loading, like upstream's TUI) stops the index
 //!   until the load ends, and a deleted card stays out of the list.
-//! * **The swap.** The generation written from the loaded corpus is swapped
-//!   in only while the corpus is still the one it was written from (its
-//!   cards were located in it); otherwise the index in use, which then
-//!   misses conversations, is dropped and queries run in memory.
+//! * **The swap.** The generation the reconcile pass left current is
+//!   swapped in only while the corpus is still the one its cards were
+//!   located in; otherwise the index in use, which then misses
+//!   conversations, is dropped and queries run in memory. Like upstream, the
+//!   swap does not ask for the cards to cover the corpus: a session that
+//!   changed after the load is searched by its newer text.
 //! * **A delete after loading** shifts the documents' rows in place
 //!   ([`Browser::remove_doc_rows`], O(cards), no path lookup), so the index
 //!   keeps answering with the right conversations. Upstream located every
@@ -325,13 +327,13 @@ impl Browser {
             .map(|index| index.cards().generation_name())
     }
 
-    /// Switches to the index of a newer generation written from the loaded
-    /// corpus, and reruns a lexical query on it keeping the selection
+    /// Switches to the index of a newer generation a reconcile pass left
+    /// current, and reruns a lexical query on it keeping the selection
     /// (upstream `swap_search_index`). Only applies once loading has
-    /// finished and while the corpus is the one the generation was written
-    /// from; otherwise an index of another generation is dropped (it lacks
-    /// what that generation added) and a lexical query runs in memory.
-    /// Returns whether the swap applied.
+    /// finished and while the corpus is the one the generation's cards were
+    /// located in; otherwise an index of another generation is dropped (it
+    /// lacks what that generation added) and a lexical query runs in
+    /// memory. Returns whether the swap applied.
     pub(super) fn swap_search_index(&mut self, swap: IndexSwap) -> bool {
         if self.is_loading()
             || self.single_file_mode

@@ -435,7 +435,7 @@ impl ListPane {
             // `<workspace>/.pi/settings.json`): the same options in the new
             // environment; the Debug log level applies from this load on
             // (T-022). Reconfigured, not replaced: dropping the loader would
-            // give up its snapshot write (and join its threads on the UI
+            // give up its reconcile pass (and join its threads on the UI
             // thread).
             let env = app_state(cx).env.clone();
             let mut options = self.loader.options().clone();

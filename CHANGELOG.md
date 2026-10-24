@@ -20,6 +20,9 @@ Release notes are taken from the `## v<version>` section of this file by the rel
   index saved with the startup snapshot, showing the first page of results before the rest. The snapshot now also
   stores the conversation text and that index (rebuilt in the background after a load that changed anything; quitting
   does not wait for the rebuild, which then runs again at the next start).
+- Updating the startup snapshot after a load is much cheaper: only conversation files that are new or changed since
+  the last update are read again and added to it, and nothing is written when no file changed. An update cut short by
+  quitting keeps what it saved and continues at the next start.
 
 ## v0.1.1
 

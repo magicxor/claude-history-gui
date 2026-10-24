@@ -205,7 +205,7 @@ pub fn init_for_test(
     }
     cx.set_global(persist::PersistWrites(false));
     // No list snapshot is read or written unless a test turns it on (its
-    // writer thread must not outlive the world's temporary directory).
+    // store-reconcile thread must not outlive the world's temporary directory).
     cx.set_global(crate::list::ListSnapshots(false));
     let services = Services::recording(recording);
     // The debug sink and the core theme are process-wide: tests that need

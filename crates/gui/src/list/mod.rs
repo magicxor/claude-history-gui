@@ -266,9 +266,9 @@ thread_local! {
 }
 
 /// Whether the list draws its first rows from the store's list snapshot and
-/// writes the snapshot after the initial load (DESIGN §11.2, upstream
-/// 3708bb6). On unless set: tests turn it off (`app::init_for_test`) and back
-/// on where they exercise it.
+/// reconciles the store with the session files after the initial load
+/// (DESIGN §11.2, upstream 3708bb6, e905169). On unless set: tests turn it off
+/// (`app::init_for_test`) and back on where they exercise it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ListSnapshots(pub bool);
 
@@ -1645,10 +1645,12 @@ impl ListPane {
         &self.loader
     }
 
-    /// Wait for the snapshot write of the initial load (tests: before the
+    /// Wait for the reconcile pass of the initial load (tests: before the
     /// world's temporary directory goes).
     #[cfg(test)]
-    pub(crate) fn finish_snapshot_write(&mut self) -> Option<claude_history_core::store::Publish> {
+    pub(crate) fn finish_snapshot_write(
+        &mut self,
+    ) -> Option<claude_history_core::store::generation::Publish> {
         self.loader.finish_snapshot_write()
     }
 

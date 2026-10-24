@@ -1,34 +1,30 @@
 //! Snapshot cards shown while loading (upstream `tui/app/snapshot_tests.rs`),
 //! re-expressed through the browser API, plus the fork's loader side: the
 //! held-back batches installed through the corpus preparation (K1), edits
-//! made on cards, and the snapshot write after the initial load.
+//! made on cards, and the reconcile pass after the initial load.
 //!
 //! Differences from upstream: the workspace is a [`WorkspaceScope`] in the
 //! sandbox (not the process cwd); upstream's key and click gating tests
 //! (resume, fork and Ctrl+O on cards, no rename or delete dialog) are GUI
 //! tests (`crates/gui/src/list/tests/snapshot.rs`). Upstream's index tests
 //! (ac7f591) type through the browser API; the fork adds the loader's
-//! `index-open` and `snapshot-writer` hand-offs, edits with an index, the
+//! `index-open` and `store-reconcile` hand-offs, edits with an index, the
 //! worker's two answers and the cards it builds.
 
 use super::test_helpers::{Sandbox, type_char, wait_for_search};
 use super::*;
 use crate::history::LoaderMessage;
-use crate::store::Publish;
-use crate::store::test_support::{conversation, unknown_fingerprints};
+use crate::store::generation::{Publish, PublishLock};
+use crate::store::test_support::conversation;
 use crate::time_filter::TimeFilter;
 use chrono::TimeZone;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 const HOUR_MS: i64 = 3_600_000;
 
 fn publish(conversations: &[Conversation]) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    let corpus = crate::store::generation::Corpus::new(
-        conversations,
-        unknown_fingerprints(conversations.len()),
-    );
-    crate::store::generation::publish(dir.path(), &corpus).unwrap();
+    crate::store::generation::publish(dir.path(), conversations).unwrap();
     dir
 }
 
@@ -248,6 +244,65 @@ fn snapshot_loader(sandbox: &Sandbox) -> HistoryLoader {
     )
 }
 
+/// Writes a Claude session file in project directory `project` of the
+/// sandbox, with one prompt `text`. Its modification time (the
+/// conversation's timestamp) is `24 - hour` hours back, so a later `hour` is
+/// newer and the reconcile pass's fingerprint of it is known. Returns its
+/// path.
+fn write_session(sandbox: &Sandbox, project: &str, name: &str, hour: u32, text: &str) -> PathBuf {
+    let dir = sandbox.projects_root().join(project);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    let line = serde_json::json!({
+        "type": "user",
+        "timestamp": format!("2024-01-01T{hour:02}:00:00Z"),
+        "cwd": "/tmp/work",
+        "message": {"role": "user", "content": text}
+    });
+    std::fs::write(&path, format!("{line}\n")).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(3600 * (24 - u64::from(hour))))
+        .unwrap();
+    path
+}
+
+/// Three sessions on disk, the newest first in the returned paths.
+fn write_sessions(sandbox: &Sandbox) -> Vec<PathBuf> {
+    vec![
+        write_session(sandbox, "-tmp-alpha", "c.jsonl", 3, "third prompt"),
+        write_session(sandbox, "-tmp-beta", "b.jsonl", 2, "second prompt"),
+        write_session(sandbox, "-tmp-alpha", "a.jsonl", 1, "first prompt"),
+    ]
+}
+
+fn display(paths: &[PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect()
+}
+
+/// The debug log of the sandbox (empty before anything was logged).
+fn debug_log(sandbox: &Sandbox) -> String {
+    std::fs::read_to_string(sandbox.env.debug_log_file().unwrap()).unwrap_or_default()
+}
+
+/// Waits until the debug log holds `text` `count` times.
+fn wait_for_log(sandbox: &Sandbox, text: &str, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while debug_log(sandbox).matches(text).count() < count {
+        assert!(
+            Instant::now() < deadline,
+            "no {text:?}: {}",
+            debug_log(sandbox)
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 #[test]
 fn the_install_swaps_in_the_held_back_batches_not_the_cards() {
     let sandbox = Sandbox::new();
@@ -442,16 +497,14 @@ fn a_rename_made_on_a_card_keeps_its_title_and_the_loaded_text() {
 }
 
 #[test]
-fn a_complete_initial_load_writes_the_snapshot_once() {
+fn a_complete_initial_load_reconciles_the_store_once() {
     let sandbox = Sandbox::new();
+    let paths = write_sessions(&sandbox);
     let mut loader = snapshot_loader(&sandbox);
     assert!(loader.open_snapshot().is_none(), "no generation yet");
 
     let mut app = loading_app(&sandbox, None, vec![]);
-    start_injected(
-        &mut loader,
-        vec![LoaderMessage::Batch(corpus()), LoaderMessage::Done],
-    );
+    assert!(loader.start_initial_load());
     poll_until_event(&mut loader, &mut app);
     assert_eq!(
         loader.finish_snapshot_write(),
@@ -459,26 +512,26 @@ fn a_complete_initial_load_writes_the_snapshot_once() {
     );
     let root = crate::store::default_root(&sandbox.env).unwrap();
     assert!(root.starts_with(sandbox.path()), "{root:?}");
+    loader.poll(&mut app);
+    assert_eq!(app.search_index_generation(), Some("g000001"));
+    assert!(
+        debug_log(&sandbox).contains("Reconcile: Outcome { publish: Published(\"g000001\")"),
+        "upstream's reconcile line: {}",
+        debug_log(&sandbox)
+    );
 
     // The next start draws its first frame from it.
     let mut next = snapshot_loader(&sandbox);
     let mut app = loading_app(&sandbox, None, vec![]);
-    app.show_snapshot(next.open_snapshot().expect("the written generation"));
-    assert_eq!(listed_paths(&app).len(), 3);
-    // The same corpus writes nothing new.
-    start_injected(
-        &mut next,
-        vec![LoaderMessage::Batch(corpus()), LoaderMessage::Done],
-    );
+    app.show_snapshot(next.open_snapshot().expect("the published generation"));
+    assert_eq!(listed_paths(&app), display(&paths));
+    // Unchanged session files write nothing.
+    assert!(next.start_initial_load());
     poll_until_event(&mut next, &mut app);
     assert_eq!(next.finish_snapshot_write(), Some(Publish::Unchanged));
-    // A refresh never writes, even of a changed corpus.
-    let mut refreshed = corpus();
-    refreshed.push(conversation("/p/-tmp-beta/d.jsonl", 4 * HOUR_MS));
-    let (tx, rx) = mpsc::channel();
-    tx.send(LoaderMessage::Batch(refreshed)).unwrap();
-    tx.send(LoaderMessage::Done).unwrap();
-    next.start_with_receiver_for_test(rx, true);
+    // A refresh starts no pass, even with a new session on disk.
+    write_session(&sandbox, "-tmp-beta", "d.jsonl", 4, "fourth prompt");
+    assert!(next.start_refresh());
     let event = poll_until_event(&mut next, &mut app);
     assert!(
         matches!(event, LoadEvent::Refreshed { new: 4, .. }),
@@ -494,8 +547,9 @@ fn a_complete_initial_load_writes_the_snapshot_once() {
 }
 
 #[test]
-fn partial_initial_loads_write_no_snapshot() {
+fn partial_initial_loads_start_no_reconcile_pass() {
     let sandbox = Sandbox::new();
+    write_sessions(&sandbox);
     let root = crate::store::default_root(&sandbox.env).unwrap();
     let cases: Vec<(&str, LoaderOptions, Vec<LoaderMessage>, bool)> = vec![
         (
@@ -554,14 +608,12 @@ fn partial_initial_loads_write_no_snapshot() {
 }
 
 #[test]
-fn reconfiguring_keeps_a_running_write() {
+fn reconfiguring_keeps_a_running_pass() {
     let sandbox = Sandbox::new();
+    write_sessions(&sandbox);
     let mut loader = snapshot_loader(&sandbox);
     let mut app = loading_app(&sandbox, None, vec![]);
-    start_injected(
-        &mut loader,
-        vec![LoaderMessage::Batch(corpus()), LoaderMessage::Done],
-    );
+    assert!(loader.start_initial_load());
     poll_until_event(&mut loader, &mut app);
     loader.reconfigure(
         sandbox.env.clone(),
@@ -574,35 +626,30 @@ fn reconfiguring_keeps_a_running_write() {
     );
     drop(loader);
     let root = crate::store::default_root(&sandbox.env).unwrap();
-    assert!(
-        crate::store::Snapshot::open(&root, true, TimeFilter::default()).is_some(),
-        "the write finished"
-    );
-    let log = std::fs::read_to_string(sandbox.env.debug_log_file().unwrap()).unwrap();
-    assert!(
-        log.contains("List snapshot: Published(\"g000001\")"),
-        "upstream's builder line: {log}"
+    assert_eq!(
+        crate::store::Snapshot::open(&root, true, TimeFilter::default())
+            .map(|snapshot| snapshot.len()),
+        Some(3),
+        "the pass finished"
     );
 }
 
-/// Quitting drops the loader: a build still running is given up (no
+/// Quitting drops the loader: a pass still running is given up (no
 /// generation, no build directory left) instead of holding up the exit.
 #[test]
-fn dropping_the_loader_gives_up_a_running_snapshot_build() {
+fn dropping_the_loader_gives_up_a_running_reconcile_pass() {
     let sandbox = Sandbox::new();
+    write_sessions(&sandbox);
     let mut loader = snapshot_loader(&sandbox);
     let (gate, cancel) = loader.gate_next_snapshot_write_for_test();
     let mut app = loading_app(&sandbox, None, vec![]);
-    start_injected(
-        &mut loader,
-        vec![LoaderMessage::Batch(corpus()), LoaderMessage::Done],
-    );
+    assert!(loader.start_initial_load());
     poll_until_event(&mut loader, &mut app);
-    // The writer has started and waits at the gate; let it go on only once
-    // the drop has asked it to stop, so the build sees the request.
+    // The pass has started and waits at the gate; let it go on only once
+    // the drop has asked it to stop, so the pass sees the request.
     let release = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(20);
-        while !cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        while !cancel.is_set() {
             assert!(Instant::now() < deadline, "the drop never cancelled");
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -614,7 +661,7 @@ fn dropping_the_loader_gives_up_a_running_snapshot_build() {
     let root = crate::store::default_root(&sandbox.env).unwrap();
     assert!(
         crate::store::Snapshot::open(&root, true, TimeFilter::default()).is_none(),
-        "the build was given up"
+        "the pass was given up"
     );
     let leftovers: Vec<_> = std::fs::read_dir(&root)
         .map(|entries| {
@@ -625,11 +672,77 @@ fn dropping_the_loader_gives_up_a_running_snapshot_build() {
         })
         .unwrap_or_default();
     assert!(leftovers.is_empty(), "{leftovers:?}");
-    let log = std::fs::read_to_string(sandbox.env.debug_log_file().unwrap()).unwrap_or_default();
+    let log = debug_log(&sandbox);
     assert!(
-        !log.to_lowercase().contains("list snapshot"),
-        "a given-up build is not logged: {log}"
+        !log.contains("Reconcile") && !log.contains("list snapshot"),
+        "a pass given up is not logged: {log}"
     );
+}
+
+/// A second GUI holds the store's lock: the pass tries again every
+/// `BUSY_RETRY` (logging the busy pass once) and publishes once the lock is
+/// free; dropping the loader while it waits ends the wait.
+#[test]
+fn a_locked_store_is_reconciled_once_the_lock_is_free() {
+    let sandbox = Sandbox::new();
+    write_sessions(&sandbox);
+    let root = crate::store::default_root(&sandbox.env).unwrap();
+    let held = PublishLock::try_acquire(&root).unwrap().unwrap();
+    let mut loader = snapshot_loader(&sandbox);
+    let mut app = loading_app(&sandbox, None, vec![]);
+    assert!(loader.start_initial_load());
+    poll_until_event(&mut loader, &mut app);
+    wait_for_log(&sandbox, "publish: Busy", 1);
+    // Long enough for a few retries.
+    std::thread::sleep(loader::BUSY_RETRY * 2);
+    drop(held);
+    assert_eq!(
+        loader.finish_snapshot_write(),
+        Some(Publish::Published("g000001".into()))
+    );
+    loader.poll(&mut app);
+    assert_eq!(app.search_index_generation(), Some("g000001"));
+    assert_eq!(
+        debug_log(&sandbox).matches("publish: Busy").count(),
+        1,
+        "{}",
+        debug_log(&sandbox)
+    );
+
+    let held = PublishLock::try_acquire(&root).unwrap().unwrap();
+    write_session(&sandbox, "-tmp-beta", "d.jsonl", 4, "fourth prompt");
+    let mut loader = snapshot_loader(&sandbox);
+    let mut app = loading_app(&sandbox, None, vec![]);
+    assert!(loader.start_initial_load());
+    poll_until_event(&mut loader, &mut app);
+    wait_for_log(&sandbox, "publish: Busy", 2);
+    drop(loader);
+    drop(held);
+    assert_eq!(
+        crate::store::Snapshot::open(&root, true, TimeFilter::default())
+            .unwrap()
+            .generation_name(),
+        "g000001",
+        "nothing was published after the drop"
+    );
+}
+
+#[test]
+fn a_cancel_wakes_a_wait_for_the_lock() {
+    let cancel = Arc::new(loader::Cancel::default());
+    let waiting = {
+        let cancel = cancel.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            (cancel.sleep(Duration::from_secs(60)), started.elapsed())
+        })
+    };
+    std::thread::sleep(Duration::from_millis(20));
+    cancel.set();
+    let (cancelled, waited) = waiting.join().unwrap();
+    assert!(cancelled);
+    assert!(waited < Duration::from_secs(60), "{waited:?}");
+    assert!(cancel.sleep(Duration::from_secs(60)), "set stays set");
 }
 
 // --- the generation's search index (upstream ac7f591) ---
@@ -770,7 +883,7 @@ fn index_scope_follows_workspace_filter() {
 }
 
 /// The current generation under `root`, opened and located in `corpus`
-/// (what the snapshot writer hands the loader).
+/// (what the reconcile thread hands the loader).
 fn swap_of(root: &Path, corpus: CorpusSnapshot) -> cards::IndexSwap {
     let snapshot = crate::store::Snapshot::open(root, true, TimeFilter::default()).unwrap();
     let index = crate::store::SearchIndex::open(snapshot).unwrap();
@@ -807,8 +920,7 @@ fn newer_generation_swaps_in_and_reruns_the_query_keeping_selection() {
     app.select_next();
     app.select_next();
 
-    let corpus = crate::store::generation::Corpus::new(&loaded, unknown_fingerprints(loaded.len()));
-    crate::store::generation::publish(root.path(), &corpus).unwrap();
+    crate::store::generation::publish(root.path(), &loaded).unwrap();
     assert!(app.swap_search_index(swap_of(root.path(), app.corpus_snapshot())));
     assert_eq!(app.search_index_generation(), Some("g000002"));
     wait_for_search(&mut app);
@@ -836,8 +948,7 @@ fn a_swap_for_a_corpus_that_changed_drops_the_stale_index() {
     let loaded = needle_corpus_with_late_needle();
     app.append_conversations(loaded.clone());
     app.finish_loading();
-    let corpus = crate::store::generation::Corpus::new(&loaded, unknown_fingerprints(loaded.len()));
-    crate::store::generation::publish(root.path(), &corpus).unwrap();
+    crate::store::generation::publish(root.path(), &loaded).unwrap();
     let swap = swap_of(root.path(), app.corpus_snapshot());
 
     type_query(&mut app, "needle");
@@ -847,7 +958,7 @@ fn a_swap_for_a_corpus_that_changed_drops_the_stale_index() {
         3,
         "in memory: the stale index is dropped"
     );
-    // An edit after the write: the new generation's positions are stale.
+    // An edit after the publish: the new generation's positions are stale.
     assert_eq!(
         app.remove_paths(&[PathBuf::from("/p/-tmp-alpha/a.jsonl")]),
         1
@@ -1074,15 +1185,22 @@ fn the_complete_ranking_keeps_a_row_selected_on_the_first_page() {
 }
 
 #[test]
-fn the_loader_opens_the_index_off_the_ui_thread_and_swaps_in_the_written_generation() {
+fn the_loader_opens_the_index_off_the_ui_thread_and_swaps_in_the_reconciled_generation() {
     let sandbox = Sandbox::new();
     let root = crate::store::default_root(&sandbox.env).unwrap();
-    let corpus = needle_corpus();
-    crate::store::generation::publish(
-        &root,
-        &crate::store::generation::Corpus::new(&corpus, unknown_fingerprints(corpus.len())),
-    )
-    .unwrap();
+    let a = write_session(
+        &sandbox,
+        "-tmp-alpha",
+        "a.jsonl",
+        1,
+        &format!("{} hidden needle here", "padding ".repeat(400)),
+    );
+    write_session(&sandbox, "-tmp-beta", "b.jsonl", 2, "full text");
+    let c = write_session(&sandbox, "-tmp-alpha", "c.jsonl", 3, "needle in the newest");
+    let sources = crate::store::reconcile::Sources::from_env(&sandbox.env);
+    crate::store::reconcile::reconcile(&root, &sources).unwrap();
+    let d = write_session(&sandbox, "-tmp-beta", "d.jsonl", 4, "late needle");
+
     let mut loader = snapshot_loader(&sandbox);
     let mut app = loading_app(&sandbox, None, vec![]);
     app.show_snapshot(loader.open_snapshot().expect("the published generation"));
@@ -1095,15 +1213,9 @@ fn the_loader_opens_the_index_off_the_ui_thread_and_swaps_in_the_written_generat
     assert_eq!(app.search_index_generation(), Some("g000001"));
     type_query(&mut app, "needle");
     wait_for_search(&mut app);
-    assert_eq!(listed_paths(&app).len(), 2);
+    assert_eq!(listed_paths(&app), display(&[c.clone(), a.clone()]));
 
-    start_injected(
-        &mut loader,
-        vec![
-            LoaderMessage::Batch(needle_corpus_with_late_needle()),
-            LoaderMessage::Done,
-        ],
-    );
+    assert!(loader.start_initial_load());
     let event = poll_until_event(&mut loader, &mut app);
     assert!(matches!(event, LoadEvent::Loaded { .. }), "{event:?}");
     assert_eq!(
@@ -1114,24 +1226,17 @@ fn the_loader_opens_the_index_off_the_ui_thread_and_swaps_in_the_written_generat
     wait_for_search(&mut app);
     assert_eq!(listed_paths(&app).len(), 3, "in memory");
 
-    assert_eq!(
-        loader.finish_snapshot_write(),
-        Some(Publish::Published("g000002".into()))
-    );
+    let Some(Publish::Published(published)) = loader.finish_snapshot_write() else {
+        panic!("the pass publishes the new session");
+    };
     loader.poll(&mut app);
-    assert_eq!(app.search_index_generation(), Some("g000002"));
+    assert_eq!(app.search_index_generation(), Some(published.as_str()));
     wait_for_search(&mut app);
-    assert_eq!(
-        listed_paths(&app),
-        vec![
-            "/p/-tmp-beta/d.jsonl",
-            "/p/-tmp-alpha/c.jsonl",
-            "/p/-tmp-alpha/a.jsonl"
-        ]
-    );
+    assert_eq!(listed_paths(&app), display(&[d, c, a]));
     let generation = crate::store::Generation::open(&root).unwrap();
+    assert_eq!(generation.name(), published);
     assert!(
         generation.open_search_files().is_some(),
-        "the written generation carries its text and index"
+        "the published generation carries its text and index"
     );
 }

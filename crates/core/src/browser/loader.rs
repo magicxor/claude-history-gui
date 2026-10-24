@@ -16,29 +16,34 @@
 //! ([`Browser::show_snapshot`]) and its search index on an `index-open`
 //! thread, which a later poll hands to the browser
 //! ([`Browser::use_search_index`]), so lexical queries run before the load
-//! ends. Once the initial load is installed a `snapshot-writer` thread
-//! writes the loaded corpus as a new generation with its text and index
-//! (nothing when it matches `CURRENT`), opens that generation's index and
-//! locates its cards in the loaded corpus; a later poll swaps it in
-//! (upstream ac7f591). Only a complete initial load (no project error, not
-//! interrupted) without a time filter is the whole corpus, so nothing else
-//! is written; refreshes never write (upstream wrote after the initial load
-//! only). Both threads send their result before they call the waker, so the
-//! poll it schedules finds it. [`HistoryLoader::finish_snapshot_write`]
-//! waits for the write; dropping the loader cancels a build that is still
-//! running and then joins both threads.
+//! ends. Once the initial load is installed a `store-reconcile` thread runs
+//! a reconcile pass ([`crate::store::reconcile`], upstream e905169): it
+//! stats every session file of the env's sources, parses only new or
+//! changed ones and publishes them as delta generations (nothing when no
+//! file changed), then opens the current generation's index and locates its
+//! cards in the loaded corpus; a later poll swaps it in (upstream
+//! ac7f591). As upstream, a pass starts only after a complete initial load
+//! (no project error, not interrupted) without a time filter; refreshes
+//! start none. Both threads send their result before they call the waker,
+//! so the poll it schedules finds it.
+//! [`HistoryLoader::finish_snapshot_write`] waits for the pass; dropping the
+//! loader cancels a pass that is still running and then joins both
+//! threads.
 //!
-//! Differences from upstream: the generation is built in this process on
-//! the `snapshot-writer` thread, with its own pool of at most four threads
-//! (half the cores), instead of a detached `--publish-snapshot` child at
-//! nice 10 that reloads the history; the build reads the corpus the
-//! browser already holds. Upstream's child outlived the TUI; here dropping
-//! the loader (at quit) gives the build up
-//! ([`crate::store::write_snapshot_cancellable`]) so quitting never waits
-//! for it, and the next complete initial load builds it again. The fork does
-//! not lower the threads' priority yet: the thread-priority port (upstream
-//! 8322afe/9ee0a03) covers `snapshot-writer` and its `snapshot-build-*`
-//! pool as well as the semantic worker.
+//! Differences from upstream: the pass runs in this process on the
+//! `store-reconcile` thread, with its own pool of at most four threads (half
+//! the cores, `store-reconcile-*`), instead of a detached `--reconcile`
+//! child at nice 10. Upstream's child outlived the TUI; here dropping the
+//! loader (at quit) gives the pass up
+//! ([`crate::store::reconcile::reconcile_cancellable`]) so quitting never
+//! waits for it; the generations it published stay and the next pass goes
+//! on from them. A pass that finds the store locked by another process (a
+//! second GUI) tries again every [`BUSY_RETRY`] until it gets the lock or
+//! the loader is dropped (upstream retried a busy pass from a later commit),
+//! so the generation it then swaps in holds what the other process
+//! published. The fork does not lower the threads' priority yet: the
+//! thread-priority port (upstream 8322afe/9ee0a03) covers `store-reconcile`
+//! and its pool as well as the semantic worker.
 
 use super::cards::IndexSwap;
 use super::corpus::corpus_edit_mark;
@@ -47,17 +52,23 @@ use crate::debug::DebugLevel;
 use crate::env::HistoryEnv;
 use crate::error::AppError;
 use crate::history::{Conversation, LoaderMessage};
-use crate::store::{Publish, SearchIndex, Snapshot};
+use crate::store::generation::{MergePolicy, Publish};
+use crate::store::reconcile::{self, Outcome, Sources};
+use crate::store::{SearchIndex, Snapshot};
 use crate::time_filter::TimeFilter;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 /// Status shown when a refresh starts (upstream wording).
 pub const REFRESHING_STATUS: &str = "Refreshing sessions...";
+
+/// How long a reconcile pass that found the store locked by another
+/// process waits before it tries again (upstream's later `BUSY_RETRY`).
+pub const BUSY_RETRY: Duration = Duration::from_secs(1);
 
 /// Default [`LoaderOptions::drain_budget`]: upstream's TUI stops draining
 /// the loader channel after 8 ms so a frame can render.
@@ -89,7 +100,8 @@ pub struct LoaderOptions {
     pub drain_budget: Option<Duration>,
     /// Use the store's list snapshot under [`crate::store::default_root`]:
     /// [`HistoryLoader::open_snapshot`] reads it, and a complete initial
-    /// load writes it. Off by default (tests and tools); the GUI turns it on
+    /// load starts a reconcile pass that brings it up to date with the
+    /// session files. Off by default (tests and tools); the GUI turns it on
     /// for its main window.
     pub snapshot: bool,
 }
@@ -305,17 +317,49 @@ struct ActiveLoad {
     /// [`corpus_edit_mark`] when the load started: rows the browser
     /// deletes or renames from then on are replayed on its corpus.
     edit_mark: u64,
-    /// When the load started: files modified after it may have changed
-    /// after they were read (the snapshot's fingerprints).
-    loaded_since: SystemTime,
 }
 
-/// What the `snapshot-writer` thread produced.
+/// What the `store-reconcile` thread produced.
 struct SnapshotWrite {
+    /// The last generation the pass published (`Unchanged` when it wrote
+    /// nothing).
     result: std::io::Result<Publish>,
-    /// The generation now current, opened and located in the written
+    /// The generation now current, opened and located in the loaded
     /// corpus, unless the browser already searches it.
     swap: Option<IndexSwap>,
+}
+
+/// Set when the loader is dropped: a running reconcile pass gives up, and a
+/// pass waiting to retry a locked store wakes at once.
+#[derive(Default)]
+pub(super) struct Cancel {
+    set: AtomicBool,
+    wait: Mutex<()>,
+    wake: Condvar,
+}
+
+impl Cancel {
+    pub(super) fn is_set(&self) -> bool {
+        self.set.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn set(&self) {
+        self.set.store(true, Ordering::Relaxed);
+        // Taken so that a waiter between its check and its wait gets the
+        // notice.
+        let _guard = self.wait.lock().unwrap_or_else(PoisonError::into_inner);
+        self.wake.notify_all();
+    }
+
+    /// Waits for `timeout` unless cancelled meanwhile; whether it was.
+    pub(super) fn sleep(&self, timeout: Duration) -> bool {
+        let guard = self.wait.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = self
+            .wake
+            .wait_timeout_while(guard, timeout, |_| !self.is_set())
+            .unwrap_or_else(PoisonError::into_inner);
+        self.is_set()
+    }
 }
 
 /// A thread of the loader whose result a poll collects. The thread sends
@@ -393,21 +437,21 @@ pub struct HistoryLoader {
     env: Arc<HistoryEnv>,
     options: LoaderOptions,
     active: Option<ActiveLoad>,
-    /// The `snapshot-writer` thread of the last initial load.
+    /// The `store-reconcile` thread of the last initial load.
     writer: Option<Background<SnapshotWrite>>,
-    /// Set when the loader is dropped: the writer gives up its build.
-    cancel: Arc<AtomicBool>,
+    /// Set when the loader is dropped: the pass gives up.
+    cancel: Arc<Cancel>,
     /// The `index-open` thread of [`HistoryLoader::open_snapshot`].
     index_open: Option<Background<Option<Arc<SearchIndex>>>>,
-    /// A written generation waiting for the next poll to swap it in.
+    /// A published generation waiting for the next poll to swap it in.
     swap: Option<IndexSwap>,
-    /// The outcome of a write a poll collected, for
+    /// The outcome of a pass a poll collected, for
     /// [`HistoryLoader::finish_snapshot_write`].
     written: Option<Publish>,
     /// Tests: the next preparation waits for a message on this channel.
     #[cfg(test)]
     prepare_gate: Option<Receiver<()>>,
-    /// Tests: the next snapshot write waits for a message on this channel
+    /// Tests: the next reconcile pass waits for a message on this channel
     /// before it starts.
     #[cfg(test)]
     write_gate: Option<Receiver<()>>,
@@ -420,7 +464,7 @@ impl HistoryLoader {
             options,
             active: None,
             writer: None,
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(Cancel::default()),
             index_open: None,
             swap: None,
             written: None,
@@ -436,7 +480,7 @@ impl HistoryLoader {
     }
 
     /// Use `env` and `options` for the next loads (a new workspace, debug
-    /// level or preview mode). A running snapshot write goes on and is
+    /// level or preview mode). A running reconcile pass goes on and is
     /// still joined on drop, so replacing the settings never waits for it.
     /// Call it while no load runs; a running load keeps its stream.
     pub fn reconfigure(&mut self, env: Arc<HistoryEnv>, options: LoaderOptions) {
@@ -473,11 +517,12 @@ impl HistoryLoader {
         Some(snapshot)
     }
 
-    /// Waits for a pending snapshot write so it is not cut short (upstream
-    /// `SnapshotStore::finish`) and returns its outcome, also when a poll
-    /// already collected it (once). A failed write (logged to the debug log
-    /// by the writer) returns `None`, as does no write. The written
-    /// generation is swapped in by the next poll.
+    /// Waits for a running reconcile pass so it is not cut short (upstream
+    /// `SnapshotStore::finish`) and returns the last generation it published
+    /// (`Unchanged` when it wrote nothing), also when a poll already
+    /// collected it (once). A failed pass (logged to the debug log by the
+    /// thread) returns `None`, as does no pass. The current generation is
+    /// swapped in by the next poll.
     pub fn finish_snapshot_write(&mut self) -> Option<Publish> {
         self.join_snapshot_write();
         self.written.take()
@@ -496,21 +541,22 @@ impl HistoryLoader {
         self.written = result.ok();
     }
 
-    /// Writes the loaded corpus in the background (upstream
-    /// `SnapshotStore::write` and its `--publish-snapshot` builder), after
-    /// the install so that edits replayed on it are included, then opens
-    /// the generation now current for [`Browser::swap_search_index`].
-    fn write_snapshot(&mut self, browser: &Browser, loaded_since: SystemTime) {
+    /// Brings the store up to date with the session files in the
+    /// background (upstream `SnapshotStore::write` and its `--reconcile`
+    /// process), after the install, then opens the generation now current
+    /// and locates its cards in the installed corpus for
+    /// [`Browser::swap_search_index`].
+    fn start_reconcile(&mut self, browser: &Browser) {
         if !self.options.snapshot || self.writer.is_some() {
             return;
         }
         let Some(root) = crate::store::default_root(&self.env) else {
             return;
         };
-        let build = SnapshotBuild {
+        let job = ReconcileJob {
             root,
+            env: self.env.clone(),
             corpus: browser.corpus_snapshot(),
-            loaded_since,
             show_last: self.options.show_last,
             in_use: browser.search_index_generation().map(str::to_owned),
             cancel: self.cancel.clone(),
@@ -518,17 +564,17 @@ impl HistoryLoader {
         };
         #[cfg(test)]
         let gate = self.write_gate.take();
-        self.writer = Background::spawn("snapshot-writer", self.options.waker.clone(), move || {
+        self.writer = Background::spawn("store-reconcile", self.options.waker.clone(), move || {
             #[cfg(test)]
             if let Some(gate) = gate {
                 let _ = gate.recv();
             }
-            build_snapshot(build)
+            reconcile_store(job)
         });
     }
 
     /// Hands the browser an index opened since the last poll, and swaps in
-    /// a generation the snapshot write produced.
+    /// the generation a reconcile pass left current.
     fn poll_search_index(&mut self, browser: &mut Browser) {
         if let Some(Some(Some(index))) = take_finished(&mut self.index_open) {
             browser.use_search_index(index);
@@ -633,7 +679,6 @@ impl HistoryLoader {
             }),
             time_filter_active: self.options.time_filter.is_active(),
             edit_mark,
-            loaded_since: SystemTime::now(),
         });
     }
 
@@ -731,7 +776,7 @@ impl HistoryLoader {
                     active.time_filter_active,
                 );
                 if whole_corpus && matches!(event, LoadEvent::Loaded { .. }) {
-                    self.write_snapshot(browser, active.loaded_since);
+                    self.start_reconcile(browser);
                 }
                 result.event = Some(event);
             }
@@ -829,7 +874,7 @@ fn drain_stream(
             Err(TryRecvError::Empty) => return StreamState::Running,
             Err(TryRecvError::Disconnected) => {
                 // Upstream treats a disconnected initial loader as done (but
-                // not as the whole corpus: no snapshot is written).
+                // not as the whole corpus: no reconcile pass starts).
                 let initial = matches!(streaming.kind, LoadKind::Initial { .. });
                 return StreamState::Ended(if initial {
                     stream_done(streaming, browser, false)
@@ -952,13 +997,14 @@ fn loaded_event(browser: &Browser, project_errors: usize, time_filter_active: bo
 }
 
 impl Drop for HistoryLoader {
-    /// Gives up a snapshot build that is still running and waits for the
-    /// writer, which then returns soon, and for an index being opened.
-    /// Upstream's TUI did not wait at exit: its builder was a detached
-    /// process that went on afterwards. An in-process build takes many
-    /// seconds, which quitting must not wait for.
+    /// Gives up a reconcile pass that is still running (or waiting to retry
+    /// a locked store) and waits for its thread, which then returns soon,
+    /// and for an index being opened. Upstream's TUI did not wait at exit:
+    /// its pass was a detached process that went on afterwards. An
+    /// in-process cold pass takes many seconds, which quitting must not wait
+    /// for.
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        self.cancel.set();
         self.join_snapshot_write();
         if let Some(index_open) = self.index_open.take() {
             index_open.join();
@@ -966,71 +1012,87 @@ impl Drop for HistoryLoader {
     }
 }
 
-/// What the `snapshot-writer` thread builds.
-struct SnapshotBuild {
+/// What the `store-reconcile` thread works on.
+struct ReconcileJob {
     root: PathBuf,
+    /// The sources are resolved on the thread (that reads Pi's settings).
+    env: Arc<HistoryEnv>,
+    /// The installed corpus the current generation's cards are located in.
     corpus: CorpusSnapshot,
-    loaded_since: SystemTime,
     show_last: bool,
     /// The generation the browser searches already: not opened again.
     in_use: Option<String>,
-    /// Set when the loader is dropped: the build is given up.
-    cancel: Arc<AtomicBool>,
+    /// Set when the loader is dropped: the pass is given up.
+    cancel: Arc<Cancel>,
     log_path: Option<PathBuf>,
 }
 
-/// The `snapshot-writer` thread's work: publish `corpus` with its text and
-/// index unless `CURRENT` holds it already, then open the current
-/// generation's index (unless it is `in_use`) and locate its cards in
-/// `corpus`. The parallel parts (text hashes, zstd frames, the suffix
-/// index) run on a pool of their own, so the build leaves cores to the UI
-/// and the search workers. The outcome goes to the debug log with
-/// upstream's lines; a build given up (the loader was dropped) is not
-/// logged.
-fn build_snapshot(build: SnapshotBuild) -> SnapshotWrite {
-    let SnapshotBuild {
+/// The `store-reconcile` thread's work: a reconcile pass over the env's
+/// sources into `root`, retried every [`BUSY_RETRY`] while another process
+/// holds the store's lock, then the current generation's index (unless it
+/// is `in_use`) with its cards located in `corpus`. The pass's parallel
+/// parts (the scan, parsing, zstd frames, the suffix index and merges) run
+/// on a pool of their own, so it leaves cores to the UI and the search
+/// workers. Each pass's outcome goes to the debug log with upstream's line
+/// (`Reconcile: {outcome:?}`; of a store found locked again and again, only
+/// the first); a pass given up (the loader was dropped) is not logged.
+fn reconcile_store(job: ReconcileJob) -> SnapshotWrite {
+    let ReconcileJob {
         root,
+        env,
         corpus,
-        loaded_since,
         show_last,
         in_use,
         cancel,
         log_path,
-    } = build;
-    let cancelled = || cancel.load(Ordering::Relaxed);
-    // Take the publish lock before fingerprinting and building: when
-    // another process (a second GUI) holds it, nothing is built.
-    let lock = match crate::store::PublishLock::try_acquire(&root) {
-        Ok(lock) => lock,
-        Err(err) => {
-            return SnapshotWrite {
-                result: Err(err),
-                swap: None,
-            };
+    } = job;
+    let cancelled = || cancel.is_set();
+    let log = |message: &str| {
+        if let Some(log_path) = &log_path {
+            let _ = crate::debug_log::log_debug(log_path, message);
         }
     };
+    let sources = Sources::from_env(&env);
     let threads = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(1, 4));
-    let result = rayon::ThreadPoolBuilder::new()
+    let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
-        .thread_name(|i| format!("snapshot-build-{i}"))
+        .thread_name(|i| format!("store-reconcile-{i}"))
         .build()
-        .map_err(std::io::Error::other)
-        .and_then(|pool| match &lock {
-            Some(lock) => pool.install(|| {
-                crate::store::write_snapshot_cancellable(lock, &corpus, loaded_since, &cancelled)
-            }),
-            // Another process holds the lock: when it already published
-            // this corpus there is nothing to wait for.
-            None if crate::store::snapshot_is_current(&root, &corpus, loaded_since) => {
-                Ok(Publish::Unchanged)
+        .map_err(std::io::Error::other);
+    let mut busy_logged = false;
+    let result = pool.and_then(|pool| {
+        loop {
+            let pass = pool.install(|| {
+                reconcile::reconcile_cancellable(&root, &sources, MergePolicy::DEFAULT, &cancelled)
+            });
+            let busy = matches!(
+                &pass,
+                Ok(Outcome {
+                    publish: Publish::Busy,
+                    ..
+                })
+            );
+            if let Ok(outcome) = &pass
+                && !(busy && busy_logged)
+            {
+                log(&format!("Reconcile: {outcome:?}"));
             }
-            None => Ok(Publish::Busy),
-        });
-    crate::bench::mark("snapshot_write");
+            if !busy {
+                break pass.map(|outcome| outcome.publish);
+            }
+            busy_logged = true;
+            if cancel.sleep(BUSY_RETRY) {
+                break Err(crate::store::generation::cancelled_build());
+            }
+        }
+    });
+    crate::bench::mark("reconcile_done");
     let given_up =
         cancelled() && matches!(&result, Err(err) if err.kind() == std::io::ErrorKind::Interrupted);
-    if !given_up && let Some(log_path) = &log_path {
-        log_snapshot_write(log_path, &result);
+    if let Err(err) = &result
+        && !given_up
+    {
+        log(&format!("Failed to build list snapshot: {err}"));
     }
     let swap = match &result {
         Ok(Publish::Published(_) | Publish::Unchanged) if !cancelled() => {
@@ -1046,19 +1108,6 @@ fn build_snapshot(build: SnapshotBuild) -> SnapshotWrite {
         _ => None,
     };
     SnapshotWrite { result, swap }
-}
-
-/// Upstream's debug-log lines for a build: `List snapshot: {outcome:?}`
-/// (its builder process) and `Failed to build list snapshot: {err}` (its
-/// TUI). Upstream's TUI checked an unchanged corpus itself and started no
-/// builder, so `Unchanged` is not logged.
-fn log_snapshot_write(log_path: &Path, result: &std::io::Result<Publish>) {
-    let message = match result {
-        Ok(Publish::Unchanged) => return,
-        Ok(outcome) => format!("List snapshot: {outcome:?}"),
-        Err(err) => format!("Failed to build list snapshot: {err}"),
-    };
-    let _ = crate::debug_log::log_debug(log_path, &message);
 }
 
 /// Forward loader messages through a new channel, calling `waker` after
@@ -1092,12 +1141,10 @@ impl HistoryLoader {
         tx
     }
 
-    /// Hold the next snapshot write until a message is sent on the returned
+    /// Hold the next reconcile pass until a message is sent on the returned
     /// channel (or it is dropped); also returns the flag the loader sets
     /// when it is dropped.
-    pub(super) fn gate_next_snapshot_write_for_test(
-        &mut self,
-    ) -> (mpsc::Sender<()>, Arc<AtomicBool>) {
+    pub(super) fn gate_next_snapshot_write_for_test(&mut self) -> (mpsc::Sender<()>, Arc<Cancel>) {
         let (tx, rx) = mpsc::channel();
         self.write_gate = Some(rx);
         (tx, self.cancel.clone())
