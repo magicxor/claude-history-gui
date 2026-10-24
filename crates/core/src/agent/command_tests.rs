@@ -364,15 +364,15 @@ fn stubbed_conversation(path: PathBuf, message_count: usize) -> history::Convers
         path,
         index: 0,
         timestamp: chrono::Local::now(),
-        preview: "session".to_string(),
-        preview_first: "session".to_string(),
-        preview_last: "session".to_string(),
-        full_text: "session".to_string(),
-        agent_search_text: String::new(),
-        semantic_route_text: String::new(),
-        semantic_turns: vec!["session".to_string()],
+        preview: "session".into(),
+        preview_first: "session".into(),
+        preview_last: "session".into(),
+        full_text: "session".into(),
+        agent_search_text: "".into(),
+        semantic_route_text: "".into(),
+        semantic_turns: vec!["session".to_string()].into(),
         semantic_turn_ranges: vec![agent::refs::MessageRange::single(1)],
-        search_text_lower: "session".to_string(),
+        search_text_lower: "session".into(),
         project_name: Some("project-a".to_string()),
         project_path: None,
         cwd: None,
@@ -758,7 +758,7 @@ fn agent_semantic_candidates_preserve_tool_results_and_select_matching_segments(
     assert_eq!(matching_tool.conversation.semantic_turns.len(), 1);
     assert!(matching_tool.conversation.semantic_turns[0].contains("distinctive_calibration"));
     assert_eq!(
-        tool_summary.conversation.semantic_turns,
+        tool_summary.conversation.semantic_turns.to_vec(),
         ["tool Read input_keys=file_path"]
     );
     assert!(
@@ -837,7 +837,7 @@ fn agent_semantic_tool_matching_sanitizes_text_and_handles_unicode_and_short_ter
         .expect("matching Unicode tool result candidate");
 
     assert_eq!(
-        tool.conversation.semantic_turns,
+        tool.conversation.semantic_turns.to_vec(),
         ["prefix Über UI menuBar suffix"]
     );
     assert!(camel_case_candidates.iter().any(|candidate| {
@@ -941,15 +941,15 @@ fn agent_semantic_candidates_require_canonical_transcript_projection() {
         path: key.path.clone(),
         index: 0,
         timestamp: chrono::Local::now(),
-        preview: "visible semantic".to_string(),
-        preview_first: "visible semantic".to_string(),
-        preview_last: "visible semantic".to_string(),
-        full_text: "visible semantic".to_string(),
-        agent_search_text: String::new(),
-        semantic_route_text: String::new(),
-        semantic_turns: vec!["visible semantic".to_string()],
+        preview: "visible semantic".into(),
+        preview_first: "visible semantic".into(),
+        preview_last: "visible semantic".into(),
+        full_text: "visible semantic".into(),
+        agent_search_text: "".into(),
+        semantic_route_text: "".into(),
+        semantic_turns: vec!["visible semantic".to_string()].into(),
         semantic_turn_ranges: vec![agent::refs::MessageRange::single(1)],
-        search_text_lower: "visible semantic".to_string(),
+        search_text_lower: "visible semantic".into(),
         project_name: Some("project-a".to_string()),
         project_path: None,
         cwd: None,

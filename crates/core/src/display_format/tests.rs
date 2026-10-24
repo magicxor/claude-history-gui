@@ -16,15 +16,15 @@ fn test_conversation() -> Conversation {
         path: PathBuf::from("/tmp/session.jsonl"),
         index: 0,
         timestamp: Local.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
-        preview: "lexical preview sentinel".to_string(),
-        preview_first: "lexical preview sentinel".to_string(),
-        preview_last: "lexical preview sentinel".to_string(),
-        full_text: "tool output sentinel summary sentinel cwd sentinel".to_string(),
-        agent_search_text: String::new(),
-        semantic_route_text: String::new(),
-        semantic_turns: vec!["semantic visible text".to_string()],
+        preview: "lexical preview sentinel".into(),
+        preview_first: "lexical preview sentinel".into(),
+        preview_last: "lexical preview sentinel".into(),
+        full_text: "tool output sentinel summary sentinel cwd sentinel".into(),
+        agent_search_text: "".into(),
+        semantic_route_text: "".into(),
+        semantic_turns: vec!["semantic visible text".to_string()].into(),
         semantic_turn_ranges: vec![crate::agent::refs::MessageRange::single(1)],
-        search_text_lower: "lexical preview sentinel".to_string(),
+        search_text_lower: "lexical preview sentinel".into(),
         project_name: Some("project sentinel".to_string()),
         project_path: None,
         cwd: Some(PathBuf::from("/cwd/sentinel")),
@@ -898,8 +898,8 @@ fn context_segments_from_ranges_require_ranges_and_width() {
 #[test]
 fn lexical_mixed_query_cached_context_uses_unquoted_and_literals() {
     let mut conversation = test_conversation();
-    conversation.preview = "visible preview".to_string();
-    conversation.full_text = format!("hidden_unquoted {} exact_literal", "x ".repeat(120));
+    conversation.preview = "visible preview".into();
+    conversation.full_text = format!("hidden_unquoted {} exact_literal", "x ".repeat(120)).into();
     let evidence = crate::search::build_lexical_evidence(
         &conversation,
         &ParsedQuery::parse("hidden_unquoted \"exact_literal\""),
@@ -1129,8 +1129,9 @@ fn semantic_list_truncates_cleanly_at_narrow_width() {
 #[test]
 fn lexical_unquoted_render_shows_cached_hidden_full_text_context() {
     let mut conversation = test_conversation();
-    conversation.preview = "visible lexical preview".to_string();
-    conversation.full_text = format!("visible lexical preview {} hiddenneedle", "x ".repeat(200));
+    conversation.preview = "visible lexical preview".into();
+    conversation.full_text =
+        format!("visible lexical preview {} hiddenneedle", "x ".repeat(200)).into();
     let evidence =
         crate::search::build_lexical_evidence(&conversation, &ParsedQuery::parse("hiddenneedle"))
             .unwrap();
@@ -1154,8 +1155,9 @@ fn lexical_unquoted_render_shows_cached_hidden_full_text_context() {
 #[test]
 fn lexical_quoted_render_shows_hidden_literal_context() {
     let mut conversation = test_conversation();
-    conversation.preview = "visible lexical preview".to_string();
-    conversation.full_text = format!("visible lexical preview {} hidden_literal", "x ".repeat(80));
+    conversation.preview = "visible lexical preview".into();
+    conversation.full_text =
+        format!("visible lexical preview {} hidden_literal", "x ".repeat(80)).into();
     let preview = row_preview(&conversation, "\"hidden_literal\"", false, None, None, 80);
     assert_eq!(preview.preview.text, "visible lexical preview");
     let context = preview.context.expect("literal context line");
@@ -1169,11 +1171,11 @@ fn literal_query_rows_without_context_keep_the_four_line_pitch() {
     // hides it in full_text (context line). Upstream reserved a fourth
     // line for both.
     let mut visible = test_conversation();
-    visible.preview = "preview with hidden_literal shown".to_string();
+    visible.preview = "preview with hidden_literal shown".into();
     visible.full_text = visible.preview.clone();
     let mut hidden = test_conversation();
-    hidden.preview = "visible lexical preview".to_string();
-    hidden.full_text = format!("visible lexical preview {} hidden_literal", "x ".repeat(80));
+    hidden.preview = "visible lexical preview".into();
+    hidden.full_text = format!("visible lexical preview {} hidden_literal", "x ".repeat(80)).into();
     let query = "\"hidden_literal\"";
     assert!(crate::browser::query_has_literals(query));
     assert_eq!(
@@ -1200,7 +1202,7 @@ fn semantic_list_uses_semantic_evidence_preview_without_full_text_context() {
 #[test]
 fn semantic_rows_with_metadata_ignore_lexical_evidence() {
     let mut conversation = test_conversation();
-    conversation.full_text = format!("{} sentinel", "x ".repeat(100));
+    conversation.full_text = format!("{} sentinel", "x ".repeat(100)).into();
     let evidence = LexicalEvidence {
         context_ranges: vec![(200, 208)],
     };
@@ -1223,7 +1225,7 @@ fn semantic_rows_with_metadata_ignore_lexical_evidence() {
 #[test]
 fn semantic_list_shows_literal_context_when_evidence_lacks_literal() {
     let mut conversation = test_conversation();
-    conversation.full_text = "tool output sentinel includes audio_generation literal".to_string();
+    conversation.full_text = "tool output sentinel includes audio_generation literal".into();
     let preview = row_preview(
         &conversation,
         "semantic \"audio_generation\"",
@@ -1287,7 +1289,7 @@ fn semantic_literal_preview_merges_overlapping_ranges() {
 #[test]
 fn semantic_literal_context_requires_all_literals_visible() {
     let mut conversation = test_conversation();
-    conversation.full_text = "alpha_exact near preview. beta_exact hidden deeper.".to_string();
+    conversation.full_text = "alpha_exact near preview. beta_exact hidden deeper.".into();
     let metadata = test_semantic_metadata("semantic alpha_exact only");
     let preview = row_preview(
         &conversation,
@@ -1305,7 +1307,7 @@ fn semantic_literal_context_requires_all_literals_visible() {
 #[test]
 fn lexical_rows_window_around_normalized_matches() {
     let mut conversation = test_conversation();
-    conversation.preview = format!("{} needle at the end", "words ".repeat(30));
+    conversation.preview = format!("{} needle at the end", "words ".repeat(30)).into();
     let preview = row_preview(&conversation, "needle", false, None, None, 44);
     assert_eq!(preview.source, PreviewSource::Preview);
     assert!(preview.preview.text.starts_with('…'), "{preview:?}");

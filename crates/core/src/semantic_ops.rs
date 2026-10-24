@@ -1767,7 +1767,7 @@ mod tests {
 
         let silent = vec![test_conversation("/projects/-p/s.jsonl", "", vec![])];
         let mut silent = silent;
-        silent[0].semantic_route_text.clear();
+        silent[0].semantic_route_text = "".into();
         silent[0].custom_title = None;
         silent[0].summary = None;
         let report = generate_semantic_cache(

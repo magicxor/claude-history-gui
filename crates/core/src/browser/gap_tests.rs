@@ -26,15 +26,15 @@ fn conversation(path: PathBuf, text: &str) -> Conversation {
         path,
         index: 0,
         timestamp: Local.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
-        preview: text.to_string(),
-        preview_first: text.to_string(),
-        preview_last: text.to_string(),
-        search_text_lower: search::normalize_for_search(text),
-        semantic_turns: vec![text.to_string()],
+        preview: text.to_string().into(),
+        preview_first: text.to_string().into(),
+        preview_last: text.to_string().into(),
+        search_text_lower: search::normalize_for_search(text).into(),
+        semantic_turns: vec![text.to_string()].into(),
         semantic_turn_ranges: vec![crate::agent::refs::MessageRange::single(1)],
-        full_text: text.to_string(),
-        agent_search_text: String::new(),
-        semantic_route_text: String::new(),
+        full_text: text.to_string().into(),
+        agent_search_text: String::new().into(),
+        semantic_route_text: String::new().into(),
         project_name: Some("project".to_string()),
         project_path: None,
         cwd: None,
@@ -920,7 +920,10 @@ fn a_uuid_jump_survives_a_refresh_or_reload_without_its_session() {
             ..
         })
     ));
-    assert_eq!(app.selected_conversation().unwrap().preview, "loaded");
+    assert_eq!(
+        app.selected_conversation().unwrap().preview,
+        "loaded".into()
+    );
 
     // A session found in the corpus that a narrower reload drops stays.
     app.replace_conversations(vec![conversation(x.clone(), "x")]);

@@ -78,7 +78,7 @@ fn l008_project_cache_hits_invalidates_keeps_negative_entries_and_rewrites_atomi
     marked.get_mut(listed_name).unwrap().preview_last = "FROM CACHE".to_string();
     cache::write_project_cache(&env, "-work-p", marked);
     let hit = load_conversations(&env, &project, true, "-work-p", None).unwrap();
-    assert_eq!(hit[0].preview, "FROM CACHE");
+    assert_eq!(hit[0].preview, "FROM CACHE".into());
 
     // A different size invalidates the entry.
     write_lines(

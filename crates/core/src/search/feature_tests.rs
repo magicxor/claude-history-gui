@@ -150,7 +150,7 @@ fn s019_hidden_match_context_is_clustered_into_at_most_three_ranges() {
         "visible start{far} needle one{far} needle two{far} needle three{far} needle four{far} needle five"
     );
     let mut conversation = one_message_conversation(&text, now, None, None, None);
-    conversation.preview = "visible start".to_string();
+    conversation.preview = "visible start".to_string().into();
     let evidence = build_lexical_evidence(&conversation, &ParsedQuery::parse("needle")).unwrap();
     assert_eq!(evidence.context_ranges.len(), 3);
     let mut previous_end = 0;
@@ -162,12 +162,12 @@ fn s019_hidden_match_context_is_clustered_into_at_most_three_ranges() {
     // Hits close together merge into one cluster.
     let close = one_message_conversation("needle needle needle", now, None, None, None);
     let mut close = close;
-    close.preview = "other".to_string();
+    close.preview = "other".to_string().into();
     let evidence = build_lexical_evidence(&close, &ParsedQuery::parse("needle")).unwrap();
     assert_eq!(evidence.context_ranges.len(), 1);
     // Nothing hidden: no evidence.
     let shown = one_message_conversation("needle", now, None, None, None);
     let mut shown = shown;
-    shown.preview = "needle".to_string();
+    shown.preview = "needle".to_string().into();
     assert!(build_lexical_evidence(&shown, &ParsedQuery::parse("needle")).is_none());
 }

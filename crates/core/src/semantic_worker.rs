@@ -610,7 +610,7 @@ fn literal_evidence_preview(
                     })
                 })
         })
-        .unwrap_or_else(|| conversation.preview.clone())
+        .unwrap_or_else(|| conversation.preview.to_string())
 }
 
 fn evidence_window(text: &str, range: (usize, usize)) -> String {
@@ -993,8 +993,8 @@ mod tests {
         let before = "b".repeat(120);
         let after = "a".repeat(120);
         let mut target = conversation("/projects/p/target.jsonl", vec![]);
-        target.full_text = format!("{before} Needle Phrase {after}");
-        target.preview = "visible preview".to_string();
+        target.full_text = format!("{before} Needle Phrase {after}").into();
+        target.preview = "visible preview".to_string().into();
         let corpus = corpus(vec![target]);
         let response = exact_literal_semantic_response(
             9,
@@ -1069,7 +1069,10 @@ mod tests {
         assert_eq!(full_corpus[1].index, 1);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].index, 1);
-        assert_eq!(candidates[0].conversation.semantic_turns, vec!["visible"]);
+        assert_eq!(
+            candidates[0].conversation.semantic_turns.to_vec(),
+            vec!["visible"]
+        );
     }
 
     #[test]
