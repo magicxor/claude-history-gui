@@ -280,6 +280,77 @@ fn loader_prepares_off_thread_and_installs_on_a_later_poll() {
 }
 
 #[test]
+fn a_spent_drain_budget_leaves_the_next_batch_to_a_later_poll() {
+    // Upstream's TUI stops draining the loader channel after 8 ms so a
+    // frame can render between batches (93e17a5). A zero budget applies
+    // one batch per poll; other messages never wait, and the waker asks
+    // for the next poll.
+    assert_eq!(
+        LoaderOptions::default().drain_budget,
+        Some(DEFAULT_DRAIN_BUDGET)
+    );
+    let sandbox = Sandbox::new();
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let counter = wakes.clone();
+    let waker: Waker = Arc::new(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+    });
+    let options = LoaderOptions::default()
+        .with_waker(waker)
+        .with_drain_budget(Some(Duration::ZERO));
+    let batches = || {
+        vec![
+            LoaderMessage::Batch(vec![dated(sandbox.path().join("a.jsonl"), "a", 1)]),
+            LoaderMessage::ProjectError,
+            LoaderMessage::Batch(vec![dated(sandbox.path().join("b.jsonl"), "b", 2)]),
+            LoaderMessage::Batch(vec![dated(sandbox.path().join("c.jsonl"), "c", 3)]),
+            LoaderMessage::Done,
+        ]
+    };
+    let mut browser = Browser::new_loading(sandbox.options());
+    let mut loader = HistoryLoader::new(sandbox.env.clone(), options.clone());
+    injected(&mut loader, batches(), false);
+
+    for (round, loaded) in [(1, 1), (2, 2)] {
+        let poll = loader.poll(&mut browser);
+        assert_eq!(poll.batches, 1, "round {round}");
+        assert!(poll.pending && !poll.preparing && poll.event.is_none());
+        assert_eq!(wakes.load(Ordering::SeqCst), round, "the waker asks again");
+        assert_eq!(browser.conversations().len(), loaded);
+        assert!(browser.is_loading() && loader.is_running());
+    }
+    let last = loader.poll(&mut browser);
+    assert_eq!(last.batches, 1);
+    assert!(!last.pending && last.preparing);
+    assert!(matches!(
+        poll_until_event(&mut loader, &mut browser),
+        LoadEvent::Loaded {
+            conversations: 3,
+            project_errors: 1
+        }
+    ));
+
+    // A refresh only buffers its batches: the budget does not apply.
+    let mut refreshed = Browser::new(Vec::new(), sandbox.options());
+    let mut loader = HistoryLoader::new(sandbox.env.clone(), options);
+    injected(&mut loader, batches(), true);
+    let poll = loader.poll(&mut refreshed);
+    assert!(!poll.pending);
+    assert!(matches!(poll.event, Some(LoadEvent::RefreshIncomplete)));
+
+    // Without a budget one poll applies every batch.
+    let mut unbounded = Browser::new_loading(sandbox.options());
+    let mut loader = HistoryLoader::new(
+        sandbox.env.clone(),
+        LoaderOptions::default().with_drain_budget(None),
+    );
+    injected(&mut loader, batches(), false);
+    let poll = loader.poll(&mut unbounded);
+    assert_eq!(poll.batches, 3);
+    assert!(!poll.pending && poll.preparing);
+}
+
+#[test]
 fn poll_stays_fast_while_a_20k_corpus_is_prepared() {
     let sandbox = Sandbox::new();
     let body = "lorem ipsum dolor sit amet consectetur ".repeat(40);

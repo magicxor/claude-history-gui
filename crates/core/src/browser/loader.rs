@@ -5,7 +5,10 @@
 //! [`HistoryLoader::poll`] never runs O(corpus) work on the caller's
 //! thread: when a stream ends, the corpus is prepared
 //! ([`Browser::prepare_corpus`]) on a `corpus-prepare` thread and a later
-//! poll installs it and returns the [`LoadEvent`].
+//! poll installs it and returns the [`LoadEvent`]. While loading, one poll
+//! appends batches for at most [`LoaderOptions::drain_budget`] and leaves
+//! the rest to the next poll (upstream `tui/runtime.rs` stops draining the
+//! loader channel after 8 ms so a frame can render between batches).
 
 use super::corpus::corpus_edit_mark;
 use super::{Browser, PreparedCorpus, Waker};
@@ -16,9 +19,14 @@ use crate::history::{Conversation, LoaderMessage};
 use crate::time_filter::TimeFilter;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::time::{Duration, Instant};
 
 /// Status shown when a refresh starts (upstream wording).
 pub const REFRESHING_STATUS: &str = "Refreshing sessions...";
+
+/// Default [`LoaderOptions::drain_budget`]: upstream's TUI stops draining
+/// the loader channel after 8 ms so a frame can render.
+pub const DEFAULT_DRAIN_BUDGET: Duration = Duration::from_millis(8);
 
 /// Settings of every load started by a [`HistoryLoader`].
 #[derive(Clone)]
@@ -32,13 +40,23 @@ pub struct LoaderOptions {
     /// Inactive by default.
     pub time_filter: TimeFilter,
     /// Called from the loader after each message it posts, and when the
-    /// corpus preparation at the end of a load finishes.
+    /// corpus preparation at the end of a load finishes. [`HistoryLoader::poll`]
+    /// also calls it synchronously on the caller's thread when the drain
+    /// budget holds a batch back ([`LoaderPoll::pending`]), so a waker must
+    /// only schedule a later poll, never poll re-entrantly.
     pub waker: Option<Waker>,
+    /// How long one [`HistoryLoader::poll`] keeps appending batches to the
+    /// browser during the initial load. A poll always applies at least one
+    /// batch; once the budget is spent the next batch waits for a later
+    /// poll ([`LoaderPoll::pending`], and the waker is called). Messages that
+    /// are not batches never wait. `None` drains everything in one poll.
+    /// Default [`DEFAULT_DRAIN_BUDGET`].
+    pub drain_budget: Option<Duration>,
 }
 
 impl Default for LoaderOptions {
     /// Last-message previews (upstream default), no debug output, no time
-    /// filter, no waker.
+    /// filter, no waker, the default drain budget.
     fn default() -> Self {
         Self::new(true)
     }
@@ -51,6 +69,7 @@ impl LoaderOptions {
             debug_level: None,
             time_filter: TimeFilter::default(),
             waker: None,
+            drain_budget: Some(DEFAULT_DRAIN_BUDGET),
         }
     }
 
@@ -68,6 +87,11 @@ impl LoaderOptions {
         self.waker = Some(waker);
         self
     }
+
+    pub fn with_drain_budget(mut self, budget: Option<Duration>) -> Self {
+        self.drain_budget = budget;
+        self
+    }
 }
 
 impl std::fmt::Debug for LoaderOptions {
@@ -77,6 +101,7 @@ impl std::fmt::Debug for LoaderOptions {
             .field("debug_level", &self.debug_level)
             .field("time_filter", &self.time_filter)
             .field("waker", &self.waker.is_some())
+            .field("drain_budget", &self.drain_budget)
             .finish()
     }
 }
@@ -173,6 +198,9 @@ pub struct LoaderPoll {
     /// `corpus-prepare` thread; a later poll (the waker fires when it is
     /// done) installs it and returns the event.
     pub preparing: bool,
+    /// The drain budget ran out with a batch still waiting: poll again (the
+    /// waker, if any, has been called for it).
+    pub pending: bool,
 }
 
 impl LoaderPoll {
@@ -203,6 +231,9 @@ enum Ending {
 struct Streaming {
     rx: Receiver<LoaderMessage>,
     kind: LoadKind,
+    /// A batch received after the drain budget ran out, applied first by
+    /// the next poll.
+    held: Option<LoaderMessage>,
 }
 
 struct Preparing {
@@ -349,7 +380,11 @@ impl HistoryLoader {
 
     fn begin(&mut self, rx: Receiver<LoaderMessage>, kind: LoadKind, edit_mark: u64) {
         self.active = Some(ActiveLoad {
-            phase: Phase::Streaming(Streaming { rx, kind }),
+            phase: Phase::Streaming(Streaming {
+                rx,
+                kind,
+                held: None,
+            }),
             time_filter_active: self.options.time_filter.is_active(),
             edit_mark,
         });
@@ -368,8 +403,10 @@ impl HistoryLoader {
         }
     }
 
-    /// Apply every pending loader message to `browser` (never blocks, and
-    /// never sorts, deduplicates or indexes the corpus on this thread).
+    /// Apply pending loader messages to `browser`. During the initial load
+    /// appending stops once [`LoaderOptions::drain_budget`] is spent (after at
+    /// least one batch) and [`LoaderPoll::pending`] is set. Never blocks, and
+    /// never sorts, deduplicates or indexes the corpus on this thread.
     pub fn poll(&mut self, browser: &mut Browser) -> LoaderPoll {
         let mut result = LoaderPoll::default();
         let Some(mut active) = self.active.take() else {
@@ -377,9 +414,19 @@ impl HistoryLoader {
         };
         browser.track_corpus_edits_since(active.edit_mark);
         if let Phase::Streaming(streaming) = &mut active.phase {
-            match drain_stream(streaming, browser, &mut result) {
+            match drain_stream(streaming, browser, &mut result, self.options.drain_budget) {
                 StreamState::Running => {
                     self.active = Some(active);
+                    return result;
+                }
+                StreamState::Yielded => {
+                    // A batch is held back: ask for another poll, so the
+                    // caller can draw a frame in between.
+                    result.pending = true;
+                    self.active = Some(active);
+                    if let Some(waker) = &self.options.waker {
+                        waker();
+                    }
                     return result;
                 }
                 StreamState::Ended(StreamEnd::Event(event)) => {
@@ -464,20 +511,36 @@ enum StreamEnd {
 }
 
 enum StreamState {
+    /// Every queued message was applied; the stream is still open.
     Running,
+    /// The drain budget ran out with a batch held back.
+    Yielded,
     Ended(StreamEnd),
 }
 
-/// Apply the pending messages of a running stream.
+/// Apply the pending messages of a running stream. Appending batches to the
+/// browser stops once `budget` is spent (after at least one batch).
 fn drain_stream(
     streaming: &mut Streaming,
     browser: &mut Browser,
     result: &mut LoaderPoll,
+    budget: Option<Duration>,
 ) -> StreamState {
+    let started = Instant::now();
     loop {
-        match streaming.rx.try_recv() {
+        let received = match streaming.held.take() {
+            Some(message) => Ok(message),
+            None => streaming.rx.try_recv(),
+        };
+        match received {
             Ok(LoaderMessage::Batch(conversations)) => match &mut streaming.kind {
                 LoadKind::Initial { .. } => {
+                    if result.batches > 0
+                        && budget.is_some_and(|budget| started.elapsed() >= budget)
+                    {
+                        streaming.held = Some(LoaderMessage::Batch(conversations));
+                        return StreamState::Yielded;
+                    }
                     browser.append_conversations(conversations);
                     result.batches += 1;
                 }

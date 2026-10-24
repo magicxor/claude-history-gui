@@ -112,7 +112,8 @@ mod types;
 pub use crate::semantic_worker::{SemanticEmbedderFactory, Waker};
 pub use corpus::{CorpusSnapshot, PreparedCorpus};
 pub use loader::{
-    HistoryLoader, LoadEvent, LoaderOptions, LoaderPoll, REFRESHING_STATUS, RefreshPolicy,
+    DEFAULT_DRAIN_BUDGET, HistoryLoader, LoadEvent, LoaderOptions, LoaderPoll, REFRESHING_STATUS,
+    RefreshPolicy,
 };
 pub use types::{
     DeleteError, DeletedSession, EscapeOutcome, ListSearchMode, LoadingState, RENAMED_STATUS,

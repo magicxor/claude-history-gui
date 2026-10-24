@@ -5,7 +5,8 @@
 //! threads or GUI background tasks, K1–K4) and renders the visible rows
 //! with a `uniform_list`. Results arrive through the waker: a bounded
 //! `async_channel` wakes `_poll_task`, which drains the loader and the
-//! search workers (`poll_all`).
+//! search workers (`poll_all`) and then yields, so a frame can be drawn
+//! between polls while the loader streams batches.
 //!
 //! Frozen contracts this pane follows:
 //! * key contexts: `ConversationList` on the pane root, `ListToolbar` on the
@@ -119,6 +120,23 @@ fn warmed_factory(
         let _ = embedder.embed_passages(&[]);
         Ok(embedder)
     })
+}
+
+/// Return to the executor once. gpui's Windows platform draws a pending
+/// frame between foreground tasks once they ran for about 10 ms; a task that
+/// never returns `Pending` is never interrupted.
+async fn yield_now() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded {
+            std::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await
 }
 
 /// Pasted text for the one-line search: `\r\n`, `\n`, `\r` and tabs become
@@ -330,6 +348,11 @@ impl ListPane {
                     Ok(None) => {}
                     Err(_) => break,
                 }
+                // Hand the UI thread back before the next poll: a wake that
+                // arrived meanwhile (for example a batch core's drain budget
+                // held back, §11.2) would otherwise be polled at once, and no
+                // frame would be drawn while batches keep coming.
+                yield_now().await;
             }
         });
         let tick_task = cx.spawn(async move |this, cx| {

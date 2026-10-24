@@ -23,6 +23,7 @@ pub mod pi;
 pub mod pi_loader;
 mod rename;
 mod session;
+mod session_loader;
 
 pub(crate) use messages::{MessageOrdinals, Placement};
 pub(crate) use session::apply_preview_mode;
