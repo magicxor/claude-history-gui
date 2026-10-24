@@ -317,14 +317,17 @@ Invoke-Seed -Name $volume -LockPath (Get-LockPath $volume) -Marker (Get-SeedMark
                 "./debug/.fingerprint/$n-*"; "./debug/build/$n-*"
             }) | ForEach-Object { "--exclude=$_" }
         # Under cargo's locks in the main volume (flock, as cargo takes them; all or none, so it never
-        # waits holding one), so a build there cannot change the source halfway. pipefail: a failed
-        # read fails the seed even when the extraction succeeds. posix format: sub-second mtimes.
+        # waits holding one), so a build there cannot change the source halfway. A missing lock file
+        # is created, as cargo itself would, so that a cargo starting meanwhile waits for the copy
+        # (the main volume is mounted writable for that alone). pipefail: a failed read fails the
+        # seed even when the extraction succeeds. posix format: sub-second mtimes.
         $copy = @'
 set -o pipefail
 [ -d /from/debug ] || exit 0
 fds=()
 for f in /from/debug/.cargo-build-lock /from/debug/.cargo-artifact-lock; do
-    [ -e "$f" ] && { exec {fd}<"$f"; fds+=("$fd"); }
+    exec {fd}>>"$f" || exit 1
+    fds+=("$fd")
 done
 waiting=
 while :; do
@@ -341,7 +344,7 @@ tar -C /from --format=posix "$@" -cf - ./debug | tar -C /target -xf -
         # --init with TINI_KILL_PROCESS_GROUP: Ctrl+C reaches the tars, not only bash.
         docker run --rm --init -e TINI_KILL_PROCESS_GROUP=1 --pull never --name "$prefix-seed-$checkout-$runId" `
             --label "$prefix.dev=1" --label "$prefix.owner=$owner" `
-            --mount "type=volume,src=$mainVolume,dst=/from,readonly" `
+            --mount "type=volume,src=$mainVolume,dst=/from" `
             --mount "type=volume,src=$volume,dst=/target" $image bash -c $copy bash @excludes
         if ($LASTEXITCODE -ne 0) { throw "Seeding $volume failed with exit code $LASTEXITCODE; run the script again to redo it." }
     } | Out-Null
