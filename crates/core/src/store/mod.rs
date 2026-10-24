@@ -20,6 +20,9 @@
 //!   [`generation::build_manifest`] accept any slice of
 //!   `Borrow<Conversation>`, so the browser's `Arc<Conversation>` corpus is
 //!   written without copying. The manifest bytes are the same.
+//! * **Windows tests.** `lexindex`'s corrupt-file test drops its open index
+//!   (three live maps) before it rewrites and truncates the index files,
+//!   which Windows refuses for a mapped file. The code is upstream's.
 //!
 //! The format, the publish protocol and the collection rules are upstream's.
 //! On Windows (NTFS) `std::fs` removes and renames over files that another
@@ -32,6 +35,8 @@
 
 pub mod card;
 pub mod generation;
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod lexindex;
 
 pub use generation::{Generation, ProjectView, Publish};
 

@@ -52,6 +52,9 @@ ureq = { version = "3.3", default-features = false, features = ["rustls"] }
 # no crates.
 bytemuck = { version = "1.25.2", features = ["derive"] }
 memmap2 = "0.9"
+# Store word-start suffix index (store::lexindex), as upstream; adds one
+# crate (fst 0.4.7, no dependencies of its own).
+fst = "0.4"
 
 # GUI crate (DESIGN §16.1). gpui-kit is pinned exactly: the GUI relies on
 # gpui-base text-selection internals verified against 0.7.3 (DESIGN §19).
