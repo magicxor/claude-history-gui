@@ -26,7 +26,6 @@ fn session(root: &Path, project: &str, uuid: &str, text: &str, day: u32) -> Conv
     conversation.timestamp = Local.with_ymd_and_hms(2024, 1, day, 0, 0, 0).unwrap();
     conversation.preview = text.to_string().into();
     conversation.full_text = text.to_string().into();
-    conversation.search_text_lower = search::normalize_for_search(text).into();
     conversation.semantic_turns = vec![text.to_string()].into();
     conversation.semantic_turn_ranges = vec![crate::agent::refs::MessageRange::single(1)];
     conversation

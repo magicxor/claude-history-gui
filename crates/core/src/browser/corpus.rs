@@ -28,7 +28,7 @@ use crate::history::Conversation;
 use crate::search::query::ParsedQuery;
 use crate::search::{self, SearchableConversation};
 use crate::store::SearchIndex;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -60,6 +60,28 @@ pub struct PreparedCorpus {
     /// with, its position in this corpus (a load over snapshot cards).
     /// Dropped by an edit that moves or changes a conversation.
     located: Option<(Arc<SearchIndex>, Vec<Option<usize>>)>,
+}
+
+/// A session re-parsed in the background (a rename, a session loaded by a
+/// UUID jump) with its normalized lexical body, so the browser's thread
+/// only installs it: [`PreparedSession::new`] does the O(text) work and
+/// runs on any thread ([`Browser::apply_renamed_session`],
+/// [`Browser::resolve_uuid_lookup_session`]).
+pub struct PreparedSession {
+    pub(super) conversation: Conversation,
+    pub(super) body_lower: Arc<str>,
+}
+
+impl PreparedSession {
+    /// Normalize the text of `conversation` (the cost of the whole
+    /// transcript: not for the UI thread).
+    pub fn new(conversation: Conversation) -> Self {
+        let body_lower = SearchableConversation::new(&conversation, 0).body_lower;
+        Self {
+            conversation,
+            body_lower,
+        }
+    }
 }
 
 /// The positions in a prepared corpus of the conversations of the corpus it
@@ -95,32 +117,43 @@ impl PreparedCorpus {
     }
 
     /// Replace the conversation at `position` (same path), with its search
-    /// data and its `index`.
-    fn replace(&mut self, position: usize, mut conversation: Arc<Conversation>) {
+    /// data and its `index`. `body` is the conversation's normalized body
+    /// when it exists already.
+    fn replace(
+        &mut self,
+        position: usize,
+        mut conversation: Arc<Conversation>,
+        body: Option<Arc<str>>,
+    ) {
         // The index holds the replaced (renamed) conversation's text.
         self.located = None;
         if conversation.index != position {
             Arc::make_mut(&mut conversation).index = position;
         }
         let previous = std::mem::replace(&mut self.conversations[position], conversation);
-        self.searchable[position] = Arc::new(SearchableConversation::new(
+        self.searchable[position] = Arc::new(searchable_entry(
             &self.conversations[position],
             position,
+            body,
         ));
         self.index.replace(&self.conversations, position, &previous);
     }
 
     /// Append a conversation (a carried UUID result); `previous_position`
-    /// is its position in the corpus being replaced.
-    fn push(&mut self, mut conversation: Arc<Conversation>, previous_position: usize) {
+    /// is its position in the corpus being replaced and `body` its
+    /// normalized body when it exists already.
+    fn push(
+        &mut self,
+        mut conversation: Arc<Conversation>,
+        previous_position: usize,
+        body: Option<Arc<str>>,
+    ) {
         let position = self.conversations.len();
         if conversation.index != position {
             Arc::make_mut(&mut conversation).index = position;
         }
-        self.searchable.push(Arc::new(SearchableConversation::new(
-            &conversation,
-            position,
-        )));
+        self.searchable
+            .push(Arc::new(searchable_entry(&conversation, position, body)));
         self.conversations.push(conversation);
         self.index.extend(&self.conversations, position);
         if let Some(slot) = self
@@ -191,8 +224,11 @@ pub(super) enum CorpusEdit {
     /// The conversation at this path left the corpus (deleted).
     Removed(PathBuf),
     /// The conversation at this path was replaced (renamed); the install
-    /// takes the browser's current version.
-    Replaced(PathBuf),
+    /// takes the browser's current version, whose normalized body is kept
+    /// here so the install does not normalize the text again. Only the
+    /// newest edit of a path keeps its body (`Some`); recording a newer
+    /// edit of the path drops the superseded bodies.
+    Replaced(PathBuf, Option<Arc<str>>),
 }
 
 /// Clock of the corpus edits of every browser (a counter, not a time).
@@ -531,7 +567,13 @@ impl Browser {
                 .is_none()
         });
         if let Some((previous_position, session)) = &carried {
-            prepared.push(session.clone(), *previous_position);
+            // The browser's search data holds the session's body already.
+            let body = self
+                .search_data_built()
+                .then(|| self.searchable.get(*previous_position))
+                .flatten()
+                .map(|entry| entry.body_lower.clone());
+            prepared.push(session.clone(), *previous_position, body);
         }
         let anchor = self.selected_path();
         // Quirk 16: with a query, the visible rows stay (in the new corpus)
@@ -677,15 +719,20 @@ impl Browser {
         self.invalidate_search_generation();
     }
 
-    /// Replace the conversation at `index` (same path) and its search data.
+    /// Replace the conversation at `index` (same path) and its search data,
+    /// built over the already normalized `body`.
     pub(super) fn replace_conversation_at(
         &mut self,
         index: usize,
         conversation: Arc<Conversation>,
+        body: Arc<str>,
     ) {
-        self.record_corpus_edit(CorpusEdit::Replaced(conversation.path.clone()));
+        self.record_corpus_edit(CorpusEdit::Replaced(
+            conversation.path.clone(),
+            Some(body.clone()),
+        ));
         if let Some(searchable) = self.search_data_mut() {
-            searchable[index] = Arc::new(SearchableConversation::new(&conversation, index));
+            searchable[index] = Arc::new(searchable_entry(&conversation, index, Some(body)));
         }
         let previous = std::mem::replace(&mut self.corpus_mut()[index], conversation);
         self.index.replace(&self.conversations, index, &previous);
@@ -693,11 +740,19 @@ impl Browser {
 
     /// Append one conversation (a session loaded from disk by a UUID jump)
     /// with its search data. Returns its index.
-    pub(super) fn push_conversation(&mut self, mut conversation: Conversation) -> usize {
+    pub(super) fn push_conversation(&mut self, session: PreparedSession) -> usize {
         let index = self.conversations.len();
+        let PreparedSession {
+            mut conversation,
+            body_lower,
+        } = session;
         conversation.index = index;
         if let Some(searchable) = self.search_data_mut() {
-            searchable.push(Arc::new(SearchableConversation::new(&conversation, index)));
+            searchable.push(Arc::new(searchable_entry(
+                &conversation,
+                index,
+                Some(body_lower),
+            )));
         }
         self.corpus_mut().push(Arc::new(conversation));
         self.index.extend(&self.conversations, index);
@@ -813,6 +868,16 @@ impl Browser {
     fn record_corpus_edit(&mut self, edit: CorpusEdit) {
         let stamp = CORPUS_EDIT_CLOCK.fetch_add(1, Ordering::SeqCst);
         let edits = &mut self.corpus_edits;
+        // Replay only reads the newest edit of a path: release the
+        // transcripts the older edits of it hold.
+        let (CorpusEdit::Removed(edited) | CorpusEdit::Replaced(edited, _)) = &edit;
+        for (_, earlier) in &mut edits.entries {
+            if let CorpusEdit::Replaced(path, body) = earlier
+                && path == edited
+            {
+                *body = None;
+            }
+        }
         edits.entries.push_back((stamp, edit));
         if edits.since.is_none() && edits.entries.len() > IDLE_CORPUS_EDITS {
             edits.entries.pop_front();
@@ -849,23 +914,23 @@ impl Browser {
             return prepared;
         }
         let mut removed = HashSet::new();
-        let mut replaced = HashSet::new();
+        let mut replaced = HashMap::new();
         for (_, edit) in edits.entries {
             match edit {
                 CorpusEdit::Removed(path) => {
                     replaced.remove(&path);
                     removed.insert(path);
                 }
-                CorpusEdit::Replaced(path) => {
+                CorpusEdit::Replaced(path, body) => {
                     // The last edit of a path wins (a session deleted, then
                     // found again by a UUID jump and renamed).
                     removed.remove(&path);
-                    replaced.insert(path);
+                    replaced.insert(path, body);
                 }
             }
         }
 
-        for path in &replaced {
+        for (path, body) in &replaced {
             let Some(current) = self
                 .position_of_path(path)
                 .map(|position| self.conversations[position].clone())
@@ -888,7 +953,7 @@ impl Browser {
                     updated.project_path = loaded.project_path.clone();
                     Arc::new(updated)
                 };
-                prepared.replace(position, renamed);
+                prepared.replace(position, renamed, body.clone());
             }
         }
 
@@ -900,6 +965,20 @@ impl Browser {
         removed_positions.dedup();
         prepared.remove_positions(&removed_positions);
         prepared
+    }
+}
+
+/// The search data of `conversation` at `index`, over its normalized `body`
+/// when that exists already (only the title, summary and project are
+/// normalized then).
+fn searchable_entry(
+    conversation: &Conversation,
+    index: usize,
+    body: Option<Arc<str>>,
+) -> SearchableConversation {
+    match body {
+        Some(body) => SearchableConversation::with_body(conversation, index, body),
+        None => SearchableConversation::new(conversation, index),
     }
 }
 

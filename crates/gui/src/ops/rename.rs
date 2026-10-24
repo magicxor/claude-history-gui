@@ -9,7 +9,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use claude_history_core::browser::RenameError;
+use claude_history_core::browser::{PreparedSession, RenameError};
 use claude_history_core::history::rename_session;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -250,8 +250,10 @@ impl RenameDialog {
         cx.notify();
         let task = {
             let path = path.clone();
-            cx.background_executor()
-                .spawn(async move { rename_session(&env, &path, source, &title, show_last) })
+            cx.background_executor().spawn(async move {
+                // The re-parsed text is normalized here, off the UI thread.
+                rename_session(&env, &path, source, &title, show_last).map(PreparedSession::new)
+            })
         };
         let dialog = cx.entity().downgrade();
         window
@@ -277,7 +279,7 @@ impl RenameDialog {
 /// then close the dialog or show the inline error. Returns whether the list
 /// applied the rename.
 fn finish(
-    result: Result<claude_history_core::history::Conversation, RenameError>,
+    result: Result<PreparedSession, RenameError>,
     path: std::path::PathBuf,
     list: Option<Entity<crate::list::ListPane>>,
     dialog: WeakEntity<RenameDialog>,

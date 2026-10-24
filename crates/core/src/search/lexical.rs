@@ -34,7 +34,14 @@ impl SearchableConversation {
     /// The search data of one conversation at `index` (what
     /// [`precompute_search_text`] builds for each element).
     pub fn new(conversation: &Conversation, index: usize) -> Self {
-        searchable_conversation(conversation, index, false)
+        searchable_conversation(conversation, index, false, None)
+    }
+
+    /// Like [`SearchableConversation::new`], with the normalized body of
+    /// `conversation` already at hand (`body`, from an earlier entry of the
+    /// same text): only the title, summary and project are normalized.
+    pub fn with_body(conversation: &Conversation, index: usize, body: Arc<str>) -> Self {
+        searchable_conversation(conversation, index, false, Some(body))
     }
 }
 
@@ -55,28 +62,39 @@ pub fn is_uuid(query: &str) -> bool {
         .all(|(part, &len)| part.len() == len && part.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
-/// Build searchable index from conversations using pre-normalized search text.
-/// Only appends the (small) project name — the expensive full_text normalization
-/// was already done during parsing/cache load.
+/// Build searchable index from conversations, normalizing their text.
 ///
 /// `C` is `Conversation` or a shared `Arc<Conversation>`.
 pub fn precompute_search_text<C>(conversations: &[C]) -> Vec<SearchableConversation>
 where
     C: Borrow<Conversation> + Sync,
 {
-    precompute_search_text_with(conversations, false)
+    precompute_search_text_with(conversations, false, |_| None)
+}
+
+/// Like [`precompute_search_text`], taking each conversation's normalized body
+/// from `reuse` when it has one, so text normalized before is not redone.
+pub fn precompute_search_text_reusing<C>(
+    conversations: &[C],
+    reuse: impl Fn(&Conversation) -> Option<Arc<str>> + Sync,
+) -> Vec<SearchableConversation>
+where
+    C: Borrow<Conversation> + Sync,
+{
+    precompute_search_text_with(conversations, false, reuse)
 }
 
 pub fn precompute_agent_search_text<C>(conversations: &[C]) -> Vec<SearchableConversation>
 where
     C: Borrow<Conversation> + Sync,
 {
-    precompute_search_text_with(conversations, true)
+    precompute_search_text_with(conversations, true, |_| None)
 }
 
 fn precompute_search_text_with<C>(
     conversations: &[C],
     include_agent_text: bool,
+    reuse: impl Fn(&Conversation) -> Option<Arc<str>> + Sync,
 ) -> Vec<SearchableConversation>
 where
     C: Borrow<Conversation> + Sync,
@@ -84,7 +102,11 @@ where
     conversations
         .par_iter()
         .enumerate()
-        .map(|(idx, conv)| searchable_conversation(conv.borrow(), idx, include_agent_text))
+        .map(|(idx, conv)| {
+            let conv = conv.borrow();
+            let body = reuse(conv);
+            searchable_conversation(conv, idx, include_agent_text, body)
+        })
         .collect()
 }
 
@@ -92,6 +114,7 @@ fn searchable_conversation(
     conv: &Conversation,
     idx: usize,
     include_agent_text: bool,
+    body: Option<Arc<str>>,
 ) -> SearchableConversation {
     let title_lower = conv
         .custom_title
@@ -110,7 +133,7 @@ fn searchable_conversation(
         .unwrap_or_default();
 
     SearchableConversation {
-        body_lower: body_search_text_lower(conv, include_agent_text),
+        body_lower: body.unwrap_or_else(|| body_search_text_lower(conv, include_agent_text)),
         title_lower,
         summary_lower,
         project_lower,
@@ -119,12 +142,13 @@ fn searchable_conversation(
 }
 
 fn body_search_text_lower(conversation: &Conversation, include_agent_text: bool) -> Arc<str> {
+    let body = normalize_for_search(&conversation.full_text);
     if !include_agent_text || conversation.agent_search_text.is_empty() {
-        conversation.search_text_lower.clone()
+        body.into()
     } else {
         format!(
             "{} {}",
-            conversation.search_text_lower,
+            body,
             normalize_for_search(&conversation.agent_search_text)
         )
         .into()
@@ -669,8 +693,6 @@ mod tests {
     }
 
     /// Create a test conversation with optional metadata.
-    /// Rebuilds search_text_lower to match production behavior:
-    /// custom_title + summary are prepended to body text before normalization.
     fn make_conv_full(
         text: &str,
         project: Option<&str>,

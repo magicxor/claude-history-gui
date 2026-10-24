@@ -21,8 +21,14 @@
 //! * **Search data stays in the browser.** Upstream's `UpdateData` rebuilt
 //!   every conversation's search data on the worker's pool; the browser
 //!   keeps one shared `Arc` per conversation, built when the corpus is
-//!   prepared off the UI thread (an edit rebuilds only its own), so the
-//!   worker never rebuilds it.
+//!   prepared off the UI thread, so the worker never rebuilds it. Upstream
+//!   503fe42 (no `search_text_lower` on conversations) reuses a body by the
+//!   `full_text` pointer in a map on the worker; the fork has no such map. An
+//!   edited entry (rename, UUID-loaded session) takes the body normalized
+//!   where the session was prepared ([`super::PreparedSession`], a
+//!   background task in the GUI), reused by the replay of an edit at an
+//!   install and by a carried UUID result: only its title, summary and
+//!   project are normalized on the UI thread.
 //! * **Cards built by the worker.** While snapshot cards are the rows, an
 //!   index answer carries the cards of the documents the browser has not
 //!   materialized yet ([`IndexScope::cards`], [`SearchResponse::cards`]),
@@ -32,7 +38,9 @@
 //!   polled).
 
 use super::corpus::{CorpusSnapshot, SearchSnapshot};
-use super::{Browser, ListSearchMode, SemanticProgress, SemanticResultMetadata, UuidLookup};
+use super::{
+    Browser, ListSearchMode, PreparedSession, SemanticProgress, SemanticResultMetadata, UuidLookup,
+};
 use crate::history::Conversation;
 use crate::search;
 use crate::search::query::ParsedQuery;
@@ -1144,7 +1152,7 @@ impl Browser {
     /// [`UuidLookup::Pending`] and the rows stay: this never touches the
     /// disk. The GUI then loads the session in the background
     /// ([`crate::history::load_session_by_uuid`]) and hands the result to
-    /// [`Browser::resolve_uuid_lookup`]. Returns whether it was found.
+    /// [`Browser::resolve_uuid_lookup_session`]. Returns whether it was found.
     pub(super) fn apply_uuid_filter(&mut self, query: &str) -> bool {
         if let Some(index) = self.find_loaded_uuid(query) {
             self.show_uuid_row(index, false);
@@ -1183,7 +1191,17 @@ impl Browser {
     /// row ([`UuidLookup::Found`] with `loaded_from_disk`); `None` reports
     /// [`UuidLookup::NotFound`] and keeps the rows (quirk 6). A session that
     /// was loaded meanwhile (a refresh) is shown without appending a copy.
+    ///
+    /// Synchronous convenience: it normalizes the session's text on the
+    /// caller's thread ([`PreparedSession::new`]); a GUI prepares it in the
+    /// background and calls [`Browser::resolve_uuid_lookup_session`].
     pub fn resolve_uuid_lookup(&mut self, uuid: &str, loaded: Option<Conversation>) {
+        self.resolve_uuid_lookup_session(uuid, loaded.map(PreparedSession::new));
+    }
+
+    /// [`Browser::resolve_uuid_lookup`] for a session prepared off this
+    /// thread: no text is normalized here.
+    pub fn resolve_uuid_lookup_session(&mut self, uuid: &str, loaded: Option<PreparedSession>) {
         let pending = matches!(
             &self.uuid_lookup,
             Some(UuidLookup::Pending { uuid: pending }) if pending == uuid

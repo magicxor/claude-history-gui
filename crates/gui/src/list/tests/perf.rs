@@ -11,6 +11,8 @@
 
 use std::time::Instant;
 
+use claude_history_core::browser::PreparedSession;
+
 use gpui_kit::AppContext as _;
 use gpui_kit::TestAppContext;
 use gpui_kit::test::TestWindowExt as _;
@@ -98,12 +100,13 @@ fn perf_20k_rows(cx: &mut TestAppContext) {
             .unwrap();
         let mut probe_renamed = (*probe_target).clone();
         probe_renamed.custom_title = Some("Core rename".to_string());
+        let probe_renamed = PreparedSession::new(probe_renamed);
         let probe_path = probe_target.path.clone();
         let victim = f.paths(cx)[12].clone();
         let (core_rename, core_remove) = f.with_window(cx, |list, _, _| {
             let t = Instant::now();
             list.browser
-                .apply_renamed(&probe_path, probe_renamed)
+                .apply_renamed_session(&probe_path, probe_renamed)
                 .unwrap();
             let core_rename = t.elapsed();
             let t = Instant::now();
@@ -119,6 +122,7 @@ fn perf_20k_rows(cx: &mut TestAppContext) {
         .unwrap();
     let mut renamed = (*target).clone();
     renamed.custom_title = Some("Renamed".to_string());
+    let renamed = PreparedSession::new(renamed);
     let path = target.path.clone();
     let t = Instant::now();
     f.with_window(cx, |list, _, cx| {

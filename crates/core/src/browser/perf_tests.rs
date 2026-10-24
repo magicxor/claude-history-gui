@@ -63,7 +63,6 @@ fn synthetic(root: &Path, index: usize) -> Conversation {
         preview: text.clone().into(),
         preview_first: text.clone().into(),
         preview_last: text.clone().into(),
-        search_text_lower: search::normalize_for_search(&text).into(),
         semantic_turns: vec![text.clone()].into(),
         semantic_turn_ranges: vec![crate::agent::refs::MessageRange::single(1)],
         full_text: text.into(),
@@ -208,7 +207,15 @@ fn rename(browser: &mut Browser, row: usize, title: String) -> Duration {
     let target = browser.row(row).unwrap().clone();
     let mut renamed = target.clone();
     renamed.custom_title = Some(title);
-    timed(|| browser.apply_renamed(&target.path, renamed).unwrap()).1
+    // The body is normalized where the rename is prepared (a background
+    // task in the GUI): only the install is timed.
+    let renamed = PreparedSession::new(renamed);
+    timed(|| {
+        browser
+            .apply_renamed_session(&target.path, renamed)
+            .unwrap()
+    })
+    .1
 }
 
 fn delete(browser: &mut Browser, row: usize) -> Duration {

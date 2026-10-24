@@ -25,7 +25,6 @@ fn conversation(project: Option<&str>, project_dir: &str, uuid: &str, text: &str
         semantic_route_text: "".into(),
         semantic_turns: vec![text.to_string()].into(),
         semantic_turn_ranges: vec![crate::agent::refs::MessageRange::single(1)],
-        search_text_lower: search::normalize_for_search(text).into(),
         project_name: project.map(str::to_string),
         project_path: None,
         cwd: None,
@@ -1031,7 +1030,7 @@ fn semantic_request_uses_live_conversations_not_stale_snapshot() {
     // A snapshot taken by someone else does not pin the browser's corpus.
     let stale = app.corpus_snapshot();
     assert_eq!(app.remove_paths(&[stale[0].path.clone()]), 1);
-    app.push_conversation(visible());
+    app.push_conversation(PreparedSession::new(visible()));
     app.corpus_changed();
     let (request_tx, request_rx) = mpsc::channel();
     let (_response_tx, response_rx) = mpsc::channel();

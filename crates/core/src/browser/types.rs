@@ -152,7 +152,8 @@ pub enum UuidLookup {
     },
     /// No loaded session has this id. The previous rows stay until the GUI
     /// has run [`crate::history::load_session_by_uuid`] in the background
-    /// and passed the result to [`super::Browser::resolve_uuid_lookup`].
+    /// and passed the result, as a [`super::PreparedSession`], to
+    /// [`super::Browser::resolve_uuid_lookup_session`].
     Pending { uuid: String },
     /// No loaded session and no `<uuid>.jsonl` in any Claude project.
     /// Upstream silently kept the previous rows (quirk 6); core reports it so

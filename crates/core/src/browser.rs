@@ -138,7 +138,7 @@ mod search_state;
 mod types;
 
 pub use crate::semantic_worker::{SemanticEmbedderFactory, Waker};
-pub use corpus::{CorpusSnapshot, PreparedCorpus};
+pub use corpus::{CorpusSnapshot, PreparedCorpus, PreparedSession};
 pub use loader::{
     DEFAULT_DRAIN_BUDGET, HistoryLoader, LoadEvent, LoaderOptions, LoaderPoll, REFRESHING_STATUS,
     RefreshPolicy,

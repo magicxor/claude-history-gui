@@ -50,7 +50,8 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
 use claude_history_core::browser::{
-    Browser, BrowserOptions, HistoryLoader, ListSearchMode, LoaderOptions, RenameError,
+    Browser, BrowserOptions, HistoryLoader, ListSearchMode, LoaderOptions, PreparedSession,
+    RenameError,
 };
 #[cfg(test)]
 use claude_history_core::browser::{LoadEvent, UuidLookup};
@@ -676,15 +677,16 @@ impl ListPane {
         }
     }
 
-    /// Apply a rename written in the background (K3).
+    /// Apply a rename written in the background (K3). The session's text is
+    /// normalized there too ([`PreparedSession::new`]), not on this thread.
     pub fn apply_renamed(
         &mut self,
         path: &Path,
-        renamed: Conversation,
+        renamed: PreparedSession,
         cx: &mut Context<Self>,
     ) -> Result<(), RenameError> {
         let started = Instant::now();
-        let result = self.browser.apply_renamed(path, renamed);
+        let result = self.browser.apply_renamed_session(path, renamed);
         if result.is_ok() {
             self.after_corpus_edit(cx);
         }

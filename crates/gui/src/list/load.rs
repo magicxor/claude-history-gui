@@ -10,8 +10,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use claude_history_core::browser::{ListSearchMode, LoadEvent, RefreshPolicy, UuidLookup};
-use claude_history_core::history::{self, Conversation};
+use claude_history_core::browser::{
+    ListSearchMode, LoadEvent, PreparedSession, RefreshPolicy, UuidLookup,
+};
+use claude_history_core::history;
 use claude_history_core::time_filter::TimeFilter;
 use claude_history_core::{HistoryEnv, WorkspaceScope};
 use gpui_kit::{Context, SharedString, Window};
@@ -603,12 +605,14 @@ impl ListPane {
         let show_last = self.browser.show_last();
         self.uuid_task = cx.spawn_in(window, async move |this, cx| {
             let lookup_uuid = uuid.clone();
-            let result: Option<Conversation> = cx
+            // The text is normalized here, off the UI thread.
+            let result: Option<PreparedSession> = cx
                 .background_executor()
                 .spawn(async move {
                     history::load_session_by_uuid(&env, &lookup_uuid, show_last)
                         .ok()
                         .flatten()
+                        .map(PreparedSession::new)
                 })
                 .await;
             this.update_in(cx, |this, window, cx| {
@@ -621,7 +625,7 @@ impl ListPane {
     fn finish_uuid_lookup(
         &mut self,
         uuid: String,
-        loaded: Option<Conversation>,
+        loaded: Option<PreparedSession>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -629,7 +633,7 @@ impl ListPane {
             self.uuid_in_flight = None;
         }
         let started = Instant::now();
-        self.browser.resolve_uuid_lookup(&uuid, loaded);
+        self.browser.resolve_uuid_lookup_session(&uuid, loaded);
         self.check_uuid_lookup(window, cx);
         if matches!(
             self.browser.uuid_lookup(),

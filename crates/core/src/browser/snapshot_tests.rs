@@ -112,7 +112,6 @@ fn query_typed_over_snapshot_runs_after_loading() {
     let sandbox = Sandbox::new();
     let mut corpus = corpus();
     corpus[1].full_text = "needle".into();
-    corpus[1].search_text_lower = "needle".into();
     let root = publish(&corpus);
     let mut app = loading_app(&sandbox, None, vec![]);
     show(&mut app, &root, TimeFilter::default());
@@ -387,8 +386,9 @@ fn a_rename_made_on_a_card_keeps_its_title_and_the_loaded_text() {
     let mut renamed = conversation("/p/-tmp-beta/b.jsonl", 2 * HOUR_MS);
     renamed.custom_title = Some("Renamed".to_string());
     renamed.full_text = "renamed full text".into();
-    renamed.search_text_lower = "renamed full text".into();
-    app.apply_renamed(&path, renamed).unwrap();
+    let session = PreparedSession::new(renamed);
+    let body = session.body_lower.clone();
+    app.apply_renamed_session(&path, session).unwrap();
     assert_eq!(listed_paths(&app).len(), 3);
 
     tx.send(LoaderMessage::Done).unwrap();
@@ -411,7 +411,20 @@ fn a_rename_made_on_a_card_keeps_its_title_and_the_loaded_text() {
         .expect("the renamed row");
     assert_eq!(row.custom_title.as_deref(), Some("Renamed"));
     assert_eq!(&*row.full_text, "renamed full text");
-    assert_eq!(&*row.search_text_lower, "renamed full text");
+    // The search data built at the end of the load holds the renamed text
+    // (the body normalized when the rename was prepared).
+    let position = row.index;
+    assert_eq!(&*app.searchable[position].body_lower, "renamed full text");
+    assert!(Arc::ptr_eq(&app.searchable[position].body_lower, &body));
+    assert!(
+        search::search(
+            &app.conversations,
+            &app.searchable,
+            "renamed",
+            chrono::Local::now()
+        )
+        .contains(&position)
+    );
     assert!(
         app.conversations()
             .iter()
@@ -633,10 +646,6 @@ fn needle_corpus() -> Vec<Conversation> {
     let mut corpus = corpus();
     corpus[0].full_text = format!("{} hidden needle here", "padding ".repeat(400)).into();
     corpus[2].full_text = "needle in the newest".into();
-    for conversation in &mut corpus {
-        conversation.search_text_lower =
-            crate::search::normalize_for_search(&conversation.full_text).into();
-    }
     corpus
 }
 
@@ -645,7 +654,6 @@ fn needle_corpus_with_late_needle() -> Vec<Conversation> {
     let mut loaded = needle_corpus();
     loaded.push(conversation("/p/-tmp-beta/d.jsonl", 4 * HOUR_MS));
     loaded[3].full_text = "late needle".into();
-    loaded[3].search_text_lower = "late needle".into();
     loaded
 }
 
@@ -951,7 +959,6 @@ fn after_loading_a_delete_keeps_the_index_in_step_and_a_rename_drops_it() {
     let mut renamed = conversation("/p/-tmp-beta/b.jsonl", 2 * HOUR_MS);
     renamed.custom_title = Some("Renamed".to_string());
     renamed.full_text = "renamed full text".into();
-    renamed.search_text_lower = "renamed full text".into();
     app.apply_renamed(Path::new("/p/-tmp-beta/b.jsonl"), renamed)
         .unwrap();
     assert_eq!(
@@ -971,7 +978,6 @@ fn many_needles(count: usize) -> Vec<Conversation> {
             let mut conversation =
                 conversation(&format!("/p/-tmp-alpha/{i:03}.jsonl"), i as i64 * HOUR_MS);
             conversation.full_text = format!("needle number {i}").into();
-            conversation.search_text_lower = conversation.full_text.clone();
             conversation
         })
         .collect()

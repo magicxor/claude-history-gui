@@ -140,7 +140,6 @@ pub(crate) fn plain_conversation(path: PathBuf) -> Conversation {
         semantic_route_text: String::new().into(),
         semantic_turns: Vec::new().into(),
         semantic_turn_ranges: Vec::new(),
-        search_text_lower: String::new().into(),
         project_name: None,
         project_path: None,
         cwd: None,

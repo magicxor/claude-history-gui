@@ -30,7 +30,6 @@ fn test_conversation(path: PathBuf, custom_title: Option<String>) -> Conversatio
         preview: "hello body".into(),
         preview_first: "hello body".into(),
         preview_last: "hello body".into(),
-        search_text_lower: search::normalize_for_search(&full_text).into(),
         semantic_turns: vec!["hello body".to_string()].into(),
         semantic_turn_ranges: vec![crate::agent::refs::MessageRange::single(1)],
         full_text: full_text.into(),

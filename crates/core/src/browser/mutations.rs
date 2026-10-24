@@ -1,7 +1,7 @@
 //! Rename and delete (upstream `tui/app/dialog_state.rs::submit_rename` and
 //! the delete branch of `tui/runtime.rs`).
 
-use super::{Browser, DeleteError, DeletedSession, ListSearchMode, RenameError};
+use super::{Browser, DeleteError, DeletedSession, ListSearchMode, PreparedSession, RenameError};
 use crate::history::{self, Conversation, Source};
 use std::path::Path;
 use std::sync::Arc;
@@ -54,14 +54,31 @@ impl Browser {
     /// The path is found through the path index and the browse rows come
     /// from the cached scope (CCR-2): the caller's thread does no work per
     /// conversation besides copying pointers and row numbers.
+    ///
+    /// Synchronous convenience: it normalizes the session's text on the
+    /// caller's thread ([`PreparedSession::new`]); a GUI prepares the
+    /// session in the background and calls [`Browser::apply_renamed_session`].
     pub fn apply_renamed(&mut self, path: &Path, renamed: Conversation) -> Result<(), RenameError> {
+        self.apply_renamed_session(path, PreparedSession::new(renamed))
+    }
+
+    /// [`Browser::apply_renamed`] for a session prepared off this thread:
+    /// no text is normalized here.
+    pub fn apply_renamed_session(
+        &mut self,
+        path: &Path,
+        renamed: PreparedSession,
+    ) -> Result<(), RenameError> {
         let index = self.position_of_path(path).ok_or(RenameError::NoTarget)?;
         let previous = &self.conversations[index];
-        let mut renamed = renamed;
+        let PreparedSession {
+            conversation: mut renamed,
+            body_lower,
+        } = renamed;
         renamed.index = index;
         renamed.project_name = previous.project_name.clone();
         renamed.project_path = previous.project_path.clone();
-        self.replace_conversation_at(index, Arc::new(renamed));
+        self.replace_conversation_at(index, Arc::new(renamed), body_lower);
         if self.is_loading() {
             // No search data or query results yet: the row just shows the
             // new title (the index of snapshot cards holds the old one).

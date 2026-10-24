@@ -15,7 +15,8 @@ use std::path::Path;
 /// preview chosen by `show_last` (addendum C1 fix: upstream always used
 /// the first messages). `Ok(None)` when there is no such file or it parses
 /// to nothing listable. Blocking; pass the result to
-/// [`crate::browser::Browser::resolve_uuid_lookup`].
+/// [`crate::browser::Browser::resolve_uuid_lookup_session`] (wrapped in a
+/// [`crate::browser::PreparedSession`] in the background).
 pub fn load_session_by_uuid(
     env: &HistoryEnv,
     uuid: &str,
@@ -42,7 +43,8 @@ pub fn load_session_by_uuid(
 }
 
 /// Rename the session at `path` (blocking; the GUI's background half of
-/// a rename, applied with [`crate::browser::Browser::apply_renamed`]).
+/// a rename, wrapped in a [`crate::browser::PreparedSession`] and applied
+/// with [`crate::browser::Browser::apply_renamed_session`]).
 ///
 /// `title = title.trim()`; an empty title clears the custom title. The
 /// rename is written in the session's own format: Claude `custom-title` +

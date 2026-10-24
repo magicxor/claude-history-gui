@@ -289,7 +289,6 @@ fn x012_searchable_text_is_never_truncated() {
         .unwrap();
     assert!(conversation.full_text.len() > 400_000);
     assert!(conversation.full_text.contains("closingneedle"));
-    assert!(conversation.search_text_lower.contains("closingneedle"));
     let conversations = vec![conversation];
     let searchable = crate::search::precompute_search_text(&conversations);
     assert_eq!(

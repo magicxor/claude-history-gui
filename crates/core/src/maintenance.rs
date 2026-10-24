@@ -1818,7 +1818,6 @@ mod tests {
         crate::semantic::test_fixtures::SemanticConversationFixture::new(path, Vec::<String>::new())
             .with_title(text)
             .with_project("proj", "/projects/proj")
-            .with_normalized_search_text_lower()
             .build()
     }
 

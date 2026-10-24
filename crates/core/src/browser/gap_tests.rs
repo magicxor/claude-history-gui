@@ -3,6 +3,7 @@
 //! rename in two halves, K4 `remove_paths`, K6 semantic suspend/resume and
 //! K18 refresh policies. Every file lives in a sandbox.
 
+use super::corpus::CorpusEdit;
 use super::test_helpers::*;
 use super::*;
 use crate::history::{LoaderMessage, Source};
@@ -29,7 +30,6 @@ fn conversation(path: PathBuf, text: &str) -> Conversation {
         preview: text.to_string().into(),
         preview_first: text.to_string().into(),
         preview_last: text.to_string().into(),
-        search_text_lower: search::normalize_for_search(text).into(),
         semantic_turns: vec![text.to_string()].into(),
         semantic_turn_ranges: vec![crate::agent::refs::MessageRange::single(1)],
         full_text: text.to_string().into(),
@@ -553,6 +553,78 @@ fn rows_deleted_or_renamed_while_a_refresh_streams_are_replayed() {
 }
 
 #[test]
+fn only_the_newest_edit_of_a_path_keeps_its_body_during_a_load() {
+    // A second rename, or a delete, of a path during a tracked load
+    // releases the transcript of the earlier edits; the install replays
+    // the newest edit with the body it kept.
+    let sandbox = Sandbox::new();
+    let root = sandbox.projects_root();
+    let twice = root.join("-p").join(format!("{UUID_A}.jsonl"));
+    let gone = root.join("-p").join(format!("{UUID_B}.jsonl"));
+    write_claude_session(&twice, sandbox.path(), "one", "two");
+    write_claude_session(&gone, sandbox.path(), "three", "four");
+    let mut browser = Browser::new(
+        vec![
+            conversation(twice.clone(), "twice"),
+            conversation(gone.clone(), "gone"),
+        ],
+        sandbox.options(),
+    );
+    let mut loader = HistoryLoader::new(sandbox.env.clone(), LoaderOptions::default());
+    let (tx, rx) = mpsc::channel();
+    loader.start_with_receiver_for_test(rx, true);
+    tx.send(LoaderMessage::Batch(vec![
+        conversation(twice.clone(), "twice"),
+        conversation(gone.clone(), "gone"),
+    ]))
+    .unwrap();
+    let first = loader.poll(&mut browser);
+    assert!(first.event.is_none() && !first.preparing);
+
+    browser.rename_conversation(&twice, "first").unwrap();
+    browser.rename_conversation(&gone, "soon deleted").unwrap();
+    browser.rename_conversation(&twice, "second").unwrap();
+    assert_eq!(browser.remove_paths(std::slice::from_ref(&gone)), 1);
+
+    let bodies = |browser: &Browser, path: &Path| {
+        browser
+            .corpus_edits
+            .entries
+            .iter()
+            .filter_map(|(_, edit)| match edit {
+                CorpusEdit::Replaced(edited, body) if edited == path => Some(body.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let twice_bodies = bodies(&browser, &twice);
+    assert_eq!(twice_bodies.len(), 2);
+    assert!(
+        twice_bodies[0].is_none(),
+        "the superseded rename kept its body"
+    );
+    let newest = twice_bodies[1]
+        .clone()
+        .expect("the newest rename keeps its body");
+    let gone_bodies = bodies(&browser, &gone);
+    assert_eq!(gone_bodies.len(), 1);
+    assert!(
+        gone_bodies[0].is_none(),
+        "a delete released the rename's body"
+    );
+
+    tx.send(LoaderMessage::Done).unwrap();
+    poll_until_event(&mut loader, &mut browser);
+    assert!(browser.conversation_by_path(&gone).is_none());
+    let (position, kept) = browser.conversation_by_path(&twice).unwrap();
+    assert_eq!(kept.custom_title.as_deref(), Some("second"));
+    assert!(Arc::ptr_eq(
+        &browser.searchable[position].body_lower,
+        &newest
+    ));
+}
+
+#[test]
 fn edits_made_before_a_load_started_are_not_replayed() {
     // A rename made long before a refresh must not override what the
     // refresh read (for example a title another program set later), and a
@@ -780,7 +852,7 @@ fn uuid_resolution_prefers_a_session_loaded_meanwhile() {
         Some(UuidLookup::Pending { .. })
     ));
     // The session arrived in the corpus before the lookup finished.
-    app.push_conversation(conversation(path.clone(), "late"));
+    app.push_conversation(PreparedSession::new(conversation(path.clone(), "late")));
     app.corpus_changed();
     app.resolve_uuid_lookup(UUID_A, Some(conversation(path.clone(), "late")));
     assert_eq!(app.conversations().len(), 2, "no duplicate is appended");
@@ -1060,6 +1132,65 @@ fn apply_renamed_reports_no_target_when_the_session_left_the_list() {
         Err(RenameError::NoTarget)
     ));
     assert_eq!(app.conversations().len(), 1);
+}
+
+#[test]
+fn edits_reuse_the_body_normalized_off_the_ui_thread() {
+    // The text of a renamed or UUID-loaded session is normalized where the
+    // session is prepared (a background task); the browser's thread, a
+    // replayed edit and a carried UUID result reuse that body.
+    let sandbox = Sandbox::new();
+    let x = sandbox.path().join("x.jsonl");
+    let y = sandbox.path().join("y.jsonl");
+    let mut app = Browser::new(
+        vec![conversation(x.clone(), "x"), conversation(y.clone(), "y")],
+        sandbox.options(),
+    );
+
+    // A rename.
+    let mut renamed = Conversation::clone(&app.conversations()[0]);
+    renamed.full_text = "Renamed Body".into();
+    let session = PreparedSession::new(renamed);
+    let body = session.body_lower.clone();
+    assert_eq!(&*body, "renamed body");
+    app.apply_renamed_session(&x, session).unwrap();
+    assert!(Arc::ptr_eq(&app.searchable[0].body_lower, &body));
+
+    // A UUID jump to a session loaded from disk.
+    let z = sandbox.path().join(format!("{UUID_A}.jsonl"));
+    let session = PreparedSession::new(conversation(z, "Loaded Text"));
+    let loaded_body = session.body_lower.clone();
+    app.set_query(UUID_A);
+    app.resolve_uuid_lookup_session(UUID_A, Some(session));
+    assert_eq!(app.searchable.len(), 3);
+    assert!(Arc::ptr_eq(&app.searchable[2].body_lower, &loaded_body));
+
+    // A refresh that carries the UUID result and replays a rename made while
+    // it loaded.
+    let mut loader = HistoryLoader::new(sandbox.env.clone(), LoaderOptions::default());
+    let (tx, rx) = mpsc::channel();
+    loader.start_with_receiver_for_test(rx, true);
+    tx.send(LoaderMessage::Batch(vec![
+        conversation(x.clone(), "x"),
+        conversation(y.clone(), "y"),
+    ]))
+    .unwrap();
+    loader.poll(&mut app);
+    let mut renamed = Conversation::clone(&app.conversations()[1]);
+    renamed.full_text = "Renamed Again".into();
+    let session = PreparedSession::new(renamed);
+    let again = session.body_lower.clone();
+    app.apply_renamed_session(&y, session).unwrap();
+    tx.send(LoaderMessage::Done).unwrap();
+    poll_until_event(&mut loader, &mut app);
+    assert_eq!(app.searchable.len(), 3, "the carried session stays");
+    let position = app.position_of_path(&y).unwrap();
+    assert!(Arc::ptr_eq(&app.searchable[position].body_lower, &again));
+    let carried = app
+        .searchable
+        .iter()
+        .find(|entry| Arc::ptr_eq(&entry.body_lower, &loaded_body));
+    assert!(carried.is_some(), "the carried session keeps its body");
 }
 
 #[test]
