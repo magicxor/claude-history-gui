@@ -39,7 +39,10 @@ fn publish_cards(world: &TestWorld) -> Vec<PathBuf> {
     }
     let root = store::default_root(&world.env).expect("a store root in the sandbox");
     assert!(root.starts_with(world.home()), "{root:?}");
-    store::write_snapshot(&root, &conversations, SystemTime::now()).expect("write the snapshot");
+    let lock = store::PublishLock::try_acquire(&root)
+        .expect("open the lock")
+        .expect("take the lock");
+    store::write_snapshot(&lock, &conversations, SystemTime::now()).expect("write the snapshot");
     conversations.into_iter().map(|c| c.path).collect()
 }
 

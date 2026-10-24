@@ -23,10 +23,10 @@
 //! * **Cancellable build.** The GUI builds generations in its own process
 //!   (upstream: a detached `--publish-snapshot` child that outlived the TUI),
 //!   so quitting must not wait for a build: [`write_snapshot_cancellable`],
-//!   [`generation::publish_cancellable`] and
+//!   [`generation::publish_locked_cancellable`] and
 //!   [`lexindex::build_cancellable`] give up soon after a flag is set,
 //!   remove their `gNNN.tmp` and publish nothing. [`write_snapshot`],
-//!   [`generation::publish`] and [`lexindex::build`] are the same code never
+//!   [`generation::publish_locked`] and [`lexindex::build`] are the same code never
 //!   cancelled, and write the same bytes as upstream.
 //! * **Windows tests.** `lexindex`'s corrupt-file test drops its open index
 //!   (three live maps) before it rewrites and truncates the index files,
@@ -51,7 +51,7 @@ pub mod lexindex;
 pub mod search;
 pub mod text;
 
-pub use generation::{Generation, ProjectView, Publish};
+pub use generation::{Generation, ProjectView, Publish, PublishLock};
 
 use crate::env::HistoryEnv;
 use crate::history::Conversation;
@@ -289,21 +289,22 @@ pub fn snapshot_is_current<C: Borrow<Conversation>>(
 }
 
 /// Writes a generation for `conversations` (the complete corpus, loaded
-/// starting at `loaded_since`) unless `CURRENT` already matches it.
+/// starting at `loaded_since`) into the root of `lock` unless `CURRENT`
+/// already matches it.
 pub fn write_snapshot<C: Borrow<Conversation>>(
-    root: &Path,
+    lock: &PublishLock,
     conversations: &[C],
     loaded_since: SystemTime,
 ) -> std::io::Result<Publish> {
-    generation::publish(root, &corpus(conversations, loaded_since))
+    generation::publish_locked(lock, &corpus(conversations, loaded_since))
 }
 
 /// [`write_snapshot`] that gives up soon after `cancelled()` returns true
-/// (fork; see [`generation::publish_cancellable`]), also while it reads the
+/// (fork; see [`generation::publish_locked_cancellable`]), also while it reads the
 /// files' fingerprints. A build given up publishes nothing and returns an
 /// [`std::io::ErrorKind::Interrupted`] error.
 pub fn write_snapshot_cancellable<C: Borrow<Conversation>>(
-    root: &Path,
+    lock: &PublishLock,
     conversations: &[C],
     loaded_since: SystemTime,
     cancelled: &(dyn Fn() -> bool + Sync),
@@ -319,7 +320,7 @@ pub fn write_snapshot_cancellable<C: Borrow<Conversation>>(
         ));
     }
     let corpus = generation::Corpus::new(conversations, fingerprints);
-    generation::publish_cancellable(root, &corpus, cancelled)
+    generation::publish_locked_cancellable(lock, &corpus, cancelled)
 }
 
 fn corpus<C: Borrow<Conversation>>(
@@ -465,15 +466,16 @@ mod tests {
             .map(|(i, path)| Arc::new(conversation(path.to_str().unwrap(), i as i64 * 1000)))
             .collect();
         let since = SystemTime::now() + Duration::from_secs(60);
+        let lock = PublishLock::try_acquire(&root).unwrap().unwrap();
         assert!(matches!(
-            write_snapshot(&root, &shared, since).unwrap(),
+            write_snapshot(&lock, &shared, since).unwrap(),
             Publish::Published(_)
         ));
         let owned: Vec<Conversation> = shared.iter().map(|c| (**c).clone()).collect();
         assert!(snapshot_is_current(&root, &shared, since));
         assert!(snapshot_is_current(&root, &owned, since));
         assert_eq!(
-            write_snapshot(&root, &owned, since).unwrap(),
+            write_snapshot(&lock, &owned, since).unwrap(),
             Publish::Unchanged
         );
 

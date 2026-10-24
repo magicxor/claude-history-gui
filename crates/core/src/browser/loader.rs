@@ -998,16 +998,33 @@ fn build_snapshot(build: SnapshotBuild) -> SnapshotWrite {
         log_path,
     } = build;
     let cancelled = || cancel.load(Ordering::Relaxed);
+    // Take the publish lock before fingerprinting and building: when
+    // another process (a second GUI) holds it, nothing is built.
+    let lock = match crate::store::PublishLock::try_acquire(&root) {
+        Ok(lock) => lock,
+        Err(err) => {
+            return SnapshotWrite {
+                result: Err(err),
+                swap: None,
+            };
+        }
+    };
     let threads = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(1, 4));
     let result = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .thread_name(|i| format!("snapshot-build-{i}"))
         .build()
         .map_err(std::io::Error::other)
-        .and_then(|pool| {
-            pool.install(|| {
-                crate::store::write_snapshot_cancellable(&root, &corpus, loaded_since, &cancelled)
-            })
+        .and_then(|pool| match &lock {
+            Some(lock) => pool.install(|| {
+                crate::store::write_snapshot_cancellable(lock, &corpus, loaded_since, &cancelled)
+            }),
+            // Another process holds the lock: when it already published
+            // this corpus there is nothing to wait for.
+            None if crate::store::snapshot_is_current(&root, &corpus, loaded_since) => {
+                Ok(Publish::Unchanged)
+            }
+            None => Ok(Publish::Busy),
         });
     crate::bench::mark("snapshot_write");
     let given_up =
