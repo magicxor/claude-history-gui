@@ -71,6 +71,18 @@ pub fn contains_prefix_match(text: &str, word: &str) -> bool {
     false
 }
 
+/// Returns `s` cut to at most `max` bytes on a char boundary.
+pub fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 pub fn contains_cjk(text: &str) -> bool {
     text.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c))
 }
@@ -78,6 +90,14 @@ pub fn contains_cjk(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_on_char_boundary_cuts_on_a_boundary() {
+        assert_eq!(truncate_on_char_boundary("abcdef", 3), "abc");
+        assert_eq!(truncate_on_char_boundary("ab", 3), "ab");
+        assert_eq!(truncate_on_char_boundary("aéé", 3), "aé");
+        assert_eq!(truncate_on_char_boundary("é", 1), "");
+    }
 
     #[test]
     fn normalizes_search_separators_and_case() {
