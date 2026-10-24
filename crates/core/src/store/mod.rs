@@ -48,8 +48,8 @@
 //! On Windows (NTFS) `std::fs` removes and renames over files that another
 //! handle maps (POSIX semantics), so collection behaves as on Unix and an
 //! open map stays readable; only writing or truncating a mapped file fails
-//! (`ERROR_USER_MAPPED_FILE`), and published files (manifest, text segments,
-//! index segments) are never written again. NTFS hard-links the unchanged
+//! (`ERROR_USER_MAPPED_FILE`), and published files (manifest, text and semantic
+//! segments, index segments) are never written again. NTFS hard-links the unchanged
 //! segments a delta generation shares with its predecessor, also while they
 //! are mapped; elsewhere they are copied, as upstream falls back. Without
 //! file ids off Unix, a session file reached through two paths (a junction)
@@ -65,6 +65,7 @@ pub mod lexindex;
 pub mod reconcile;
 pub mod search;
 pub mod segments;
+pub mod semantic;
 pub mod text;
 
 pub use generation::{Generation, ProjectView};
