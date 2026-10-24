@@ -26,7 +26,7 @@ release check (`update`) replaces the self-updater.
 | `env` | `HistoryEnv` (every path and environment input: home, `CLAUDE_CONFIG_DIR`, Pi/OMP variables, `PATH`, the workspace that replaces the process cwd, cache/config/log locations) and `WorkspaceScope` |
 | `config` | the CLI's `config.toml` (read-only, upstream schema), `gui.toml` overrides plus the `[gui]` table, layered loading, atomic `gui.toml` saving (whole file, or only the changed keys with comments kept: `save_gui_config_changes`), neutral `KeyChord` key bindings |
 | `history` | Claude/Pi/OMP discovery and loading (streaming, with Claude concurrent to Pi/OMP, and blocking), JSONL parsing, per-project caches, Pi/OMP caches (one shared loader, rewritten only when the file set changed), rename, delete, delete-empty, path encoding |
-| `store` | the on-disk list snapshot (upstream `store`): an immutable, memory-mapped generation manifest under `<history cache base dir>/v3/roots-<hash>` (newest-first card rows, a project table, file fingerprints and a string heap, validated on open), published atomically under a `LOCK` (unchanged corpora write nothing) and collected two generations behind `CURRENT`; `Snapshot` reads the newest cards in a scope for the browser's first rows; `lexindex` is the word-start suffix index for list search (`base.fst` fst partitions, `base.post` postings, `base.short` 1-2 byte prefix columns, memory-mapped and validated on open; per-document capped term frequencies for a query word or adjacent pair; not yet built or read by the browser) |
+| `store` | the on-disk list snapshot (upstream `store`): an immutable, memory-mapped generation manifest under `<history cache base dir>/v3/roots-<hash>` (newest-first card rows, a project table, file fingerprints and a string heap, validated on open), published atomically under a `LOCK` (unchanged corpora write nothing) and collected two generations behind `CURRENT`; `Snapshot` reads the newest cards in a scope for the browser's first rows; `lexindex` is the word-start suffix index for list search (`base.fst` fst partitions, `base.post` postings, `base.short` 1-2 byte prefix columns, memory-mapped and validated on open; per-document capped term frequencies for a query word or adjacent pair; not yet built or read by the browser); `search` ranks conversations over that index with the same results, scores and order as `search::lexical` (per-word tf from postings, title/summary/project from cards, freshness from timestamps, adjacency from pair terms; conversation text is read only for literals, words over 24 bytes, self-overlapping words and CJK; `Ranking::top(n)` evaluates lazily by upper bound, `complete()` the rest), checked against `debug_search` by oracle tests; the `#[ignore]` `real_corpus_oracle` reads a QA sandbox named by `CHG_SEARCH_CORPUS_HOME` (needs the `.qa-sandbox` marker) |
 | `search` | query parsing, lexical/literal search and evidence, `SearchMode` |
 | `semantic` | chunking, embedding cache, fastembed embedder, semantic index and ranking |
 | `agent` | the agent protocol (`search`, `within`, `read`, `outline`): `agent::args` (request structs with `validate()`), `agent::cli` (upstream's `agent ...` command line), `agent::execute` (an `AgentResponse`: the CLI's exact stdout/stderr/exit code plus the result as data), `agent::execute_text`, `AgentService` (cancellable) |
@@ -77,6 +77,11 @@ model, the update check panics and the terminal spawn functions return
 `Unsupported`. `tests/hermetic_guards.rs`
 checks that build. `examples/terminal_smoke.rs` opens a real terminal and is
 only run by CI smoke jobs.
+
+The ignored `store::search::tests::real_corpus_oracle` compares index search with the in-memory search on a
+QA sandbox's history: set `CHG_SEARCH_CORPUS_HOME` to a sandbox made with `tools/qa/new-sandbox.ps1` (the
+`.qa-sandbox` marker is required) and run `cargo test --release -p claude-history-core --lib
+store::search::tests::real_corpus_oracle -- --ignored --nocapture`.
 
 Tests are hermetic:
 

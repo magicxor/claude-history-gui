@@ -23,6 +23,10 @@
 //! * **Windows tests.** `lexindex`'s corrupt-file test drops its open index
 //!   (three live maps) before it rewrites and truncates the index files,
 //!   which Windows refuses for a mapped file. The code is upstream's.
+//! * **Real-corpus oracle.** The ignored `search` oracle test reads the QA
+//!   sandbox named by `CHG_SEARCH_CORPUS_HOME` (it must contain
+//!   `.qa-sandbox`) through [`HistoryEnv::sandbox`], never the process home,
+//!   and skips when the variable is unset. The code under test is upstream's.
 //!
 //! The format, the publish protocol and the collection rules are upstream's.
 //! On Windows (NTFS) `std::fs` removes and renames over files that another
@@ -37,6 +41,8 @@ pub mod card;
 pub mod generation;
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod lexindex;
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod search;
 
 pub use generation::{Generation, ProjectView, Publish};
 
