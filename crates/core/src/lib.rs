@@ -34,6 +34,7 @@ pub mod markdown;
 pub mod program;
 pub mod search;
 pub mod semantic;
+pub mod store;
 pub mod syntax;
 pub mod text_match;
 pub mod theme;

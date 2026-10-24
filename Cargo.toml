@@ -46,6 +46,12 @@ hf-hub = { version = "=0.5.0", default-features = false, features = ["ureq", "ru
 # Update check (HTTPS with rustls). Already in the tree through fastembed's
 # hf-hub, so it adds no crates.
 ureq = { version = "3.3", default-features = false, features = ["rustls"] }
+# Store generation manifests (Pod records read in place from a memory map),
+# as upstream. Both are already in gpui-kit's tree at upstream's versions
+# (bytemuck 1.25.2 with bytemuck_derive 1.12.1, memmap2 0.9.11), so they add
+# no crates.
+bytemuck = { version = "1.25.2", features = ["derive"] }
+memmap2 = "0.9"
 
 # GUI crate (DESIGN §16.1). gpui-kit is pinned exactly: the GUI relies on
 # gpui-base text-selection internals verified against 0.7.3 (DESIGN §19).

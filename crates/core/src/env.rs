@@ -246,10 +246,14 @@ impl HistoryEnv {
         })
     }
 
-    /// Directory of the per-project Claude history caches. Namespaced by
-    /// `CLAUDE_CONFIG_DIR` exactly like upstream (`config-{hash}/projects`);
-    /// a blank value uses the default namespace, like [`Self::claude_dir`].
-    pub fn history_cache_dir(&self) -> Option<PathBuf> {
+    /// Cache directory of this Claude config root (upstream
+    /// `history::cache::cache_base_dir`): the cache root, or a
+    /// `config-{hash}` directory inside it when `CLAUDE_CONFIG_DIR` is set,
+    /// to avoid cross-config cache collisions. A blank value uses the default
+    /// namespace, like [`Self::claude_dir`]. Holds the per-project history
+    /// caches ([`Self::history_cache_dir`]) and the store
+    /// ([`crate::store::default_root`]).
+    pub fn history_cache_base_dir(&self) -> Option<PathBuf> {
         let base = self.cache_root()?;
         if let Some(config_dir) = self.claude_config_override() {
             // Upstream hashed the `String` value of CLAUDE_CONFIG_DIR; hashing
@@ -257,10 +261,18 @@ impl HistoryEnv {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             std::hash::Hash::hash(config_dir.to_string_lossy().as_ref(), &mut hasher);
             let hash = std::hash::Hasher::finish(&hasher);
-            Some(base.join(format!("config-{:016x}", hash)).join("projects"))
+            Some(base.join(format!("config-{:016x}", hash)))
         } else {
-            Some(base.join("projects"))
+            Some(base)
         }
+    }
+
+    /// Directory of the per-project Claude history caches
+    /// (`<history cache base dir>/projects`). Namespaced by
+    /// `CLAUDE_CONFIG_DIR` exactly like upstream (`config-{hash}/projects`).
+    pub fn history_cache_dir(&self) -> Option<PathBuf> {
+        self.history_cache_base_dir()
+            .map(|base| base.join("projects"))
     }
 
     /// Cache file of a Pi/OMP session root:
@@ -575,7 +587,9 @@ mod tests {
             env.claude_dir().unwrap(),
             env.claude_projects_root().unwrap(),
             env.cache_root().unwrap(),
+            env.history_cache_base_dir().unwrap(),
             env.history_cache_dir().unwrap(),
+            crate::store::default_root(&env).unwrap(),
             env.source_cache_path(root.path(), "pi").unwrap(),
             env.semantic_cache_dir().unwrap(),
             env.embedding_cache_file().unwrap(),
@@ -606,7 +620,9 @@ mod tests {
         );
         let cache = home.join(".cache").join("claude-history-gui");
         assert_eq!(env.cache_root().unwrap(), cache);
+        assert_eq!(env.history_cache_base_dir().unwrap(), cache);
         assert_eq!(env.history_cache_dir().unwrap(), cache.join("projects"));
+        assert_eq!(crate::store::default_root(&env).unwrap(), cache.join("v3"));
         assert_eq!(
             env.embedding_cache_file().unwrap(),
             cache.join("semantic").join("embeddings-v1.bin")
@@ -734,8 +750,16 @@ mod tests {
             ..HistoryEnv::default()
         };
         assert_eq!(
+            env.history_cache_base_dir().unwrap(),
+            PathBuf::from("cache").join(&expected)
+        );
+        assert_eq!(
             env.history_cache_dir().unwrap(),
-            PathBuf::from("cache").join(expected).join("projects")
+            PathBuf::from("cache").join(&expected).join("projects")
+        );
+        assert_eq!(
+            crate::store::default_root(&env).unwrap(),
+            PathBuf::from("cache").join(&expected).join("v3")
         );
     }
 

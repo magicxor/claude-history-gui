@@ -933,11 +933,13 @@ version = "0.1.76"
 dependencies = [
  "bincode",
  "blake3",
+ "bytemuck",
  "chrono",
  "fastembed",
  "hf-hub",
  "home",
  "libc",
+ "memmap2",
  "ort",
  "pulldown-cmark",
  "rayon",
