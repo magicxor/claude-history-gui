@@ -1242,7 +1242,7 @@ pub fn build_row_preview(input: &RowPreviewInput<'_>) -> RowPreview {
         .flatten();
     let lexical_context = lexical_evidence.and_then(|evidence| {
         build_context_segments_from_ranges(
-            &conv.full_text,
+            &evidence.text,
             &evidence.context_ranges,
             max_preview_len,
         )

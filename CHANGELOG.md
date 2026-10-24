@@ -14,6 +14,10 @@ Release notes are taken from the `## v<version>` section of this file by the rel
   Pi/OMP session folder, so a different one never shows another's conversations at startup.
 - Quoted and identifier literals match only at word starts (after a non-alphanumeric character): "Config" no longer
   matches inside AppConfig.
+- Searching works right after startup: while the history is still loading, a keyword query answers from the search
+  index saved with the startup snapshot, showing the first page of results before the rest. The snapshot now also
+  stores the conversation text and that index (rebuilt in the background after a load that changed anything; quitting
+  does not wait for the rebuild, which then runs again at the next start).
 
 ## v0.1.1
 

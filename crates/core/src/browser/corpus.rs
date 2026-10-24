@@ -22,13 +22,12 @@
 //! edits stamped from that mark on (made while the loader read the files,
 //! buffered them or prepared them).
 
-use super::index::{
-    CardScope, CorpusIndex, ScopeIndex, ScopeSettings, remove_positions_in_place, without_positions,
-};
-use super::{Browser, ListSearchMode, Readiness, ReconcileState, SNAPSHOT_ROWS, UuidLookup};
+use super::index::{CorpusIndex, ScopeSettings, remove_positions_in_place, without_positions};
+use super::{Browser, ListSearchMode, Readiness, ReconcileState, UuidLookup};
 use crate::history::Conversation;
 use crate::search::query::ParsedQuery;
 use crate::search::{self, SearchableConversation};
+use crate::store::SearchIndex;
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -57,6 +56,10 @@ pub struct PreparedCorpus {
     /// Where each row of the corpus being replaced moved (a refresh
     /// prepared by a [`super::HistoryLoader`]).
     pub(super) remap: Option<Remap>,
+    /// For each card of the index the cards being replaced were searched
+    /// with, its position in this corpus (a load over snapshot cards).
+    /// Dropped by an edit that moves or changes a conversation.
+    located: Option<(Arc<SearchIndex>, Vec<Option<usize>>)>,
 }
 
 /// The positions in a prepared corpus of the conversations of the corpus it
@@ -75,6 +78,9 @@ pub(super) struct Remap {
 pub(super) struct PrepareContext {
     scope: ScopeSettings,
     previous: Option<CorpusSnapshot>,
+    /// The index searched over the snapshot cards, whose cards are located
+    /// in the prepared corpus.
+    index: Option<Arc<SearchIndex>>,
 }
 
 impl PreparedCorpus {
@@ -91,6 +97,8 @@ impl PreparedCorpus {
     /// Replace the conversation at `position` (same path), with its search
     /// data and its `index`.
     fn replace(&mut self, position: usize, mut conversation: Arc<Conversation>) {
+        // The index holds the replaced (renamed) conversation's text.
+        self.located = None;
         if conversation.index != position {
             Arc::make_mut(&mut conversation).index = position;
         }
@@ -137,6 +145,7 @@ impl PreparedCorpus {
         remove_positions_in_place(&mut self.conversations, removed);
         remove_positions_in_place(&mut self.searchable, removed);
         self.index.remove(removed, &gone, old_len);
+        self.located = None;
         if let Some(remap) = &mut self.remap {
             for slot in &mut remap.positions {
                 if let Some(position) = *slot {
@@ -149,6 +158,22 @@ impl PreparedCorpus {
         }
         // The later conversations moved: their `index` is set by the install.
         self.indexed = false;
+    }
+}
+
+impl PreparedCorpus {
+    /// The cards' positions in this corpus, when they were located for
+    /// `current` (the index the browser searches).
+    pub(super) fn take_located(
+        &mut self,
+        current: Option<&Arc<SearchIndex>>,
+    ) -> Option<Vec<Option<usize>>> {
+        match (self.located.take(), current) {
+            (Some((index, located)), Some(current)) if Arc::ptr_eq(&index, current) => {
+                Some(located)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -215,6 +240,10 @@ impl Browser {
         PrepareContext {
             scope: self.scope_settings(),
             previous: refresh.then(|| self.corpus_snapshot()),
+            index: self
+                .search_index
+                .clone()
+                .filter(|_| !refresh && self.pending.is_some()),
         }
     }
 
@@ -245,11 +274,24 @@ impl Browser {
             .into_iter()
             .map(Arc::new)
             .collect();
-        let (settings, previous) = match context {
-            Some(context) => (Some(context.scope), context.previous),
-            None => (None, None),
+        let (settings, previous, search_index) = match context {
+            Some(context) => (Some(context.scope), context.previous, context.index),
+            None => (None, None, None),
         };
         let index = CorpusIndex::build(&conversations, settings);
+        // O(corpus), so here rather than at the install (upstream mapped the
+        // cards on the TUI thread when loading finished).
+        // An index whose cards miss a newer conversation or hold an older
+        // text of a changed one is not kept: queries run in memory until the
+        // rebuilt generation is swapped in (a quit before that would carry
+        // the stale index into the next session).
+        let located = search_index.and_then(|search_index| {
+            let located = search_index.cards().locate(&conversations);
+            search_index
+                .cards()
+                .covers(&conversations, &located)
+                .then_some((search_index, located))
+        });
         let remap = previous.map(|previous| {
             let positions = previous
                 .iter()
@@ -266,6 +308,7 @@ impl Browser {
             index,
             indexed,
             remap,
+            located,
         }
     }
 
@@ -286,52 +329,6 @@ impl Browser {
         } else {
             self.replace_with(prepared);
         }
-    }
-
-    /// Shows the newest cards of `snapshot` until loading finishes (call it
-    /// on a loading browser before the load starts). Loaded batches are held
-    /// back meanwhile and swapped in when the load is installed, keeping the
-    /// selected session. No-op on a browser that is not loading or shows a
-    /// single file.
-    ///
-    /// At most [`SNAPSHOT_ROWS`] cards are materialized, in the current
-    /// scope (exclusions, workspace) and the snapshot's time filter; the
-    /// first row is selected and [`super::Readiness::list`] is set.
-    pub fn show_snapshot(&mut self, snapshot: crate::store::Snapshot) {
-        if !self.is_loading() || self.single_file_mode {
-            return;
-        }
-        if self.pending.is_none() {
-            // Rows that arrived before the cards (normally none) wait with
-            // the rest of the load.
-            self.pending = Some(std::mem::take(&mut self.conversations));
-        }
-        self.snapshot = Some(snapshot);
-        self.show_snapshot_cards();
-    }
-
-    /// Re-reads the snapshot cards for the current scope. The cards are in
-    /// scope by construction ([`CardScope`]), so the scope index marks every
-    /// card without evaluating any (no canonicalization per Pi/OMP card).
-    pub(super) fn show_snapshot_cards(&mut self) {
-        let Some(snapshot) = &self.snapshot else {
-            return;
-        };
-        let scope = CardScope::new(&self.excluded_projects, self.effective_workspace());
-        let cards: Vec<Arc<Conversation>> = snapshot
-            .conversations(SNAPSHOT_ROWS, |project| scope.project_visible(project))
-            .into_iter()
-            .map(Arc::new)
-            .collect();
-        let mut index = CorpusIndex::build(&cards, None);
-        index.scope = ScopeIndex::all(cards.len(), self.scope_settings());
-        let filtered = (0..cards.len()).collect();
-        self.conversations = Arc::new(cards);
-        self.index = index;
-        self.uuid_lookup = None;
-        self.lexical_evidence.clear();
-        self.apply_filtered(filtered);
-        self.readiness.list = true;
     }
 
     /// The conversations a running load has delivered: the batches held
@@ -428,20 +425,44 @@ impl Browser {
     }
 
     /// Finish a load with a prepared corpus. Replaces any snapshot cards,
-    /// keeping the selected session (upstream `finish_loading`).
+    /// keeping the selected session (upstream `finish_loading`). The index
+    /// searched over the cards stays in use when the preparation located
+    /// its cards in the corpus (and no edit moved them since); rows it
+    /// showed for a lexical query stay shown until the query answers again.
     fn finish_with(&mut self, prepared: PreparedCorpus) {
+        let shown_docs = self.shown_docs();
+        let card_evidence = if shown_docs.is_some() {
+            self.card_evidence()
+        } else {
+            Vec::new()
+        };
         // The held-back batches go first (the prepared corpus holds them,
         // and `set_corpus` can then index them in place); the cards stay
         // the rows until `set_corpus`, for the replay of edits made on them.
         let card_anchor = self.leave_snapshot();
-        let prepared = self.replay_corpus_edits(prepared);
+        let mut prepared = self.replay_corpus_edits(prepared);
+        let located = prepared.take_located(self.search_index.as_ref());
+        self.clear_cards();
         self.set_corpus(prepared);
+        match located {
+            Some(located) => self.doc_rows = located,
+            None => self.drop_search_index(),
+        }
 
         // The loading rows index the unsorted corpus. Rebuild them against
         // the sorted one: a query (below) leaves them visible until its
         // results arrive, so stale indices would show (and select) the
         // wrong, possibly excluded, conversations. Upstream kept them.
-        self.filtered = self.scope_rows();
+        self.filtered = match shown_docs.filter(|_| self.search_index.is_some()) {
+            Some(docs) => {
+                let rows = docs
+                    .iter()
+                    .filter_map(|&doc| self.doc_rows.get(doc as usize).copied().flatten())
+                    .collect::<Vec<_>>();
+                self.filter_indices(rows)
+            }
+            None => self.scope_rows(),
+        };
         let anchor = card_anchor.flatten();
         self.selected = anchor
             .as_deref()
@@ -449,6 +470,18 @@ impl Browser {
             .or_else(|| (!self.filtered.is_empty()).then_some(0));
         self.readiness = Readiness::ready();
         self.corpus_changed();
+        self.send_index_scope();
+        if self.search_index.is_some() {
+            self.lexical_evidence = card_evidence
+                .into_iter()
+                .filter_map(|(doc, evidence)| {
+                    Some((
+                        self.doc_rows.get(doc as usize).copied().flatten()?,
+                        evidence,
+                    ))
+                })
+                .collect();
+        }
         // Snapshot cards: the selected session stays selected through the
         // query below (its results select it again when they contain it).
         // Without cards the first row is selected (L-003).
@@ -478,6 +511,8 @@ impl Browser {
     /// file synchronously here; without that, the lookup would fall back to
     /// [`UuidLookup::Pending`] with no GUI request to resolve it.
     fn replace_with(&mut self, prepared: PreparedCorpus) {
+        // The index holds the corpus before the refresh.
+        self.drop_search_index();
         let mut prepared = self.replay_corpus_edits(prepared);
         let uuid_result = self.uuid_lookup.clone();
         let carried = match &uuid_result {
@@ -577,6 +612,7 @@ impl Browser {
             index,
             indexed,
             remap,
+            located: _,
         } = prepared;
         // The remap holds the previous corpus: release it first.
         drop(remap);
@@ -665,6 +701,7 @@ impl Browser {
         }
         self.corpus_mut().push(Arc::new(conversation));
         self.index.extend(&self.conversations, index);
+        self.pushed_non_card();
         index
     }
 
@@ -724,6 +761,7 @@ impl Browser {
             remove_shared_positions(&mut self.searchable, removed);
         }
         self.index.remove(removed, &gone, old_len);
+        self.remove_doc_rows(removed);
 
         self.filtered = self
             .filtered
@@ -758,8 +796,12 @@ impl Browser {
 
         self.corpus_changed();
         // `corpus_changed` dropped the pending answer; a lexical search that
-        // was running goes out again so the rows settle on its result.
-        if search_was_in_flight && self.list_search_mode == ListSearchMode::Lexical {
+        // was running goes out again so the rows settle on its result (not
+        // over cards whose index the removal stopped).
+        if search_was_in_flight
+            && self.list_search_mode == ListSearchMode::Lexical
+            && self.readiness.lexical
+        {
             let query = self.query.trim().to_string();
             if !ParsedQuery::parse(&query).is_effectively_empty() && !search::is_uuid(&query) {
                 self.dispatch_lexical_search(query);

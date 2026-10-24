@@ -344,8 +344,10 @@ impl ListPane {
         // The first frame lists the newest cards of the store's snapshot
         // (bounded: the manifest is mapped and validated, at most
         // `SNAPSHOT_ROWS` cards are built); the loaded corpus replaces them
-        // at `Loaded`, keeping the selection (§11.2). Without a usable
-        // snapshot the rows stream in as before.
+        // at `Loaded`, keeping the selection (§11.2). Core opens the
+        // snapshot's search index on its own thread and a later poll hands
+        // it to the browser, so queries run before the load ends. Without a
+        // usable snapshot the rows stream in as before.
         if let Some(snapshot) = loader.open_snapshot() {
             browser.show_snapshot(snapshot);
         }
@@ -1249,6 +1251,13 @@ impl ListPane {
             // loading, upstream 3708bb6).
             "list.ready" => self.list_ready().to_string(),
             "list.snapshot" => self.browser.shows_snapshot().to_string(),
+            // The store generation whose index lexical queries run on
+            // (upstream ac7f591), empty without one.
+            "list.index" => self
+                .browser
+                .search_index_generation()
+                .unwrap_or_default()
+                .to_string(),
             "list.refreshing" => self.is_refreshing().to_string(),
             "list.query" => self.query(cx).to_string(),
             "list.query_calls" => self.query_calls.to_string(),
@@ -1663,6 +1672,16 @@ impl ListPane {
     #[cfg(test)]
     pub(crate) fn step(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.poll_all(window, cx);
+    }
+
+    /// Apply the search workers' answers without polling the loader (tests:
+    /// a query answered over the snapshot cards while the load waits).
+    #[cfg(test)]
+    pub(crate) fn poll_search_only(&mut self, cx: &mut Context<Self>) -> bool {
+        let applied = self.browser.poll();
+        self.emit_selection(false, cx);
+        cx.notify();
+        applied
     }
 
     /// Pause or resume the automatic poll loop (tests).

@@ -13,22 +13,45 @@
 //! With [`LoaderOptions::snapshot`] on, the loader also does what upstream's
 //! runtime `SnapshotStore` did: [`HistoryLoader::open_snapshot`] opens the
 //! store's current generation for the first frame
-//! ([`Browser::show_snapshot`]), and once the initial load is installed a
-//! `snapshot-writer` thread writes the loaded corpus as a new generation
-//! (nothing when it matches `CURRENT`). Only a complete initial load (no
-//! project error, not interrupted) without a time filter is the whole
-//! corpus, so nothing else is written; refreshes never write (upstream
-//! wrote after the initial load only). The write is joined on drop, and by
-//! [`HistoryLoader::finish_snapshot_write`].
+//! ([`Browser::show_snapshot`]) and its search index on an `index-open`
+//! thread, which a later poll hands to the browser
+//! ([`Browser::use_search_index`]), so lexical queries run before the load
+//! ends. Once the initial load is installed a `snapshot-writer` thread
+//! writes the loaded corpus as a new generation with its text and index
+//! (nothing when it matches `CURRENT`), opens that generation's index and
+//! locates its cards in the loaded corpus; a later poll swaps it in
+//! (upstream ac7f591). Only a complete initial load (no project error, not
+//! interrupted) without a time filter is the whole corpus, so nothing else
+//! is written; refreshes never write (upstream wrote after the initial load
+//! only). Both threads send their result before they call the waker, so the
+//! poll it schedules finds it. [`HistoryLoader::finish_snapshot_write`]
+//! waits for the write; dropping the loader cancels a build that is still
+//! running and then joins both threads.
+//!
+//! Differences from upstream: the generation is built in this process on
+//! the `snapshot-writer` thread, with its own pool of at most four threads
+//! (half the cores), instead of a detached `--publish-snapshot` child at
+//! nice 10 that reloads the history; the build reads the corpus the
+//! browser already holds. Upstream's child outlived the TUI; here dropping
+//! the loader (at quit) gives the build up
+//! ([`crate::store::write_snapshot_cancellable`]) so quitting never waits
+//! for it, and the next complete initial load builds it again. The fork does
+//! not lower the threads' priority yet: the thread-priority port (upstream
+//! 8322afe/9ee0a03) covers `snapshot-writer` and its `snapshot-build-*`
+//! pool as well as the semantic worker.
 
+use super::cards::IndexSwap;
 use super::corpus::corpus_edit_mark;
-use super::{Browser, PreparedCorpus, Waker};
+use super::{Browser, CorpusSnapshot, PreparedCorpus, Waker};
 use crate::debug::DebugLevel;
 use crate::env::HistoryEnv;
 use crate::error::AppError;
 use crate::history::{Conversation, LoaderMessage};
+use crate::store::{Publish, SearchIndex, Snapshot};
 use crate::time_filter::TimeFilter;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
@@ -287,8 +310,65 @@ struct ActiveLoad {
     loaded_since: SystemTime,
 }
 
-/// A running write of the list snapshot.
-type SnapshotWriter = JoinHandle<std::io::Result<crate::store::Publish>>;
+/// What the `snapshot-writer` thread produced.
+struct SnapshotWrite {
+    result: std::io::Result<Publish>,
+    /// The generation now current, opened and located in the written
+    /// corpus, unless the browser already searches it.
+    swap: Option<IndexSwap>,
+}
+
+/// A thread of the loader whose result a poll collects. The thread sends
+/// the result before it calls the waker, so the poll the waker schedules
+/// finds it even while the thread is still finishing.
+struct Background<T> {
+    result: Receiver<T>,
+    thread: JoinHandle<()>,
+}
+
+impl<T: Send + 'static> Background<T> {
+    /// Runs `work` on a named thread (8 MiB stack); `None` when the thread
+    /// cannot be started.
+    fn spawn(
+        name: &str,
+        waker: Option<Waker>,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<Self> {
+        let (tx, result) = mpsc::channel();
+        std::thread::Builder::new()
+            .name(name.into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let _ = tx.send(work());
+                if let Some(waker) = waker {
+                    waker();
+                }
+            })
+            .ok()
+            .map(|thread| Self { result, thread })
+    }
+
+    /// Waits for the thread and returns its result (`None` if it panicked).
+    fn join(self) -> Option<T> {
+        let _ = self.thread.join();
+        self.result.try_recv().ok()
+    }
+}
+
+/// The result of `task` once its thread has sent it (or `None` for a
+/// thread that panicked), then joins the thread, which only calls the waker
+/// after sending. Never waits for the work itself.
+fn take_finished<T>(task: &mut Option<Background<T>>) -> Option<Option<T>> {
+    let received = match task.as_ref()?.result.try_recv() {
+        Ok(value) => Some(value),
+        Err(TryRecvError::Empty) => return None,
+        Err(TryRecvError::Disconnected) => None,
+    };
+    if let Some(task) = task.take() {
+        let _ = task.thread.join();
+    }
+    Some(received)
+}
 
 /// Runs the streaming history loader and applies its messages to a
 /// [`Browser`].
@@ -314,10 +394,23 @@ pub struct HistoryLoader {
     options: LoaderOptions,
     active: Option<ActiveLoad>,
     /// The `snapshot-writer` thread of the last initial load.
-    writer: Option<SnapshotWriter>,
+    writer: Option<Background<SnapshotWrite>>,
+    /// Set when the loader is dropped: the writer gives up its build.
+    cancel: Arc<AtomicBool>,
+    /// The `index-open` thread of [`HistoryLoader::open_snapshot`].
+    index_open: Option<Background<Option<Arc<SearchIndex>>>>,
+    /// A written generation waiting for the next poll to swap it in.
+    swap: Option<IndexSwap>,
+    /// The outcome of a write a poll collected, for
+    /// [`HistoryLoader::finish_snapshot_write`].
+    written: Option<Publish>,
     /// Tests: the next preparation waits for a message on this channel.
     #[cfg(test)]
     prepare_gate: Option<Receiver<()>>,
+    /// Tests: the next snapshot write waits for a message on this channel
+    /// before it starts.
+    #[cfg(test)]
+    write_gate: Option<Receiver<()>>,
 }
 
 impl HistoryLoader {
@@ -327,8 +420,14 @@ impl HistoryLoader {
             options,
             active: None,
             writer: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            index_open: None,
+            swap: None,
+            written: None,
             #[cfg(test)]
             prepare_gate: None,
+            #[cfg(test)]
+            write_gate: None,
         }
     }
 
@@ -347,40 +446,60 @@ impl HistoryLoader {
 
     /// The store's current list snapshot, for the first frame
     /// ([`Browser::show_snapshot`], upstream `SnapshotStore::open`), read
-    /// with the options' preview mode and time filter. `None` unless
+    /// with the options' preview mode and time filter. Its search index is
+    /// opened on an `index-open` thread, and a later [`HistoryLoader::poll`]
+    /// hands it to the browser ([`Browser::use_search_index`]; upstream
+    /// `App::open_search_index`, on the TUI thread). `None` unless
     /// [`LoaderOptions::snapshot`] is on, or without a usable generation
     /// (first run, corruption, version mismatch): startup then streams.
-    pub fn open_snapshot(&self) -> Option<crate::store::Snapshot> {
+    pub fn open_snapshot(&mut self) -> Option<Snapshot> {
         if !self.options.snapshot {
             return None;
         }
-        crate::store::Snapshot::open(
+        let snapshot = Snapshot::open(
             &crate::store::default_root(&self.env)?,
             self.options.show_last,
             self.options.time_filter,
-        )
+        )?;
+        if self.index_open.is_none() {
+            let cards = snapshot.clone();
+            self.index_open =
+                Background::spawn("index-open", self.options.waker.clone(), move || {
+                    let index = SearchIndex::open(cards).map(Arc::new);
+                    crate::bench::mark("index_open");
+                    index
+                });
+        }
+        Some(snapshot)
     }
 
     /// Waits for a pending snapshot write so it is not cut short (upstream
-    /// `SnapshotStore::finish`) and returns its outcome. A failed write is
-    /// logged to the debug log and returns `None`, as does no write.
-    pub fn finish_snapshot_write(&mut self) -> Option<crate::store::Publish> {
-        let result = self.writer.take()?.join().ok()?;
-        result
-            .map_err(|err| {
-                if let Some(log_path) = self.env.debug_log_file() {
-                    let _ = crate::debug_log::log_debug(
-                        &log_path,
-                        &format!("Failed to write list snapshot: {err}"),
-                    );
-                }
-            })
-            .ok()
+    /// `SnapshotStore::finish`) and returns its outcome, also when a poll
+    /// already collected it (once). A failed write (logged to the debug log
+    /// by the writer) returns `None`, as does no write. The written
+    /// generation is swapped in by the next poll.
+    pub fn finish_snapshot_write(&mut self) -> Option<Publish> {
+        self.join_snapshot_write();
+        self.written.take()
+    }
+
+    fn join_snapshot_write(&mut self) {
+        if let Some(write) = self.writer.take().and_then(Background::join) {
+            self.take_write(write);
+        }
+    }
+
+    fn take_write(&mut self, SnapshotWrite { result, swap }: SnapshotWrite) {
+        if swap.is_some() {
+            self.swap = swap;
+        }
+        self.written = result.ok();
     }
 
     /// Writes the loaded corpus in the background (upstream
-    /// `SnapshotStore::write`), after the install so that edits replayed on
-    /// it are included.
+    /// `SnapshotStore::write` and its `--publish-snapshot` builder), after
+    /// the install so that edits replayed on it are included, then opens
+    /// the generation now current for [`Browser::swap_search_index`].
     fn write_snapshot(&mut self, browser: &Browser, loaded_since: SystemTime) {
         if !self.options.snapshot || self.writer.is_some() {
             return;
@@ -388,16 +507,40 @@ impl HistoryLoader {
         let Some(root) = crate::store::default_root(&self.env) else {
             return;
         };
-        let conversations = browser.corpus_snapshot();
-        self.writer = std::thread::Builder::new()
-            .name("snapshot-writer".into())
-            .stack_size(8 * 1024 * 1024)
-            .spawn(move || {
-                let result = crate::store::write_snapshot(&root, &conversations, loaded_since);
-                crate::bench::mark("snapshot_write");
-                result
-            })
-            .ok();
+        let build = SnapshotBuild {
+            root,
+            corpus: browser.corpus_snapshot(),
+            loaded_since,
+            show_last: self.options.show_last,
+            in_use: browser.search_index_generation().map(str::to_owned),
+            cancel: self.cancel.clone(),
+            log_path: self.env.debug_log_file(),
+        };
+        #[cfg(test)]
+        let gate = self.write_gate.take();
+        self.writer = Background::spawn("snapshot-writer", self.options.waker.clone(), move || {
+            #[cfg(test)]
+            if let Some(gate) = gate {
+                let _ = gate.recv();
+            }
+            build_snapshot(build)
+        });
+    }
+
+    /// Hands the browser an index opened since the last poll, and swaps in
+    /// a generation the snapshot write produced.
+    fn poll_search_index(&mut self, browser: &mut Browser) {
+        if let Some(Some(Some(index))) = take_finished(&mut self.index_open) {
+            browser.use_search_index(index);
+        }
+        if let Some(Some(write)) = take_finished(&mut self.writer) {
+            self.take_write(write);
+        }
+        if !browser.is_loading()
+            && let Some(swap) = self.swap.take()
+        {
+            browser.swap_search_index(swap);
+        }
     }
 
     /// The time filter of the next load.
@@ -513,6 +656,7 @@ impl HistoryLoader {
     /// never sorts, deduplicates or indexes the corpus on this thread.
     pub fn poll(&mut self, browser: &mut Browser) -> LoaderPoll {
         let mut result = LoaderPoll::default();
+        self.poll_search_index(browser);
         let Some(mut active) = self.active.take() else {
             return result;
         };
@@ -808,11 +952,96 @@ fn loaded_event(browser: &Browser, project_errors: usize, time_filter_active: bo
 }
 
 impl Drop for HistoryLoader {
-    /// Waits for a pending snapshot write so it is not cut short (upstream
-    /// joined it when the TUI exited).
+    /// Gives up a snapshot build that is still running and waits for the
+    /// writer, which then returns soon, and for an index being opened.
+    /// Upstream's TUI did not wait at exit: its builder was a detached
+    /// process that went on afterwards. An in-process build takes many
+    /// seconds, which quitting must not wait for.
     fn drop(&mut self) {
-        self.finish_snapshot_write();
+        self.cancel.store(true, Ordering::Relaxed);
+        self.join_snapshot_write();
+        if let Some(index_open) = self.index_open.take() {
+            index_open.join();
+        }
     }
+}
+
+/// What the `snapshot-writer` thread builds.
+struct SnapshotBuild {
+    root: PathBuf,
+    corpus: CorpusSnapshot,
+    loaded_since: SystemTime,
+    show_last: bool,
+    /// The generation the browser searches already: not opened again.
+    in_use: Option<String>,
+    /// Set when the loader is dropped: the build is given up.
+    cancel: Arc<AtomicBool>,
+    log_path: Option<PathBuf>,
+}
+
+/// The `snapshot-writer` thread's work: publish `corpus` with its text and
+/// index unless `CURRENT` holds it already, then open the current
+/// generation's index (unless it is `in_use`) and locate its cards in
+/// `corpus`. The parallel parts (text hashes, zstd frames, the suffix
+/// index) run on a pool of their own, so the build leaves cores to the UI
+/// and the search workers. The outcome goes to the debug log with
+/// upstream's lines; a build given up (the loader was dropped) is not
+/// logged.
+fn build_snapshot(build: SnapshotBuild) -> SnapshotWrite {
+    let SnapshotBuild {
+        root,
+        corpus,
+        loaded_since,
+        show_last,
+        in_use,
+        cancel,
+        log_path,
+    } = build;
+    let cancelled = || cancel.load(Ordering::Relaxed);
+    let threads = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(1, 4));
+    let result = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("snapshot-build-{i}"))
+        .build()
+        .map_err(std::io::Error::other)
+        .and_then(|pool| {
+            pool.install(|| {
+                crate::store::write_snapshot_cancellable(&root, &corpus, loaded_since, &cancelled)
+            })
+        });
+    crate::bench::mark("snapshot_write");
+    let given_up =
+        cancelled() && matches!(&result, Err(err) if err.kind() == std::io::ErrorKind::Interrupted);
+    if !given_up && let Some(log_path) = &log_path {
+        log_snapshot_write(log_path, &result);
+    }
+    let swap = match &result {
+        Ok(Publish::Published(_) | Publish::Unchanged) if !cancelled() => {
+            Snapshot::open(&root, show_last, TimeFilter::default())
+                .filter(|snapshot| in_use.as_deref() != Some(snapshot.generation_name()))
+                .and_then(SearchIndex::open)
+                .map(|index| IndexSwap {
+                    located: index.cards().locate(&corpus),
+                    index: Arc::new(index),
+                    corpus,
+                })
+        }
+        _ => None,
+    };
+    SnapshotWrite { result, swap }
+}
+
+/// Upstream's debug-log lines for a build: `List snapshot: {outcome:?}`
+/// (its builder process) and `Failed to build list snapshot: {err}` (its
+/// TUI). Upstream's TUI checked an unchanged corpus itself and started no
+/// builder, so `Unchanged` is not logged.
+fn log_snapshot_write(log_path: &Path, result: &std::io::Result<Publish>) {
+    let message = match result {
+        Ok(Publish::Unchanged) => return,
+        Ok(outcome) => format!("List snapshot: {outcome:?}"),
+        Err(err) => format!("Failed to build list snapshot: {err}"),
+    };
+    let _ = crate::debug_log::log_debug(log_path, &message);
 }
 
 /// Forward loader messages through a new channel, calling `waker` after
@@ -844,6 +1073,17 @@ impl HistoryLoader {
         let (tx, rx) = mpsc::channel();
         self.prepare_gate = Some(rx);
         tx
+    }
+
+    /// Hold the next snapshot write until a message is sent on the returned
+    /// channel (or it is dropped); also returns the flag the loader sets
+    /// when it is dropped.
+    pub(super) fn gate_next_snapshot_write_for_test(
+        &mut self,
+    ) -> (mpsc::Sender<()>, Arc<AtomicBool>) {
+        let (tx, rx) = mpsc::channel();
+        self.write_gate = Some(rx);
+        (tx, self.cancel.clone())
     }
 
     /// Drive a hand-made message stream (tests).

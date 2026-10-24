@@ -408,6 +408,9 @@ fn stale_response_with_current_generation_but_old_mode_is_ignored() {
 
     tx.send(SearchResponse {
         filtered: vec![0],
+        index: None,
+        complete: true,
+        cards: Vec::new(),
         generation: 7,
         mode: ListSearchMode::Lexical,
         evidence: HashMap::new(),
@@ -819,6 +822,7 @@ fn semantic_search_worker_returns_lexical_fallback() {
         mode: ListSearchMode::Semantic,
         conversations: app.corpus_snapshot(),
         searchable: app.searchable.clone(),
+        index: None,
     })
     .unwrap();
 
@@ -858,6 +862,9 @@ fn semantic_search_applies_lexical_fallback_while_pending() {
     app.selected = Some(0);
     tx.send(SearchResponse {
         filtered: vec![0],
+        index: None,
+        complete: true,
+        cards: Vec::new(),
         generation: 7,
         mode: ListSearchMode::Semantic,
         evidence: HashMap::new(),
@@ -883,6 +890,9 @@ fn empty_lexical_fallback_keeps_results_visible_while_semantic_search_is_pending
     app.selected = Some(0);
     tx.send(SearchResponse {
         filtered: Vec::new(),
+        index: None,
+        complete: true,
+        cards: Vec::new(),
         generation: 7,
         mode: ListSearchMode::Semantic,
         evidence: HashMap::new(),
@@ -907,6 +917,9 @@ fn semantic_search_ignores_lexical_fallback_after_completion() {
     app.selected = Some(0);
     tx.send(SearchResponse {
         filtered: Vec::new(),
+        index: None,
+        complete: true,
+        cards: Vec::new(),
         generation: 7,
         mode: ListSearchMode::Semantic,
         evidence: HashMap::new(),
@@ -1476,6 +1489,9 @@ fn uuid_dispatch_invalidates_stale_search_response() {
 
     tx.send(SearchResponse {
         filtered: vec![1],
+        index: None,
+        complete: true,
+        cards: Vec::new(),
         generation: 1,
         mode: ListSearchMode::Lexical,
         evidence: HashMap::new(),
@@ -1502,6 +1518,9 @@ fn finish_loading_invalidates_stale_loading_search_response() {
 
     tx.send(SearchResponse {
         filtered: vec![],
+        index: None,
+        complete: true,
+        cards: Vec::new(),
         generation: 1,
         mode: ListSearchMode::Lexical,
         evidence: HashMap::new(),

@@ -46,9 +46,10 @@ impl Browser {
     /// is not moved (addendum B3); only its corpus element and its search
     /// data change. Semantic metadata and lexical evidence are cleared.
     /// The query is re-applied (a lexical query in the background, keeping
-    /// the rows) and the renamed session stays selected when it is shown.
-    /// [`RenameError::NoTarget`] when `path` is no longer loaded (deleted
-    /// or refreshed away meanwhile).
+    /// the rows, over the loaded corpus: the store index in use holds the
+    /// old title, so it is dropped as upstream) and the renamed session
+    /// stays selected when it is shown. [`RenameError::NoTarget`] when
+    /// `path` is no longer loaded (deleted or refreshed away meanwhile).
     ///
     /// The path is found through the path index and the browse rows come
     /// from the cached scope (CCR-2): the caller's thread does no work per
@@ -63,9 +64,12 @@ impl Browser {
         self.replace_conversation_at(index, Arc::new(renamed));
         if self.is_loading() {
             // No search data or query results yet: the row just shows the
-            // new title.
+            // new title (the index of snapshot cards holds the old one).
+            self.cards_edited();
             return Ok(());
         }
+        // The index holds the old title.
+        self.drop_search_index();
         self.corpus_changed();
 
         let path = path.to_path_buf();

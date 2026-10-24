@@ -6,7 +6,10 @@
 //! Differences from upstream: the workspace is a [`WorkspaceScope`] in the
 //! sandbox (not the process cwd); upstream's key and click gating tests
 //! (resume, fork and Ctrl+O on cards, no rename or delete dialog) are GUI
-//! tests (`crates/gui/src/list/tests/snapshot.rs`).
+//! tests (`crates/gui/src/list/tests/snapshot.rs`). Upstream's index tests
+//! (ac7f591) type through the browser API; the fork adds the loader's
+//! `index-open` and `snapshot-writer` hand-offs, edits with an index, the
+//! worker's two answers and the cards it builds.
 
 use super::test_helpers::{Sandbox, type_char, wait_for_search};
 use super::*;
@@ -21,11 +24,11 @@ const HOUR_MS: i64 = 3_600_000;
 
 fn publish(conversations: &[Conversation]) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = crate::store::generation::build_manifest(
+    let corpus = crate::store::generation::Corpus::new(
         conversations,
-        &unknown_fingerprints(conversations.len()),
+        unknown_fingerprints(conversations.len()),
     );
-    crate::store::generation::publish(dir.path(), &manifest).unwrap();
+    crate::store::generation::publish(dir.path(), &corpus).unwrap();
     dir
 }
 
@@ -538,7 +541,7 @@ fn partial_initial_loads_write_no_snapshot() {
 }
 
 #[test]
-fn reconfiguring_keeps_a_running_write_and_dropping_joins_it() {
+fn reconfiguring_keeps_a_running_write() {
     let sandbox = Sandbox::new();
     let mut loader = snapshot_loader(&sandbox);
     let mut app = loading_app(&sandbox, None, vec![]);
@@ -552,10 +555,577 @@ fn reconfiguring_keeps_a_running_write_and_dropping_joins_it() {
         LoaderOptions::new(false).with_snapshot(true),
     );
     assert!(!loader.options().show_last);
+    assert_eq!(
+        loader.finish_snapshot_write(),
+        Some(Publish::Published("g000001".into()))
+    );
     drop(loader);
     let root = crate::store::default_root(&sandbox.env).unwrap();
     assert!(
         crate::store::Snapshot::open(&root, true, TimeFilter::default()).is_some(),
-        "the write finished before the loader was gone"
+        "the write finished"
+    );
+    let log = std::fs::read_to_string(sandbox.env.debug_log_file().unwrap()).unwrap();
+    assert!(
+        log.contains("List snapshot: Published(\"g000001\")"),
+        "upstream's builder line: {log}"
+    );
+}
+
+/// Quitting drops the loader: a build still running is given up (no
+/// generation, no build directory left) instead of holding up the exit.
+#[test]
+fn dropping_the_loader_gives_up_a_running_snapshot_build() {
+    let sandbox = Sandbox::new();
+    let mut loader = snapshot_loader(&sandbox);
+    let (gate, cancel) = loader.gate_next_snapshot_write_for_test();
+    let mut app = loading_app(&sandbox, None, vec![]);
+    start_injected(
+        &mut loader,
+        vec![LoaderMessage::Batch(corpus()), LoaderMessage::Done],
+    );
+    poll_until_event(&mut loader, &mut app);
+    // The writer has started and waits at the gate; let it go on only once
+    // the drop has asked it to stop, so the build sees the request.
+    let release = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            assert!(Instant::now() < deadline, "the drop never cancelled");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(gate);
+    });
+    drop(loader);
+    release.join().unwrap();
+
+    let root = crate::store::default_root(&sandbox.env).unwrap();
+    assert!(
+        crate::store::Snapshot::open(&root, true, TimeFilter::default()).is_none(),
+        "the build was given up"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(&root)
+        .map(|entries| {
+            entries
+                .map(|entry| entry.unwrap().file_name())
+                .filter(|name| name != "LOCK")
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+    let log = std::fs::read_to_string(sandbox.env.debug_log_file().unwrap()).unwrap_or_default();
+    assert!(
+        !log.to_lowercase().contains("list snapshot"),
+        "a given-up build is not logged: {log}"
+    );
+}
+
+// --- the generation's search index (upstream ac7f591) ---
+
+fn type_query(app: &mut Browser, query: &str) {
+    for c in query.chars() {
+        type_char(app, c);
+    }
+}
+
+/// `corpus()` with a hidden match far into the oldest conversation's text
+/// and one in the newest.
+fn needle_corpus() -> Vec<Conversation> {
+    let mut corpus = corpus();
+    corpus[0].full_text = format!("{} hidden needle here", "padding ".repeat(400)).into();
+    corpus[2].full_text = "needle in the newest".into();
+    for conversation in &mut corpus {
+        conversation.search_text_lower =
+            crate::search::normalize_for_search(&conversation.full_text).into();
+    }
+    corpus
+}
+
+/// `needle_corpus()` plus a newer conversation with a match.
+fn needle_corpus_with_late_needle() -> Vec<Conversation> {
+    let mut loaded = needle_corpus();
+    loaded.push(conversation("/p/-tmp-beta/d.jsonl", 4 * HOUR_MS));
+    loaded[3].full_text = "late needle".into();
+    loaded[3].search_text_lower = "late needle".into();
+    loaded
+}
+
+#[test]
+fn index_answers_queries_before_loading_with_evidence_from_frames() {
+    let sandbox = Sandbox::new();
+    let root = publish(&needle_corpus());
+    let mut app = loading_app(&sandbox, None, vec![]);
+    show(&mut app, &root, TimeFilter::default());
+    assert!(!app.readiness().lexical);
+    assert!(app.open_search_index());
+    assert!(app.readiness().lexical);
+    assert!(app.is_loading());
+
+    type_query(&mut app, "needle");
+    wait_for_search(&mut app);
+    assert_eq!(
+        listed_paths(&app),
+        vec!["/p/-tmp-alpha/c.jsonl", "/p/-tmp-alpha/a.jsonl"]
+    );
+    let hidden = app.filtered()[1];
+    let evidence = app
+        .lexical_evidence(hidden)
+        .expect("evidence from the frame");
+    let (start, end) = evidence.context_ranges[0];
+    assert_eq!(&evidence.text[start..end], "needle");
+    assert!(evidence.text.len() < 4000);
+    assert_eq!(app.count_text(), "Loading... 0");
+
+    // Loading keeps the index and maps its results to loaded conversations.
+    app.append_conversations(needle_corpus());
+    app.finish_loading();
+    assert_eq!(
+        listed_paths(&app),
+        vec!["/p/-tmp-alpha/c.jsonl", "/p/-tmp-alpha/a.jsonl"],
+        "the rows the index answered stay until the query answers again"
+    );
+    wait_for_search(&mut app);
+    assert_eq!(app.search_index_generation(), Some("g000001"));
+    assert_eq!(
+        listed_paths(&app),
+        vec!["/p/-tmp-alpha/c.jsonl", "/p/-tmp-alpha/a.jsonl"]
+    );
+    assert_eq!(
+        &*app.conversations()[app.filtered()[0]].full_text,
+        "needle in the newest"
+    );
+}
+
+#[test]
+fn index_results_match_in_memory_search_after_loading() {
+    let sandbox = Sandbox::new();
+    let corpus = needle_corpus();
+    let root = publish(&corpus);
+    let mut app = loading_app(&sandbox, None, vec![]);
+    show(&mut app, &root, TimeFilter::default());
+    assert!(app.open_search_index());
+    app.append_conversations(corpus.clone());
+    app.finish_loading();
+    assert!(app.search_index_generation().is_some());
+
+    let mut in_memory = loading_app(&sandbox, None, vec![]);
+    in_memory.append_conversations(corpus);
+    in_memory.finish_loading();
+    for query in [
+        "needle",
+        "full",
+        "\"hidden needle\"",
+        "padding needle",
+        "zzz",
+    ] {
+        app.set_query(query);
+        wait_for_search(&mut app);
+        in_memory.set_query(query);
+        wait_for_search(&mut in_memory);
+        assert_eq!(listed_paths(&app), listed_paths(&in_memory), "{query}");
+    }
+}
+
+#[test]
+fn index_scope_follows_workspace_filter() {
+    let sandbox = Sandbox::new();
+    let beta_dir = sandbox.path().join("beta");
+    std::fs::create_dir_all(&beta_dir).unwrap();
+    let beta = crate::env::workspace_project_dir_name(&beta_dir);
+    let mut corpus = needle_corpus();
+    corpus[1].path = PathBuf::from(format!("/p/{beta}/b.jsonl"));
+    let root = publish(&corpus);
+    let mut app = loading_app(&sandbox, Some(&beta_dir), vec![]);
+    show(&mut app, &root, TimeFilter::default());
+    assert!(app.open_search_index());
+    type_query(&mut app, "full");
+    wait_for_search(&mut app);
+    assert_eq!(listed_paths(&app), vec![format!("/p/{beta}/b.jsonl")]);
+    app.set_query("needle");
+    wait_for_search(&mut app);
+    assert!(
+        listed_paths(&app).is_empty(),
+        "the needles are out of scope"
+    );
+
+    app.toggle_workspace_filter();
+    assert!(!app.workspace_filter());
+    wait_for_search(&mut app);
+    assert_eq!(
+        listed_paths(&app),
+        vec!["/p/-tmp-alpha/c.jsonl", "/p/-tmp-alpha/a.jsonl"]
+    );
+    app.set_query("full text");
+    wait_for_search(&mut app);
+    assert_eq!(listed_paths(&app), vec![format!("/p/{beta}/b.jsonl")]);
+    app.set_query("");
+    assert_eq!(listed_paths(&app).len(), 3, "the browse list of the cards");
+}
+
+/// The current generation under `root`, opened and located in `corpus`
+/// (what the snapshot writer hands the loader).
+fn swap_of(root: &Path, corpus: CorpusSnapshot) -> cards::IndexSwap {
+    let snapshot = crate::store::Snapshot::open(root, true, TimeFilter::default()).unwrap();
+    let index = crate::store::SearchIndex::open(snapshot).unwrap();
+    cards::IndexSwap {
+        located: index.cards().locate(&corpus),
+        index: Arc::new(index),
+        corpus,
+    }
+}
+
+#[test]
+fn newer_generation_swaps_in_and_reruns_the_query_keeping_selection() {
+    let sandbox = Sandbox::new();
+    let root = publish(&needle_corpus());
+    let mut app = loading_app(&sandbox, None, vec![]);
+    show(&mut app, &root, TimeFilter::default());
+    assert!(app.open_search_index());
+    let loaded = needle_corpus_with_late_needle();
+    app.append_conversations(loaded.clone());
+    app.finish_loading();
+    type_query(&mut app, "needle");
+    wait_for_search(&mut app);
+    // The startup index misses the new conversation: it is dropped and the
+    // query runs in memory.
+    assert_eq!(app.search_index_generation(), None);
+    assert_eq!(
+        listed_paths(&app),
+        vec![
+            "/p/-tmp-beta/d.jsonl",
+            "/p/-tmp-alpha/c.jsonl",
+            "/p/-tmp-alpha/a.jsonl"
+        ]
+    );
+    app.select_next();
+    app.select_next();
+
+    let corpus = crate::store::generation::Corpus::new(&loaded, unknown_fingerprints(loaded.len()));
+    crate::store::generation::publish(root.path(), &corpus).unwrap();
+    assert!(app.swap_search_index(swap_of(root.path(), app.corpus_snapshot())));
+    assert_eq!(app.search_index_generation(), Some("g000002"));
+    wait_for_search(&mut app);
+    assert_eq!(
+        listed_paths(&app),
+        vec![
+            "/p/-tmp-beta/d.jsonl",
+            "/p/-tmp-alpha/c.jsonl",
+            "/p/-tmp-alpha/a.jsonl"
+        ]
+    );
+    assert_eq!(
+        app.selected_path(),
+        Some(PathBuf::from("/p/-tmp-alpha/a.jsonl"))
+    );
+}
+
+#[test]
+fn a_swap_for_a_corpus_that_changed_drops_the_stale_index() {
+    let sandbox = Sandbox::new();
+    let root = publish(&needle_corpus());
+    let mut app = loading_app(&sandbox, None, vec![]);
+    show(&mut app, &root, TimeFilter::default());
+    assert!(app.open_search_index());
+    let loaded = needle_corpus_with_late_needle();
+    app.append_conversations(loaded.clone());
+    app.finish_loading();
+    let corpus = crate::store::generation::Corpus::new(&loaded, unknown_fingerprints(loaded.len()));
+    crate::store::generation::publish(root.path(), &corpus).unwrap();
+    let swap = swap_of(root.path(), app.corpus_snapshot());
+
+    type_query(&mut app, "needle");
+    wait_for_search(&mut app);
+    assert_eq!(
+        listed_paths(&app).len(),
+        3,
+        "in memory: the stale index is dropped"
+    );
+    // An edit after the write: the new generation's positions are stale.
+    assert_eq!(
+        app.remove_paths(&[PathBuf::from("/p/-tmp-alpha/a.jsonl")]),
+        1
+    );
+    assert!(!app.swap_search_index(swap));
+    assert_eq!(app.search_index_generation(), None);
+    wait_for_search(&mut app);
+    assert_eq!(
+        listed_paths(&app),
+        vec!["/p/-tmp-beta/d.jsonl", "/p/-tmp-alpha/c.jsonl"],
+        "in memory: the late conversation is found"
+    );
+}
+
+#[test]
+fn snapshot_without_index_files_waits_for_loading() {
+    let sandbox = Sandbox::new();
+    let root = publish(&needle_corpus());
+    let generation = std::fs::read_to_string(root.path().join("CURRENT")).unwrap();
+    std::fs::remove_file(root.path().join(generation.trim()).join("base.fst")).unwrap();
+    let mut app = loading_app(&sandbox, None, vec![]);
+    show(&mut app, &root, TimeFilter::default());
+    assert!(!app.open_search_index());
+    type_query(&mut app, "needle");
+    assert!(!app.has_search_work_in_flight());
+
+    app.append_conversations(needle_corpus());
+    app.finish_loading();
+    wait_for_search(&mut app);
+    assert_eq!(
+        listed_paths(&app),
+        vec!["/p/-tmp-alpha/c.jsonl", "/p/-tmp-alpha/a.jsonl"]
+    );
+}
+
+#[test]
+fn edits_on_cards_stop_the_index_until_the_load_ends() {
+    let sandbox = Sandbox::new();
+    let root = publish(&needle_corpus());
+    let mut app = loading_app(&sandbox, None, vec![]);
+    show(&mut app, &root, TimeFilter::default());
+    assert!(app.open_search_index());
+    type_query(&mut app, "needle");
+    wait_for_search(&mut app);
+    assert_eq!(listed_paths(&app).len(), 2);
+    app.set_query("needle ");
+    assert!(app.has_search_work_in_flight());
+
+    assert_eq!(
+        app.remove_paths(&[PathBuf::from("/p/-tmp-alpha/c.jsonl")]),
+        1
+    );
+    assert!(!app.readiness().lexical, "queries wait for the load again");
+    assert!(
+        !app.has_search_work_in_flight(),
+        "the abandoned query does not run over the cards in memory"
+    );
+    assert_eq!(listed_paths(&app), vec!["/p/-tmp-alpha/a.jsonl"]);
+    assert_eq!(app.search_index_generation(), None);
+    assert!(!app.open_search_index(), "not while the cards are edited");
+    // A scope change shows the browse list of the cards again.
+    app.set_excluded_projects(vec!["gamma".to_string()]);
+    assert_eq!(
+        listed_paths(&app),
+        vec!["/p/-tmp-beta/b.jsonl", "/p/-tmp-alpha/a.jsonl"],
+        "the deleted card stays out of the browse list"
+    );
+    type_query(&mut app, " again");
+    assert!(!app.has_search_work_in_flight());
+    app.set_query("needle");
+
+    // The query runs in memory once loaded (a synchronous `finish_loading`
+    // replays no edit; the loader's install does, see
+    // `edits_made_on_cards_are_replayed_on_the_loaded_corpus`).
+    app.append_conversations(needle_corpus());
+    app.finish_loading();
+    assert_eq!(app.search_index_generation(), None);
+    wait_for_search(&mut app);
+    assert_eq!(
+        listed_paths(&app),
+        vec!["/p/-tmp-alpha/c.jsonl", "/p/-tmp-alpha/a.jsonl"]
+    );
+}
+
+#[test]
+fn after_loading_a_delete_keeps_the_index_in_step_and_a_rename_drops_it() {
+    let sandbox = Sandbox::new();
+    let root = publish(&needle_corpus());
+    let mut app = loading_app(&sandbox, None, vec![]);
+    show(&mut app, &root, TimeFilter::default());
+    assert!(app.open_search_index());
+    app.append_conversations(needle_corpus());
+    app.finish_loading();
+    assert!(app.search_index_generation().is_some());
+
+    assert_eq!(
+        app.remove_paths(&[PathBuf::from("/p/-tmp-alpha/c.jsonl")]),
+        1
+    );
+    assert!(app.search_index_generation().is_some());
+    type_query(&mut app, "needle");
+    wait_for_search(&mut app);
+    assert_eq!(listed_paths(&app), vec!["/p/-tmp-alpha/a.jsonl"]);
+    app.set_query("full");
+    wait_for_search(&mut app);
+    assert_eq!(listed_paths(&app), vec!["/p/-tmp-beta/b.jsonl"]);
+
+    // What `rename_session` returns: the session re-read from its file.
+    let mut renamed = conversation("/p/-tmp-beta/b.jsonl", 2 * HOUR_MS);
+    renamed.custom_title = Some("Renamed".to_string());
+    renamed.full_text = "renamed full text".into();
+    renamed.search_text_lower = "renamed full text".into();
+    app.apply_renamed(Path::new("/p/-tmp-beta/b.jsonl"), renamed)
+        .unwrap();
+    assert_eq!(
+        app.search_index_generation(),
+        None,
+        "the index holds the old title"
+    );
+    app.set_query("renamed");
+    wait_for_search(&mut app);
+    assert_eq!(listed_paths(&app), vec!["/p/-tmp-beta/b.jsonl"]);
+}
+
+/// `count` conversations that all match `needle`, the newest last.
+fn many_needles(count: usize) -> Vec<Conversation> {
+    (0..count)
+        .map(|i| {
+            let mut conversation =
+                conversation(&format!("/p/-tmp-alpha/{i:03}.jsonl"), i as i64 * HOUR_MS);
+            conversation.full_text = format!("needle number {i}").into();
+            conversation.search_text_lower = conversation.full_text.clone();
+            conversation
+        })
+        .collect()
+}
+
+#[test]
+fn the_index_answers_with_the_top_page_then_every_result() {
+    let root = publish(&many_needles(120));
+    let snapshot = crate::store::Snapshot::open(root.path(), true, TimeFilter::default()).unwrap();
+    let index = Arc::new(crate::store::SearchIndex::open(snapshot).unwrap());
+    let materialized: Arc<[std::sync::atomic::AtomicBool]> = (0..120)
+        .map(|doc| std::sync::atomic::AtomicBool::new(doc < 10))
+        .collect();
+    let (tx, rx) = search_state::spawn_search_worker(None);
+    tx.send(search_state::SearchCommand {
+        query: "needle".to_string(),
+        generation: 3,
+        mode: ListSearchMode::Lexical,
+        conversations: Arc::default(),
+        searchable: Arc::default(),
+        index: Some(search_state::IndexScope {
+            index: index.clone(),
+            docs: Arc::new(vec![true; 120]),
+            cards: Some(materialized),
+        }),
+    })
+    .unwrap();
+    let page = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(!page.complete);
+    assert_eq!(page.filtered.len(), search_state::TOP_PAGE);
+    assert!(Arc::ptr_eq(page.index.as_ref().unwrap(), &index));
+    let carded: Vec<u32> = page.cards.iter().map(|(doc, _)| *doc).collect();
+    assert!(
+        page.filtered
+            .iter()
+            .all(|&doc| (doc < 10) != carded.contains(&(doc as u32))),
+        "cards for the docs not materialized"
+    );
+    let complete = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(complete.complete);
+    assert_eq!(complete.generation, 3);
+    assert_eq!(complete.filtered.len(), 120);
+    assert_eq!(complete.filtered[..50], page.filtered[..]);
+    assert_eq!(
+        complete.cards.len() + page.cards.len(),
+        110,
+        "each card is built once"
+    );
+}
+
+#[test]
+fn the_complete_ranking_keeps_a_row_selected_on_the_first_page() {
+    let sandbox = Sandbox::new();
+    let root = publish(&many_needles(120));
+    let mut app = loading_app(&sandbox, None, vec![]);
+    show(&mut app, &root, TimeFilter::default());
+    assert!(app.open_search_index());
+    let index = app.search_index.clone().unwrap();
+    let (tx, rx) = mpsc::channel();
+    app.search_rx = rx;
+    type_query(&mut app, "needle");
+    let generation = app.search_generation;
+    let ranking: Vec<usize> = (0..120).map(|doc| (doc * 7) % 120).collect();
+    let response = |filtered: Vec<usize>, complete: bool| SearchResponse {
+        filtered,
+        index: Some(index.clone()),
+        complete,
+        generation,
+        mode: ListSearchMode::Lexical,
+        evidence: HashMap::new(),
+        cards: Vec::new(),
+    };
+
+    tx.send(response(ranking[..50].to_vec(), false)).unwrap();
+    assert!(app.poll());
+    assert_eq!(app.filtered().len(), 50);
+    assert!(app.has_search_work_in_flight(), "the rest is coming");
+    app.select_next();
+    app.select_next();
+    let chosen = app.selected_path();
+
+    tx.send(response(ranking.clone(), true)).unwrap();
+    assert!(app.poll());
+    assert_eq!(app.filtered().len(), 120);
+    assert!(!app.has_search_work_in_flight());
+    assert_eq!(app.selected(), Some(2));
+    assert_eq!(app.selected_path(), chosen);
+
+    // An answer from an index no longer in use is dropped.
+    app.drop_search_index();
+    tx.send(response(ranking[..3].to_vec(), true)).unwrap();
+    assert!(!app.poll());
+    assert_eq!(app.filtered().len(), 120);
+}
+
+#[test]
+fn the_loader_opens_the_index_off_the_ui_thread_and_swaps_in_the_written_generation() {
+    let sandbox = Sandbox::new();
+    let root = crate::store::default_root(&sandbox.env).unwrap();
+    let corpus = needle_corpus();
+    crate::store::generation::publish(
+        &root,
+        &crate::store::generation::Corpus::new(&corpus, unknown_fingerprints(corpus.len())),
+    )
+    .unwrap();
+    let mut loader = snapshot_loader(&sandbox);
+    let mut app = loading_app(&sandbox, None, vec![]);
+    app.show_snapshot(loader.open_snapshot().expect("the published generation"));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !app.readiness().lexical {
+        assert!(Instant::now() < deadline, "the index did not arrive");
+        loader.poll(&mut app);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(app.search_index_generation(), Some("g000001"));
+    type_query(&mut app, "needle");
+    wait_for_search(&mut app);
+    assert_eq!(listed_paths(&app).len(), 2);
+
+    start_injected(
+        &mut loader,
+        vec![
+            LoaderMessage::Batch(needle_corpus_with_late_needle()),
+            LoaderMessage::Done,
+        ],
+    );
+    let event = poll_until_event(&mut loader, &mut app);
+    assert!(matches!(event, LoadEvent::Loaded { .. }), "{event:?}");
+    assert_eq!(
+        app.search_index_generation(),
+        None,
+        "the cards miss a conversation"
+    );
+    wait_for_search(&mut app);
+    assert_eq!(listed_paths(&app).len(), 3, "in memory");
+
+    assert_eq!(
+        loader.finish_snapshot_write(),
+        Some(Publish::Published("g000002".into()))
+    );
+    loader.poll(&mut app);
+    assert_eq!(app.search_index_generation(), Some("g000002"));
+    wait_for_search(&mut app);
+    assert_eq!(
+        listed_paths(&app),
+        vec![
+            "/p/-tmp-beta/d.jsonl",
+            "/p/-tmp-alpha/c.jsonl",
+            "/p/-tmp-alpha/a.jsonl"
+        ]
+    );
+    let generation = crate::store::Generation::open(&root).unwrap();
+    assert!(
+        generation.open_search_files().is_some(),
+        "the written generation carries its text and index"
     );
 }

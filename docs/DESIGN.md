@@ -419,7 +419,10 @@ Single-file window: Root ─► SingleFileWindow (Entity, key_context "SingleFil
 Background work (all threads named, 8 MiB stack via `std::thread::Builder::stack_size`):
 * core-owned: `history-loader` + `history-loader-forwarder` (streaming load), `corpus-prepare` (K1: sort, dedupe,
   search index off the UI thread), `corpus-release` (drops a replaced corpus off the UI thread), `search-worker`
-  (lexical), `semantic-search-worker` (spawned by `core::browser::Browser`);
+  (lexical), `semantic-search-worker` (spawned by `core::browser::Browser`), `index-open` (opens the
+  startup snapshot's search index), `snapshot-writer` (writes the next generation); rayon pools
+  (`lexical-rank-worker`, `index-search-*` up to 8 threads, `snapshot-build-*` up to 4) use rayon's default
+  stack size, not 8 MiB;
 * GUI-owned: `viewer-worker` (one per ViewerPane: single-flight parse + document + items + segments, §7.5),
   `agent-worker` (Deep Search + agent panel, single-flight per request kind with cancellation), short-lived tool
   threads (`semantic-cache-gen`, `update-check`, `delete-empty-scan`, `uuid-load`, `rename-write`, `delete-exec`,
@@ -442,7 +445,7 @@ truth.
 | `env` | `HistoryEnv { home_dir, claude_config_dir, pi_coding_agent_dir, pi_coding_agent_session_dir, pi_config_dir, omp_profile, pi_profile, xdg_data_home, path_var, pathext, workspace_dir, cache_root, config_file, gui_config_file, debug_log_file }` (+ `env_path_base`, K16: `with_env_path_base`, `launch_base_dir()`, `env_value_base_dir()`; `main` sets it to the launch cwd), `from_process_env()` (main only), `sandbox(root)`, `with_workspace`, `claude_dir()`, `claude_projects_root()`, `claude_projects_dir_for(dir)`, `cache_root()`, `semantic_cache_dir()`, `embedding_cache_file()`, `semantic_model_dir()`, `config_file()`, `gui_config_file()`, `debug_log_file()`, `workspace()`, `resolve_program(name, override)`; `WorkspaceScope { dir, project_dir_name }`, `WorkspaceScope::new`, `canonical_dir()`; `STATE_DIR_NAME`, `CACHE_DIR_NAME` |
 | `config` | `ConfigFile`, `GuiConfigFile`, `GuiSettings { theme, terminal, claude_path, pi_path, omp_path, default_workspace, restore_session }`, `LayeredConfig { cli, gui_file, effective, gui }`, `load_config_from(path)`, `load_gui_config_from(path)` (loaded **independently**, §11.1), `ConfigFile::overlaid_with(&GuiConfigFile)`, `save_gui_config_changes` (K12), `KeyChord::{short_label, help_label, gpui_keystroke, config_string}`, `parse_key_binding`, `KeyBindings { resume, fork, rename, delete, refresh }` + `from_config`, `conflicts_with_ctrl_t`, `AgentScopeConfig`, `AgentConfig` |
 | `settings` | `parse_launch_args(args) -> Result<LaunchCommand, LaunchArgsError>` (`LaunchCommand::{Run(GuiLaunchArgs), Help, Version, DeleteEmpty { local, all, yes }, Update, Agent(AgentCli), SubcommandHelp(String)}`; K14/K15, `SubcommandHelp` added by WP-C: `update --help`, `delete-empty -h`, `help <subcommand>` → print the text, exit 0), `GuiLaunchArgs` (+`display_flags`, `search_mode_override`, `picker`, `time_filter`, `settings`, `validate`), `help_text(program)`, `effective_settings(config, flags, mode_override) -> EffectiveSettings { show_last, show_tools, tool_display, show_thinking, search_mode, list_search_mode, exclude_projects, keys, semantic_toggle_enabled, resume_default_args }`, `EffectiveSettings::initial_view_prefs()`, `initial_tool_display`, `PickerAction::{ShowPath, ShowId, Resume{fork}}`, `picker_output(action, conv)`, `session_id_from_path(path)` |
-| `browser` | `Browser` (`new_loading`, `append_conversations`, `set_query`, `escape -> EscapeOutcome`, `toggle_workspace_filter`, `set_workspace_filter`, `set_workspace`, `set_excluded_projects`, `toggle_list_search_mode`, `set_list_search_mode`, `poll`, `has_search_work_in_flight`, `filtered`, `row`, `selected`, `select*`, `select_half_page_down(viewport_rows)`, `selected_path`, `selected_conversation`, `has_multiple_sources`, `conversation_by_path`, `count_text`, `search_status_text`, `semantic_status_text`, `semantic_activity_status_text`, `semantic_error`, `semantic_progress`, `semantic_result_metadata[_for_selection]`, `lexical_evidence`, `row_preview_input`, `row_header_input`, `uuid_lookup`, `rename_prefill`, `workspace`, `has_project_context`, `list_search_mode`, `is_loading`, `readiness() -> Readiness { list, lexical, reconcile: ReconcileState::{Running { loaded }, Done}, semantic }`, `show_snapshot(store::Snapshot)`, `shows_snapshot`; upstream 3708bb6 replaced `loading_state`), `SNAPSHOT_ROWS`, `BrowserOptions` (+ builders, `embedder_factory`, `waker`, `semantic_available`), `HistoryLoader` (`new`, `reconfigure`, `start_initial_load`, `start_refresh`, `set_time_filter`, `is_running`, `is_refreshing`, `open_snapshot`, `finish_snapshot_write`, `poll(&mut Browser) -> LoaderPoll` incl. `pending`), `LoaderOptions` (incl. `drain_budget`, default `DEFAULT_DRAIN_BUDGET` = 8 ms, upstream 93e17a5; `snapshot`, default off, 3708bb6), `LoadEvent::{Loaded, NoHistory, LoadFailed, Refreshed, RefreshIncomplete, RefreshFailed, RefreshInterrupted}` (+`status_message`), `ListSearchMode`, `SemanticProgress`, `SemanticResultMetadata`, `UuidLookup`, `RenameError`, `DeleteError`, `Waker`, `SemanticEmbedderFactory`, `query_has_literals`; K1–K4, K6, K18 additions |
+| `browser` | `Browser` (`new_loading`, `append_conversations`, `set_query`, `escape -> EscapeOutcome`, `toggle_workspace_filter`, `set_workspace_filter`, `set_workspace`, `set_excluded_projects`, `toggle_list_search_mode`, `set_list_search_mode`, `poll`, `has_search_work_in_flight`, `filtered`, `row`, `selected`, `select*`, `select_half_page_down(viewport_rows)`, `selected_path`, `selected_conversation`, `has_multiple_sources`, `conversation_by_path`, `count_text`, `search_status_text`, `semantic_status_text`, `semantic_activity_status_text`, `semantic_error`, `semantic_progress`, `semantic_result_metadata[_for_selection]`, `lexical_evidence`, `row_preview_input`, `row_header_input`, `uuid_lookup`, `rename_prefill`, `workspace`, `has_project_context`, `list_search_mode`, `is_loading` (`reconcile != Done`, ac7f591), `readiness() -> Readiness { list, lexical, reconcile: ReconcileState::{Running { loaded }, Done}, semantic }`, `show_snapshot(store::Snapshot)`, `shows_snapshot`; upstream 3708bb6 replaced `loading_state`; `use_search_index(Arc<store::SearchIndex>)`, `open_search_index`, `search_index_generation`: lexical queries on the store generation's index, ac7f591), `SNAPSHOT_ROWS`, `BrowserOptions` (+ builders, `embedder_factory`, `waker`, `semantic_available`), `HistoryLoader` (`new`, `reconfigure`, `start_initial_load`, `start_refresh`, `set_time_filter`, `is_running`, `is_refreshing`, `open_snapshot` (`&mut self`: also opens the snapshot's search index on `index-open`, handed over by a later `poll`), `finish_snapshot_write`, `poll(&mut Browser) -> LoaderPoll` incl. `pending`), `LoaderOptions` (incl. `drain_budget`, default `DEFAULT_DRAIN_BUDGET` = 8 ms, upstream 93e17a5; `snapshot`, default off, 3708bb6), `LoadEvent::{Loaded, NoHistory, LoadFailed, Refreshed, RefreshIncomplete, RefreshFailed, RefreshInterrupted}` (+`status_message`), `ListSearchMode`, `SemanticProgress`, `SemanticResultMetadata`, `UuidLookup`, `RenameError`, `DeleteError`, `Waker`, `SemanticEmbedderFactory`, `query_has_literals`; K1–K4, K6, K18 additions |
 | `display_format` | `build_row_header(&RowHeaderInput) -> RowHeader { project, custom_title, summary, message_count, semantic_score, duration, timestamp, recency, .. }`, `build_row_preview(&RowPreviewInput) -> RowPreview { preview, source, context }`, `HighlightQuery` (`parse`, `needs_literal_context`, `match_ranges`), `HighlightedText`, `Recency`, `format_model_name`, `format_tokens`, `format_tokens_long`, `format_msg_count_long`, `format_duration_minutes`, `format_header_timestamp`, `semantic_row_metadata`, `semantic_rationale_label`, `sanitize_preview` |
 | `view` | `ViewerModel { path, entries, prefs, expanded }` (`open`, `from_entries`, `cycle_tool_display`, `toggle_thinking`, `toggle_timing`, `toggle_expanded`, `document`, `export_options`, `session_id`, `message_text`, `plain_display`), `ViewPrefs`, `ToolDisplayMode` (+`next`, `status_label`), `ConversationDocument` (`navigable_indices`, `navigable_entry_indices`, `nav_position`, `message_at_nav_position`), `DocMessage`, `DocMessageKind`, `DocBlock` (`toggle_id`, `tool_output_id`, `plain_text`), `DocBlockKind`, `DocTiming`, `Fold`, `DocToolCall`, `DocToolResult`, `DocSubagentToolResult`, `ToolBodyLine`, `BodyLineKind`, `LabelRole` (+`color`), `ToolOutputId`, `fitted_name`, `NAME_WIDTH`, `TRUNCATED_BODY_LINES`, `TRUNCATED_RESULT_LINES`, `MessageNav`, `ViewSearch<M>`, `ViewSearchMode`, `escape -> ViewEscape`, `capture_anchor_entry`, `find_entry_or_prev`; K5, K9 additions |
 | `export` | `ExportFormat::{ALL, from_index, index, label, extension}`, `ExportOptions`, `generate_export`, `export_to_path -> Result<(), ExportError>`, `default_export_file_name`, `plain_display(path, options)`, `exported_status`, constants `COPIED_TO_CLIPBOARD`, `MESSAGE_COPIED_TO_CLIPBOARD`, `NO_TEXT_CONTENT`, `MESSAGE_NOT_FOUND`, `PATH_COPIED_TO_CLIPBOARD`, `SESSION_ID_COPIED_TO_CLIPBOARD`; K11 |
@@ -1404,7 +1407,8 @@ program override is configured or `CHG_ALLOW_REAL_LAUNCH=1` (§15.4).
 | Work | Mechanism | Result delivery | Stale guard |
 |---|---|---|---|
 | Initial load / refresh / reload | core `HistoryLoader` (`LoaderOptions::with_waker`), K1 off-thread preparation, K18 policy | waker → `async_channel::bounded::<()>(1)` → ListPane `_poll_task` → `loader.poll(&mut browser)` then `browser.poll()`, then one yield to the executor | core |
-| Lexical + semantic search | core `Browser` workers, same waker | same task → `browser.poll()` → `on_results` | core generations |
+| Lexical + semantic search | core `Browser` workers, same waker; the lexical worker ranks the loaded corpus on a one-thread pool or the store index on `index-search-*` (≤ 8 threads, top page first, ac7f591) | same task → `browser.poll()` → `on_results` | core generations; index answers by `Arc` identity |
+| Store search index and list snapshot (ac7f591) | core `HistoryLoader`: `index-open` thread opens the startup generation's index; `snapshot-writer` thread (own `snapshot-build-*` pool, ≤ 4 threads) writes the loaded corpus with its text and index, then opens and locates the current generation; each sends its result before calling the waker; dropping the loader gives up a running build (`store::write_snapshot_cancellable`), then joins both | waker → `loader.poll` → `Browser::use_search_index` / swap | generation name, corpus `Arc` identity |
 | UUID lookup (K2) | `cx.background_spawn(history::load_session_by_uuid)` when `uuid_lookup() == Pending` | `browser.resolve_uuid_lookup(uuid, conv)` | core ignores a stale UUID |
 | Rename (K3) | `cx.background_spawn(history::rename_session(..))` | `browser.apply_renamed(path, conv)` | dialog id + path |
 | Delete (K4) | `background_spawn(plan_session_delete)` → dialog → `background_spawn(execute_session_delete)` | `CorpusNotice::Deleted(plan files)` | dialog disabled while running |
@@ -2240,14 +2244,35 @@ recorded each frame (for the keyboard context menu position).
      Pi/OMP project path, W1) and the launch time filter, and selects the first: `Readiness::list` is set, so Open,
      Resume, Fork and Ctrl+O work on them (AD6), while the view stays `Loading` (Rename/Delete wait; the suffix reads
      `Loading… <n>` from `Readiness::reconcile`). Batches are held back behind the cards (`Browser::pending`) instead of
-     being appended; Tab and workspace/exclusion changes re-read the cards. The K1 preparation prepares the held-back
-     batches, and the install swaps them in at once keeping the selected card's session (no new `SelectionChanged`,
-     so the viewer keeps its conversation; `CorpusChanged` refreshes its header). A query typed over cards is applied
-     after the swap through the worker.
+     being appended; Tab and workspace/exclusion changes decide every card's scope again (from the generation's
+     projects). The K1 preparation prepares the held-back batches, and the install swaps them in at once keeping the
+     selected card's session (no new `SelectionChanged`, so the viewer keeps its conversation; `CorpusChanged`
+     refreshes its header).
+   * **Search before the load ends (upstream ac7f591).** `open_snapshot` also opens the generation's search index
+     (`base.fst/post/short` and the zstd text frames, §13.4) on an `index-open` thread; a later poll hands it to the
+     browser (`use_search_index`), which sets `Readiness::lexical`. From then on a lexical query typed over the cards
+     runs on the index: the worker answers the top 50 rows with their evidence (windows of the text decompressed from
+     the frames) and then every result, abandoning the rest when a newer query arrives; it builds the cards of the
+     docs it returns, so the UI thread only appends them. A selection made on the first page survives the complete
+     answer. Without index files (an older generation) a query waits for the load, as before; a semantic query always
+     waits. A rename or delete made on a card stops the index until the load ends (the GUI offers neither while
+     loading). The corpus preparation locates the index's cards in the loaded corpus, so after the swap the shown
+     results stay and queries keep running on the index; a rename or a refresh drops it (queries then run in memory). When the cards do not cover the loaded corpus (a newer conversation, a changed timestamp) the index is
+     dropped at once and queries run in memory, so a quit before the rebuilt generation ends cannot carry a stale
+     index into the next session.
    * After `Loaded` of a complete initial load (no project error, not interrupted, no time filter) core writes the
-     loaded corpus as a new generation on a `snapshot-writer` thread (nothing when it matches `CURRENT`); refreshes
-     and reloads never write. Reloads reconfigure the loader (`HistoryLoader::reconfigure`) instead of replacing it, so
-     the UI thread never waits for the write; dropping the loader at quit joins it.
+     loaded corpus as a new generation with its text and index on a `snapshot-writer` thread (nothing when it matches
+     `CURRENT`; upstream ran a detached `--publish-snapshot` process); refreshes and reloads never write. The thread
+     then opens the current generation and locates its cards in the corpus it wrote; the next poll swaps it in and
+     reruns a lexical query keeping the selection, unless the corpus changed meanwhile (then the older index is
+     dropped and queries run in memory). Reloads reconfigure the loader (`HistoryLoader::reconfigure`) instead of
+     replacing it, so the UI thread never waits for the write. At quit gpui drops the list pane, and with it the loader,
+     on the main thread before the process exits: the drop sets a flag that the build checks while it reads the
+     fingerprints, writes the text frames and builds the index (`store::write_snapshot_cancellable`), so a build still
+     running is given up within moments (no generation, its `gNNN.tmp` removed) and the window closes without waiting;
+     the next complete initial load builds it again (upstream's detached builder process outlived the TUI). The
+     `index-open` and `snapshot-writer` threads send their result before they call the waker, so the poll it schedules
+     always finds it.
 2. Waker → `_poll_task` → `poll_all(cx)`: `let p = loader.poll(&mut browser)` (appends batches; at the end the K1
    preparation runs on `corpus-prepare` and a later poll installs it) then `browser.poll()`; notify once. One poll
    appends batches for at most `LoaderOptions::drain_budget` (8 ms, upstream 93e17a5; at least one batch): a batch
@@ -2263,7 +2288,8 @@ recorded each frame (for the keyboard context menu position).
    * `NoHistory(e)` → empty view with `e` text (`No conversation history found in selected scope[ within the
      requested time range]`) + [Refresh] [Clear time filter] (if active).
    * `LoadFailed(e)` → error view `Couldn't load history` + `e` + [Retry] (`start_refresh`) [Show debug log].
-4. A query typed while loading is kept in the Input and passed to `browser.set_query` (core applies it at the end).
+4. A query typed while loading is kept in the Input and passed to `browser.set_query` (core runs it on the snapshot's
+   index when one is open, else applies it at the end).
 
 ### 11.3 Refresh (Ctrl+L, F5, toolbar, menu, palette; also after delete-empty / delete-by-ID if the viewer is unaffected)
 1. `loader.start_refresh()` returns false while a load runs (no-op, parity). Else the footer shows the persistent
@@ -2705,7 +2731,7 @@ ignored).
 | Claude data | `$CLAUDE_CONFIG_DIR` or `<home>/.claude` (read; written by rename/delete/fork-copy/delete-empty) |
 | Pi / OMP sessions | per core loaders (`PI_*`, `OMP_PROFILE`, `XDG_DATA_HOME`, relative values against the launch cwd (K16), workspace `.pi/settings.json`) |
 | GUI caches | `<home>/.cache/claude-history-gui/{projects,config-<hash>/projects,pi,omp,semantic,launch}` |
-| List snapshot (store) | `<home>/.cache/claude-history-gui[/config-<hash>]/v3/roots-<hash>/` (`store::default_root`; `roots-<hash>` covers the resolved Pi and OMP session roots, so another workspace `.pi/settings.json` or `PI_*` value reads and writes its own generations): `LOCK`, `CURRENT`, `gNNNNNN/manifest` (cards newest first; read for the first frame, written after a complete initial load, §11.2; upstream's format) |
+| List snapshot (store) | `<home>/.cache/claude-history-gui[/config-<hash>]/v3/roots-<hash>/` (`store::default_root`; `roots-<hash>` covers the resolved Pi and OMP session roots, so another workspace `.pi/settings.json` or `PI_*` value reads and writes its own generations): `LOCK`, `CURRENT`, `gNNNNNN/manifest` (cards newest first, card format version 2), `gNNNNNN/text-0000.zst` (each conversation's text as one checksummed zstd frame), `gNNNNNN/base.fst`, `base.post`, `base.short` (the word-start suffix index); read for the first frame and searched before the load ends, written in one rename after a complete initial load, §11.2; upstream's format (ac7f591) |
 | Embedding model | `<home>/.cache/claude-history-gui/semantic/fastembed` |
 | CLI config | `<home>/.config/claude-history/config.toml` (read-only) |
 | GUI config | `<home>/.config/claude-history/gui.toml` |
@@ -2896,7 +2922,7 @@ quit 0
 ```
   Probe keys (`qa/probe.rs`, read-only accessors on the panes): `list.count`, `list.loaded`, `list.loading`,
   `list.ready` (rows listed newest first and actionable: snapshot cards while loading), `list.snapshot` (the rows are
-  snapshot cards), `list.query`, `list.mode`, `list.scope`, `list.selected_title`, `list.selected_path`, `list.ui_busy_max`,
+  snapshot cards), `list.index` (the store generation lexical queries run on, empty without one), `list.query`, `list.mode`, `list.scope`, `list.selected_title`, `list.selected_path`, `list.ui_busy_max`,
   `viewer.path`, `viewer.items`, `viewer.messages`, `viewer.nav_focus`, `viewer.indicator`, `viewer.search.count`,
   `viewer.search.current`, `viewer.tool_display`, `viewer.thinking`, `viewer.timing`, `viewer.frame_p95`,
   `focus` (list|viewer|agent|deep|dialog|none), `dialog` (open dialog id or none), `toast.last`, `clipboard`,
@@ -2975,8 +3001,10 @@ precondition (no O(corpus) work on the UI thread: e.g. K1/K2/K3 paths are async,
 * **First rows** (upstream 3708bb6; not gated yet): with a snapshot, the first frame lists the newest cards.
   `ListPane::new` maps and validates the manifest (linear in its rows, memory only) and builds at most 500 cards on
   the UI thread before the first frame (upstream measured 7.7 ms to the populated first frame); re-reading the cards
-  on a scope change is the same bounded work. The swap at load end is the K1 install (the target above); the snapshot
-  write runs on `snapshot-writer`.
+  on a scope change decides every card's scope from its project (memory only). The swap at load end is the K1 install
+  (the target above); the snapshot write runs on `snapshot-writer`. Opening the search index (it normalizes every
+  title) runs on `index-open`, locating its cards in the loaded corpus on `corpus-prepare` and `snapshot-writer`; an
+  index answer costs the UI thread one pointer push per new card (the worker builds the cards) and a lookup per row.
 * **Viewer** (`perf-viewer.qa`, synthetic 10k messages with 20 tool outputs of 5,000 lines, opened in Full mode):
   first content ≤ 3.5 s after open; install ≤ 50 ms UI time; page-through avg ≤ 12 ms, p95 ≤ 20 ms; idle frame ≤ 3 ms;
   toggle `t`/`T` ≤ 60 ms UI time; first search ≤ 60 ms; working set ≤ 400 MB, and within ±10% after opening 20

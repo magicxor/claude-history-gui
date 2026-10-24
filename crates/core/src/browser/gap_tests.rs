@@ -680,6 +680,7 @@ fn the_search_worker_coalesces_to_the_latest_query() {
         mode: ListSearchMode::Lexical,
         conversations: app.corpus_snapshot(),
         searchable: app.searchable.clone(),
+        index: None,
     };
     for (generation, query) in [(1, "n"), (2, "ne"), (3, "need")] {
         tx.send(command(generation, query)).unwrap();

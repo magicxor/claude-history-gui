@@ -142,23 +142,40 @@ fn s019_hidden_match_context_is_clustered_into_at_most_three_ranges() {
     );
     let mut conversation = one_message_conversation(&text, now, None, None, None);
     conversation.preview = "visible start".to_string().into();
-    let evidence = build_lexical_evidence(&conversation, &ParsedQuery::parse("needle")).unwrap();
+    let evidence = build_lexical_evidence(
+        &conversation.full_text,
+        &conversation.preview,
+        &ParsedQuery::parse("needle"),
+    )
+    .unwrap();
     assert_eq!(evidence.context_ranges.len(), 3);
     let mut previous_end = 0;
     for (start, end) in &evidence.context_ranges {
         assert!(*start >= previous_end, "ordered and disjoint");
-        assert!(conversation.full_text[*start..*end].contains("needle"));
+        assert!(evidence.text[*start..*end].contains("needle"));
         previous_end = *end;
     }
     // Hits close together merge into one cluster.
     let close = one_message_conversation("needle needle needle", now, None, None, None);
     let mut close = close;
     close.preview = "other".to_string().into();
-    let evidence = build_lexical_evidence(&close, &ParsedQuery::parse("needle")).unwrap();
+    let evidence = build_lexical_evidence(
+        &close.full_text,
+        &close.preview,
+        &ParsedQuery::parse("needle"),
+    )
+    .unwrap();
     assert_eq!(evidence.context_ranges.len(), 1);
     // Nothing hidden: no evidence.
     let shown = one_message_conversation("needle", now, None, None, None);
     let mut shown = shown;
     shown.preview = "needle".to_string().into();
-    assert!(build_lexical_evidence(&shown, &ParsedQuery::parse("needle")).is_none());
+    assert!(
+        build_lexical_evidence(
+            &shown.full_text,
+            &shown.preview,
+            &ParsedQuery::parse("needle")
+        )
+        .is_none()
+    );
 }

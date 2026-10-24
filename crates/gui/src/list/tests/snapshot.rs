@@ -1,8 +1,9 @@
-//! G tests of the startup snapshot (L-099, L-062, L-068, L-040, A-001;
-//! upstream 3708bb6): the first rows are the store's snapshot cards, newest
-//! first, before any batch arrives; Resume, Fork and Ctrl+O work on them,
-//! Rename and Delete wait for the load; the loaded corpus replaces them
-//! keeping the selection, and the initial load writes the snapshot.
+//! G tests of the startup snapshot (L-099, L-062, L-068, L-040, A-001, L-004;
+//! upstream 3708bb6, ac7f591): the first rows are the store's snapshot cards,
+//! newest first, before any batch arrives; Resume, Fork and Ctrl+O work on
+//! them, Rename and Delete wait for the load; a query runs on the snapshot's
+//! index before the load ends; the loaded corpus replaces the cards keeping
+//! the selection, and the initial load writes the snapshot with its index.
 //!
 //! Snapshots are off in tests (`app::init_for_test`); each test here turns
 //! them on before opening the window and joins the write before its world
@@ -253,6 +254,81 @@ fn the_viewer_of_a_card_waits_to_rename_and_delete(cx: &mut TestAppContext) {
     assert!(opened, "delete works once the load ended");
 }
 
+/// L-004, upstream ac7f591: the snapshot's search index opens off the UI
+/// thread; a query typed while the load still runs then lists the matching
+/// cards at once (the loaded corpus is not needed), and the loaded corpus
+/// keeps those rows and the index.
+#[gpui_kit::test]
+fn a_query_typed_over_cards_runs_on_the_snapshot_index(cx: &mut TestAppContext) {
+    let world = TestWorld::new();
+    let written = listed_corpus(&world);
+    let cards = publish_cards(&world);
+    let f = open_with_snapshots(cx, &world);
+    f.step_until(cx, "the snapshot's index", |list| {
+        list.browser().readiness().lexical
+    });
+    assert!(f.read(cx, |list, _| list.is_loading()));
+
+    f.type_text(cx, "deploy");
+    assert!(
+        f.read(cx, |list, _| list.is_loading()
+            && list.browser().has_search_work_in_flight()),
+        "the query runs while loading"
+    );
+    // Only the search answers: the load waits meanwhile.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while f.read(cx, |list, _| list.browser().has_search_work_in_flight()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the index did not answer"
+        );
+        f.list.update(cx, |list, cx| list.poll_search_only(cx));
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(3));
+    }
+    assert!(f.read(cx, |list, _| list.is_loading()), "still loading");
+    let found = f.paths(cx);
+    assert!(found.contains(&written[1]), "{found:?}");
+    assert!(found.len() < cards.len(), "{found:?}");
+    assert!(
+        f.titles(cx).iter().all(|title| title.starts_with("Card ")),
+        "the rows are cards: {:?}",
+        f.titles(cx)
+    );
+
+    f.resume(cx);
+    f.wait_loaded(cx);
+    assert_eq!(f.paths(cx), found, "the loaded corpus keeps the rows");
+    assert!(
+        f.titles(cx).iter().all(|title| !title.starts_with("Card ")),
+        "{:?}",
+        f.titles(cx)
+    );
+    assert!(
+        f.read(cx, |list, _| list
+            .browser()
+            .search_index_generation()
+            .is_some()),
+        "the loaded corpus keeps an index"
+    );
+    // The cards' titles differ from the loaded ones: a new generation is
+    // written and swapped in, and the query runs on it again.
+    assert_eq!(
+        f.list.update(cx, |list, _| list.finish_snapshot_write()),
+        Some(Publish::Published("g000002".to_string()))
+    );
+    f.step(cx);
+    f.wait_idle(cx);
+    assert_eq!(
+        f.read(cx, |list, _| list
+            .browser()
+            .search_index_generation()
+            .map(str::to_string)),
+        Some("g000002".to_string())
+    );
+    assert_eq!(f.paths(cx), found);
+}
+
 /// L-099, L-003: the loaded corpus replaces the cards in one step and the
 /// selected card's session stays selected (no new `SelectionChanged`, so the
 /// viewer keeps its conversation).
@@ -305,7 +381,11 @@ fn the_initial_load_writes_the_snapshot(cx: &mut TestAppContext) {
     );
     let root = store::default_root(&world.env).unwrap();
     let snapshot = store::Snapshot::open(&root, true, TimeFilter::default()).expect("CURRENT");
-    assert_eq!(snapshot.conversations(100, |_| true).len(), 8);
+    assert_eq!(snapshot.head(100, |_| true).len(), 8);
+    assert!(
+        store::SearchIndex::open(snapshot).is_some(),
+        "the generation carries its text and index"
+    );
 
     // A second window over the same corpus loads the same rows and writes
     // nothing new.

@@ -1,5 +1,35 @@
 //! Query dispatch, the lexical worker, and semantic orchestration (upstream
 //! `tui/app/search_state.rs`).
+//!
+//! The lexical worker searches either the loaded corpus in memory or, when
+//! the browser has one, a store generation's index ([`IndexScope`]). An
+//! index search answers twice: the top [`TOP_PAGE`] rows with their evidence
+//! first, then every result, unless a newer query arrives while it completes
+//! the ranking (upstream ac7f591).
+//!
+//! # Differences from upstream
+//!
+//! * **Per-query data.** Every command is a query that carries what it
+//!   searches: the browser's shared corpus and search data
+//!   ([`SearchCommand::conversations`], [`SearchCommand::searchable`]) or the
+//!   index with its documents in scope ([`SearchCommand::index`]). Upstream's
+//!   worker kept them as state, set by `UpdateData` and `UseIndex` commands,
+//!   and queued those commands while it completed an index search. Here the
+//!   worker releases the snapshots before it answers (CCR-2), every command
+//!   received while completing replaces that search, and a single `queued`
+//!   slot holds it (upstream: a `VecDeque`).
+//! * **Search data stays in the browser.** Upstream's `UpdateData` rebuilt
+//!   every conversation's search data on the worker's pool; the browser
+//!   keeps one shared `Arc` per conversation, built when the corpus is
+//!   prepared off the UI thread (an edit rebuilds only its own), so the
+//!   worker never rebuilds it.
+//! * **Cards built by the worker.** While snapshot cards are the rows, an
+//!   index answer carries the cards of the documents the browser has not
+//!   materialized yet ([`IndexScope::cards`], [`SearchResponse::cards`]),
+//!   built on the index pool, so the UI thread only appends them (upstream
+//!   built them on the TUI thread).
+//! * **Waker.** The worker calls the waker after each answer (upstream's TUI
+//!   polled).
 
 use super::corpus::{CorpusSnapshot, SearchSnapshot};
 use super::{Browser, ListSearchMode, SemanticProgress, SemanticResultMetadata, UuidLookup};
@@ -11,8 +41,11 @@ use crate::semantic_worker::{
     SemanticSearchMessage, SemanticWorkerCommand, SemanticWorkerConfig, Waker,
     spawn_semantic_worker_thread,
 };
-use std::collections::HashMap;
+use crate::store;
+use rayon::prelude::*;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 #[derive(Default)]
@@ -43,32 +76,89 @@ pub(super) struct SearchCommand {
     pub(super) query: String,
     pub(super) generation: u64,
     pub(super) mode: ListSearchMode,
+    /// Empty when `index` is set.
     pub(super) conversations: CorpusSnapshot,
+    /// Empty when `index` is set.
     pub(super) searchable: SearchSnapshot,
+    /// Search this generation index instead of `conversations`.
+    pub(super) index: Option<IndexScope>,
+}
+
+/// A generation index and the documents a query may return.
+#[derive(Clone)]
+pub(super) struct IndexScope {
+    pub(super) index: Arc<store::SearchIndex>,
+    /// Whether each document is in scope, by doc id.
+    pub(super) docs: Arc<Vec<bool>>,
+    /// While snapshot cards are the rows (fork): which docs the browser has
+    /// materialized as cards, by doc id. The worker builds the cards of the
+    /// other docs it returns, so the browser only appends them. Only a hint:
+    /// the browser builds a card that is missing and drops a duplicate.
+    pub(super) cards: Option<Arc<[AtomicBool]>>,
 }
 
 pub(super) struct SearchResponse {
+    /// Conversation indices in rank order, or doc ids of `index` when it is
+    /// set.
     pub(super) filtered: Vec<usize>,
+    /// The index the doc ids belong to.
+    pub(super) index: Option<Arc<store::SearchIndex>>,
+    /// Whether `filtered` holds every result rather than the first page.
+    pub(super) complete: bool,
     pub(super) generation: u64,
     pub(super) mode: ListSearchMode,
+    /// Evidence keyed like `filtered`.
     pub(super) evidence: HashMap<usize, search::LexicalEvidence>,
+    /// Cards of docs in `filtered` that were not materialized yet
+    /// ([`IndexScope::cards`]).
+    pub(super) cards: Vec<(u32, Arc<Conversation>)>,
 }
+
+/// Results ranked before the first response of an index search: more than
+/// a screen holds.
+pub(super) const TOP_PAGE: usize = 50;
+/// Results ranked between checks for a newer command while completing.
+const COMPLETE_STEP: usize = 256;
+const MAX_EVIDENCE_ROWS: usize = 200;
 
 fn build_search_evidence(
     conversations: &[Arc<Conversation>],
     filtered: &[usize],
     parsed: &ParsedQuery,
 ) -> HashMap<usize, search::LexicalEvidence> {
-    const MAX_EVIDENCE_ROWS: usize = 200;
-
     filtered
         .iter()
         .take(MAX_EVIDENCE_ROWS)
         .filter_map(|&index| {
-            search::build_lexical_evidence(&conversations[index], parsed)
+            let conversation = &conversations[index];
+            search::build_lexical_evidence(&conversation.full_text, &conversation.preview, parsed)
                 .map(|evidence| (index, evidence))
         })
         .collect()
+}
+
+/// Evidence for `docs` that `evidence` does not hold yet, read from their
+/// text frames in parallel.
+fn add_index_evidence(
+    index: &store::SearchIndex,
+    docs: &[u32],
+    parsed: &ParsedQuery,
+    evidence: &mut HashMap<usize, search::LexicalEvidence>,
+) {
+    let missing: Vec<u32> = docs
+        .iter()
+        .copied()
+        .filter(|&doc| !evidence.contains_key(&(doc as usize)))
+        .collect();
+    let found: Vec<(usize, search::LexicalEvidence)> = missing
+        .par_iter()
+        .filter_map(|&doc| {
+            let text = index.text(doc);
+            search::build_lexical_evidence(&text, index.cards().preview(doc), parsed)
+                .map(|evidence| (doc as usize, evidence))
+        })
+        .collect();
+    evidence.extend(found);
 }
 
 /// Coalescing (S-005): `first` is superseded by every command already queued,
@@ -84,10 +174,202 @@ pub(super) fn latest_command(
     command
 }
 
-/// The lexical search worker: one thread with a one-thread rayon pool. It
-/// drains every queued command and runs only the latest query (coalescing),
-/// against the snapshots that query carries, which it releases before it
-/// answers. `waker` is called after each response.
+struct SearchWorker {
+    commands: mpsc::Receiver<SearchCommand>,
+    responses: mpsc::Sender<SearchResponse>,
+    waker: Option<Waker>,
+    /// A command received while an index search was being completed; it
+    /// replaces that search and is handled next.
+    queued: Option<SearchCommand>,
+    /// Ranks loaded conversations one query at a time, leaving the other
+    /// cores to the UI and loader.
+    memory_pool: rayon::ThreadPool,
+    /// Ranks index queries, reads their evidence and builds their cards.
+    index_pool: rayon::ThreadPool,
+}
+
+impl SearchWorker {
+    fn run(mut self) {
+        loop {
+            let first = match self.queued.take() {
+                Some(command) => command,
+                None => match self.commands.recv() {
+                    Ok(command) => command,
+                    Err(_) => return,
+                },
+            };
+            let SearchCommand {
+                query,
+                generation,
+                mode,
+                conversations,
+                searchable,
+                index,
+            } = latest_command(first, &self.commands);
+            match index {
+                Some(scope) => {
+                    drop((conversations, searchable));
+                    self.search_index(&scope, &query, generation, mode);
+                }
+                None => self.search_memory(conversations, searchable, &query, generation, mode),
+            }
+        }
+    }
+
+    fn send(&self, response: SearchResponse) {
+        if self.responses.send(response).is_ok()
+            && let Some(waker) = &self.waker
+        {
+            waker();
+        }
+    }
+
+    fn search_memory(
+        &self,
+        conversations: CorpusSnapshot,
+        searchable: SearchSnapshot,
+        query: &str,
+        generation: u64,
+        mode: ListSearchMode,
+    ) {
+        let (filtered, evidence) = self.memory_pool.install(|| {
+            let now = chrono::Local::now();
+            let filtered = search::search(&conversations, &searchable, query, now);
+            let parsed = ParsedQuery::parse(query);
+            let evidence = build_search_evidence(&conversations, &filtered, &parsed);
+            (filtered, evidence)
+        });
+        // Release the snapshots before answering: once the browser sees the
+        // answer, an edit finds its vectors unshared (when no other query is
+        // queued).
+        drop(searchable);
+        drop(conversations);
+        self.send(SearchResponse {
+            filtered,
+            index: None,
+            complete: true,
+            generation,
+            mode,
+            evidence,
+            cards: Vec::new(),
+        });
+    }
+
+    /// Sends the first page as soon as it is final, then every result,
+    /// unless a newer search arrives first.
+    fn search_index(
+        &mut self,
+        scope: &IndexScope,
+        query: &str,
+        generation: u64,
+        mode: ListSearchMode,
+    ) {
+        let index = &scope.index;
+        let in_scope = |doc: u32| scope.docs.get(doc as usize).copied().unwrap_or(false);
+        let parsed = ParsedQuery::parse(query);
+        let mut evidence = HashMap::new();
+        // Docs whose cards an earlier response of this search carried.
+        let mut carded = HashSet::new();
+        let mut ranking = self
+            .index_pool
+            .install(|| index.search(query, chrono::Local::now(), &in_scope));
+
+        let top: Vec<u32> = self
+            .index_pool
+            .install(|| ranking.top(TOP_PAGE).iter().map(|hit| hit.doc).collect());
+        self.index_pool
+            .install(|| add_index_evidence(index, &top, &parsed, &mut evidence));
+        let reply = IndexReply {
+            scope,
+            generation,
+            mode,
+        };
+        let complete = top.len() < TOP_PAGE;
+        self.send_index(&reply, &top, complete, &evidence, &mut carded);
+        if complete {
+            return;
+        }
+
+        let mut ranked = TOP_PAGE;
+        loop {
+            if let Ok(command) = self.commands.try_recv() {
+                // Every command is a newer query: abandon this one.
+                self.queued = Some(command);
+                return;
+            }
+            ranked += COMPLETE_STEP;
+            if self.index_pool.install(|| ranking.top(ranked).len()) < ranked {
+                break;
+            }
+        }
+        let docs: Vec<u32> = self
+            .index_pool
+            .install(|| ranking.complete().iter().map(|hit| hit.doc).collect());
+        let shown = &docs[..docs.len().min(MAX_EVIDENCE_ROWS)];
+        self.index_pool
+            .install(|| add_index_evidence(index, shown, &parsed, &mut evidence));
+        self.send_index(&reply, &docs, true, &evidence, &mut carded);
+    }
+
+    /// Answers with `docs` of the query's index, and the cards of those the
+    /// browser has not materialized (while cards are the rows).
+    fn send_index(
+        &self,
+        reply: &IndexReply,
+        docs: &[u32],
+        complete: bool,
+        evidence: &HashMap<usize, search::LexicalEvidence>,
+        carded: &mut HashSet<u32>,
+    ) {
+        let scope = reply.scope;
+        let cards = match &scope.cards {
+            Some(materialized) => {
+                let missing: Vec<u32> = docs
+                    .iter()
+                    .copied()
+                    .filter(|&doc| {
+                        !carded.contains(&doc)
+                            && !materialized
+                                .get(doc as usize)
+                                .is_some_and(|flag| flag.load(Ordering::Relaxed))
+                    })
+                    .collect();
+                carded.extend(missing.iter().copied());
+                let snapshot = scope.index.cards();
+                self.index_pool.install(|| {
+                    missing
+                        .par_iter()
+                        .map(|&doc| (doc, Arc::new(snapshot.card(doc))))
+                        .collect()
+                })
+            }
+            None => Vec::new(),
+        };
+        self.send(SearchResponse {
+            filtered: docs.iter().map(|&doc| doc as usize).collect(),
+            index: Some(scope.index.clone()),
+            complete,
+            generation: reply.generation,
+            mode: reply.mode,
+            evidence: evidence.clone(),
+            cards,
+        });
+    }
+}
+
+/// What every response of one index search carries.
+struct IndexReply<'a> {
+    scope: &'a IndexScope,
+    generation: u64,
+    mode: ListSearchMode,
+}
+
+/// The lexical search worker ("search-worker"): it drains every queued
+/// command and runs only the latest query (coalescing), against the
+/// snapshots or the index that query carries; the snapshots are released
+/// before it answers. Loaded conversations are ranked on a one-thread pool,
+/// index queries on a pool of up to 8 threads. `waker` is called after each
+/// response.
 pub(super) fn spawn_search_worker(
     waker: Option<Waker>,
 ) -> (mpsc::Sender<SearchCommand>, mpsc::Receiver<SearchResponse>) {
@@ -97,45 +379,26 @@ pub(super) fn spawn_search_worker(
     std::thread::Builder::new()
         .name("search-worker".into())
         .spawn(move || {
-            let pool = rayon::ThreadPoolBuilder::new()
+            let memory_pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(1)
                 .thread_name(|_| "lexical-rank-worker".to_string())
                 .build()
                 .expect("failed to create lexical ranking thread pool");
-            pool.install(move || {
-                while let Ok(first) = cmd_rx.recv() {
-                    let command = latest_command(first, &cmd_rx);
-                    let SearchCommand {
-                        query,
-                        generation,
-                        mode,
-                        conversations,
-                        searchable,
-                    } = command;
-
-                    let now = chrono::Local::now();
-                    let filtered = search::search(&conversations, &searchable, &query, now);
-                    let parsed = ParsedQuery::parse(&query);
-                    let evidence = build_search_evidence(&conversations, &filtered, &parsed);
-                    // Release the snapshots before answering: once the
-                    // browser sees the answer, an edit finds its vectors
-                    // unshared (when no other query is queued).
-                    drop(searchable);
-                    drop(conversations);
-
-                    let sent = res_tx
-                        .send(SearchResponse {
-                            filtered,
-                            generation,
-                            mode,
-                            evidence,
-                        })
-                        .is_ok();
-                    if sent && let Some(waker) = &waker {
-                        waker();
-                    }
-                }
-            });
+            let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
+            let index_pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|i| format!("index-search-{i}"))
+                .build()
+                .expect("failed to create index search thread pool");
+            SearchWorker {
+                commands: cmd_rx,
+                responses: res_tx,
+                waker,
+                queued: None,
+                memory_pool,
+                index_pool,
+            }
+            .run();
         })
         .expect("failed to spawn search worker thread");
 
@@ -146,6 +409,7 @@ impl Browser {
     pub(super) fn invalidate_search_generation(&mut self) {
         self.search_generation += 1;
         self.search_in_flight = false;
+        self.search_page_shown = false;
         self.lexical_evidence.clear();
         self.semantic_search.pending_generation = None;
         self.semantic_search.pending_status = None;
@@ -352,19 +616,33 @@ impl Browser {
     pub(super) fn dispatch_lexical_search(&mut self, query: String) {
         self.search_generation += 1;
         self.search_in_flight = true;
+        self.search_page_shown = false;
         self.send_lexical_search(query, self.search_generation, self.list_search_mode);
     }
 
-    /// Hand the lexical worker a query with the current corpus and search
-    /// data (pointer copies of the snapshots).
+    /// Hand the lexical worker a query with the index in use and the docs in
+    /// scope, else with the current corpus and search data (pointer copies
+    /// of the snapshots).
     fn send_lexical_search(&self, query: String, generation: u64, mode: ListSearchMode) {
-        let _ = self.search_tx.send(SearchCommand {
-            query,
-            generation,
-            mode,
-            conversations: self.conversations.clone(),
-            searchable: self.searchable.clone(),
-        });
+        let command = match &self.index_scope {
+            Some(scope) => SearchCommand {
+                query,
+                generation,
+                mode,
+                conversations: Arc::default(),
+                searchable: Arc::default(),
+                index: Some(scope.clone()),
+            },
+            None => SearchCommand {
+                query,
+                generation,
+                mode,
+                conversations: self.conversations.clone(),
+                searchable: self.searchable.clone(),
+                index: None,
+            },
+        };
+        let _ = self.search_tx.send(command);
     }
 
     fn dispatch_semantic_search(&mut self, query: String, prewarm: bool) {
@@ -382,6 +660,7 @@ impl Browser {
             return;
         }
         self.search_generation += 1;
+        self.search_page_shown = false;
         self.search_in_flight = !prewarm;
         self.semantic_search.pending_generation = Some(self.search_generation);
         // Embedding activity remains visible while a replacement query waits for the worker.
@@ -450,6 +729,7 @@ impl Browser {
     /// semantic answer follows), a prewarm does nothing.
     fn dispatch_while_suspended(&mut self, query: String, prewarm: bool) {
         self.search_generation += 1;
+        self.search_page_shown = false;
         self.semantic_search.error = None;
         self.semantic_search.pending_status = None;
         self.semantic_search.prewarm_generation = None;
@@ -489,26 +769,49 @@ impl Browser {
         while let Ok(response) = self.search_rx.try_recv() {
             let semantic_fallback_pending = response.mode == ListSearchMode::Semantic
                 && self.semantic_search.pending_generation == Some(response.generation);
+            // An answer from an index no longer in use (dropped or swapped)
+            // does not apply.
+            let index_current = match (&response.index, &self.search_index) {
+                (None, _) => true,
+                (Some(answered), Some(current)) => Arc::ptr_eq(answered, current),
+                (Some(_), None) => false,
+            };
             if response.generation == self.search_generation
                 && response.mode == self.list_search_mode
                 && (response.mode == ListSearchMode::Lexical || semantic_fallback_pending)
+                && index_current
             {
-                let filtered = self.filter_indices(response.filtered);
+                let (filtered, evidence) = if response.index.is_some() {
+                    let filtered = self.rows_of_docs(&response.filtered, response.cards);
+                    (filtered, self.evidence_of_docs(response.evidence))
+                } else {
+                    (self.filter_indices(response.filtered), response.evidence)
+                };
                 let suspended = self.semantic_search.suspended;
                 if response.mode == ListSearchMode::Semantic && filtered.is_empty() && !suspended {
-                    self.search_in_flight = false;
+                    self.search_in_flight = !response.complete;
                     continue;
                 }
-                self.lexical_evidence = response.evidence;
+                self.lexical_evidence = evidence;
                 if response.mode == ListSearchMode::Semantic {
                     self.semantic_search.results.clear();
-                    if suspended {
+                    if suspended && response.complete {
                         // No semantic answer follows while suspended.
                         self.semantic_search.pending_generation = None;
                     }
                 }
+                if self.search_in_flight
+                    && !self.filtered.is_empty()
+                    && self.selection_anchor.is_none()
+                    && self.search_page_shown
+                {
+                    // The complete ranking extends the page already shown;
+                    // keep what the user selected on it.
+                    self.selection_anchor = self.selected_path();
+                }
                 self.apply_filtered(filtered);
-                self.search_in_flight = false;
+                self.search_page_shown = !response.complete;
+                self.search_in_flight = !response.complete;
                 applied = true;
             }
         }
@@ -693,7 +996,9 @@ impl Browser {
 
     /// Replace the query. Like any query edit in the TUI: clears the
     /// selection anchor and searches immediately, except while loading (the
-    /// query is applied when loading finishes). Unchanged text is a no-op.
+    /// query is applied when loading finishes) unless a lexical query can
+    /// run on the snapshot's index ([`super::Readiness::lexical`]).
+    /// Unchanged text is a no-op.
     pub fn set_query(&mut self, query: impl Into<String>) {
         let query = query.into();
         if query == self.query {
@@ -701,7 +1006,9 @@ impl Browser {
         }
         self.query = query;
         self.clear_selection_anchor();
-        if !self.is_loading() {
+        if !self.is_loading()
+            || (self.readiness.lexical && self.list_search_mode == ListSearchMode::Lexical)
+        {
             self.dispatch_search();
         }
     }
@@ -767,8 +1074,9 @@ impl Browser {
         self.semantic_sent_scope_signature = None;
         self.invalidate_search_generation();
         if self.snapshot.is_some() {
-            // Snapshot cards are re-read for the new scope.
-            self.show_snapshot_cards();
+            // The cards' scope is decided again; a lexical query on their
+            // index runs again.
+            self.rescope_cards();
             return;
         }
         // The one O(n) pass of a scope change: the rows in scope.
@@ -778,6 +1086,8 @@ impl Browser {
             self.apply_scope_only_filter();
             return;
         }
+        // The docs an index query may return follow the scope.
+        self.send_index_scope();
         if self.list_search_mode == ListSearchMode::Semantic && !self.query.trim().is_empty() {
             self.dispatch_search();
         } else {
@@ -786,8 +1096,13 @@ impl Browser {
     }
 
     /// While loading: every loaded row that passes the exclusions and the
-    /// scope, in arrival order.
+    /// scope, in arrival order (over snapshot cards, the browse list of the
+    /// newest cards).
     fn apply_scope_only_filter(&mut self) {
+        if self.snapshot.is_some() {
+            self.show_snapshot_cards();
+            return;
+        }
         let filtered = self.scope_rows();
         self.apply_filtered(filtered);
     }
@@ -801,8 +1116,13 @@ impl Browser {
         self.list_search_mode = self.list_search_mode.toggled();
         self.invalidate_search_generation();
         if self.is_loading() {
-            // Quirk 14 fix: the mode is applied when loading finishes.
-            self.apply_scope_only_filter();
+            if self.readiness.lexical && self.list_search_mode == ListSearchMode::Lexical {
+                // Back to lexical over the snapshot's index.
+                self.update_filter();
+            } else {
+                // Quirk 14 fix: the mode is applied when loading finishes.
+                self.apply_scope_only_filter();
+            }
             return;
         }
         if self.list_search_mode == ListSearchMode::Semantic && self.query.trim().is_empty() {
@@ -900,7 +1220,7 @@ impl Browser {
         let query = self.query.trim().to_string();
         self.uuid_lookup = None;
 
-        if ParsedQuery::parse(&query).is_effectively_empty() {
+        if ParsedQuery::parse(&query).is_effectively_empty() || !self.readiness.lexical {
             self.semantic_search.error = None;
             self.apply_browse_filter();
             return;
@@ -923,8 +1243,13 @@ impl Browser {
     }
 
     /// The browse list: every conversation that passes the exclusions and
-    /// the scope, in corpus order (newest first once loaded).
+    /// the scope, in corpus order (newest first once loaded); over snapshot
+    /// cards, the newest cards.
     fn apply_browse_filter(&mut self) {
+        if self.snapshot.is_some() {
+            self.show_snapshot_cards();
+            return;
+        }
         let filtered = self.scope_rows();
         self.apply_filtered(filtered);
     }

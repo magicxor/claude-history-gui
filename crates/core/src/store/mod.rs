@@ -1,10 +1,10 @@
-//! Disk snapshot of the conversation list, readable before any history is
-//! loaded.
+//! Disk snapshot of the conversation list and its lexical index, readable
+//! before any history is loaded.
 //!
-//! The snapshot is a generation directory under `v3/roots-<hash>/` in the cache
-//! dir (see `default_root` and `generation`). The TUI renders its first frame
-//! from the newest cards and replaces them with fully loaded conversations
-//! once loading finishes.
+//! The snapshot is a generation directory under `v3/roots-<hash>/` in the
+//! cache dir (see `default_root` and `generation`). The TUI renders its first
+//! frame from the newest cards, searches the generation's index, and replaces
+//! the cards with fully loaded conversations once loading finishes.
 //!
 //! # Differences from upstream
 //!
@@ -16,10 +16,18 @@
 //!   `.pi/settings.json`). Upstream returned `None` under
 //!   `cfg(test)`; here tests are kept off the user's cache by
 //!   [`HistoryEnv::sandbox`] and temporary roots instead.
-//! * **Shared corpus.** [`write_snapshot`] and
-//!   [`generation::build_manifest`] accept any slice of
+//! * **Shared corpus.** [`write_snapshot`], [`snapshot_is_current`],
+//!   [`Snapshot::locate`] and [`generation::Corpus::new`] accept any slice of
 //!   `Borrow<Conversation>`, so the browser's `Arc<Conversation>` corpus is
-//!   written without copying. The manifest bytes are the same.
+//!   written and located without copying. The written bytes are the same.
+//! * **Cancellable build.** The GUI builds generations in its own process
+//!   (upstream: a detached `--publish-snapshot` child that outlived the TUI),
+//!   so quitting must not wait for a build: [`write_snapshot_cancellable`],
+//!   [`generation::publish_cancellable`] and
+//!   [`lexindex::build_cancellable`] give up soon after a flag is set,
+//!   remove their `gNNN.tmp` and publish nothing. [`write_snapshot`],
+//!   [`generation::publish`] and [`lexindex::build`] are the same code never
+//!   cancelled, and write the same bytes as upstream.
 //! * **Windows tests.** `lexindex`'s corrupt-file test drops its open index
 //!   (three live maps) before it rewrites and truncates the index files,
 //!   which Windows refuses for a mapped file. The code is upstream's.
@@ -32,25 +40,27 @@
 //! On Windows (NTFS) `std::fs` removes and renames over files that another
 //! handle maps (POSIX semantics), so collection behaves as on Unix and an
 //! open map stays readable; only writing or truncating a mapped file fails
-//! (`ERROR_USER_MAPPED_FILE`), and published files are never written again.
-//! On a file system without POSIX semantics, removing a generation that a
-//! reader still maps fails silently, like every collection error, and a later
-//! publish removes it once the map is dropped.
+//! (`ERROR_USER_MAPPED_FILE`), and published files (manifest, text segments,
+//! index) are never written again. On a file system without POSIX semantics,
+//! removing a generation that a reader still maps fails silently, like every
+//! collection error, and a later publish removes it once the map is dropped.
 
 pub mod card;
 pub mod generation;
-#[cfg_attr(not(test), allow(dead_code))]
 pub mod lexindex;
-#[cfg_attr(not(test), allow(dead_code))]
 pub mod search;
+pub mod text;
 
 pub use generation::{Generation, ProjectView, Publish};
 
 use crate::env::HistoryEnv;
 use crate::history::Conversation;
 use crate::time_filter::TimeFilter;
-use std::borrow::Borrow;
+use chrono::{DateTime, Local};
+use std::borrow::{Borrow, Cow};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 /// Store root: `v3/roots-<hash>/` beside the other caches. The cache dir is
@@ -91,8 +101,9 @@ fn source_roots_namespace(pi: Option<&Path>, omp: Option<&Path>) -> String {
 }
 
 /// Cards of the current generation, shown until the full corpus is loaded.
+#[derive(Clone)]
 pub struct Snapshot {
-    generation: Generation,
+    generation: Arc<Generation>,
     show_last: bool,
     time: TimeFilter,
 }
@@ -102,7 +113,7 @@ impl Snapshot {
     /// usable one.
     pub fn open(root: &Path, show_last: bool, time: TimeFilter) -> Option<Self> {
         Some(Self {
-            generation: Generation::open(root)?,
+            generation: Arc::new(Generation::open(root)?),
             show_last,
             time,
         })
@@ -112,34 +123,169 @@ impl Snapshot {
         self.generation.name()
     }
 
-    /// The newest `n` cards inside the time filter whose project passes
-    /// `project_visible`, as list-only conversations indexed from 0.
-    pub fn conversations(
+    /// Number of cards; doc ids are `0..len()`.
+    pub fn len(&self) -> usize {
+        self.generation.rows().len()
+    }
+
+    /// Whether the generation has no card (fork: the library API's
+    /// companion of `len`).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Ids of the newest `n` cards inside the time filter whose project
+    /// passes `project_visible`.
+    pub fn head(&self, n: usize, project_visible: impl FnMut(&ProjectView) -> bool) -> Vec<u32> {
+        let visible = self.project_visibility(project_visible);
+        self.generation.head(n, |row| {
+            visible[row.project_id as usize] && in_time(&self.time, row)
+        })
+    }
+
+    /// For every card, whether it is inside the time filter and its project
+    /// passes `project_visible`.
+    pub fn scope(&self, project_visible: impl FnMut(&ProjectView) -> bool) -> Vec<bool> {
+        let visible = self.project_visibility(project_visible);
+        self.generation
+            .rows()
+            .iter()
+            .map(|row| visible[row.project_id as usize] && in_time(&self.time, row))
+            .collect()
+    }
+
+    fn project_visibility(
         &self,
-        n: usize,
         mut project_visible: impl FnMut(&ProjectView) -> bool,
-    ) -> Vec<Conversation> {
-        let generation = &self.generation;
-        let visible: Vec<bool> = (0..generation.projects().len() as u32)
-            .map(|id| project_visible(&generation.project(id)))
-            .collect();
-        let time = &self.time;
-        generation
-            .head(n, |row| {
-                visible[row.project_id as usize]
-                    && (!time.is_active()
-                        || chrono::DateTime::from_timestamp_millis(row.timestamp_ms)
-                            .is_some_and(|timestamp| time.matches(timestamp)))
-            })
-            .into_iter()
+    ) -> Vec<bool> {
+        (0..self.generation.projects().len() as u32)
+            .map(|id| project_visible(&self.generation.project(id)))
+            .collect()
+    }
+
+    /// Card `doc` as a list-only conversation.
+    pub fn card(&self, doc: u32) -> Conversation {
+        self.generation.conversation(doc, self.show_last)
+    }
+
+    /// The preview card `doc` shows.
+    pub fn preview(&self, doc: u32) -> &str {
+        let row = &self.generation.rows()[doc as usize];
+        self.generation.str(if self.show_last {
+            row.preview_last
+        } else {
+            row.preview_first
+        })
+    }
+
+    /// For every card, the index in `conversations` of the conversation
+    /// stored at the same path, if any.
+    pub fn locate<C: Borrow<Conversation>>(&self, conversations: &[C]) -> Vec<Option<usize>> {
+        let by_path: HashMap<&Path, usize> = conversations
+            .iter()
             .enumerate()
-            .map(|(index, row)| {
-                let mut conversation = generation.conversation(row, self.show_last);
-                conversation.index = index;
-                conversation
+            .map(|(index, conversation)| (conversation.borrow().path.as_path(), index))
+            .collect();
+        self.generation
+            .rows()
+            .iter()
+            .map(|row| {
+                by_path
+                    .get(Path::new(self.generation.str(row.path)))
+                    .copied()
             })
             .collect()
     }
+
+    /// Whether the cards describe exactly `conversations`, given the
+    /// result of [`Self::locate`]: every conversation has a card with the
+    /// same timestamp. A newer or changed conversation makes it false.
+    pub fn covers<C: Borrow<Conversation>>(
+        &self,
+        conversations: &[C],
+        located: &[Option<usize>],
+    ) -> bool {
+        let mut matched = 0;
+        for (row, position) in self.generation.rows().iter().zip(located) {
+            if let Some(position) = position {
+                if conversations[*position]
+                    .borrow()
+                    .timestamp
+                    .timestamp_millis()
+                    != row.timestamp_ms
+                {
+                    return false;
+                }
+                matched += 1;
+            }
+        }
+        matched == conversations.len()
+    }
+}
+
+fn in_time(time: &TimeFilter, row: &card::CardRow) -> bool {
+    !time.is_active()
+        || chrono::DateTime::from_timestamp_millis(row.timestamp_ms)
+            .is_some_and(|timestamp| time.matches(timestamp))
+}
+
+/// A generation's cards, suffix index and text, ready for lexical search.
+pub struct SearchIndex {
+    cards: Snapshot,
+    index: lexindex::LexIndex,
+    text: text::TextSegments,
+    docs: search::SearchDocs,
+}
+
+impl SearchIndex {
+    /// Opens the index and text of the generation behind `cards`; `None`
+    /// when it has none usable.
+    pub fn open(cards: Snapshot) -> Option<Self> {
+        let (index, text) = cards.generation.open_search_files()?;
+        Some(Self {
+            docs: search::SearchDocs::from_generation(&cards.generation),
+            cards,
+            index,
+            text,
+        })
+    }
+
+    pub fn cards(&self) -> &Snapshot {
+        &self.cards
+    }
+
+    /// Starts `query` over the documents for which `scope` holds.
+    pub fn search<'a>(
+        &'a self,
+        query: &str,
+        now: DateTime<Local>,
+        scope: &(dyn Fn(u32) -> bool + Sync),
+    ) -> search::Ranking<'a> {
+        search::search(&self.index, &self.docs, self, query, now, scope)
+    }
+
+    /// `Conversation::full_text` of card `doc`, decompressed from its frame.
+    pub fn text(&self, doc: u32) -> String {
+        let row = &self.cards.generation.rows()[doc as usize];
+        self.text.read(row.text).unwrap_or_default()
+    }
+}
+
+impl search::TextSource for SearchIndex {
+    fn full_text(&self, doc: u32) -> Cow<'_, str> {
+        Cow::Owned(self.text(doc))
+    }
+}
+
+/// Whether `CURRENT` under `root` already holds `conversations` (the
+/// complete corpus, loaded starting at `loaded_since`) with its index, so
+/// `write_snapshot` would write nothing.
+pub fn snapshot_is_current<C: Borrow<Conversation>>(
+    root: &Path,
+    conversations: &[C],
+    loaded_since: SystemTime,
+) -> bool {
+    generation::is_current(root, &corpus(conversations, loaded_since))
 }
 
 /// Writes a generation for `conversations` (the complete corpus, loaded
@@ -149,12 +295,42 @@ pub fn write_snapshot<C: Borrow<Conversation>>(
     conversations: &[C],
     loaded_since: SystemTime,
 ) -> std::io::Result<Publish> {
-    let fingerprints: Vec<_> = conversations
+    generation::publish(root, &corpus(conversations, loaded_since))
+}
+
+/// [`write_snapshot`] that gives up soon after `cancelled()` returns true
+/// (fork; see [`generation::publish_cancellable`]), also while it reads the
+/// files' fingerprints. A build given up publishes nothing and returns an
+/// [`std::io::ErrorKind::Interrupted`] error.
+pub fn write_snapshot_cancellable<C: Borrow<Conversation>>(
+    root: &Path,
+    conversations: &[C],
+    loaded_since: SystemTime,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> std::io::Result<Publish> {
+    let mut fingerprints = Vec::with_capacity(conversations.len());
+    for conversation in conversations {
+        if cancelled() {
+            return Err(generation::cancelled_build());
+        }
+        fingerprints.push(generation::fingerprint(
+            &conversation.borrow().path,
+            loaded_since,
+        ));
+    }
+    let corpus = generation::Corpus::new(conversations, fingerprints);
+    generation::publish_cancellable(root, &corpus, cancelled)
+}
+
+fn corpus<C: Borrow<Conversation>>(
+    conversations: &[C],
+    loaded_since: SystemTime,
+) -> generation::Corpus<'_> {
+    let fingerprints = conversations
         .iter()
         .map(|conversation| generation::fingerprint(&conversation.borrow().path, loaded_since))
         .collect();
-    let manifest = generation::build_manifest(conversations, &fingerprints);
-    generation::publish(root, &manifest)
+    generation::Corpus::new(conversations, fingerprints)
 }
 
 #[cfg(test)]
@@ -213,7 +389,8 @@ pub(crate) mod test_support {
     }
 }
 
-/// Fork-only: the env-derived root and the `Borrow<Conversation>` writer.
+/// Fork-only: the env-derived root and the `Borrow<Conversation>` writer and
+/// locator.
 #[cfg(test)]
 mod tests {
     use super::test_support::conversation;
@@ -294,19 +471,29 @@ mod tests {
             Publish::Published(_)
         ));
         let owned: Vec<Conversation> = shared.iter().map(|c| (**c).clone()).collect();
+        assert!(snapshot_is_current(&root, &shared, since));
+        assert!(snapshot_is_current(&root, &owned, since));
         assert_eq!(
             write_snapshot(&root, &owned, since).unwrap(),
             Publish::Unchanged
         );
 
         let snapshot = Snapshot::open(&root, false, TimeFilter::default()).unwrap();
-        let cards = snapshot.conversations(2, |_| true);
+        let cards: Vec<_> = snapshot
+            .head(2, |_| true)
+            .into_iter()
+            .map(|doc| snapshot.card(doc))
+            .collect();
         let listed: Vec<_> = cards.iter().map(|c| (c.index, c.path.clone())).collect();
         assert_eq!(listed, vec![(0, paths[2].clone()), (1, paths[1].clone()),]);
         assert!(
             snapshot
-                .conversations(10, |project| project.name != Some("app"))
+                .head(10, |project| project.name != Some("app"))
                 .is_empty()
         );
+        // The shared corpus is located without copying, newest card first.
+        assert_eq!(snapshot.locate(&shared), vec![Some(2), Some(1), Some(0)]);
+        let index = SearchIndex::open(snapshot).expect("the index was written");
+        assert_eq!(index.text(0), "full text");
     }
 }

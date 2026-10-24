@@ -7,7 +7,8 @@
 //! ranked row list, the selection, and two background workers:
 //!
 //! * a lexical search worker thread ("search-worker") that coalesces queued
-//!   queries and answers with generation-tagged results;
+//!   queries and answers with generation-tagged results, over the loaded
+//!   corpus or a store generation's index (top page first);
 //! * a lazily spawned semantic worker ([`crate::semantic_worker`]), with
 //!   corpus/scope versioning, prewarming and a lexical fallback while the
 //!   semantic answer is pending.
@@ -45,10 +46,14 @@
 //! snapshot ([`Browser::show_snapshot`], [`HistoryLoader::open_snapshot`])
 //! before the loader starts: at most [`SNAPSHOT_ROWS`] cards, newest first,
 //! in the current scope and time filter. They are the corpus until loading
-//! finishes ([`Readiness::list`] is set, [`Readiness::lexical`] is not);
-//! loaded batches are held back meanwhile and the install swaps them in at
-//! once, keeping the selected session by path. Toggling the scope or
-//! changing the workspace or exclusions re-reads the cards.
+//! finishes ([`Readiness::list`] is set); loaded batches are held back
+//! meanwhile and the install swaps them in at once, keeping the selected
+//! session by path. Toggling the scope or changing the workspace or
+//! exclusions decides every card's scope again. Once the generation's
+//! search index is open ([`Browser::use_search_index`],
+//! [`Readiness::lexical`]) a lexical query runs on it before the load ends,
+//! its results materialized as cards; the loaded corpus keeps using the
+//! index (see `cards`).
 //!
 //! # Differences from upstream
 //!
@@ -69,8 +74,10 @@
 //! * **Quirk 14.** While loading, toggling the workspace scope or the search
 //!   mode (and changing the workspace or exclusions) only re-applies the
 //!   scope and exclusions to the loaded rows. The query is applied when
-//!   loading finishes. Upstream filtered against the not-yet-built search
-//!   index and showed an empty list until loading finished.
+//!   loading finishes, unless the snapshot's search index is open
+//!   ([`Readiness::lexical`]): then a lexical query reruns on it (see
+//!   `cards`). Upstream filtered against the not-yet-built search index and
+//!   showed an empty list until loading finished.
 //! * **Quirk 16.** A refresh with a non-empty query keeps the previous rows
 //!   (re-mapped to the refreshed corpus by path) until the new results
 //!   arrive. Upstream cleared the list until the worker answered.
@@ -121,6 +128,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
 
+mod cards;
 mod corpus;
 mod index;
 mod list_state;
@@ -143,7 +151,9 @@ pub use types::{
 
 use corpus::{CorpusEdits, SearchSnapshot};
 use index::{CorpusIndex, ScopeSettings};
-use search_state::{SearchCommand, SearchResponse, SemanticSearchState, spawn_search_worker};
+use search_state::{
+    IndexScope, SearchCommand, SearchResponse, SemanticSearchState, spawn_search_worker,
+};
 
 /// Snapshot cards materialized for the list while loading. Bounded so the
 /// first frame costs the same whatever the corpus size.
@@ -292,6 +302,15 @@ pub struct Browser {
     readiness: Readiness,
     /// Snapshot whose cards are shown while loading
     snapshot: Option<crate::store::Snapshot>,
+    /// Generation index lexical queries run against, when there is one
+    search_index: Option<Arc<crate::store::SearchIndex>>,
+    /// The index and the docs a query may return, sent with each lexical
+    /// query while `search_index` is set
+    index_scope: Option<IndexScope>,
+    /// For each card of the snapshot or index, its index in `conversations`
+    doc_rows: Vec<Option<usize>>,
+    /// The materialized cards, while snapshot cards are shown
+    cards: cards::CardRows,
     /// Loaded conversations held back while snapshot cards are shown (shared
     /// with the corpus preparation at the end of the load)
     pending: Option<CorpusSnapshot>,
@@ -313,6 +332,9 @@ pub struct Browser {
     search_generation: u64,
     /// Whether a search is currently in-flight on the worker thread
     search_in_flight: bool,
+    /// Whether `filtered` is the first page of an index search still being
+    /// completed
+    search_page_shown: bool,
     /// Current list search mode
     list_search_mode: ListSearchMode,
     /// Semantic search state
@@ -387,6 +409,10 @@ impl Browser {
             query: String::new(),
             readiness: parts.readiness,
             snapshot: None,
+            search_index: None,
+            index_scope: None,
+            doc_rows: Vec::new(),
+            cards: cards::CardRows::default(),
             pending: None,
             single_file_mode: parts.single_file_mode,
             single_file_error: parts.single_file_error,
@@ -397,6 +423,7 @@ impl Browser {
             search_rx: parts.search_rx,
             search_generation: 0,
             search_in_flight: false,
+            search_page_shown: false,
             list_search_mode,
             semantic_search: SemanticSearchState {
                 available: semantic_available,
@@ -548,9 +575,10 @@ impl Browser {
         &self.readiness
     }
 
-    /// Whether the full corpus is still loading, so queries and edits wait.
+    /// Whether the full corpus is still loading, so edits wait (and queries,
+    /// unless the snapshot's index answers them: [`Readiness::lexical`]).
     pub fn is_loading(&self) -> bool {
-        !self.readiness.lexical
+        self.readiness.reconcile != ReconcileState::Done
     }
 
     /// Whether the rows are snapshot cards ([`Browser::show_snapshot`]),

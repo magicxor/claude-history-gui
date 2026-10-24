@@ -290,6 +290,7 @@ impl DocTerms {
 }
 
 /// Sizes and counts of a built index.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Default, Clone)]
 pub struct BuildStats {
     pub docs: usize,
@@ -308,6 +309,7 @@ pub struct Built {
     pub fst: Vec<u8>,
     pub post: Vec<u8>,
     pub short: Vec<u8>,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub stats: BuildStats,
 }
 
@@ -333,20 +335,41 @@ pub fn build<'a, F>(n_docs: usize, lowered: F) -> Built
 where
     F: Fn(u32) -> Cow<'a, str> + Sync,
 {
+    build_cancellable(n_docs, lowered, &|| false).expect("a build that is never cancelled")
+}
+
+/// [`build`] that gives up soon after `cancelled()` returns true (fork: the
+/// GUI builds generations in its own process and must not wait for a build
+/// when it quits). It is asked before each document's terms, each partition
+/// and the short prefixes; `None` when the build was given up.
+pub fn build_cancellable<'a, F>(
+    n_docs: usize,
+    lowered: F,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Option<Built>
+where
+    F: Fn(u32) -> Cow<'a, str> + Sync,
+{
     assert!(n_docs <= u32::MAX as usize);
     let docs: Vec<DocTerms> = (0..n_docs as u32)
         .into_par_iter()
-        .map(|doc| DocTerms::new(&lowered(doc)))
-        .collect();
+        .map(|doc| (!cancelled()).then(|| DocTerms::new(&lowered(doc))))
+        .collect::<Option<_>>()?;
     let bounds = partition_bounds(&docs);
     let parts: Vec<Part> = (0..bounds.len() + 1)
         .into_par_iter()
         .map(|part| {
+            if cancelled() {
+                return None;
+            }
             let lo = part.checked_sub(1).map(|i| bounds[i].as_slice());
             let hi = bounds.get(part).map(Vec::as_slice);
-            build_part(&docs, lo, hi)
+            Some(build_part(&docs, lo, hi))
         })
-        .collect();
+        .collect::<Option<_>>()?;
+    if cancelled() {
+        return None;
+    }
     let short = build_short(&docs, n_docs);
     drop(docs);
 
@@ -387,12 +410,12 @@ where
         post_bytes: post.len(),
         short_bytes: short.0.len(),
     };
-    Built {
+    Some(Built {
         fst,
         post,
         short: short.0,
         stats,
-    }
+    })
 }
 
 /// Sorted, distinct terms splitting the term space into partitions of
@@ -908,6 +931,42 @@ mod tests {
                 assert_eq!(tf[doc], naive_tf(text, word), "word {word:?} doc {doc}");
             }
         }
+    }
+
+    /// Fork: the cancellable build behind the GUI's in-process publish.
+    #[test]
+    fn a_cancelled_build_stops_early_and_an_uncancelled_one_is_the_same() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let n_docs = 100_000;
+        let cancel = AtomicBool::new(false);
+        let lowered_docs = AtomicUsize::new(0);
+        let built = build_cancellable(
+            n_docs,
+            |doc| {
+                lowered_docs.fetch_add(1, Ordering::Relaxed);
+                if doc == 10 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                Cow::Borrowed("alpha beta gamma")
+            },
+            &|| cancel.load(Ordering::Relaxed),
+        );
+        assert!(built.is_none());
+        let lowered_docs = lowered_docs.load(Ordering::Relaxed);
+        assert!(
+            lowered_docs < n_docs / 2,
+            "{lowered_docs} documents lowered"
+        );
+
+        let texts = ["alpha beta", "", "gamma alpha"];
+        let lowered = |doc: u32| Cow::Borrowed(texts[doc as usize]);
+        let plain = build(texts.len(), lowered);
+        let uncancelled = build_cancellable(texts.len(), lowered, &|| false).unwrap();
+        assert_eq!(
+            (plain.fst, plain.post, plain.short),
+            (uncancelled.fst, uncancelled.post, uncancelled.short)
+        );
+        assert!(build_cancellable(texts.len(), lowered, &|| true).is_none());
     }
 
     #[test]

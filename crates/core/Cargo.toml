@@ -52,12 +52,14 @@ ureq.workspace = true
 # Format-preserving gui.toml edits (config::save_gui_config_changes). The
 # same version gpui-kit already brings into the GUI's tree.
 toml_edit.workspace = true
-# Store generation manifests (store::card, store::generation) and the
-# word-start suffix index (store::lexindex).
+# Store generation manifests (store::card, store::generation), the
+# word-start suffix index (store::lexindex) and the text segments
+# (store::text).
 bytemuck.workspace = true
 memmap2.workspace = true
 fst.workspace = true
 memchr.workspace = true
+zstd.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # getrusage for bench::mark_peak_rss.

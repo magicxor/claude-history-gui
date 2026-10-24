@@ -413,11 +413,22 @@ impl ScopeIndex {
     /// for rows already chosen under `settings` (snapshot cards, picked by
     /// [`CardScope`]).
     pub(super) fn all(len: usize, settings: ScopeSettings) -> Self {
+        Self::from_members(vec![true; len], settings)
+    }
+
+    /// The scope with the membership of each conversation decided elsewhere
+    /// (snapshot cards: from their generation's projects, [`CardScope`]).
+    pub(super) fn from_members(member: Vec<bool>, settings: ScopeSettings) -> Self {
+        let rows = member
+            .iter()
+            .enumerate()
+            .filter_map(|(position, &member)| member.then_some(position))
+            .collect();
         Self {
             valid: true,
             settings,
-            rows: Arc::new((0..len).collect()),
-            member: vec![true; len],
+            rows: Arc::new(rows),
+            member,
         }
     }
 
@@ -471,6 +482,17 @@ impl ScopeIndex {
                 .filter_map(|(offset, &member)| member.then_some(start + offset)),
         );
         self.member.extend(added);
+    }
+
+    /// Add a conversation appended at `position` that is in scope by
+    /// construction (a snapshot card a query on the cards' index returned).
+    fn push_member(&mut self, position: usize) {
+        if !self.valid || self.member.len() != position {
+            self.invalidate();
+            return;
+        }
+        self.member.push(true);
+        Arc::make_mut(&mut self.rows).push(position);
     }
 
     /// Re-evaluate the conversation at `position` (it was replaced).
@@ -588,6 +610,13 @@ impl CorpusIndex {
             self.add(conversation, start + offset);
         }
         self.scope.extend(conversations, start);
+    }
+
+    /// Index the conversation appended at `position`, in scope by
+    /// construction ([`ScopeIndex::push_member`]): no scope test runs.
+    pub(super) fn push_in_scope(&mut self, conversations: &[Arc<Conversation>], position: usize) {
+        self.add(&conversations[position], position);
+        self.scope.push_member(position);
     }
 
     /// The conversation at `position` was replaced; `previous` is the one it

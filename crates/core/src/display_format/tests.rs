@@ -901,16 +901,55 @@ fn lexical_mixed_query_cached_context_uses_unquoted_and_literals() {
     conversation.preview = "visible preview".into();
     conversation.full_text = format!("hidden_unquoted {} exact_literal", "x ".repeat(120)).into();
     let evidence = crate::search::build_lexical_evidence(
-        &conversation,
+        &conversation.full_text,
+        &conversation.preview,
         &ParsedQuery::parse("hidden_unquoted \"exact_literal\""),
     )
     .unwrap();
     let ctx =
-        build_context_segments_from_ranges(&conversation.full_text, &evidence.context_ranges, 120)
-            .unwrap();
+        build_context_segments_from_ranges(&evidence.text, &evidence.context_ranges, 120).unwrap();
 
     assert!(ctx.contains("exact_literal"), "{ctx:?}");
     assert!(ctx.contains("hidden_unquoted"), "{ctx:?}");
+}
+
+#[test]
+fn evidence_windows_give_the_same_context_as_the_full_text() {
+    let filler = |n: usize| "héllo <tag> wörld 测试 ".repeat(n);
+    let texts = [
+        format!("needle {} needle", filler(10)),
+        format!(
+            "{} needle {} other_needle {}",
+            filler(400),
+            filler(3),
+            filler(400)
+        ),
+        format!("{} needle {} other_needle", filler(2), filler(900)),
+        format!("needle{}", filler(1)),
+    ];
+    for full_text in &texts {
+        for query in ["needle", "needle \"other_needle\""] {
+            let parsed = ParsedQuery::parse(query);
+            let preview = "unrelated preview";
+            let ranges =
+                crate::search::evidence::full_text_context_ranges(full_text, preview, &parsed)
+                    .unwrap();
+            let evidence =
+                crate::search::build_lexical_evidence(full_text, preview, &parsed).unwrap();
+            assert!(evidence.text.len() < full_text.len() || full_text.len() < 4096);
+            for width in [10, 40, 80, 200, 1000, 2000] {
+                assert_eq!(
+                    build_context_segments_from_ranges(
+                        &evidence.text,
+                        &evidence.context_ranges,
+                        width
+                    ),
+                    build_context_segments_from_ranges(full_text, &ranges, width),
+                    "{query:?} width {width}"
+                );
+            }
+        }
+    }
 }
 
 // --- word boundary tests ---
@@ -1132,9 +1171,12 @@ fn lexical_unquoted_render_shows_cached_hidden_full_text_context() {
     conversation.preview = "visible lexical preview".into();
     conversation.full_text =
         format!("visible lexical preview {} hiddenneedle", "x ".repeat(200)).into();
-    let evidence =
-        crate::search::build_lexical_evidence(&conversation, &ParsedQuery::parse("hiddenneedle"))
-            .unwrap();
+    let evidence = crate::search::build_lexical_evidence(
+        &conversation.full_text,
+        &conversation.preview,
+        &ParsedQuery::parse("hiddenneedle"),
+    )
+    .unwrap();
     let preview = row_preview(
         &conversation,
         "hiddenneedle",
@@ -1205,6 +1247,7 @@ fn semantic_rows_with_metadata_ignore_lexical_evidence() {
     conversation.full_text = format!("{} sentinel", "x ".repeat(100)).into();
     let evidence = LexicalEvidence {
         context_ranges: vec![(200, 208)],
+        text: conversation.full_text.to_string(),
     };
     let metadata = test_semantic_metadata("semantic evidence only");
     let with_metadata = row_preview(
