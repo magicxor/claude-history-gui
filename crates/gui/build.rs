@@ -1,12 +1,20 @@
 //! Build script of the GUI binary (DESIGN §14.4).
 //!
+//! Windows MSVC: every executable of this package, test harnesses and
+//! examples included, gets an 8 MB main-thread stack (`/STACK:8000000`): the
+//! default 1 MiB is too small for some deep recursion and for GPUI's deep
+//! element trees. It is set here, like in core's build script, and not as
+//! rustflags in `.cargo/config.toml`: cargo also merges that file into
+//! worktrees nested in the main checkout (`.claude/worktrees/*`).
+//!
 //! Windows MSVC: the statically linked ONNX Runtime (ort-sys, through core's
 //! fastembed) always links DirectML, so the executable would import
 //! `DirectML.dll` even though only the CPU execution provider is used.
 //! Delay-loading it means the DLL is resolved only if DirectML is ever used,
 //! so the app starts on systems without it (verified in spike-platform).
-//! The arguments apply to binaries only (`rustc-link-arg-bins`), never to test
-//! executables.
+//! The delay-load arguments apply to binary targets only
+//! (`rustc-link-arg-bins`): the app and the bin's own unit-test harness, not
+//! the library's test executables.
 //!
 //! Windows: `assets/windows/app.rc` (icon + version information) is compiled
 //! with `embed-resource` and linked into the `claude-history-gui` binary
@@ -19,6 +27,7 @@ fn main() {
     let windows = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
     let msvc = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
     if windows && msvc {
+        println!("cargo:rustc-link-arg=/STACK:8000000");
         println!("cargo:rustc-link-arg-bins=/DELAYLOAD:DirectML.dll");
         println!("cargo:rustc-link-arg-bins=delayimp.lib");
         // LNK4199 ("no imports found from DirectML.dll") is expected for

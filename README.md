@@ -97,7 +97,9 @@ cargo build -p claude-history-gui --release
 * MSVC toolchain with the Visual Studio 2022 *Desktop development with C++* workload, the Windows SDK and CMake.
 * The first build needs network access: `ort-sys` downloads the static ONNX Runtime (cached in
   `%LOCALAPPDATA%\ort.pyke.io`). Never enable `+crt-static` (it fails with LNK2038).
-* `.cargo/config.toml` sets the 8 MiB main-thread stack and `RUST_MIN_STACK` for test threads.
+* The build scripts of both crates set the 8 MB main-thread stack (`/STACK:8000000`), and `.cargo/config.toml`
+  sets `RUST_MIN_STACK` (8 MiB) for test threads. The project sets no rustflags, so a `[build] rustflags` in your
+  user cargo config applies to it (never put `+crt-static` there).
 * DirectML is delay-loaded (`build.rs`), so the exe starts on systems without it. The exe needs the VC++
   2015-2022 x64 runtime; the release zip ships the four DLLs next to the exe.
 * The release exe is a Windows GUI program that attaches to the parent console when it has output to print
@@ -342,7 +344,8 @@ Workspace layout (`Cargo.toml` members):
   scenario runner behind the `qa` feature.
 * `docs/`: [`DESIGN.md`](docs/DESIGN.md) (authoritative spec) and [`FEATURES.md`](docs/FEATURES.md) (parity
   rows), see [`docs/README.md`](docs/README.md). `packaging/` holds the per-OS release assets, `tools/` the CI
-  scripts and QA helpers.
+  scripts, QA helpers and development helpers (`tools/dev`: seeding a worktree's build, Linux builds in
+  Docker; see [`AGENTS.md`](AGENTS.md)).
 
 ```sh
 cargo fmt --all --check

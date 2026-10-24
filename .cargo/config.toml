@@ -1,10 +1,12 @@
-# The default 1 MiB main-thread stack on Windows MSVC is too small for some
-# deep recursion (markdown layout, serde of large transcripts, tests) and for
-# GPUI's deep element trees.
-[target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "link-arg=/STACK:8000000"]
+# The 8 MB main-thread stack on Windows MSVC (/STACK:8000000) comes from the
+# build scripts of both crates, not from rustflags here: cargo also merges this
+# file into worktrees nested in the main checkout (.claude/worktrees/*), which
+# doubles array values (changing every crate's hash) and fails outright when
+# one checkout has an array and the other a string. (An empty array would not
+# help either: cargo treats it as unset, so it would not shadow a user's
+# [build] rustflags the way the old target rustflags did.)
 
 [env]
-# libtest runs every test on its own thread; give those threads the same
-# 8 MiB the main thread gets (DESIGN §14.4).
+# libtest runs every test on its own thread; give those threads about the
+# same stack as the main thread (8 MiB, DESIGN §14.4).
 RUST_MIN_STACK = "8388608"

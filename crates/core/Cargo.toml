@@ -8,6 +8,8 @@ repository.workspace = true
 description = "UI-agnostic core of claude-history-gui: Claude Code / Pi / OMP history loading, search, semantic search, agent protocol and rendering helpers. Derived from claude-history (https://github.com/raine/claude-history, MIT, Copyright (c) 2024 Raine)."
 readme = "README.md"
 publish = false
+# Windows MSVC main-thread stack size only (see build.rs).
+build = "build.rs"
 
 [lib]
 name = "claude_history_core"
