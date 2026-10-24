@@ -12,6 +12,8 @@ Release notes are taken from the `## v<version>` section of this file by the rel
   load, and they can be opened, resumed and forked at once; rename and delete become available when loading
   finishes, which swaps in the loaded list without moving the selection. The snapshot is kept per workspace and
   Pi/OMP session folder, so a different one never shows another's conversations at startup.
+- Quoted and identifier literals match only at word starts (after a non-alphanumeric character): "Config" no longer
+  matches inside AppConfig.
 
 ## v0.1.1
 

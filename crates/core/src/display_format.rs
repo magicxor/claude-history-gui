@@ -892,7 +892,7 @@ pub fn find_normalized_match_ranges(text: &str, query_normalized: &str) -> Vec<(
 /// A list query prepared for highlighting.
 ///
 /// Literals are the quoted literals plus unquoted terms containing `_`
-/// (identifier literals: exact substring, smart case). The remaining
+/// (identifier literals: matched at word starts, smart case). The remaining
 /// unquoted terms are normalized with
 /// [`crate::search::normalize_for_search`].
 #[derive(Clone, Debug, Default)]
@@ -1023,7 +1023,7 @@ impl HighlightQuery {
 pub enum ContextMatchSpec {
     /// A normalized term (word-start, case-insensitive matching).
     Normalized(String),
-    /// A literal (exact substring, smart case).
+    /// A literal (matched at word starts, smart case).
     Literal(Literal),
 }
 

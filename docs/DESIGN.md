@@ -2170,6 +2170,9 @@ from `build_row_preview` (`PreviewSource` = semantic evidence / lexical context 
 (quoted literals **or** unquoted `_`-identifiers, which core treats as literal filters; fixes quirk 10; WP1's P test
 asserts `a_b` → true and raises a CCR if `literal_context_specs` does not cover it). All rows use
 `row_h = rems(5.5)` while it is on; rows without a context line render an empty fourth line.
+A literal matches only where it starts at a word start (the start of the text or after a non-alphanumeric character:
+`_ . / -` and whitespace all begin words), in every surface that uses core's `Literal` (filters, exact fallback,
+agent retrieval, highlights); `"Config"` does not match inside `AppConfig`.
 
 ### 10.4 Search input status (L-032)
 `Browser::search_status_text()` (`Loading… <n>` after the `…` substitution of §12, `<i>/<n>`, `0/<n>`, `sem …`,

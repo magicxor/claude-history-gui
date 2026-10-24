@@ -136,7 +136,7 @@ Test-only hooks referenced below (`#[cfg(test)]`, owned by the pane's WP): `List
 | ID | Original | GUI | Acceptance | WP |
 |---|---|---|---|---|
 | S-001 | Query parsing: `"…"` literals, unterminated quote literal, empty quotes dropped, `is_effectively_empty`, `is_quoted_only` (`src/search/query.rs:11-80`) | core `ParsedQuery` | U: core `ParsedQuery` tests — quoted literal, unterminated quote, empty quotes dropped, `is_effectively_empty`, `is_quoted_only` | WP-C |
-| S-002 | Literal smart case (uppercase → case-sensitive) (`src/search/literal.rs:18-25`) | core | U: core literal test — `"Foo"` is case-sensitive, `"foo"` matches `FOO` | WP-C |
+| S-002 | Literal smart case (uppercase → case-sensitive); literals match only at word starts (start of text or after a non-alphanumeric char; upstream e223d56) (`src/search/literal.rs:18-25`) | core | U: core literal test — `"Foo"` is case-sensitive, `"foo"` matches `FOO` | WP-C |
 | S-003 | A quoted UUID is a literal, not a jump | core | U: core UUID/literal test | WP-C |
 | S-004 | No debounce; every edit dispatches while Ready (`src/tui/app/search_state.rs:240-278`) | `InputEvent::Change` → `browser.set_query` immediately | G: typing `abc` after `Loaded` produces three `set_query` calls (probe `list.query_calls` = 3) | WP1 |
 | S-005 | Lexical worker: one thread, coalesces to the latest query, evidence for top 200 (`src/tui/app/search_state.rs:49-138`) | core worker + GUI waker | G: typing 10 characters without parking ends with rows matching only the final query; no later poll changes them; with rows that differ per prefix no intermediate answer stays applied; U: core `latest_command` keeps only the latest queued command | WP1 |
