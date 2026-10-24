@@ -53,5 +53,9 @@ ureq.workspace = true
 # same version gpui-kit already brings into the GUI's tree.
 toml_edit.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# getrusage for bench::mark_peak_rss.
+libc.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true

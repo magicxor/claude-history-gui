@@ -937,6 +937,7 @@ dependencies = [
  "fastembed",
  "hf-hub",
  "home",
+ "libc",
  "ort",
  "pulldown-cmark",
  "rayon",

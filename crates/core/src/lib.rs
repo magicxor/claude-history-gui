@@ -21,6 +21,7 @@
 )]
 
 pub mod agent;
+pub mod bench;
 pub mod claude;
 pub mod commands;
 pub mod config;
