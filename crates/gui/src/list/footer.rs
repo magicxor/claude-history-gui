@@ -4,8 +4,10 @@
 //! kept. WP1.
 //!
 //! The hint chips are only shown while the list has focus and no activity is
-//! displayed; the five action chips are dimmed while the initial load runs
-//! (AD6). Refresh is never advertised (L-041).
+//! displayed. While the initial load runs (AD6) the rename and delete chips
+//! are dimmed, and open, resume and fork until the rows are listed newest
+//! first (snapshot cards, upstream 3708bb6). Refresh is never advertised
+//! (L-041).
 
 use claude_history_core::browser::{ListSearchMode, SemanticProgress};
 use gpui_kit::component::kbd::Kbd;
@@ -243,7 +245,9 @@ impl ListPane {
     }
 
     fn chip_specs(&self, cx: &App) -> Vec<ChipSpec> {
+        // Rows can be opened before loading finishes, edited only after.
         let loading = self.is_loading();
+        let not_ready = !self.list_ready();
         let picker = crate::exit::is_picker(cx);
         let mut specs = Vec::new();
         let spec = |kind: ChipKind,
@@ -281,7 +285,7 @@ impl ListPane {
             CTX_LIST,
             HINT_STACK,
             "open",
-            loading,
+            not_ready,
         ));
         specs.extend(spec(
             ChipKind::Resume,
@@ -289,7 +293,7 @@ impl ListPane {
             CTX_LIST,
             HINT_STACK,
             "resume",
-            loading,
+            not_ready,
         ));
         specs.extend(spec(
             ChipKind::Fork,
@@ -297,7 +301,7 @@ impl ListPane {
             CTX_LIST,
             HINT_STACK,
             "fork",
-            loading,
+            not_ready,
         ));
         specs.extend(spec(
             ChipKind::Rename,

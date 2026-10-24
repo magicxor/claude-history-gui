@@ -63,7 +63,7 @@ use gpui_kit::component::scroll::Scrollbar;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Action, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    Action, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, Global,
     InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels, Point, Render,
     ScrollStrategy, SharedString, Styled as _, Subscription, Task, UniformListScrollHandle, Window,
     div, px, uniform_list,
@@ -264,6 +264,20 @@ thread_local! {
     pub(crate) static PAUSE_NEW_POLLS: Cell<bool> = const { Cell::new(false) };
 }
 
+/// Whether the list draws its first rows from the store's list snapshot and
+/// writes the snapshot after the initial load (DESIGN §11.2, upstream
+/// 3708bb6). On unless set: tests turn it off (`app::init_for_test`) and back
+/// on where they exercise it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ListSnapshots(pub bool);
+
+impl Global for ListSnapshots {}
+
+fn snapshots_enabled(cx: &App) -> bool {
+    cx.try_global::<ListSnapshots>()
+        .is_none_or(|snapshots| snapshots.0)
+}
+
 /// A toast the list pushed (tests and QA read them; `LastToast` only keeps the last text).
 #[cfg(any(test, feature = "qa"))]
 #[derive(Clone, Debug, PartialEq)]
@@ -317,15 +331,24 @@ impl ListPane {
             .with_workspace_filter(local && workspace.is_some())
             .with_waker(waker.clone())
             .with_embedder_factory(warmed_factory(crate::embedder::browser_factory(cx)));
-        let browser = Browser::new_loading(options);
+        let mut browser = Browser::new_loading(options);
         let loader_env = env.clone();
         let mut loader = HistoryLoader::new(
             env,
             LoaderOptions::new(show_last)
                 .with_debug_level(level)
                 .with_time_filter(launch_filter)
-                .with_waker(waker),
+                .with_waker(waker)
+                .with_snapshot(snapshots_enabled(cx)),
         );
+        // The first frame lists the newest cards of the store's snapshot
+        // (bounded: the manifest is mapped and validated, at most
+        // `SNAPSHOT_ROWS` cards are built); the loaded corpus replaces them
+        // at `Loaded`, keeping the selection (§11.2). Without a usable
+        // snapshot the rows stream in as before.
+        if let Some(snapshot) = loader.open_snapshot() {
+            browser.show_snapshot(snapshot);
+        }
         loader.start_initial_load();
 
         let poll_task = cx.spawn_in(window, async move |this, cx| {
@@ -585,6 +608,14 @@ impl ListPane {
         matches!(self.view, ViewState::Loading)
     }
 
+    /// Whether the rows are listed newest first and can be opened, resumed
+    /// and forked: snapshot cards during the initial load, else once it has
+    /// finished (core's `Readiness::list`). Rename and delete wait for
+    /// [`ListPane::is_loading`] to end (AD6).
+    pub fn list_ready(&self) -> bool {
+        self.browser.readiness().list
+    }
+
     pub fn mode(&self) -> ListSearchMode {
         self.browser.list_search_mode()
     }
@@ -697,7 +728,7 @@ impl ListPane {
         if !self.loader.is_running() {
             let mut options = self.loader.options().clone();
             options.show_last = show_last;
-            self.loader = HistoryLoader::new(self.loader_env.clone(), options);
+            self.loader.reconfigure(self.loader_env.clone(), options);
         }
         self.refresh(cx);
     }
@@ -1096,7 +1127,7 @@ impl ListPane {
         while self.row_menus.len() > ROW_MENU_TOKENS_KEPT {
             self.row_menus.pop_front();
         }
-        let model = context_menu::build(token, &target, self.is_loading(), cx);
+        let model = context_menu::build(token, &target, self.is_loading(), self.list_ready(), cx);
         context_menu::show(&model, at, window, cx);
         self.last_menu = Some(model);
     }
@@ -1136,11 +1167,17 @@ impl ListPane {
             }
             return;
         };
-        // While loading, Resume/Fork/Rename/Delete/Select no-op (AD6, quirk 3).
-        if self.is_loading()
-            && (routing::needs_known_source(action) || action.as_any().is::<SelectAndExit>())
-        {
-            return;
+        // While loading, Rename and Delete no-op; Resume, Fork and Select
+        // (Ctrl+O, picker) work once the rows are listed newest first:
+        // snapshot cards carry the path, source and project they need (AD6,
+        // quirk 3, upstream 3708bb6).
+        if self.is_loading() {
+            let any = action.as_any();
+            let edit = any.is::<Rename>() || any.is::<Delete>();
+            let act = any.is::<Resume>() || any.is::<Fork>() || any.is::<SelectAndExit>();
+            if edit || (act && !self.list_ready()) {
+                return;
+            }
         }
         match routing::run_session_action(action, target.clone(), options, window, cx) {
             SessionRoute::Open { agent_tab } => cx.emit(ListPaneEvent::OpenRequested {
@@ -1208,6 +1245,10 @@ impl ListPane {
             "list.total" => self.browser.conversations().len().to_string(),
             "list.loaded" => (!self.is_loading()).to_string(),
             "list.loading" => self.is_loading().to_string(),
+            // Rows listed newest first and actionable (snapshot cards while
+            // loading, upstream 3708bb6).
+            "list.ready" => self.list_ready().to_string(),
+            "list.snapshot" => self.browser.shows_snapshot().to_string(),
             "list.refreshing" => self.is_refreshing().to_string(),
             "list.query" => self.query(cx).to_string(),
             "list.query_calls" => self.query_calls.to_string(),
@@ -1591,6 +1632,13 @@ impl ListPane {
     #[cfg(test)]
     pub(crate) fn loader(&self) -> &HistoryLoader {
         &self.loader
+    }
+
+    /// Wait for the snapshot write of the initial load (tests: before the
+    /// world's temporary directory goes).
+    #[cfg(test)]
+    pub(crate) fn finish_snapshot_write(&mut self) -> Option<claude_history_core::store::Publish> {
+        self.loader.finish_snapshot_write()
     }
 
     /// The UUID lookup outcome of the current query (tests).

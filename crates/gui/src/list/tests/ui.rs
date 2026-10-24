@@ -318,7 +318,7 @@ fn the_row_menu_disables_modifying_items_while_loading(cx: &mut TestAppContext) 
     listed_corpus(&world);
     let f = ListFixture::open_loaded(cx, &world, &[]);
     let target = f.read(cx, |list, _| list.selected_target()).unwrap();
-    let model = cx.read(|cx| crate::list::context_menu::build(1, &target, true, cx));
+    let model = cx.read(|cx| crate::list::context_menu::build(1, &target, true, false, cx));
     for label in ["Resume", "Fork", "Rename…", "Delete…"] {
         assert!(model.is_disabled(label), "{label}");
     }
@@ -326,7 +326,7 @@ fn the_row_menu_disables_modifying_items_while_loading(cx: &mut TestAppContext) 
     // An unknown source disables them too.
     let mut unknown = target.clone();
     unknown.source = None;
-    let model = cx.read(|cx| crate::list::context_menu::build(2, &unknown, false, cx));
+    let model = cx.read(|cx| crate::list::context_menu::build(2, &unknown, false, true, cx));
     assert!(model.is_disabled("Resume") && model.is_disabled("Delete…"));
     // The header session ID differs only for Pi/OMP-style ids.
     assert!(

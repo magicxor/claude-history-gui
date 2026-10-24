@@ -22,8 +22,10 @@
 //! edits stamped from that mark on (made while the loader read the files,
 //! buffered them or prepared them).
 
-use super::index::{CorpusIndex, ScopeSettings, remove_positions_in_place, without_positions};
-use super::{Browser, ListSearchMode, LoadingState, UuidLookup};
+use super::index::{
+    CardScope, CorpusIndex, ScopeIndex, ScopeSettings, remove_positions_in_place, without_positions,
+};
+use super::{Browser, ListSearchMode, Readiness, ReconcileState, SNAPSHOT_ROWS, UuidLookup};
 use crate::history::Conversation;
 use crate::search::query::ParsedQuery;
 use crate::search::{self, SearchableConversation};
@@ -286,11 +288,87 @@ impl Browser {
         }
     }
 
+    /// Shows the newest cards of `snapshot` until loading finishes (call it
+    /// on a loading browser before the load starts). Loaded batches are held
+    /// back meanwhile and swapped in when the load is installed, keeping the
+    /// selected session. No-op on a browser that is not loading or shows a
+    /// single file.
+    ///
+    /// At most [`SNAPSHOT_ROWS`] cards are materialized, in the current
+    /// scope (exclusions, workspace) and the snapshot's time filter; the
+    /// first row is selected and [`super::Readiness::list`] is set.
+    pub fn show_snapshot(&mut self, snapshot: crate::store::Snapshot) {
+        if !self.is_loading() || self.single_file_mode {
+            return;
+        }
+        if self.pending.is_none() {
+            // Rows that arrived before the cards (normally none) wait with
+            // the rest of the load.
+            self.pending = Some(std::mem::take(&mut self.conversations));
+        }
+        self.snapshot = Some(snapshot);
+        self.show_snapshot_cards();
+    }
+
+    /// Re-reads the snapshot cards for the current scope. The cards are in
+    /// scope by construction ([`CardScope`]), so the scope index marks every
+    /// card without evaluating any (no canonicalization per Pi/OMP card).
+    pub(super) fn show_snapshot_cards(&mut self) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let scope = CardScope::new(&self.excluded_projects, self.effective_workspace());
+        let cards: Vec<Arc<Conversation>> = snapshot
+            .conversations(SNAPSHOT_ROWS, |project| scope.project_visible(project))
+            .into_iter()
+            .map(Arc::new)
+            .collect();
+        let mut index = CorpusIndex::build(&cards, None);
+        index.scope = ScopeIndex::all(cards.len(), self.scope_settings());
+        let filtered = (0..cards.len()).collect();
+        self.conversations = Arc::new(cards);
+        self.index = index;
+        self.uuid_lookup = None;
+        self.lexical_evidence.clear();
+        self.apply_filtered(filtered);
+        self.readiness.list = true;
+    }
+
+    /// The conversations a running load has delivered: the batches held
+    /// back behind the snapshot cards, else the loading rows.
+    pub(super) fn loading_corpus(&self) -> CorpusSnapshot {
+        self.pending
+            .clone()
+            .unwrap_or_else(|| self.conversations.clone())
+    }
+
+    /// Leave the snapshot cards before the loaded corpus is installed: drops
+    /// the cards' snapshot (unmapping it) and the held-back batches (the
+    /// prepared corpus holds them), and returns the session to keep
+    /// selected. `None` when no cards were shown.
+    fn leave_snapshot(&mut self) -> Option<Option<PathBuf>> {
+        self.pending.take()?;
+        self.snapshot = None;
+        Some(
+            self.selection_anchor
+                .take()
+                .or_else(|| self.selected_path()),
+        )
+    }
+
     /// Append a batch of conversations during loading, unsorted, in arrival
     /// order. The batch is filtered by exclusions and scope (not by the
     /// query) and the first row is selected if nothing was. The search
-    /// index is built when loading finishes.
+    /// index is built when loading finishes. While snapshot cards are shown
+    /// the batch is held back until then.
     pub fn append_conversations(&mut self, new_convs: Vec<Conversation>) {
+        if let Some(pending) = &mut self.pending {
+            Arc::make_mut(pending).extend(new_convs.into_iter().map(Arc::new));
+            self.readiness.reconcile = ReconcileState::Running {
+                loaded: pending.len(),
+            };
+            return;
+        }
         let start_idx = self.conversations.len();
         self.corpus_mut()
             .extend(new_convs.into_iter().map(Arc::new));
@@ -306,22 +384,22 @@ impl Browser {
             self.selected = Some(0);
         }
 
-        // Update loading count
-        self.loading_state = LoadingState::Loading {
+        self.readiness.reconcile = ReconcileState::Running {
             loaded: self.conversations.len(),
         };
     }
 
     /// Mark loading as complete: sort newest first, reindex, build the
     /// search index, apply the query typed while loading (selection resets
-    /// to the first row), then dispatch the semantic search or prewarm.
+    /// to the first row, or stays on the selected snapshot card's session),
+    /// then dispatch the semantic search or prewarm.
     ///
     /// Synchronous convenience: it runs [`Browser::prepare_corpus`] on the
     /// caller's thread. [`HistoryLoader`](super::HistoryLoader) prepares on
     /// a worker thread instead.
     pub fn finish_loading(&mut self) {
         let context = self.prepare_context(false);
-        let prepared = Self::prepare_shared(self.conversations.clone(), false, Some(context));
+        let prepared = Self::prepare_shared(self.loading_corpus(), false, Some(context));
         self.finish_with(prepared);
     }
 
@@ -349,8 +427,13 @@ impl Browser {
         self.install_prepared(prepared);
     }
 
-    /// Finish a load with a prepared corpus.
+    /// Finish a load with a prepared corpus. Replaces any snapshot cards,
+    /// keeping the selected session (upstream `finish_loading`).
     fn finish_with(&mut self, prepared: PreparedCorpus) {
+        // The held-back batches go first (the prepared corpus holds them,
+        // and `set_corpus` can then index them in place); the cards stay
+        // the rows until `set_corpus`, for the replay of edits made on them.
+        let card_anchor = self.leave_snapshot();
         let prepared = self.replay_corpus_edits(prepared);
         self.set_corpus(prepared);
 
@@ -359,10 +442,17 @@ impl Browser {
         // results arrive, so stale indices would show (and select) the
         // wrong, possibly excluded, conversations. Upstream kept them.
         self.filtered = self.scope_rows();
-        self.selected = (!self.filtered.is_empty()).then_some(0);
-        self.selection_anchor = None;
-        self.loading_state = LoadingState::Ready;
+        let anchor = card_anchor.flatten();
+        self.selected = anchor
+            .as_deref()
+            .and_then(|anchor| self.row_of_path(&self.filtered, anchor))
+            .or_else(|| (!self.filtered.is_empty()).then_some(0));
+        self.readiness = Readiness::ready();
         self.corpus_changed();
+        // Snapshot cards: the selected session stays selected through the
+        // query below (its results select it again when they contain it).
+        // Without cards the first row is selected (L-003).
+        self.selection_anchor = anchor;
 
         // Apply the query typed while loading (exclusions and scope are
         // already applied).
@@ -371,6 +461,10 @@ impl Browser {
             self.dispatch_search();
         } else {
             self.prewarm_semantic_cache();
+        }
+        if !self.search_in_flight {
+            // Applied already (browse, UUID jump): no later result set needs it.
+            self.selection_anchor = None;
         }
     }
 
@@ -492,9 +586,9 @@ impl Browser {
         ));
         if !indexed {
             if self.is_loading() {
-                // The loading rows are the prepared conversations: dropping
-                // them only releases pointers, and lets the reindex below
-                // write in place.
+                // The loading rows are the prepared conversations (or at
+                // most `SNAPSHOT_ROWS` cards): dropping them only releases
+                // pointers, and lets the reindex below write in place.
                 previous = None;
             }
             // A refresh shares only the few replayed or carried

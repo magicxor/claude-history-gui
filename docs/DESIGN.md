@@ -347,7 +347,7 @@ artifact names, toolchain pinned.
 | AD3 | `Home`/`End` in the list = first/last row (TUI), via `ConversationList > Input` duplicates. Caret home/end: `ctrl-home`/`ctrl-end`. | TUI parity. |
 | AD4 | PageUp/PageDown move by the number of visible rows; Ctrl+D by half of that. | LIST quirk 4 [fix]. |
 | AD5 | Mouse wheel scrolls the list viewport (does not move the selection). | Desktop convention; virtual list (LIST quirk 5 [fix]). |
-| AD6 | Viewing (click/Enter → viewer) is allowed while loading; Resume/Fork/Rename/Delete/Ctrl+O stay disabled while loading (hints dimmed). | Capture-at-open makes viewing safe; destructive parity kept. |
+| AD6 | Viewing (click/Enter → viewer) is allowed while loading. Resume/Fork/Ctrl+O work once the rows are listed newest first (`Readiness::list`: the startup snapshot's cards, §11.2, upstream 3708bb6), else they wait for the load; Rename/Delete stay disabled until the load ends. Hints and row-menu items are dimmed/disabled accordingly. | Capture-at-open makes viewing safe; cards carry the path, source and project resume needs; edits wait like upstream's (the loader may be reading the files). |
 | AD7 | In-viewer search matches over the rendered segment text (no ledger chrome) and counts occurrences, `i/n` = occurrence index; state machine = core `view::ViewSearch<SegMatch>`. | PD7; fixes VIEW quirk 12. |
 | AD8 | Rename (F2) and Refresh also work from the viewer (additive). | Menus work everywhere; no conflict. |
 | AD9 | Generate semantic cache always uses the whole corpus (fresh load, no time filter), so core's `GENERATE_WITH_TIME_FILTER_ERROR` never triggers. | The GUI loads independently of the list filter. |
@@ -442,7 +442,7 @@ truth.
 | `env` | `HistoryEnv { home_dir, claude_config_dir, pi_coding_agent_dir, pi_coding_agent_session_dir, pi_config_dir, omp_profile, pi_profile, xdg_data_home, path_var, pathext, workspace_dir, cache_root, config_file, gui_config_file, debug_log_file }` (+ `env_path_base`, K16: `with_env_path_base`, `launch_base_dir()`, `env_value_base_dir()`; `main` sets it to the launch cwd), `from_process_env()` (main only), `sandbox(root)`, `with_workspace`, `claude_dir()`, `claude_projects_root()`, `claude_projects_dir_for(dir)`, `cache_root()`, `semantic_cache_dir()`, `embedding_cache_file()`, `semantic_model_dir()`, `config_file()`, `gui_config_file()`, `debug_log_file()`, `workspace()`, `resolve_program(name, override)`; `WorkspaceScope { dir, project_dir_name }`, `WorkspaceScope::new`, `canonical_dir()`; `STATE_DIR_NAME`, `CACHE_DIR_NAME` |
 | `config` | `ConfigFile`, `GuiConfigFile`, `GuiSettings { theme, terminal, claude_path, pi_path, omp_path, default_workspace, restore_session }`, `LayeredConfig { cli, gui_file, effective, gui }`, `load_config_from(path)`, `load_gui_config_from(path)` (loaded **independently**, §11.1), `ConfigFile::overlaid_with(&GuiConfigFile)`, `save_gui_config_changes` (K12), `KeyChord::{short_label, help_label, gpui_keystroke, config_string}`, `parse_key_binding`, `KeyBindings { resume, fork, rename, delete, refresh }` + `from_config`, `conflicts_with_ctrl_t`, `AgentScopeConfig`, `AgentConfig` |
 | `settings` | `parse_launch_args(args) -> Result<LaunchCommand, LaunchArgsError>` (`LaunchCommand::{Run(GuiLaunchArgs), Help, Version, DeleteEmpty { local, all, yes }, Update, Agent(AgentCli), SubcommandHelp(String)}`; K14/K15, `SubcommandHelp` added by WP-C: `update --help`, `delete-empty -h`, `help <subcommand>` → print the text, exit 0), `GuiLaunchArgs` (+`display_flags`, `search_mode_override`, `picker`, `time_filter`, `settings`, `validate`), `help_text(program)`, `effective_settings(config, flags, mode_override) -> EffectiveSettings { show_last, show_tools, tool_display, show_thinking, search_mode, list_search_mode, exclude_projects, keys, semantic_toggle_enabled, resume_default_args }`, `EffectiveSettings::initial_view_prefs()`, `initial_tool_display`, `PickerAction::{ShowPath, ShowId, Resume{fork}}`, `picker_output(action, conv)`, `session_id_from_path(path)` |
-| `browser` | `Browser` (`new_loading`, `append_conversations`, `set_query`, `escape -> EscapeOutcome`, `toggle_workspace_filter`, `set_workspace_filter`, `set_workspace`, `set_excluded_projects`, `toggle_list_search_mode`, `set_list_search_mode`, `poll`, `has_search_work_in_flight`, `filtered`, `row`, `selected`, `select*`, `select_half_page_down(viewport_rows)`, `selected_path`, `selected_conversation`, `has_multiple_sources`, `conversation_by_path`, `count_text`, `search_status_text`, `semantic_status_text`, `semantic_activity_status_text`, `semantic_error`, `semantic_progress`, `semantic_result_metadata[_for_selection]`, `lexical_evidence`, `row_preview_input`, `row_header_input`, `uuid_lookup`, `rename_prefill`, `workspace`, `has_project_context`, `list_search_mode`, `is_loading`, `loading_state`), `BrowserOptions` (+ builders, `embedder_factory`, `waker`, `semantic_available`), `HistoryLoader` (`new`, `start_initial_load`, `start_refresh`, `set_time_filter`, `is_running`, `is_refreshing`, `poll(&mut Browser) -> LoaderPoll` incl. `pending`), `LoaderOptions` (incl. `drain_budget`, default `DEFAULT_DRAIN_BUDGET` = 8 ms, upstream 93e17a5), `LoadEvent::{Loaded, NoHistory, LoadFailed, Refreshed, RefreshIncomplete, RefreshFailed, RefreshInterrupted}` (+`status_message`), `ListSearchMode`, `SemanticProgress`, `SemanticResultMetadata`, `UuidLookup`, `RenameError`, `DeleteError`, `Waker`, `SemanticEmbedderFactory`, `query_has_literals`; K1–K4, K6, K18 additions |
+| `browser` | `Browser` (`new_loading`, `append_conversations`, `set_query`, `escape -> EscapeOutcome`, `toggle_workspace_filter`, `set_workspace_filter`, `set_workspace`, `set_excluded_projects`, `toggle_list_search_mode`, `set_list_search_mode`, `poll`, `has_search_work_in_flight`, `filtered`, `row`, `selected`, `select*`, `select_half_page_down(viewport_rows)`, `selected_path`, `selected_conversation`, `has_multiple_sources`, `conversation_by_path`, `count_text`, `search_status_text`, `semantic_status_text`, `semantic_activity_status_text`, `semantic_error`, `semantic_progress`, `semantic_result_metadata[_for_selection]`, `lexical_evidence`, `row_preview_input`, `row_header_input`, `uuid_lookup`, `rename_prefill`, `workspace`, `has_project_context`, `list_search_mode`, `is_loading`, `readiness() -> Readiness { list, lexical, reconcile: ReconcileState::{Running { loaded }, Done}, semantic }`, `show_snapshot(store::Snapshot)`, `shows_snapshot`; upstream 3708bb6 replaced `loading_state`), `SNAPSHOT_ROWS`, `BrowserOptions` (+ builders, `embedder_factory`, `waker`, `semantic_available`), `HistoryLoader` (`new`, `reconfigure`, `start_initial_load`, `start_refresh`, `set_time_filter`, `is_running`, `is_refreshing`, `open_snapshot`, `finish_snapshot_write`, `poll(&mut Browser) -> LoaderPoll` incl. `pending`), `LoaderOptions` (incl. `drain_budget`, default `DEFAULT_DRAIN_BUDGET` = 8 ms, upstream 93e17a5; `snapshot`, default off, 3708bb6), `LoadEvent::{Loaded, NoHistory, LoadFailed, Refreshed, RefreshIncomplete, RefreshFailed, RefreshInterrupted}` (+`status_message`), `ListSearchMode`, `SemanticProgress`, `SemanticResultMetadata`, `UuidLookup`, `RenameError`, `DeleteError`, `Waker`, `SemanticEmbedderFactory`, `query_has_literals`; K1–K4, K6, K18 additions |
 | `display_format` | `build_row_header(&RowHeaderInput) -> RowHeader { project, custom_title, summary, message_count, semantic_score, duration, timestamp, recency, .. }`, `build_row_preview(&RowPreviewInput) -> RowPreview { preview, source, context }`, `HighlightQuery` (`parse`, `needs_literal_context`, `match_ranges`), `HighlightedText`, `Recency`, `format_model_name`, `format_tokens`, `format_tokens_long`, `format_msg_count_long`, `format_duration_minutes`, `format_header_timestamp`, `semantic_row_metadata`, `semantic_rationale_label`, `sanitize_preview` |
 | `view` | `ViewerModel { path, entries, prefs, expanded }` (`open`, `from_entries`, `cycle_tool_display`, `toggle_thinking`, `toggle_timing`, `toggle_expanded`, `document`, `export_options`, `session_id`, `message_text`, `plain_display`), `ViewPrefs`, `ToolDisplayMode` (+`next`, `status_label`), `ConversationDocument` (`navigable_indices`, `navigable_entry_indices`, `nav_position`, `message_at_nav_position`), `DocMessage`, `DocMessageKind`, `DocBlock` (`toggle_id`, `tool_output_id`, `plain_text`), `DocBlockKind`, `DocTiming`, `Fold`, `DocToolCall`, `DocToolResult`, `DocSubagentToolResult`, `ToolBodyLine`, `BodyLineKind`, `LabelRole` (+`color`), `ToolOutputId`, `fitted_name`, `NAME_WIDTH`, `TRUNCATED_BODY_LINES`, `TRUNCATED_RESULT_LINES`, `MessageNav`, `ViewSearch<M>`, `ViewSearchMode`, `escape -> ViewEscape`, `capture_anchor_entry`, `find_entry_or_prev`; K5, K9 additions |
 | `export` | `ExportFormat::{ALL, from_index, index, label, extension}`, `ExportOptions`, `generate_export`, `export_to_path -> Result<(), ExportError>`, `default_export_file_name`, `plain_display(path, options)`, `exported_status`, constants `COPIED_TO_CLIPBOARD`, `MESSAGE_COPIED_TO_CLIPBOARD`, `NO_TEXT_CONTENT`, `MESSAGE_NOT_FOUND`, `PATH_COPIED_TO_CLIPBOARD`, `SESSION_ID_COPIED_TO_CLIPBOARD`; K11 |
@@ -658,7 +658,8 @@ selection (A1). Right-click also selects and previews the row (the list keeps fo
 └──────────────────────────────┘
 ```
 Shortcut labels come from the live keymap. Items that need a known source (Resume, Fork, Rename, Delete) are
-disabled for targets with an unknown source; while loading they are disabled (AD6).
+disabled for targets with an unknown source. While loading, Rename and Delete are disabled, and Resume and Fork until
+the rows are listed newest first (snapshot cards, AD6).
 
 ### 5.3 Workspace picker and time filter dropdowns
 ```
@@ -1754,8 +1755,9 @@ Five actions — **Resume, Fork, Rename, Delete, Refresh** — take their keystr
 (`gui.toml [keys]` > `config.toml [keys]` > defaults ctrl+r, ctrl+f, f2, ctrl+x, ctrl+l; core
 `settings::EffectiveSettings::keys`). Each is registered in `ConversationList && !ListToolbar`, `ConversationList >
 Input` and `Viewer && !Input` (`keymap::USER_BINDING_CONTEXTS`; AD8 adds Rename/Refresh in the viewer). Single-file windows have no handler for
-Resume/Fork/Rename/Delete → menu items disabled (parity). While loading, Resume/Fork/Rename/Delete and SelectAndExit
-handlers return early and their hints are dimmed (AD6).
+Resume/Fork/Rename/Delete → menu items disabled (parity). While loading, the Rename/Delete handlers return early and
+their hints are dimmed; Resume/Fork/SelectAndExit (and the open hint) only until the rows are listed newest first
+(`ListPane::list_ready`, snapshot cards; AD6).
 
 Validation and warnings (Settings → Keys, also applied at startup):
 * Errors (binding rejected, previous value kept): core `parse_key_binding` messages (`Unknown modifier: …`,
@@ -1809,8 +1811,9 @@ Static rows such as `f5 → Refresh` are never removed by a rebinding (C-034). N
 * Footer/status hints use `Kbd::binding_for_action(&A, Some(ctx), window)` and render nothing when `None`. Hints
   are shown only for the region that has focus, after state (counts, activity), in priority order; chips that do
   not fit the measured width are dropped from the lowest priority up; `F1 help` always stays.
-  * List footer (priority order): `⏎ open`, Resume `resume`, Fork `fork`, Rename `rename`, Delete `delete` (these
-    five dimmed while loading), `Tab All|Prj` (only with a workspace; active value accent/bold), `Ctrl+T lex|sem`
+  * List footer (priority order): `⏎ open`, Resume `resume`, Fork `fork`, Rename `rename`, Delete `delete`
+    (open/resume/fork dimmed until the rows are listed (`ListPane::list_ready`), rename/delete while loading),
+    `Tab All|Prj` (only with a workspace; active value accent/bold), `Ctrl+T lex|sem`
     (only when ToggleSearchMode is bound; active value accent/bold), `F1 help`; picker mode puts `Esc cancel` first.
     Semantic activity or the refresh indicator replaces the hints (TUI parity).
   * Viewer status (priority order, search inactive): `/ search`, `e export`, `y yank`, Resume `resume`, Fork `fork`,
@@ -2217,14 +2220,31 @@ recorded each frame (for the keyboard context menu position).
 4. After the first frame (`cx.defer`): one configuration-error dialog per failing file (§5.20); startup tool (AD14:
    `run_startup_tool`); QA runner start (feature `qa`); `login-shell-path` probe (macOS/Linux when not started from a
    terminal, §14.2).
-5. `ListPane::new` starts the initial load (§11.2) immediately.
+5. `ListPane::new` opens the store's list snapshot and starts the initial load (§11.2) immediately: with a usable
+   generation the first frame already lists the newest conversations.
 
 ### 11.2 Initial load (streaming)
 1. `ListPane::new`: `browser = Browser::new_loading(BrowserOptions::new(env).with_show_last(settings.show_last)
    .with_default_mode(app.list_mode).with_exclude_projects(settings.exclude_projects).with_workspace(workspace)
    .with_workspace_filter(args.local && workspace.is_some()).with_waker(waker).with_embedder_factory(shared.browser_factory()))`;
-   `loader = HistoryLoader::new(env, LoaderOptions::new(show_last).with_debug_level(level).with_time_filter(launch.time_filter).with_waker(waker))`;
-   `loader.start_initial_load()`. `level` = `--debug` level, else the Debug log dialog's selector (default Info).
+   `loader = HistoryLoader::new(env, LoaderOptions::new(show_last).with_debug_level(level).with_time_filter(launch.time_filter).with_waker(waker).with_snapshot(true))`;
+   `if let Some(s) = loader.open_snapshot() { browser.show_snapshot(s) }`; `loader.start_initial_load()`. `level` =
+   `--debug` level, else the Debug log dialog's selector (default Info). The snapshot option is on unless the
+   `ListSnapshots(false)` global says otherwise (G tests; see §13.4 for the store).
+   * **Startup snapshot (upstream 3708bb6).** `open_snapshot` maps the store's `CURRENT` generation (`None` on the
+     first run, after corruption or a format change: the rows then stream in as below). `show_snapshot` lists at most
+     `SNAPSHOT_ROWS` (500) cards, newest first, in the current scope (exclusions; Claude directory name or canonical
+     Pi/OMP project path, W1) and the launch time filter, and selects the first: `Readiness::list` is set, so Open,
+     Resume, Fork and Ctrl+O work on them (AD6), while the view stays `Loading` (Rename/Delete wait; the suffix reads
+     `Loading… <n>` from `Readiness::reconcile`). Batches are held back behind the cards (`Browser::pending`) instead of
+     being appended; Tab and workspace/exclusion changes re-read the cards. The K1 preparation prepares the held-back
+     batches, and the install swaps them in at once keeping the selected card's session (no new `SelectionChanged`,
+     so the viewer keeps its conversation; `CorpusChanged` refreshes its header). A query typed over cards is applied
+     after the swap through the worker.
+   * After `Loaded` of a complete initial load (no project error, not interrupted, no time filter) core writes the
+     loaded corpus as a new generation on a `snapshot-writer` thread (nothing when it matches `CURRENT`); refreshes
+     and reloads never write. Reloads reconfigure the loader (`HistoryLoader::reconfigure`) instead of replacing it, so
+     the UI thread never waits for the write; dropping the loader at quit joins it.
 2. Waker → `_poll_task` → `poll_all(cx)`: `let p = loader.poll(&mut browser)` (appends batches; at the end the K1
    preparation runs on `corpus-prepare` and a later poll installs it) then `browser.poll()`; notify once. One poll
    appends batches for at most `LoaderOptions::drain_budget` (8 ms, upstream 93e17a5; at least one batch): a batch
@@ -2233,7 +2253,8 @@ recorded each frame (for the keyboard context menu position).
    one batch per project) concurrently with Pi then OMP (first row alone, then batches of 32, deduplicated Pi-first);
    batches from both arrive interleaved.
 3. On `p.event`:
-   * `Loaded { project_errors }` → selection row 0 → `SelectionChanged`; `project_errors > 0` → warning toast
+   * `Loaded { project_errors }` → selection row 0 (the selected card's session after snapshot cards) →
+     `SelectionChanged` when it changed; `project_errors > 0` → warning toast
      `N project(s) could not be loaded. See Tools → Debug log.`; `CorpusChanged`, `LoadStateChanged`; project paths
      for the workspace picker recomputed in the background.
    * `NoHistory(e)` → empty view with `e` text (`No conversation history found in selected scope[ within the
@@ -2317,7 +2338,7 @@ the worker (§9.6); Active search `refresh`ed. Clicking an expandable control al
 5. Pending searches: core keeps indices consistent (F8).
 
 ### 11.10 Resume / Fork
-1. Capture `target`; loading, unknown source or single-file → no-op.
+1. Capture `target`; loading before the rows are listed (`list_ready`), unknown source or single-file → no-op.
 2. `conv` = `list.conversation(&target.path)` (live `project_path`) or, when not in the corpus, a background
    `process_conversation_file` → `ResumeTarget`.
 3. `plan = core::resume::plan_resume(&env, &conv, workspace.as_ref(), fork, &settings.resume_default_args,
@@ -2359,8 +2380,8 @@ found: <p>` / `Not a file: <p>` → window opens in an error state), open `Singl
 the app quits when no windows remain.
 
 ### 11.13 Picker mode and Ctrl+O
-1. Ctrl+O / Select (not while loading; no selection → nothing): ListPane flushes the pending preview, captures the
-   target → `ops::select::select_and_exit(target, window, cx)`.
+1. Ctrl+O / Select (not before the rows are listed; no selection → nothing): ListPane flushes the pending
+   preview, captures the target → `ops::select::select_and_exit(target, window, cx)`.
 2. Picker ShowPath/ShowId → `settings::picker_output(action, conv)` → `exit::quit_with_output(line + "\n")`
    (`services.write_stdout`, flush, `cx.quit()`, exit 0). Error → stderr `Error: <e>`, exit 1. No stdout → toast
    `Nothing to print to …` and stay open.
@@ -2681,6 +2702,7 @@ ignored).
 | Claude data | `$CLAUDE_CONFIG_DIR` or `<home>/.claude` (read; written by rename/delete/fork-copy/delete-empty) |
 | Pi / OMP sessions | per core loaders (`PI_*`, `OMP_PROFILE`, `XDG_DATA_HOME`, relative values against the launch cwd (K16), workspace `.pi/settings.json`) |
 | GUI caches | `<home>/.cache/claude-history-gui/{projects,config-<hash>/projects,pi,omp,semantic,launch}` |
+| List snapshot (store) | `<home>/.cache/claude-history-gui[/config-<hash>]/v3/` (`store::default_root`): `LOCK`, `CURRENT`, `gNNNNNN/manifest` (cards newest first; read for the first frame, written after a complete initial load, §11.2; upstream's format) |
 | Embedding model | `<home>/.cache/claude-history-gui/semantic/fastembed` |
 | CLI config | `<home>/.config/claude-history/config.toml` (read-only) |
 | GUI config | `<home>/.config/claude-history/gui.toml` |
@@ -2870,7 +2892,8 @@ resize 1280 820
 quit 0
 ```
   Probe keys (`qa/probe.rs`, read-only accessors on the panes): `list.count`, `list.loaded`, `list.loading`,
-  `list.query`, `list.mode`, `list.scope`, `list.selected_title`, `list.selected_path`, `list.ui_busy_max`,
+  `list.ready` (rows listed newest first and actionable: snapshot cards while loading), `list.snapshot` (the rows are
+  snapshot cards), `list.query`, `list.mode`, `list.scope`, `list.selected_title`, `list.selected_path`, `list.ui_busy_max`,
   `viewer.path`, `viewer.items`, `viewer.messages`, `viewer.nav_focus`, `viewer.indicator`, `viewer.search.count`,
   `viewer.search.current`, `viewer.tool_display`, `viewer.thinking`, `viewer.timing`, `viewer.frame_p95`,
   `focus` (list|viewer|agent|deep|dialog|none), `dialog` (open dialog id or none), `toast.last`, `clipboard`,
@@ -2946,6 +2969,11 @@ precondition (no O(corpus) work on the UI thread: e.g. K1/K2/K3 paths are async,
 * **List** (`perf-list.qa`, synthetic 20k-row sandbox via `synth::corpus`): UI-thread time ≤ 16 ms at load end
   (install), ≤ 16 ms at refresh end, ≤ 5 ms for rename apply, ≤ 5 ms for delete removal, ≤ 2 ms for a UUID paste,
   ≤ 2 ms per typed key; idle CPU ≈ 0 over 60 s (no timer besides the 30 s ticker).
+* **First rows** (upstream 3708bb6; not gated yet): with a snapshot, the first frame lists the newest cards.
+  `ListPane::new` maps and validates the manifest (linear in its rows, memory only) and builds at most 500 cards on
+  the UI thread before the first frame (upstream measured 7.7 ms to the populated first frame); re-reading the cards
+  on a scope change is the same bounded work. The swap at load end is the K1 install (the target above); the snapshot
+  write runs on `snapshot-writer`.
 * **Viewer** (`perf-viewer.qa`, synthetic 10k messages with 20 tool outputs of 5,000 lines, opened in Full mode):
   first content ≤ 3.5 s after open; install ≤ 50 ms UI time; page-through avg ≤ 12 ms, p95 ≤ 20 ms; idle frame ≤ 3 ms;
   toggle `t`/`T` ≤ 60 ms UI time; first search ≤ 60 ms; working set ≤ 400 MB, and within ±10% after opening 20

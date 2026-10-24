@@ -9,6 +9,17 @@
 //! appends batches for at most [`LoaderOptions::drain_budget`] and leaves
 //! the rest to the next poll (upstream `tui/runtime.rs` stops draining the
 //! loader channel after 8 ms so a frame can render between batches).
+//!
+//! With [`LoaderOptions::snapshot`] on, the loader also does what upstream's
+//! runtime `SnapshotStore` did: [`HistoryLoader::open_snapshot`] opens the
+//! store's current generation for the first frame
+//! ([`Browser::show_snapshot`]), and once the initial load is installed a
+//! `snapshot-writer` thread writes the loaded corpus as a new generation
+//! (nothing when it matches `CURRENT`). Only a complete initial load (no
+//! project error, not interrupted) without a time filter is the whole
+//! corpus, so nothing else is written; refreshes never write (upstream
+//! wrote after the initial load only). The write is joined on drop, and by
+//! [`HistoryLoader::finish_snapshot_write`].
 
 use super::corpus::corpus_edit_mark;
 use super::{Browser, PreparedCorpus, Waker};
@@ -19,7 +30,8 @@ use crate::history::{Conversation, LoaderMessage};
 use crate::time_filter::TimeFilter;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::time::{Duration, Instant};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime};
 
 /// Status shown when a refresh starts (upstream wording).
 pub const REFRESHING_STATUS: &str = "Refreshing sessions...";
@@ -52,6 +64,11 @@ pub struct LoaderOptions {
     /// are not batches never wait. `None` drains everything in one poll.
     /// Default [`DEFAULT_DRAIN_BUDGET`].
     pub drain_budget: Option<Duration>,
+    /// Use the store's list snapshot under [`crate::store::default_root`]:
+    /// [`HistoryLoader::open_snapshot`] reads it, and a complete initial
+    /// load writes it. Off by default (tests and tools); the GUI turns it on
+    /// for its main window.
+    pub snapshot: bool,
 }
 
 impl Default for LoaderOptions {
@@ -70,6 +87,7 @@ impl LoaderOptions {
             time_filter: TimeFilter::default(),
             waker: None,
             drain_budget: Some(DEFAULT_DRAIN_BUDGET),
+            snapshot: false,
         }
     }
 
@@ -92,6 +110,11 @@ impl LoaderOptions {
         self.drain_budget = budget;
         self
     }
+
+    pub fn with_snapshot(mut self, snapshot: bool) -> Self {
+        self.snapshot = snapshot;
+        self
+    }
 }
 
 impl std::fmt::Debug for LoaderOptions {
@@ -102,6 +125,7 @@ impl std::fmt::Debug for LoaderOptions {
             .field("time_filter", &self.time_filter)
             .field("waker", &self.waker.is_some())
             .field("drain_budget", &self.drain_budget)
+            .field("snapshot", &self.snapshot)
             .finish()
     }
 }
@@ -223,9 +247,15 @@ enum LoadKind {
 
 /// The event an installed preparation reports.
 enum Ending {
-    Loaded { project_errors: usize },
+    /// `complete`: the stream ended with `Done` (not a dropped loader).
+    Loaded {
+        project_errors: usize,
+        complete: bool,
+    },
     LoadFailed(AppError),
-    Refreshed { project_errors: usize },
+    Refreshed {
+        project_errors: usize,
+    },
 }
 
 struct Streaming {
@@ -252,7 +282,13 @@ struct ActiveLoad {
     /// [`corpus_edit_mark`] when the load started: rows the browser
     /// deletes or renames from then on are replayed on its corpus.
     edit_mark: u64,
+    /// When the load started: files modified after it may have changed
+    /// after they were read (the snapshot's fingerprints).
+    loaded_since: SystemTime,
 }
+
+/// A running write of the list snapshot.
+type SnapshotWriter = JoinHandle<std::io::Result<crate::store::Publish>>;
 
 /// Runs the streaming history loader and applies its messages to a
 /// [`Browser`].
@@ -277,6 +313,8 @@ pub struct HistoryLoader {
     env: Arc<HistoryEnv>,
     options: LoaderOptions,
     active: Option<ActiveLoad>,
+    /// The `snapshot-writer` thread of the last initial load.
+    writer: Option<SnapshotWriter>,
     /// Tests: the next preparation waits for a message on this channel.
     #[cfg(test)]
     prepare_gate: Option<Receiver<()>>,
@@ -288,6 +326,7 @@ impl HistoryLoader {
             env,
             options,
             active: None,
+            writer: None,
             #[cfg(test)]
             prepare_gate: None,
         }
@@ -295,6 +334,70 @@ impl HistoryLoader {
 
     pub fn options(&self) -> &LoaderOptions {
         &self.options
+    }
+
+    /// Use `env` and `options` for the next loads (a new workspace, debug
+    /// level or preview mode). A running snapshot write goes on and is
+    /// still joined on drop, so replacing the settings never waits for it.
+    /// Call it while no load runs; a running load keeps its stream.
+    pub fn reconfigure(&mut self, env: Arc<HistoryEnv>, options: LoaderOptions) {
+        self.env = env;
+        self.options = options;
+    }
+
+    /// The store's current list snapshot, for the first frame
+    /// ([`Browser::show_snapshot`], upstream `SnapshotStore::open`), read
+    /// with the options' preview mode and time filter. `None` unless
+    /// [`LoaderOptions::snapshot`] is on, or without a usable generation
+    /// (first run, corruption, version mismatch): startup then streams.
+    pub fn open_snapshot(&self) -> Option<crate::store::Snapshot> {
+        if !self.options.snapshot {
+            return None;
+        }
+        crate::store::Snapshot::open(
+            &crate::store::default_root(&self.env)?,
+            self.options.show_last,
+            self.options.time_filter,
+        )
+    }
+
+    /// Waits for a pending snapshot write so it is not cut short (upstream
+    /// `SnapshotStore::finish`) and returns its outcome. A failed write is
+    /// logged to the debug log and returns `None`, as does no write.
+    pub fn finish_snapshot_write(&mut self) -> Option<crate::store::Publish> {
+        let result = self.writer.take()?.join().ok()?;
+        result
+            .map_err(|err| {
+                if let Some(log_path) = self.env.debug_log_file() {
+                    let _ = crate::debug_log::log_debug(
+                        &log_path,
+                        &format!("Failed to write list snapshot: {err}"),
+                    );
+                }
+            })
+            .ok()
+    }
+
+    /// Writes the loaded corpus in the background (upstream
+    /// `SnapshotStore::write`), after the install so that edits replayed on
+    /// it are included.
+    fn write_snapshot(&mut self, browser: &Browser, loaded_since: SystemTime) {
+        if !self.options.snapshot || self.writer.is_some() {
+            return;
+        }
+        let Some(root) = crate::store::default_root(&self.env) else {
+            return;
+        };
+        let conversations = browser.corpus_snapshot();
+        self.writer = std::thread::Builder::new()
+            .name("snapshot-writer".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let result = crate::store::write_snapshot(&root, &conversations, loaded_since);
+                crate::bench::mark("snapshot_write");
+                result
+            })
+            .ok();
     }
 
     /// The time filter of the next load.
@@ -387,6 +490,7 @@ impl HistoryLoader {
             }),
             time_filter_active: self.options.time_filter.is_active(),
             edit_mark,
+            loaded_since: SystemTime::now(),
         });
     }
 
@@ -467,12 +571,25 @@ impl HistoryLoader {
                 let Phase::Preparing(preparing) = active.phase else {
                     unreachable!();
                 };
-                result.event = Some(install(
+                // Only a complete load outside any time window is the whole
+                // corpus (upstream `SnapshotStore::write`).
+                let whole_corpus = matches!(
+                    preparing.ending,
+                    Ending::Loaded {
+                        project_errors: 0,
+                        complete: true
+                    }
+                ) && !active.time_filter_active;
+                let event = install(
                     browser,
                     prepared,
                     preparing.ending,
                     active.time_filter_active,
-                ));
+                );
+                if whole_corpus && matches!(event, LoadEvent::Loaded { .. }) {
+                    self.write_snapshot(browser, active.loaded_since);
+                }
+                result.event = Some(event);
             }
             Err(TryRecvError::Empty) => {
                 result.preparing = true;
@@ -487,7 +604,7 @@ impl HistoryLoader {
                 };
                 result.event = Some(match preparing.ending {
                     Ending::Refreshed { .. } => LoadEvent::RefreshInterrupted,
-                    Ending::Loaded { project_errors } => {
+                    Ending::Loaded { project_errors, .. } => {
                         browser.finish_loading();
                         loaded_event(browser, project_errors, active.time_filter_active)
                     }
@@ -562,13 +679,16 @@ fn drain_stream(
                     LoadKind::Refresh { .. } => StreamEnd::Event(LoadEvent::RefreshFailed(error)),
                 });
             }
-            Ok(LoaderMessage::Done) => return StreamState::Ended(stream_done(streaming, browser)),
+            Ok(LoaderMessage::Done) => {
+                return StreamState::Ended(stream_done(streaming, browser, true));
+            }
             Err(TryRecvError::Empty) => return StreamState::Running,
             Err(TryRecvError::Disconnected) => {
-                // Upstream treats a disconnected initial loader as done.
+                // Upstream treats a disconnected initial loader as done (but
+                // not as the whole corpus: no snapshot is written).
                 let initial = matches!(streaming.kind, LoadKind::Initial { .. });
                 return StreamState::Ended(if initial {
-                    stream_done(streaming, browser)
+                    stream_done(streaming, browser, false)
                 } else {
                     StreamEnd::Event(LoadEvent::RefreshInterrupted)
                 });
@@ -577,13 +697,14 @@ fn drain_stream(
     }
 }
 
-/// The stream finished normally.
-fn stream_done(streaming: &mut Streaming, browser: &Browser) -> StreamEnd {
+/// The stream finished (`complete`: with `Done`, not a dropped loader).
+fn stream_done(streaming: &mut Streaming, browser: &Browser, complete: bool) -> StreamEnd {
     match &mut streaming.kind {
         LoadKind::Initial { project_errors } => StreamEnd::Prepare(
             loading_rows_job(browser),
             Ending::Loaded {
                 project_errors: *project_errors,
+                complete,
             },
         ),
         LoadKind::Refresh {
@@ -618,9 +739,11 @@ fn stream_done(streaming: &mut Streaming, browser: &Browser) -> StreamEnd {
 }
 
 /// Prepare the loading rows of the browser (they stay visible meanwhile),
-/// with the rows in scope under its current settings.
+/// with the rows in scope under its current settings. While snapshot cards
+/// are shown, the batches held back behind them are prepared, never the
+/// cards.
 fn loading_rows_job(browser: &Browser) -> PrepareJob {
-    let snapshot = browser.corpus_snapshot();
+    let snapshot = browser.loading_corpus();
     let context = browser.prepare_context(false);
     Box::new(move || Browser::prepare_shared(snapshot, false, Some(context)))
 }
@@ -647,7 +770,7 @@ fn install(
     time_filter_active: bool,
 ) -> LoadEvent {
     match ending {
-        Ending::Loaded { project_errors } => {
+        Ending::Loaded { project_errors, .. } => {
             browser.install_prepared(prepared);
             loaded_event(browser, project_errors, time_filter_active)
         }
@@ -681,6 +804,14 @@ fn loaded_event(browser: &Browser, project_errors: usize, time_filter_active: bo
             conversations: browser.conversations().len(),
             project_errors,
         }
+    }
+}
+
+impl Drop for HistoryLoader {
+    /// Waits for a pending snapshot write so it is not cut short (upstream
+    /// joined it when the TUI exited).
+    fn drop(&mut self) {
+        self.finish_snapshot_write();
     }
 }
 

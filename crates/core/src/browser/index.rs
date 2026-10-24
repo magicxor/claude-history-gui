@@ -305,6 +305,60 @@ impl<'a> ScopeFilter<'a> {
     }
 }
 
+/// The scope test of a snapshot card's project (upstream
+/// `card_project_visible`): the card counterpart of [`ScopeFilter`], decided
+/// once per project of the generation instead of once per row.
+///
+/// * Exclusions match the project name like [`ScopeFilter`].
+/// * With a workspace, a Claude project is kept when its directory name is
+///   the same project as the workspace (worktree aware); a Pi/OMP project
+///   when its canonical path (stored by the writer) is the canonical
+///   workspace directory, both in comparable form (W1: the writer stored the
+///   raw `canonicalize()` output, `\\?\C:\...` on Windows). Upstream
+///   compared with the canonical process cwd.
+pub(super) struct CardScope<'a> {
+    excluded: &'a HashSet<String>,
+    workspace: Option<&'a WorkspaceScope>,
+    /// The workspace canonicalized once per card walk.
+    workspace_dir: Option<PathBuf>,
+}
+
+impl<'a> CardScope<'a> {
+    /// `workspace` is `None` when the workspace scope is off.
+    pub(super) fn new(
+        excluded: &'a HashSet<String>,
+        workspace: Option<&'a WorkspaceScope>,
+    ) -> Self {
+        Self {
+            excluded,
+            workspace,
+            workspace_dir: workspace.map(|workspace| comparable_dir(&workspace.canonical_dir())),
+        }
+    }
+
+    pub(super) fn project_visible(&self, project: &crate::store::ProjectView) -> bool {
+        if project
+            .name
+            .is_some_and(|name| project_is_excluded(name, self.excluded))
+        {
+            return false;
+        }
+        let Some(workspace) = self.workspace else {
+            return true;
+        };
+        if project.key_is_path {
+            !project.workspace_key.is_empty()
+                && self.workspace_dir.as_deref()
+                    == Some(comparable_dir(Path::new(project.workspace_key)).as_path())
+        } else {
+            crate::history::path::is_same_project(
+                project.workspace_key,
+                workspace.project_dir_name(),
+            )
+        }
+    }
+}
+
 /// `path` canonicalized when possible, in comparable form.
 fn comparable_canonical(path: &Path) -> PathBuf {
     comparable_dir(&path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
@@ -352,6 +406,18 @@ impl ScopeIndex {
             settings,
             rows: Arc::new(rows),
             member,
+        }
+    }
+
+    /// Every one of `len` conversations in scope, without evaluating them:
+    /// for rows already chosen under `settings` (snapshot cards, picked by
+    /// [`CardScope`]).
+    pub(super) fn all(len: usize, settings: ScopeSettings) -> Self {
+        Self {
+            valid: true,
+            settings,
+            rows: Arc::new((0..len).collect()),
+            member: vec![true; len],
         }
     }
 
@@ -718,6 +784,48 @@ mod tests {
         assert_eq!(items, [1, 2, 4, 5, 6, 7, 8]);
         assert_eq!(without_positions(&[1, 2, 3, 4], &[1, 2]), [1, 4]);
         assert_eq!(without_positions(&[1, 2, 3], &[]), [1, 2, 3]);
+    }
+
+    #[test]
+    fn card_scope_decides_per_project_like_the_row_filter() {
+        use crate::store::ProjectView;
+        fn project<'a>(name: Option<&'a str>, key: &'a str, key_is_path: bool) -> ProjectView<'a> {
+            ProjectView {
+                name,
+                workspace_key: key,
+                key_is_path,
+            }
+        }
+        let excluded: HashSet<String> = ["hidden".to_string()].into_iter().collect();
+        let all = CardScope::new(&excluded, None);
+        assert!(all.project_visible(&project(Some("app"), "-x-app", false)));
+        assert!(!all.project_visible(&project(Some("hidden"), "-x-hidden", false)));
+        assert!(
+            !all.project_visible(&project(Some("hidden/feature"), "-x-hidden", false)),
+            "a worktree of an excluded project"
+        );
+        assert!(all.project_visible(&project(None, "", true)));
+
+        let dir = if cfg!(windows) {
+            r"C:\no-such-dir\app"
+        } else {
+            "/no-such-dir/app"
+        };
+        let workspace = WorkspaceScope::new(dir).unwrap();
+        let scoped = CardScope::new(&excluded, Some(&workspace));
+        let encoded = workspace.project_dir_name();
+        assert!(scoped.project_visible(&project(Some("app"), encoded, false)));
+        assert!(!scoped.project_visible(&project(Some("api"), "-elsewhere-api", false)));
+        assert!(scoped.project_visible(&project(Some("app"), dir, true)));
+        assert!(
+            !scoped.project_visible(&project(Some("app"), "", true)),
+            "a Pi/OMP project without a path"
+        );
+        #[cfg(windows)]
+        assert!(
+            scoped.project_visible(&project(Some("app"), r"\\?\C:\no-such-dir\app", true)),
+            "W1: the writer's canonical spelling matches"
+        );
     }
 
     #[test]

@@ -1548,7 +1548,10 @@ fn exclude_projects_filters_incremental_loading() {
     ]);
 
     assert_eq!(filtered_projects(&app), vec![Some("Visible")]);
-    assert_eq!(app.loading_state(), &LoadingState::Loading { loaded: 2 });
+    assert_eq!(
+        app.readiness().reconcile,
+        ReconcileState::Running { loaded: 2 }
+    );
     assert_eq!(app.count_text(), "Loading... 2");
 }
 

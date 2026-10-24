@@ -90,14 +90,45 @@ pub struct SemanticResultMetadata {
     pub explanation: SemanticExplanation,
 }
 
-/// Loading state of the list.
+/// Which parts of the list are usable. Each part becomes ready on its own.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Readiness {
+    /// Rows are shown newest first and can be opened, resumed and forked.
+    /// They are snapshot cards until loading finishes.
+    pub list: bool,
+    /// Lexical queries run against the loaded corpus.
+    pub lexical: bool,
+    /// Progress of loading conversations from native history.
+    pub reconcile: ReconcileState,
+    /// The semantic worker can rank the loaded corpus.
+    pub semantic: bool,
+}
+
+impl Readiness {
+    pub fn ready() -> Self {
+        Self {
+            list: true,
+            lexical: true,
+            reconcile: ReconcileState::Done,
+            semantic: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum LoadingState {
-    /// Still loading conversations; `loaded` counts every conversation
-    /// received so far (including excluded ones).
-    Loading { loaded: usize },
-    /// All conversations loaded and ready.
-    Ready,
+pub enum ReconcileState {
+    /// Loading; `loaded` conversations have arrived so far (including
+    /// excluded ones).
+    Running {
+        loaded: usize,
+    },
+    Done,
+}
+
+impl Default for ReconcileState {
+    fn default() -> Self {
+        Self::Running { loaded: 0 }
+    }
 }
 
 /// Result of [`super::Browser::escape`] (upstream: Esc in the list).
@@ -268,5 +299,15 @@ mod tests {
             .status_message(),
             None
         );
+    }
+
+    #[test]
+    fn readiness_starts_loading_and_becomes_ready_at_once() {
+        let loading = Readiness::default();
+        assert!(!loading.list && !loading.lexical && !loading.semantic);
+        assert_eq!(loading.reconcile, ReconcileState::Running { loaded: 0 });
+        let ready = Readiness::ready();
+        assert!(ready.list && ready.lexical && ready.semantic);
+        assert_eq!(ready.reconcile, ReconcileState::Done);
     }
 }

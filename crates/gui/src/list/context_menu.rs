@@ -93,8 +93,17 @@ impl RowMenuModel {
 }
 
 /// The menu for `target` (§5.2). Resume, Fork, Rename and Delete need a known
-/// source and are disabled while the initial load runs (AD6).
-pub fn build(token: u64, target: &ConversationTarget, loading: bool, cx: &App) -> RowMenuModel {
+/// source. While the initial load runs (`loading`) Rename and Delete are
+/// disabled; Resume and Fork only until the rows are listed newest first
+/// (`list_ready`: snapshot cards, AD6, upstream 3708bb6).
+pub fn build(
+    token: u64,
+    target: &ConversationTarget,
+    loading: bool,
+    list_ready: bool,
+    cx: &App,
+) -> RowMenuModel {
+    let resume_disabled = !list_ready || !target.can_modify();
     let modify_disabled = loading || !target.can_modify();
     let item = |label: &'static str, item: RowMenuItem, disabled: bool| {
         let action = row_menu_action(item);
@@ -110,8 +119,8 @@ pub fn build(token: u64, target: &ConversationTarget, loading: bool, cx: &App) -
     };
     let mut entries = vec![
         item("Open", RowMenuItem::Open, false),
-        item("Resume", RowMenuItem::Resume, modify_disabled),
-        item("Fork", RowMenuItem::Fork, modify_disabled),
+        item("Resume", RowMenuItem::Resume, resume_disabled),
+        item("Fork", RowMenuItem::Fork, resume_disabled),
         item("Rename…", RowMenuItem::Rename, modify_disabled),
         item("Export…", RowMenuItem::Export, false),
         MenuEntry::Submenu {

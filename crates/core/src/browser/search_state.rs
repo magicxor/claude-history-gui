@@ -466,14 +466,14 @@ impl Browser {
         self.send_lexical_search(query, self.search_generation, ListSearchMode::Semantic);
     }
 
-    /// In semantic mode with an empty query (and not loading), ask the
-    /// semantic worker to load the model and embed the corpus in the
-    /// background.
+    /// In semantic mode with an empty query (and the semantic worker able
+    /// to rank the loaded corpus), ask the semantic worker to load the model
+    /// and embed the corpus in the background.
     pub(super) fn prewarm_semantic_cache(&mut self) {
         if self.semantic_search.available
             && self.list_search_mode == ListSearchMode::Semantic
             && self.query.trim().is_empty()
-            && !self.is_loading()
+            && self.readiness.semantic
         {
             self.dispatch_semantic_search(String::new(), true);
         }
@@ -766,6 +766,11 @@ impl Browser {
     fn scope_changed(&mut self) {
         self.semantic_sent_scope_signature = None;
         self.invalidate_search_generation();
+        if self.snapshot.is_some() {
+            // Snapshot cards are re-read for the new scope.
+            self.show_snapshot_cards();
+            return;
+        }
         // The one O(n) pass of a scope change: the rows in scope.
         self.ensure_scope();
         if self.is_loading() {

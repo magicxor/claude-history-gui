@@ -2036,6 +2036,17 @@ impl ViewerPane {
         if self.mode == ViewerMode::SingleFile && routing::is_main_window_only(action) {
             return false;
         }
+        // Cards can be opened while the initial load runs (AD6); like the
+        // list, Rename and Delete wait for the load (upstream 3708bb6 gates
+        // the viewer's delete key the same way).
+        if self.mode == ViewerMode::Main
+            && (action.as_any().is::<Rename>() || action.as_any().is::<Delete>())
+            && crate::globals::main_panes(cx)
+                .list()
+                .is_some_and(|list| list.read(cx).is_loading())
+        {
+            return true;
+        }
         let Some(target) = self.target.clone() else {
             notify::no_conversation_open(window, cx);
             return true;

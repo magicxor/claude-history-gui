@@ -10,9 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use claude_history_core::browser::{
-    HistoryLoader, ListSearchMode, LoadEvent, RefreshPolicy, UuidLookup,
-};
+use claude_history_core::browser::{ListSearchMode, LoadEvent, RefreshPolicy, UuidLookup};
 use claude_history_core::history::{self, Conversation};
 use claude_history_core::time_filter::TimeFilter;
 use claude_history_core::{HistoryEnv, WorkspaceScope};
@@ -432,12 +430,14 @@ impl ListPane {
         let level_changed = self.loader.options().debug_level != level;
         if changes.workspace.is_some() || level_changed {
             // The loader's environment carries the workspace (Pi's
-            // `<workspace>/.pi/settings.json`): a new loader with the same
-            // options; the Debug log level applies from this load on (T-022).
+            // `<workspace>/.pi/settings.json`): the same options in the new
+            // environment; the Debug log level applies from this load on
+            // (T-022). Reconfigured, not replaced: dropping the loader would
+            // wait for its snapshot write on the UI thread.
             let env = app_state(cx).env.clone();
             let mut options = self.loader.options().clone();
             options.debug_level = level;
-            self.loader = HistoryLoader::new(env.clone(), options);
+            self.loader.reconfigure(env.clone(), options);
             self.loader_env = env;
         }
         self.loader.set_time_filter(self.time_filter);
@@ -477,7 +477,7 @@ impl ListPane {
         let workspace = undo.workspace;
         update_app_state(cx, |state, _| state.set_workspace(workspace));
         let options = self.loader.options().clone();
-        self.loader = HistoryLoader::new(undo.env.clone(), options);
+        self.loader.reconfigure(undo.env.clone(), options);
         self.loader_env = undo.env;
     }
 

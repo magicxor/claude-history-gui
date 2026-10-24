@@ -39,6 +39,17 @@
 //! to be re-applied (end of a load, a rename, a scope change) is sent to the
 //! lexical worker while the current rows stay visible.
 //!
+//! # Snapshot cards
+//!
+//! A loading browser can show the newest cards of the store's generation
+//! snapshot ([`Browser::show_snapshot`], [`HistoryLoader::open_snapshot`])
+//! before the loader starts: at most [`SNAPSHOT_ROWS`] cards, newest first,
+//! in the current scope and time filter. They are the corpus until loading
+//! finishes ([`Readiness::list`] is set, [`Readiness::lexical`] is not);
+//! loaded batches are held back meanwhile and the install swaps them in at
+//! once, keeping the selected session by path. Toggling the scope or
+//! changing the workspace or exclusions re-reads the cards.
+//!
 //! # Differences from upstream
 //!
 //! Behavior is kept identical to the TUI except for these documented fixes
@@ -83,6 +94,15 @@
 //!   also forced lexical mode).
 //! * **Failed initial load.** [`LoadEvent::LoadFailed`] leaves the browser
 //!   ready, so [`HistoryLoader::start_refresh`] can retry (upstream exited).
+//! * **Snapshot cards.** The cards' workspace test is [`WorkspaceScope`]'s
+//!   (D2, W1), not the process cwd. They are swapped out by the install of
+//!   the prepared corpus (K1), not by a synchronous `finish_loading`. Core
+//!   does not refuse a rename or delete of a card: like any edit made while
+//!   loading, the install replays it on the loaded corpus (K1). The GUI
+//!   still disables both until loading finishes, as upstream's keys did.
+//!   The snapshot is written by [`HistoryLoader`] only when
+//!   [`LoaderOptions::snapshot`] is on (the GUI's production path; upstream
+//!   wrote it from its runtime unless built for tests).
 //!
 //! The other section-12 quirks are presentation or key handling and belong
 //! to the GUI (1-5, 10-12, 15); 13 (Windows worktree names) is fixed in
@@ -116,13 +136,18 @@ pub use loader::{
     RefreshPolicy,
 };
 pub use types::{
-    DeleteError, DeletedSession, EscapeOutcome, ListSearchMode, LoadingState, RENAMED_STATUS,
-    RenameError, SemanticProgress, SemanticResultMetadata, UuidLookup, query_has_literals,
+    DeleteError, DeletedSession, EscapeOutcome, ListSearchMode, RENAMED_STATUS, Readiness,
+    ReconcileState, RenameError, SemanticProgress, SemanticResultMetadata, UuidLookup,
+    query_has_literals,
 };
 
 use corpus::{CorpusEdits, SearchSnapshot};
 use index::{CorpusIndex, ScopeSettings};
 use search_state::{SearchCommand, SearchResponse, SemanticSearchState, spawn_search_worker};
+
+/// Snapshot cards materialized for the list while loading. Bounded so the
+/// first frame costs the same whatever the corpus size.
+pub const SNAPSHOT_ROWS: usize = 500;
 
 /// Construction options of a [`Browser`].
 #[derive(Clone)]
@@ -263,8 +288,13 @@ pub struct Browser {
     selection_anchor: Option<PathBuf>,
     /// Current search query
     query: String,
-    /// Loading state
-    loading_state: LoadingState,
+    /// Which parts of the list are usable
+    readiness: Readiness,
+    /// Snapshot whose cards are shown while loading
+    snapshot: Option<crate::store::Snapshot>,
+    /// Loaded conversations held back while snapshot cards are shown (shared
+    /// with the corpus preparation at the end of the load)
+    pending: Option<CorpusSnapshot>,
     /// Whether the browser shows a single opened file (no list)
     single_file_mode: bool,
     /// Why the single opened file could not be parsed, if it could not
@@ -301,7 +331,7 @@ struct BrowserParts {
     searchable: Vec<SearchableConversation>,
     filtered: Vec<usize>,
     selected: Option<usize>,
-    loading_state: LoadingState,
+    readiness: Readiness,
     single_file_mode: bool,
     single_file_error: Option<String>,
     search_tx: mpsc::Sender<SearchCommand>,
@@ -355,7 +385,9 @@ impl Browser {
             selected: parts.selected,
             selection_anchor: None,
             query: String::new(),
-            loading_state: parts.loading_state,
+            readiness: parts.readiness,
+            snapshot: None,
+            pending: None,
             single_file_mode: parts.single_file_mode,
             single_file_error: parts.single_file_error,
             workspace_filter,
@@ -388,7 +420,7 @@ impl Browser {
                 searchable,
                 filtered: Vec::new(),
                 selected: None,
-                loading_state: LoadingState::Ready,
+                readiness: Readiness::ready(),
                 single_file_mode: false,
                 single_file_error: None,
                 search_tx,
@@ -415,7 +447,7 @@ impl Browser {
                 searchable: Vec::new(),
                 filtered: Vec::new(),
                 selected: None,
-                loading_state: LoadingState::Loading { loaded: 0 },
+                readiness: Readiness::default(),
                 single_file_mode: false,
                 single_file_error: None,
                 search_tx,
@@ -477,7 +509,7 @@ impl Browser {
                 searchable: Vec::new(),
                 filtered,
                 selected,
-                loading_state: LoadingState::Ready,
+                readiness: Readiness::ready(),
                 single_file_mode: true,
                 single_file_error,
                 search_tx,
@@ -511,12 +543,20 @@ impl Browser {
             .collect()
     }
 
-    pub fn loading_state(&self) -> &LoadingState {
-        &self.loading_state
+    /// Which parts of the list are usable.
+    pub fn readiness(&self) -> &Readiness {
+        &self.readiness
     }
 
+    /// Whether the full corpus is still loading, so queries and edits wait.
     pub fn is_loading(&self) -> bool {
-        matches!(self.loading_state, LoadingState::Loading { .. })
+        !self.readiness.lexical
+    }
+
+    /// Whether the rows are snapshot cards ([`Browser::show_snapshot`]),
+    /// shown until loading finishes.
+    pub fn shows_snapshot(&self) -> bool {
+        self.snapshot.is_some()
     }
 
     /// Row list: indices into [`Browser::conversations`], in display order.
@@ -615,9 +655,9 @@ impl Browser {
     /// Search-bar count text: `"Loading... <n>"`, `"<sel>/<rows>"` or
     /// `"0/<rows>"` (upstream `render_search_bar`).
     pub fn count_text(&self) -> String {
-        match &self.loading_state {
-            LoadingState::Loading { loaded } => format!("Loading... {}", loaded),
-            LoadingState::Ready => match self.selected {
+        match &self.readiness.reconcile {
+            ReconcileState::Running { loaded } => format!("Loading... {}", loaded),
+            ReconcileState::Done => match self.selected {
                 Some(selected) => format!("{}/{}", selected + 1, self.filtered.len()),
                 None => format!("0/{}", self.filtered.len()),
             },
@@ -724,3 +764,6 @@ mod ccr_tests;
 
 #[cfg(test)]
 mod perf_tests;
+
+#[cfg(test)]
+mod snapshot_tests;

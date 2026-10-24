@@ -17,7 +17,7 @@ use crate::test_support::fixtures_ops::{
 };
 
 fn labels(cx: &TestAppContext, target: &crate::model::ConversationTarget) -> Vec<String> {
-    cx.read(|cx| crate::list::context_menu::build(0, target, false, cx).labels())
+    cx.read(|cx| crate::list::context_menu::build(0, target, false, true, cx).labels())
 }
 
 /// Whether the app menu's Session menu lists Copy header session ID now.
