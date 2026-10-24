@@ -622,7 +622,15 @@ mod tests {
         assert_eq!(env.cache_root().unwrap(), cache);
         assert_eq!(env.history_cache_base_dir().unwrap(), cache);
         assert_eq!(env.history_cache_dir().unwrap(), cache.join("projects"));
-        assert_eq!(crate::store::default_root(&env).unwrap(), cache.join("v3"));
+        let store = crate::store::default_root(&env).unwrap();
+        assert_eq!(store.parent().unwrap(), cache.join("v3"));
+        assert!(
+            store
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("roots-")
+        );
         assert_eq!(
             env.embedding_cache_file().unwrap(),
             cache.join("semantic").join("embeddings-v1.bin")
@@ -758,7 +766,7 @@ mod tests {
             PathBuf::from("cache").join(&expected).join("projects")
         );
         assert_eq!(
-            crate::store::default_root(&env).unwrap(),
+            crate::store::default_root(&env).unwrap().parent().unwrap(),
             PathBuf::from("cache").join(&expected).join("v3")
         );
     }

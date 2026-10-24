@@ -1,16 +1,19 @@
 //! Disk snapshot of the conversation list, readable before any history is
 //! loaded.
 //!
-//! The snapshot is a generation directory under `v3/` in the cache dir (see
-//! `generation`). The TUI renders its first frame from the newest cards and
-//! replaces them with fully loaded conversations once loading finishes.
+//! The snapshot is a generation directory under `v3/roots-<hash>/` in the cache
+//! dir (see `default_root` and `generation`). The TUI renders its first frame
+//! from the newest cards and replaces them with fully loaded conversations
+//! once loading finishes.
 //!
 //! # Differences from upstream
 //!
 //! * **Root (hermetic).** [`default_root`] takes the [`HistoryEnv`] and
-//!   derives `v3/` from [`HistoryEnv::history_cache_base_dir`] (the fork's
-//!   own cache root, `~/.cache/claude-history-gui`, namespaced by
-//!   `CLAUDE_CONFIG_DIR` like upstream). Upstream returned `None` under
+//!   derives `v3/roots-<hash>/` from [`HistoryEnv::history_cache_base_dir`]
+//!   (the fork's own cache root, `~/.cache/claude-history-gui`, namespaced by
+//!   `CLAUDE_CONFIG_DIR` like upstream) and the Pi/OMP session roots resolved
+//!   from the same env (the Pi root also follows the workspace's
+//!   `.pi/settings.json`). Upstream returned `None` under
 //!   `cfg(test)`; here tests are kept off the user's cache by
 //!   [`HistoryEnv::sandbox`] and temporary roots instead.
 //! * **Shared corpus.** [`write_snapshot`] and
@@ -39,11 +42,41 @@ use std::borrow::Borrow;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// Store root: `v3/` beside the other caches, namespaced like them by
-/// `CLAUDE_CONFIG_DIR` ([`HistoryEnv::history_cache_base_dir`]). `None`
-/// without a cache root.
+/// Store root: `v3/roots-<hash>/` beside the other caches. The cache dir is
+/// namespaced by `CLAUDE_CONFIG_DIR` ([`HistoryEnv::history_cache_base_dir`]),
+/// and the hash covers the Pi and OMP session roots resolved from `env`, so a
+/// snapshot is only read by runs that load the same sources. `None` without a
+/// cache root.
 pub fn default_root(env: &HistoryEnv) -> Option<PathBuf> {
-    env.history_cache_base_dir().map(|base| base.join("v3"))
+    let pi = crate::history::pi_loader::session_root(env).ok();
+    let omp = crate::history::omp_loader::session_root(env).ok();
+    let namespace = source_roots_namespace(
+        pi.as_ref().map(|root| root.path.as_path()),
+        omp.as_ref().map(|root| root.path.as_path()),
+    );
+    env.history_cache_base_dir()
+        .map(|base| base.join("v3").join(namespace))
+}
+
+/// Directory name identifying the Pi and OMP session roots, canonicalized
+/// when they exist.
+fn source_roots_namespace(pi: Option<&Path>, omp: Option<&Path>) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for root in [pi, omp] {
+        match root {
+            Some(path) => {
+                let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+                let bytes = resolved.as_os_str().as_encoded_bytes();
+                hasher.update(&[1]);
+                hasher.update(&(bytes.len() as u64).to_le_bytes());
+                hasher.update(bytes);
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+    }
+    format!("roots-{}", &hasher.finalize().to_hex()[..16])
 }
 
 /// Cards of the current generation, shown until the full corpus is loaded.
@@ -176,6 +209,41 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn snapshot_namespace_follows_pi_and_omp_roots() {
+        let pi = Path::new("/tmp/claude-history-test/pi-sessions");
+        let other_pi = Path::new("/tmp/claude-history-test/other-pi-sessions");
+        let omp = Path::new("/tmp/claude-history-test/omp-sessions");
+
+        let base = source_roots_namespace(Some(pi), Some(omp));
+        assert!(base.starts_with("roots-"));
+        assert_eq!(base, source_roots_namespace(Some(pi), Some(omp)));
+        for other in [
+            source_roots_namespace(Some(other_pi), Some(omp)),
+            source_roots_namespace(Some(pi), Some(other_pi)),
+            source_roots_namespace(Some(omp), Some(pi)),
+            source_roots_namespace(None, Some(omp)),
+            source_roots_namespace(Some(pi), None),
+        ] {
+            assert_ne!(base, other);
+        }
+    }
+
+    #[test]
+    fn default_root_follows_the_resolved_pi_session_root() {
+        let home = tempfile::tempdir().unwrap();
+        let base = default_root(&HistoryEnv::sandbox(home.path())).unwrap();
+        let again = default_root(&HistoryEnv::sandbox(home.path())).unwrap();
+        assert_eq!(base, again);
+        let moved = default_root(
+            &HistoryEnv::sandbox(home.path()).with_pi_session_dir(home.path().join("elsewhere")),
+        )
+        .unwrap();
+        assert_ne!(base, moved);
+        assert_eq!(base.parent(), moved.parent());
+        assert!(base.parent().unwrap().ends_with("v3"));
+    }
 
     #[test]
     fn shared_corpus_writes_the_same_snapshot_under_the_sandbox_root() {

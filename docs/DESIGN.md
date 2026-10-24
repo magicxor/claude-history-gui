@@ -2702,7 +2702,7 @@ ignored).
 | Claude data | `$CLAUDE_CONFIG_DIR` or `<home>/.claude` (read; written by rename/delete/fork-copy/delete-empty) |
 | Pi / OMP sessions | per core loaders (`PI_*`, `OMP_PROFILE`, `XDG_DATA_HOME`, relative values against the launch cwd (K16), workspace `.pi/settings.json`) |
 | GUI caches | `<home>/.cache/claude-history-gui/{projects,config-<hash>/projects,pi,omp,semantic,launch}` |
-| List snapshot (store) | `<home>/.cache/claude-history-gui[/config-<hash>]/v3/` (`store::default_root`): `LOCK`, `CURRENT`, `gNNNNNN/manifest` (cards newest first; read for the first frame, written after a complete initial load, §11.2; upstream's format) |
+| List snapshot (store) | `<home>/.cache/claude-history-gui[/config-<hash>]/v3/roots-<hash>/` (`store::default_root`; `roots-<hash>` covers the resolved Pi and OMP session roots, so another workspace `.pi/settings.json` or `PI_*` value reads and writes its own generations): `LOCK`, `CURRENT`, `gNNNNNN/manifest` (cards newest first; read for the first frame, written after a complete initial load, §11.2; upstream's format) |
 | Embedding model | `<home>/.cache/claude-history-gui/semantic/fastembed` |
 | CLI config | `<home>/.config/claude-history/config.toml` (read-only) |
 | GUI config | `<home>/.config/claude-history/gui.toml` |

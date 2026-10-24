@@ -10,7 +10,8 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 - Lower memory use: conversation text is shared instead of copied, and search no longer keeps a second copy of it.
 - The list shows the newest conversations right away at startup, taken from a snapshot of the previous complete
   load, and they can be opened, resumed and forked at once; rename and delete become available when loading
-  finishes, which swaps in the loaded list without moving the selection.
+  finishes, which swaps in the loaded list without moving the selection. The snapshot is kept per workspace and
+  Pi/OMP session folder, so a different one never shows another's conversations at startup.
 
 ## v0.1.1
 

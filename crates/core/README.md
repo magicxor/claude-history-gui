@@ -26,7 +26,7 @@ release check (`update`) replaces the self-updater.
 | `env` | `HistoryEnv` (every path and environment input: home, `CLAUDE_CONFIG_DIR`, Pi/OMP variables, `PATH`, the workspace that replaces the process cwd, cache/config/log locations) and `WorkspaceScope` |
 | `config` | the CLI's `config.toml` (read-only, upstream schema), `gui.toml` overrides plus the `[gui]` table, layered loading, atomic `gui.toml` saving (whole file, or only the changed keys with comments kept: `save_gui_config_changes`), neutral `KeyChord` key bindings |
 | `history` | Claude/Pi/OMP discovery and loading (streaming, with Claude concurrent to Pi/OMP, and blocking), JSONL parsing, per-project caches, Pi/OMP caches (one shared loader, rewritten only when the file set changed), rename, delete, delete-empty, path encoding |
-| `store` | the on-disk list snapshot (upstream `store`): an immutable, memory-mapped generation manifest under `<history cache base dir>/v3` (newest-first card rows, a project table, file fingerprints and a string heap, validated on open), published atomically under a `LOCK` (unchanged corpora write nothing) and collected two generations behind `CURRENT`; `Snapshot` reads the newest cards in a scope for the browser's first rows |
+| `store` | the on-disk list snapshot (upstream `store`): an immutable, memory-mapped generation manifest under `<history cache base dir>/v3/roots-<hash>` (newest-first card rows, a project table, file fingerprints and a string heap, validated on open), published atomically under a `LOCK` (unchanged corpora write nothing) and collected two generations behind `CURRENT`; `Snapshot` reads the newest cards in a scope for the browser's first rows |
 | `search` | query parsing, lexical/literal search and evidence, `SearchMode` |
 | `semantic` | chunking, embedding cache, fastembed embedder, semantic index and ranking |
 | `agent` | the agent protocol (`search`, `within`, `read`, `outline`): `agent::args` (request structs with `validate()`), `agent::cli` (upstream's `agent ...` command line), `agent::execute` (an `AgentResponse`: the CLI's exact stdout/stderr/exit code plus the result as data), `agent::execute_text`, `AgentService` (cancellable) |
@@ -54,7 +54,7 @@ installed `claude-history` CLI:
 | What | Default |
 |---|---|
 | Claude data | `$CLAUDE_CONFIG_DIR` (must be absolute; blank counts as unset) or `~/.claude` |
-| caches (history, Pi/OMP, list snapshot `v3/`, semantic embeddings, fastembed model) | `~/.cache/claude-history-gui` |
+| caches (history, Pi/OMP, list snapshot `v3/roots-<hash>/`, semantic embeddings, fastembed model) | `~/.cache/claude-history-gui` |
 | CLI config (read-only, shared settings) | `~/.config/claude-history/config.toml` |
 | GUI config (GUI settings and overrides) | `~/.config/claude-history/gui.toml` |
 | debug log | `~/.local/state/claude-history-gui/debug.log` |
