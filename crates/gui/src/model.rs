@@ -155,6 +155,10 @@ pub struct HeaderInfo {
     pub timestamp: DateTime<Local>,
     pub summary: Option<SharedString>,
     pub parse_error_count: usize,
+    /// Whether `parse_error_count` is known: a row from the store (a card)
+    /// carries no parse errors, so the viewer counts them from the file
+    /// (upstream 358becb).
+    pub parse_errors_known: bool,
     pub file_stem: SharedString,
 }
 
@@ -173,6 +177,7 @@ impl HeaderInfo {
             timestamp: c.timestamp,
             summary: non_empty(c.summary.as_deref()).map(|s| SharedString::from(s.to_string())),
             parse_error_count: c.parse_errors.len(),
+            parse_errors_known: true,
             file_stem: file_stem.into(),
         }
     }
@@ -193,6 +198,7 @@ impl HeaderInfo {
             timestamp: DateTime::<Local>::from(std::time::SystemTime::UNIX_EPOCH),
             summary: None,
             parse_error_count: 0,
+            parse_errors_known: true,
             file_stem,
         }
     }

@@ -409,7 +409,6 @@ fn stale_response_with_current_generation_but_old_mode_is_ignored() {
         filtered: vec![0],
         index: None,
         complete: true,
-        cards: Vec::new(),
         generation: 7,
         mode: ListSearchMode::Lexical,
         evidence: HashMap::new(),
@@ -863,7 +862,6 @@ fn semantic_search_applies_lexical_fallback_while_pending() {
         filtered: vec![0],
         index: None,
         complete: true,
-        cards: Vec::new(),
         generation: 7,
         mode: ListSearchMode::Semantic,
         evidence: HashMap::new(),
@@ -891,7 +889,6 @@ fn empty_lexical_fallback_keeps_results_visible_while_semantic_search_is_pending
         filtered: Vec::new(),
         index: None,
         complete: true,
-        cards: Vec::new(),
         generation: 7,
         mode: ListSearchMode::Semantic,
         evidence: HashMap::new(),
@@ -918,7 +915,6 @@ fn semantic_search_ignores_lexical_fallback_after_completion() {
         filtered: Vec::new(),
         index: None,
         complete: true,
-        cards: Vec::new(),
         generation: 7,
         mode: ListSearchMode::Semantic,
         evidence: HashMap::new(),
@@ -1490,7 +1486,6 @@ fn uuid_dispatch_invalidates_stale_search_response() {
         filtered: vec![1],
         index: None,
         complete: true,
-        cards: Vec::new(),
         generation: 1,
         mode: ListSearchMode::Lexical,
         evidence: HashMap::new(),
@@ -1519,7 +1514,6 @@ fn finish_loading_invalidates_stale_loading_search_response() {
         filtered: vec![],
         index: None,
         complete: true,
-        cards: Vec::new(),
         generation: 1,
         mode: ListSearchMode::Lexical,
         evidence: HashMap::new(),
@@ -1566,10 +1560,7 @@ fn exclude_projects_filters_incremental_loading() {
     ]);
 
     assert_eq!(filtered_projects(&app), vec![Some("Visible")]);
-    assert_eq!(
-        app.readiness().reconcile,
-        ReconcileState::Running { loaded: 2 }
-    );
+    assert_eq!(app.readiness().reconcile, ReconcileState::Running);
     assert_eq!(app.count_text(), "Loading... 2");
 }
 

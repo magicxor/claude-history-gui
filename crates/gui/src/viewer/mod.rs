@@ -317,7 +317,26 @@ pub struct ViewerPane {
     window: AnyWindowHandle,
     /// The latest build request (dropping it cancels an unstarted build).
     _build_task: Task<()>,
+    /// Counts the open file's malformed lines when the header does not know
+    /// them (a card's header).
+    _parse_count_task: Task<()>,
+    /// The last count of a file's malformed lines, kept for the headers
+    /// that replace a card's header (each corpus change) until the file
+    /// changes (V-008).
+    parse_count: Option<ParseCount>,
+    /// Tests: the files counted so far.
+    #[cfg(test)]
+    parse_counts: usize,
     _subscriptions: Vec<Subscription>,
+}
+
+/// Malformed lines counted in a file for a card's header (V-008).
+#[derive(Clone, Debug)]
+struct ParseCount {
+    path: std::path::PathBuf,
+    /// The file's modification time when it was counted.
+    modified: Option<std::time::SystemTime>,
+    errors: usize,
 }
 
 impl EventEmitter<ViewerPaneEvent> for ViewerPane {}
@@ -398,6 +417,10 @@ impl ViewerPane {
             action_log: Vec::new(),
             window: window.window_handle(),
             _build_task: Task::ready(()),
+            _parse_count_task: Task::ready(()),
+            parse_count: None,
+            #[cfg(test)]
+            parse_counts: 0,
             _subscriptions: subscriptions,
         }
     }
@@ -478,9 +501,77 @@ impl ViewerPane {
     }
 
     /// The header from the live corpus (`None`: the file stem only, V-006).
+    /// A header that does not know its parse errors (a card in store mode)
+    /// gets them counted from the file in the background (V-008): once per
+    /// file and modification time, so the headers of later corpus changes
+    /// (a generation swapped in every few seconds while the store is
+    /// indexed) keep the last count instead of dropping the badge and
+    /// parsing the file again.
     pub fn set_header(&mut self, info: Option<HeaderInfo>, cx: &mut Context<Self>) {
+        let mut info = info;
+        let mut count = None;
+        if let (Some(header), Some(target)) = (info.as_mut(), self.target.as_ref())
+            && !header.parse_errors_known
+        {
+            let known = self
+                .parse_count
+                .clone()
+                .filter(|known| same_path(&known.path, &target.path));
+            if let Some(known) = &known {
+                header.parse_error_count = known.errors;
+                header.parse_errors_known = true;
+            }
+            count = Some((target.path.clone(), known));
+        }
         self.header = info;
+        if let Some((path, known)) = count {
+            let counted = path.clone();
+            let task = cx.background_executor().spawn(async move {
+                let modified = std::fs::metadata(&counted)
+                    .and_then(|meta| meta.modified())
+                    .ok();
+                if known.is_some_and(|known| modified.is_some() && known.modified == modified) {
+                    return None;
+                }
+                let errors = claude_history_core::export::display_parse_errors(&counted)
+                    .map(|errors| errors.len())
+                    .unwrap_or(0);
+                Some((modified, errors))
+            });
+            self._parse_count_task = cx.spawn(async move |this, cx| {
+                let Some((modified, errors)) = task.await else {
+                    return;
+                };
+                this.update(cx, |this, cx| {
+                    #[cfg(test)]
+                    {
+                        this.parse_counts += 1;
+                    }
+                    this.parse_count = Some(ParseCount {
+                        path: path.clone(),
+                        modified,
+                        errors,
+                    });
+                    let same = this
+                        .target
+                        .as_ref()
+                        .is_some_and(|target| same_path(&target.path, &path));
+                    if let Some(header) = this.header.as_mut().filter(|_| same) {
+                        header.parse_error_count = errors;
+                        header.parse_errors_known = true;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            });
+        }
         cx.notify();
+    }
+
+    /// Tests: how many times a card's file was counted for its header.
+    #[cfg(test)]
+    pub fn parse_counts(&self) -> usize {
+        self.parse_counts
     }
 
     /// Export options of the open conversation's current view.

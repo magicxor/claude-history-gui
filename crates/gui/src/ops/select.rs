@@ -301,7 +301,18 @@ fn print_export(target: ConversationTarget, window: &mut Window, cx: &mut App) {
     let path = target.path.clone();
     let task = cx.background_executor().spawn(async move {
         if debug_requested {
-            print_diagnostics(&env, conversation.as_deref(), &path, level);
+            // A list row from the store (a card) carries no parse errors:
+            // the file is parsed again (upstream 358becb).
+            let parsed =
+                claude_history_core::history::process_conversation_file(path.clone(), None, None)
+                    .ok()
+                    .flatten();
+            print_diagnostics(
+                &env,
+                parsed.as_ref().or(conversation.as_deref()),
+                &path,
+                level,
+            );
         }
         print_text(&path, plain, options)
     });

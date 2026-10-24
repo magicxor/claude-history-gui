@@ -3,7 +3,9 @@
 //! `ListPane` owns core's `Browser` and `HistoryLoader` exclusively (UI
 //! thread, bounded work only: every O(corpus) or I/O step runs on core
 //! threads or GUI background tasks, K1–K4) and renders the visible rows
-//! with a `uniform_list`. Results arrive through the waker: a bounded
+//! with a `uniform_list`. The rows are the cards of the store's generation
+//! (store mode, upstream 358becb), or the history loaded in memory when the
+//! store is off. Results arrive through the waker: a bounded
 //! `async_channel` wakes `_poll_task`, which drains the loader and the
 //! search workers (`poll_all`) and then yields, so a frame can be drawn
 //! between polls while the loader streams batches.
@@ -178,6 +180,9 @@ pub struct ListPane {
     loader_env: Arc<claude_history_core::HistoryEnv>,
     /// `(loading, refreshing)` as last announced with `LoadStateChanged`.
     load_flags: (bool, bool),
+    /// Whether the store was reconciling at the last poll (a transition to
+    /// `false` announces `CorpusChanged`: the list may now be complete).
+    was_reconciling: bool,
     view: ViewState,
     scroll: UniformListScrollHandle,
     /// `HighlightQuery::parse` of the query, parsed once per query change.
@@ -247,6 +252,10 @@ pub struct ListPane {
     #[cfg(test)]
     loading_snapshots: Vec<LoadingSnapshot>,
     _subscriptions: Vec<Subscription>,
+    /// Tests: the world's directory, released after `loader` (declared
+    /// before it, so dropped first) joined its reconcile pass.
+    #[cfg(test)]
+    _world_dir: Option<crate::test_support::WorldDir>,
 }
 
 /// The state right after a poll that appended batches mid-load (tests).
@@ -265,10 +274,13 @@ thread_local! {
     pub(crate) static PAUSE_NEW_POLLS: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Whether the list draws its first rows from the store's list snapshot and
-/// reconciles the store with the session files after the initial load
-/// (DESIGN §11.2, upstream 3708bb6, e905169). On unless set: tests turn it off
-/// (`app::init_for_test`) and back on where they exercise it.
+/// Whether the list comes from the store's generations (store mode: the
+/// rows are cards, a reconcile pass keeps the store up to date with the
+/// session files and each newer generation is swapped in; DESIGN §11.2,
+/// upstream 3708bb6, e905169, 358becb). Off, the history is loaded in memory.
+/// On unless set: `app::init_for_test` sets it on too, and
+/// `test_support::use_memory_list` turns it off for tests of the in-memory
+/// loader.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ListSnapshots(pub bool);
 
@@ -342,13 +354,14 @@ impl ListPane {
                 .with_waker(waker)
                 .with_snapshot(snapshots_enabled(cx)),
         );
-        // The first frame lists the newest cards of the store's snapshot
-        // (bounded: the manifest is mapped and validated, at most
-        // `SNAPSHOT_ROWS` cards are built); the loaded corpus replaces them
-        // at `Loaded`, keeping the selection (§11.2). Core opens the
-        // snapshot's search index on its own thread and a later poll hands
-        // it to the browser, so queries run before the load ends. Without a
-        // usable snapshot the rows stream in as before.
+        // Store mode: the first frame lists the newest cards of the store's
+        // current generation (bounded: the manifest is mapped and validated,
+        // at most `SNAPSHOT_ROWS` cards are built). Core materializes every
+        // card and opens the generation's index on its own thread, and a
+        // later poll installs them (`Loaded`, keeping the selection); the
+        // initial load is a reconcile pass whose newer generations are
+        // swapped in (§11.2). Without a generation the rows wait for the
+        // first one the pass publishes; with the store off they stream in.
         if let Some(snapshot) = loader.open_snapshot() {
             browser.show_snapshot(snapshot);
         }
@@ -442,6 +455,7 @@ impl ListPane {
             loader,
             loader_env,
             load_flags: (true, false),
+            was_reconciling: false,
             view: ViewState::Loading,
             scroll: UniformListScrollHandle::new(),
             highlight: HighlightQuery::parse(""),
@@ -491,6 +505,8 @@ impl ListPane {
             #[cfg(test)]
             loading_snapshots: Vec::new(),
             _subscriptions: subscriptions,
+            #[cfg(test)]
+            _world_dir: cx.try_global::<crate::test_support::WorldDir>().cloned(),
         };
         this.refresh_recent_workspaces(recents, cx);
         this
@@ -546,7 +562,10 @@ impl ListPane {
             self.browser
                 .conversations()
                 .iter()
-                .position(|conversation| path_matches(&conversation.path, path))
+                .enumerate()
+                .position(|(index, conversation)| {
+                    path_matches(&conversation.path, path) && !self.browser.is_hidden(index)
+                })
         } else {
             None
         }
@@ -588,8 +607,12 @@ impl ListPane {
 
     /// The viewer header for `path` from the live corpus (`None`: not loaded).
     pub fn header_info(&self, path: &Path) -> Option<HeaderInfo> {
-        self.conversation(path)
-            .map(|conversation| HeaderInfo::from_conversation(&conversation))
+        self.conversation(path).map(|conversation| {
+            let mut info = HeaderInfo::from_conversation(&conversation);
+            // Cards carry no parse errors: the viewer counts them.
+            info.parse_errors_known = !self.browser.shows_snapshot();
+            info
+        })
     }
 
     /// Select the row of `path`; `false` when it is not listed.
@@ -606,15 +629,26 @@ impl ListPane {
         true
     }
 
+    /// Store mode: a reconcile pass runs or is due, or a generation it
+    /// published is still being opened. `false` once the newest generation
+    /// is shown in full (always `false` in memory). On a fresh store the
+    /// list is partial until the first pass is done.
+    pub fn is_reconciling(&self) -> bool {
+        self.loader.uses_store()
+            && (self.browser.readiness().reconcile
+                == claude_history_core::browser::ReconcileState::Running
+                || self.loader.is_preparing())
+    }
+
     /// Whether the initial load is still running.
     pub fn is_loading(&self) -> bool {
         matches!(self.view, ViewState::Loading)
     }
 
     /// Whether the rows are listed newest first and can be opened, resumed
-    /// and forked: snapshot cards during the initial load, else once it has
-    /// finished (core's `Readiness::list`). Rename and delete wait for
-    /// [`ListPane::is_loading`] to end (AD6).
+    /// and forked: the first cards of the generation during the initial
+    /// load, else once it has finished (core's `Readiness::list`). Rename and
+    /// delete wait for [`ListPane::is_loading`] to end (AD6).
     pub fn list_ready(&self) -> bool {
         self.browser.readiness().list
     }
@@ -1249,10 +1283,17 @@ impl ListPane {
             "list.total" => self.browser.conversations().len().to_string(),
             "list.loaded" => (!self.is_loading()).to_string(),
             "list.loading" => self.is_loading().to_string(),
-            // Rows listed newest first and actionable (snapshot cards while
+            // Rows listed newest first and actionable (the first cards while
             // loading, upstream 3708bb6).
             "list.ready" => self.list_ready().to_string(),
+            // Store mode: the rows are cards of this generation (upstream
+            // 358becb), empty with the store off.
             "list.snapshot" => self.browser.shows_snapshot().to_string(),
+            "list.generation" => self
+                .browser
+                .generation_name()
+                .unwrap_or_default()
+                .to_string(),
             // The store generation whose index lexical queries run on
             // (upstream ac7f591), empty without one.
             "list.index" => self
@@ -1261,6 +1302,10 @@ impl ListPane {
                 .unwrap_or_default()
                 .to_string(),
             "list.refreshing" => self.is_refreshing().to_string(),
+            // Store mode: a reconcile pass runs or is due, or a generation it
+            // published is still being opened; `false` once the newest
+            // generation is shown in full (always `false` in memory).
+            "list.reconciling" => self.is_reconciling().to_string(),
             "list.query" => self.query(cx).to_string(),
             "list.query_calls" => self.query_calls.to_string(),
             "list.mode" => self.mode().label().to_string(),
@@ -1537,6 +1582,10 @@ impl ListPane {
     ) -> Vec<gpui_kit::AnyElement> {
         let started = Instant::now();
         self.rendered_rows = range.clone();
+        // Store mode: the literal context of visible rows the search worker
+        // left without evidence is read from their text frames in the
+        // background (a later poll repaints them).
+        self.browser.fill_visible_evidence(range.clone());
         let roles = crate::theme_tokens::roles(cx);
         let mono = cx.theme().mono_font_family.clone();
         let rem = window.rem_size().as_f32();
@@ -1645,8 +1694,8 @@ impl ListPane {
         &self.loader
     }
 
-    /// Wait for the reconcile pass of the initial load (tests: before the
-    /// world's temporary directory goes).
+    /// Wait for the running reconcile pass and the ones asked for after it
+    /// (tests: before the world's temporary directory goes).
     #[cfg(test)]
     pub(crate) fn finish_snapshot_write(
         &mut self,
@@ -1676,16 +1725,6 @@ impl ListPane {
     #[cfg(test)]
     pub(crate) fn step(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.poll_all(window, cx);
-    }
-
-    /// Apply the search workers' answers without polling the loader (tests:
-    /// a query answered over the snapshot cards while the load waits).
-    #[cfg(test)]
-    pub(crate) fn poll_search_only(&mut self, cx: &mut Context<Self>) -> bool {
-        let applied = self.browser.poll();
-        self.emit_selection(false, cx);
-        cx.notify();
-        applied
     }
 
     /// Pause or resume the automatic poll loop (tests).

@@ -16,12 +16,14 @@
 //! Workers post their answers to channels; the GUI calls [`Browser::poll`]
 //! to apply them. [`BrowserOptions::waker`] is called from the worker
 //! threads after each answer, so a GUI can schedule that poll instead of
-//! using a timer. [`HistoryLoader`] drives the streaming history loader into
-//! a browser (initial load and buffered refresh).
+//! using a timer. [`HistoryLoader`] fills a browser: from the store's
+//! generations (generation mode, the GUI's main list), or else with the
+//! streaming history loader (initial load and buffered refresh).
 //!
-//! # Corpus storage
+//! # Corpus storage (in memory)
 //!
-//! Every conversation exists once, as an `Arc<Conversation>` in a
+//! Without a store (no cache directory, a tool, a test) the browser holds
+//! the loaded history. Every conversation exists once, as an `Arc<Conversation>` in a
 //! [`CorpusSnapshot`] shared by the browser, the lexical worker and the
 //! semantic worker (its search data likewise, one `Arc` per conversation).
 //! The lexical worker gets the snapshots with each query and releases them
@@ -40,20 +42,17 @@
 //! to be re-applied (end of a load, a rename, a scope change) is sent to the
 //! lexical worker while the current rows stay visible.
 //!
-//! # Snapshot cards
+//! # Generation mode
 //!
-//! A loading browser can show the newest cards of the store's generation
-//! snapshot ([`Browser::show_snapshot`], [`HistoryLoader::open_snapshot`])
-//! before the loader starts: at most [`SNAPSHOT_ROWS`] cards, newest first,
-//! in the current scope and time filter. They are the corpus until loading
-//! finishes ([`Readiness::list`] is set); loaded batches are held back
-//! meanwhile and the install swaps them in at once, keeping the selected
-//! session by path. Toggling the scope or changing the workspace or
-//! exclusions decides every card's scope again. Once the generation's
-//! search index is open ([`Browser::use_search_index`],
-//! [`Readiness::lexical`]) a lexical query runs on it before the load ends,
-//! its results materialized as cards; the loaded corpus keeps using the
-//! index (see `cards`).
+//! With a store the rows are the cards of the store's current generation
+//! (upstream 358becb): [`Browser::show_snapshot`] lists the newest
+//! [`SNAPSHOT_ROWS`] cards for the first frame, a [`HistoryLoader`] then
+//! installs every card with the generation's search index (opened off the
+//! UI thread) and swaps in each newer generation a reconcile pass publishes,
+//! keeping the query, the scope and the selected session. Cards carry no
+//! text: lexical queries run on the index, and semantic search loads the
+//! full conversations on first use. Deletes and renames are overlays until
+//! a generation holds them (see `cards`).
 //!
 //! # Differences from upstream
 //!
@@ -71,13 +70,12 @@
 //!   sessions loaded from disk by a UUID jump honor
 //!   [`BrowserOptions::show_last`] for their preview (upstream always used
 //!   the first messages).
-//! * **Quirk 14.** While loading, toggling the workspace scope or the search
-//!   mode (and changing the workspace or exclusions) only re-applies the
-//!   scope and exclusions to the loaded rows. The query is applied when
-//!   loading finishes, unless the snapshot's search index is open
-//!   ([`Readiness::lexical`]): then a lexical query reruns on it (see
-//!   `cards`). Upstream filtered against the not-yet-built search index and
-//!   showed an empty list until loading finished.
+//! * **Quirk 14.** While loading in memory, toggling the workspace scope or
+//!   the search mode (and changing the workspace or exclusions) only
+//!   re-applies the scope and exclusions to the loaded rows; the query is
+//!   applied when loading finishes. Upstream filtered against the
+//!   not-yet-built search index and showed an empty list until loading
+//!   finished.
 //! * **Quirk 16.** A refresh with a non-empty query keeps the previous rows
 //!   (re-mapped to the refreshed corpus by path) until the new results
 //!   arrive. Upstream cleared the list until the worker answered.
@@ -101,15 +99,21 @@
 //!   also forced lexical mode).
 //! * **Failed initial load.** [`LoadEvent::LoadFailed`] leaves the browser
 //!   ready, so [`HistoryLoader::start_refresh`] can retry (upstream exited).
-//! * **Snapshot cards.** The cards' workspace test is [`WorkspaceScope`]'s
-//!   (D2, W1), not the process cwd. They are swapped out by the install of
-//!   the prepared corpus (K1), not by a synchronous `finish_loading`. Core
-//!   does not refuse a rename or delete of a card: like any edit made while
-//!   loading, the install replays it on the loaded corpus (K1). The GUI
-//!   still disables both until loading finishes, as upstream's keys did.
-//!   The snapshot is written by [`HistoryLoader`] only when
-//!   [`LoaderOptions::snapshot`] is on (the GUI's production path; upstream
-//!   wrote it from its runtime unless built for tests).
+//! * **Generation mode.** The cards' workspace test is [`WorkspaceScope`]'s
+//!   (D2, W1), not the process cwd. Every card is materialized and the index
+//!   opened off the UI thread, and a swap keeps a query's rows until it
+//!   answers (see `cards`). The store is used only when
+//!   [`LoaderOptions::snapshot`] is on (the GUI's main list; upstream used it
+//!   whenever there was a cache directory). Without it the history loads in
+//!   memory, streamed in the background ([`HistoryLoader`]; upstream loaded
+//!   it synchronously before the first frame).
+//! * **In-memory install (upstream 358becb `show_conversations`: not
+//!   adopted).** Upstream's `show_conversations`, the in-memory install of
+//!   the no-cache-directory initial load and refresh, deduplicates the
+//!   initial load by canonical path. The fork keeps `finish_loading` and
+//!   `replace_conversations` with addendum C2 (the initial load does not
+//!   deduplicate), and `load_all_conversations_streaming` and
+//!   `LoaderMessage`, which upstream removed.
 //!
 //! The other section-12 quirks are presentation or key handling and belong
 //! to the GUI (1-5, 10-12, 15); 13 (Windows worktree names) is fixed in
@@ -152,11 +156,13 @@ pub use types::{
 use corpus::{CorpusEdits, SearchSnapshot};
 use index::{CorpusIndex, ScopeSettings};
 use search_state::{
-    IndexScope, SearchCommand, SearchResponse, SemanticSearchState, spawn_search_worker,
+    IndexScope, SearchCommand, SearchResponse, SemanticCorpus, SemanticSearchState,
+    spawn_search_worker,
 };
 
-/// Snapshot cards materialized for the list while loading. Bounded so the
-/// first frame costs the same whatever the corpus size.
+/// Cards materialized for the first frame. Bounded so the first frame costs
+/// the same whatever the corpus size; the full list follows once the
+/// generation is open.
 pub const SNAPSHOT_ROWS: usize = 500;
 
 /// Construction options of a [`Browser`].
@@ -273,7 +279,9 @@ pub struct Browser {
     show_last: bool,
     waker: Option<Waker>,
     embedder_factory: Option<SemanticEmbedderFactory>,
-    /// All loaded conversations, shared with the lexical and semantic workers
+    /// Rows of the list. In generation mode (`snapshot` set) the cards
+    /// materialized so far, without text; otherwise every loaded
+    /// conversation, shared with the lexical and semantic workers
     conversations: CorpusSnapshot,
     /// Precomputed search data, parallel to `conversations` once built
     /// (empty while loading and in single-file mode); shared with the
@@ -300,20 +308,23 @@ pub struct Browser {
     query: String,
     /// Which parts of the list are usable
     readiness: Readiness,
-    /// Snapshot whose cards are shown while loading
+    /// Generation whose cards are the rows, in generation mode
     snapshot: Option<crate::store::Snapshot>,
     /// Generation index lexical queries run against, when there is one
     search_index: Option<Arc<crate::store::SearchIndex>>,
     /// The index and the docs a query may return, sent with each lexical
     /// query while `search_index` is set
     index_scope: Option<IndexScope>,
-    /// For each card of the snapshot or index, its index in `conversations`
+    /// Row of each card of the snapshot, once materialized, while only the
+    /// first cards are shown
     doc_rows: Vec<Option<usize>>,
-    /// The materialized cards, while snapshot cards are shown
+    /// Generation mode's cards, overlays and reconcile request
     cards: cards::CardRows,
-    /// Loaded conversations held back while snapshot cards are shown (shared
-    /// with the corpus preparation at the end of the load)
-    pending: Option<CorpusSnapshot>,
+    /// Full conversations for semantic search in generation mode, loaded
+    /// on first use
+    semantic_corpus: SemanticCorpus,
+    /// Batches of the in-memory loader are being appended
+    streaming: bool,
     /// Whether the browser shows a single opened file (no list)
     single_file_mode: bool,
     /// Why the single opened file could not be parsed, if it could not
@@ -346,6 +357,38 @@ pub struct Browser {
     /// Rows deleted or renamed while a [`HistoryLoader`] loads; replayed on
     /// the corpus it installs
     corpus_edits: CorpusEdits,
+    /// Helper threads joined when the browser is dropped
+    helpers: HelperThreads,
+}
+
+/// Helper threads of a browser that may outlive the call that started them
+/// (`row-evidence`, a `semantic-corpus` job given up): they read the store's
+/// mapped files or write history caches, so the browser joins them when it
+/// is dropped and none outlives it (in a test, its sandbox directory).
+#[derive(Default)]
+struct HelperThreads(Vec<std::thread::JoinHandle<()>>);
+
+impl HelperThreads {
+    /// Keeps `thread`, forgetting the threads that have ended.
+    fn push(&mut self, thread: std::thread::JoinHandle<()>) {
+        self.0.retain(|thread| !thread.is_finished());
+        self.0.push(thread);
+    }
+
+    fn join_all(&mut self) {
+        for thread in self.0.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for Browser {
+    /// Gives up a semantic corpus still loading (it stops before its next
+    /// project) and waits for the helper threads.
+    fn drop(&mut self) {
+        self.retire_semantic_corpus();
+        self.helpers.join_all();
+    }
 }
 
 struct BrowserParts {
@@ -413,7 +456,8 @@ impl Browser {
             index_scope: None,
             doc_rows: Vec::new(),
             cards: cards::CardRows::default(),
-            pending: None,
+            semantic_corpus: SemanticCorpus::default(),
+            streaming: false,
             single_file_mode: parts.single_file_mode,
             single_file_error: parts.single_file_error,
             workspace_filter,
@@ -432,6 +476,7 @@ impl Browser {
             lexical_evidence: HashMap::new(),
             uuid_lookup: None,
             corpus_edits: CorpusEdits::default(),
+            helpers: HelperThreads::default(),
         }
     }
 
@@ -556,15 +601,15 @@ impl Browser {
     }
 
     /// Change the preview mode (applies to later renames; the rows are
-    /// replaced by the next load).
+    /// replaced by the next load or generation).
     pub fn set_show_last(&mut self, show_last: bool) {
         self.show_last = show_last;
     }
 
     /// Consume the browser and return its conversations (cloned where a
     /// worker still shares them).
-    pub fn into_conversations(self) -> Vec<Conversation> {
-        Arc::unwrap_or_clone(self.conversations)
+    pub fn into_conversations(mut self) -> Vec<Conversation> {
+        Arc::unwrap_or_clone(std::mem::take(&mut self.conversations))
             .into_iter()
             .map(Arc::unwrap_or_clone)
             .collect()
@@ -575,16 +620,10 @@ impl Browser {
         &self.readiness
     }
 
-    /// Whether the full corpus is still loading, so edits wait (and queries,
-    /// unless the snapshot's index answers them: [`Readiness::lexical`]).
+    /// Whether there are no rows yet ([`Readiness::list`]): the in-memory
+    /// history is still loading, or no generation is shown yet.
     pub fn is_loading(&self) -> bool {
-        self.readiness.reconcile != ReconcileState::Done
-    }
-
-    /// Whether the rows are snapshot cards ([`Browser::show_snapshot`]),
-    /// shown until loading finishes.
-    pub fn shows_snapshot(&self) -> bool {
-        self.snapshot.is_some()
+        !self.readiness.list
     }
 
     /// Row list: indices into [`Browser::conversations`], in display order.
@@ -592,8 +631,9 @@ impl Browser {
         &self.filtered
     }
 
-    /// Every loaded conversation (including excluded and out-of-scope ones).
-    /// The elements are shared with the search workers.
+    /// Every row's conversation (including excluded and out-of-scope ones):
+    /// the loaded conversations, or the cards in generation mode. The
+    /// elements are shared with the search workers.
     pub fn conversations(&self) -> &[Arc<Conversation>] {
         &self.conversations
     }
@@ -618,9 +658,12 @@ impl Browser {
     }
 
     /// Index (into [`Browser::conversations`]) of the first loaded session
-    /// at `path` (an indexed lookup, CCR-2).
+    /// at `path` (an indexed lookup, CCR-2); never a row hidden by a delete
+    /// in generation mode.
     pub(super) fn position_of_path(&self, path: &Path) -> Option<usize> {
-        self.index.first_path(&self.conversations, path)
+        self.index
+            .first_path(&self.conversations, path)
+            .filter(|&index| !self.is_hidden(index))
     }
 
     /// Selected row (position in [`Browser::filtered`]).
@@ -680,15 +723,21 @@ impl Browser {
         self.uuid_lookup.as_ref()
     }
 
-    /// Search-bar count text: `"Loading... <n>"`, `"<sel>/<rows>"` or
-    /// `"0/<rows>"` (upstream `render_search_bar`).
+    /// Search-bar count text: `"Loading..."` before there are rows,
+    /// `"<sel>/<rows>"` or `"0/<rows>"` (upstream `render_search_bar`).
+    /// While the in-memory loader streams, `"Loading... <n>"` with the
+    /// conversations received (fork: upstream loaded in memory before the
+    /// first frame).
     pub fn count_text(&self) -> String {
-        match &self.readiness.reconcile {
-            ReconcileState::Running { loaded } => format!("Loading... {}", loaded),
-            ReconcileState::Done => match self.selected {
-                Some(selected) => format!("{}/{}", selected + 1, self.filtered.len()),
-                None => format!("0/{}", self.filtered.len()),
-            },
+        if !self.readiness.list {
+            if self.streaming {
+                return format!("Loading... {}", self.conversations.len());
+            }
+            return "Loading...".to_string();
+        }
+        match self.selected {
+            Some(selected) => format!("{}/{}", selected + 1, self.filtered.len()),
+            None => format!("0/{}", self.filtered.len()),
         }
     }
 

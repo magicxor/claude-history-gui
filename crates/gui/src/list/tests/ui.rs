@@ -49,6 +49,8 @@ fn chip(model: &FooterModel, kind: ChipKind) -> Option<String> {
 fn footer_hints_follow_the_keymap_and_the_focus(cx: &mut TestAppContext) {
     let world = TestWorld::new();
     listed_corpus(&world);
+    // Store off: the in-memory loader streams batches.
+    crate::test_support::use_memory_list(cx, &world, &[]);
     let f = ListFixture::open_paused(cx, &world, &[]);
     f.step_until(cx, "the first batch", |list| {
         !list.loading_snapshots().is_empty()
@@ -422,6 +424,8 @@ fn the_time_filter_is_applied_kept_and_reverted(cx: &mut TestAppContext) {
         .summary("Old")
         .start(Utc::now() - Duration::days(30))
         .write(&world);
+    // Store off: an in-memory reload reads the files again and can fail (in store mode the cards are re-scoped).
+    crate::test_support::use_memory_list(cx, &world, &["--since", "1d"]);
     let f = ListFixture::open_loaded(cx, &world, &["--since", "1d"]);
     assert_eq!(f.titles(cx), vec!["Recent".to_string()]);
     assert_eq!(
@@ -477,6 +481,8 @@ fn the_time_filter_is_applied_kept_and_reverted(cx: &mut TestAppContext) {
 fn a_failing_workspace_reload_reverts(cx: &mut TestAppContext) {
     let world = TestWorld::new();
     SessionSpec::new("proj", 1).summary("One").write(&world);
+    // Store off: an in-memory reload reads the files again and can fail.
+    crate::test_support::use_memory_list(cx, &world, &[]);
     let f = ListFixture::open_loaded(cx, &world, &[]);
     let dir = world.home().join("some-workspace");
     std::fs::create_dir_all(&dir).unwrap();
@@ -602,6 +608,8 @@ fn a_queued_time_filter_reverts_to_the_committed_one(cx: &mut TestAppContext) {
         .summary("Very old")
         .start(Utc::now() - Duration::days(800))
         .write(&world);
+    // Store off: an in-memory reload reads the files again and can fail (in store mode the cards are re-scoped).
+    crate::test_support::use_memory_list(cx, &world, &[]);
     let f = ListFixture::open_loaded(cx, &world, &[]);
     assert_eq!(f.titles(cx).len(), 2);
     std::fs::remove_dir_all(world.projects_root()).unwrap();

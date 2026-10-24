@@ -22,6 +22,11 @@
 # one scheduler hiccup decides a p95). Medians judge, never one sampled frame.
 
 wait-loaded 180s
+# Store mode (upstream 358becb): the sandbox has no store yet; the initial reconcile pass lists the
+# newest sessions first and swaps in a generation every few seconds. Measure once its last generation
+# (every session) is shown.
+wait-for list.total > 19999 600s
+wait-for list.reconciling == false 600s
 expect list.total > 20000
 paste "ffffffff-1c2d-4e5f-8a9b-0c1d2e3f4a5b"
 wait-for list.count == 1 10s

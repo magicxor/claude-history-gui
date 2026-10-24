@@ -600,12 +600,15 @@ impl Workspace {
         }
     }
 
-    /// PD3 rule 3 (c), L-082: once the first load is complete, a launch
+    /// PD3 rule 3 (c), L-082: once the first load is complete (in store mode:
+    /// the first reconcile pass is done too, so a fresh store lists every
+    /// session, not only the newest delta generation), a launch
     /// directory recorded as the cwd of a loaded Pi/OMP conversation becomes
     /// the workspace when rules 1–5 chose none; the list then re-scopes and
     /// reloads (integrator, Phase A, WP7 request).
     fn apply_recorded_cwd_once(&mut self, cx: &mut Context<Self>) {
-        if self.recorded_cwd_checked || self.list.read(cx).is_loading() {
+        let list = self.list.read(cx);
+        if self.recorded_cwd_checked || list.is_loading() || list.is_reconciling() {
             return;
         }
         self.recorded_cwd_checked = true;

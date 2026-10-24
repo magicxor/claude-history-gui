@@ -29,9 +29,10 @@ All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-h
 ## Features
 
 **Conversation list**
-* Claude Code, Pi and OMP conversations in one virtualized list: the newest ones are shown at once from an on-disk
-  snapshot (kept up to date in the background after each complete load, reading only the conversation files that
-  changed), the rest is read in the background (streamed in on the first run), with cached parsing.
+* Claude Code, Pi and OMP conversations in one virtualized list, listed and searched from an on-disk index that is
+  kept up to date in the background (reading only the conversation files that changed, at start, on refresh and
+  after a rename or delete): the newest ones are shown at once and the full history is never loaded into memory
+  for the list. The first run indexes the history in the background, newest first.
 * Search as you type. **Lexical** search (with highlighted matches and a literal mode for quoted text) or
   **semantic** search (local embedding model, downloaded on first use; falls back to lexical while the cache is
   not ready). Ctrl+T toggles the mode.
@@ -301,7 +302,7 @@ Ctrl+W deletes a word in text fields and never closes a window.
 | `~/.config/claude-history/gui.toml` | the GUI's settings: a `[gui]` table plus overrides of `[display]`, `[resume]`, `[keys]`, `[tui]`, `[search]`, `[agent]`; written only by the Settings dialog (changed keys only, comments kept) |
 | `~/.local/state/claude-history-gui/state.json` | window bounds, pane widths, last workspace and recent folders, view defaults |
 | `~/.local/state/claude-history-gui/debug.log` | debug log |
-| `~/.cache/claude-history-gui/` | conversation caches, the list snapshot (`v3/roots-<hash>/`), and the semantic cache and embedding model |
+| `~/.cache/claude-history-gui/` | conversation caches, the list's index (`v3/roots-<hash>/`: the cards and search index the list reads), and the semantic cache and embedding model |
 
 On Windows `~` is `%USERPROFILE%`. The effective value of a setting is: command-line flag, then `gui.toml`, then
 `config.toml`, then (when `[gui] restore_session` is on) the remembered value, then the default. The time filter

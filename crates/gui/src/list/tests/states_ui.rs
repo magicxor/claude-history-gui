@@ -45,6 +45,8 @@ fn has_dialog(f: &ListFixture, cx: &mut TestAppContext) -> bool {
 fn the_error_view_is_drawn_and_its_buttons_work(cx: &mut TestAppContext) {
     let world = TestWorld::new();
     std::fs::remove_dir_all(world.projects_root()).unwrap();
+    // Store off: the in-memory loader reports a missing projects dir.
+    crate::test_support::use_memory_list(cx, &world, &[]);
     let f = ListFixture::open_loaded(cx, &world, &[]);
     assert_eq!(
         rendered_state(&f, cx),

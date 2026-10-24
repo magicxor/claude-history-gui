@@ -231,10 +231,21 @@ impl Global for TestLaunch {}
 // ---------------------------------------------------------------------------
 
 /// A sandbox home with Claude/Pi/OMP data, config and caches in a temp dir.
+/// The directory is removed once the world and every list pane opened on it
+/// are gone (see [`WorldDir`]).
 pub struct TestWorld {
-    pub tmp: tempfile::TempDir,
+    pub tmp: Arc<tempfile::TempDir>,
     pub env: HistoryEnv,
 }
+
+/// The world's directory, held by each list pane of the test app: the pane's
+/// loader (dropped first) gives up and joins its reconcile pass before the
+/// directory can go, so no pass writes into a removed world (the app, and
+/// its panes, outlive the test function's locals).
+#[derive(Clone)]
+pub struct WorldDir(pub Arc<tempfile::TempDir>);
+
+impl gpui_kit::Global for WorldDir {}
 
 impl Default for TestWorld {
     fn default() -> Self {
@@ -251,7 +262,10 @@ impl TestWorld {
         let env = HistoryEnv::sandbox(tmp.path());
         std::fs::create_dir_all(tmp.path().join(".claude").join("projects"))
             .expect("create the projects dir");
-        Self { tmp, env }
+        Self {
+            tmp: Arc::new(tmp),
+            env,
+        }
     }
 
     /// The sandbox home.
@@ -423,6 +437,14 @@ fn ensure_app(cx: &mut TestAppContext, world: &TestWorld, args: &[&str]) {
     // poll task; the test scheduler refuses foreign-thread wake-ups unless
     // parking is allowed (tests wait in real time).
     cx.executor().allow_parking();
+}
+
+/// Initialise the test app on `world` with `args` and the list's store off:
+/// the window opened next loads the history in memory (tests of that path;
+/// `app::init_for_test` turns the store on).
+pub fn use_memory_list(cx: &mut TestAppContext, world: &TestWorld, args: &[&str]) {
+    ensure_app(cx, world, args);
+    cx.update(|cx| cx.set_global(crate::list::ListSnapshots(false)));
 }
 
 /// Open the production main window on `world` with command-line `args`.

@@ -778,6 +778,7 @@ mod pure {
                 .unwrap(),
             summary: None,
             parse_error_count: 0,
+            parse_errors_known: true,
             file_stem: "3f2a".into(),
         }
     }
@@ -1463,6 +1464,80 @@ mod gui {
             assert!(std::time::Instant::now() < deadline, "{text}");
             std::thread::sleep(Duration::from_millis(3));
         }
+    }
+
+    /// Wait until the header's parse-error badge reads `errors`.
+    fn wait_parse_errors(cx: &mut TestAppContext, viewer: &Entity<ViewerPane>, errors: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while read(cx, viewer, |v| v.header_layout().unwrap().parse_errors) != errors {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the badge never read {errors}"
+            );
+            cx.executor().allow_parking();
+            std::thread::sleep(Duration::from_millis(10));
+            cx.run_until_parked();
+        }
+    }
+
+    /// V-008 in store mode (review fix): a card's header does not know its
+    /// malformed lines, so the viewer counts them from the file once; the
+    /// headers that replace it at each corpus change keep that count at
+    /// once (no badge flicker) and do not parse the unchanged file again; a
+    /// changed file is counted again.
+    #[gpui_kit::test]
+    fn v008_a_cards_parse_errors_are_counted_once_per_file_version(cx: &mut TestAppContext) {
+        let world = TestWorld::new();
+        let paths = world.standard_corpus();
+        let broken = paths
+            .iter()
+            .find(|p| {
+                p.to_string_lossy()
+                    .contains(&crate::test_support::synth::uuid(91))
+            })
+            .unwrap()
+            .clone();
+        let (main, ws) = crate::test_support::open_main(cx, &world, &[]);
+        let viewer = open_in_main(cx, main, &ws, &broken, true);
+        wait_parse_errors(cx, &viewer, 1);
+        assert_eq!(read(cx, &viewer, |v| v.parse_counts()), 1);
+
+        let list = cx.read(|cx| ws.read(cx).list().clone());
+        let header = cx
+            .read(|cx| list.read(cx).header_info(&broken))
+            .expect("the session is listed");
+        assert!(!header.parse_errors_known, "a card's header");
+        viewer.update(cx, |v, cx| v.set_header(Some(header.clone()), cx));
+        assert_eq!(
+            read(cx, &viewer, |v| v.header_layout().unwrap().parse_errors),
+            1,
+            "the count is kept at once"
+        );
+        for _ in 0..20 {
+            cx.executor().allow_parking();
+            std::thread::sleep(Duration::from_millis(5));
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            read(cx, &viewer, |v| v.parse_counts()),
+            1,
+            "the unchanged file is not parsed again"
+        );
+
+        // A second malformed line (a later modification time, whatever the
+        // file system's resolution): the file is counted again.
+        let modified = std::fs::metadata(&broken).unwrap().modified().unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&broken)
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"{not json either\n").unwrap();
+        file.set_modified(modified + Duration::from_secs(2))
+            .unwrap();
+        drop(file);
+        viewer.update(cx, |v, cx| v.set_header(Some(header), cx));
+        wait_parse_errors(cx, &viewer, 2);
+        assert_eq!(read(cx, &viewer, |v| v.parse_counts()), 2);
     }
 
     // ----- status, toggles ---------------------------------------------------------

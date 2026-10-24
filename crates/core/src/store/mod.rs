@@ -2,9 +2,9 @@
 //! before any history is loaded.
 //!
 //! The snapshot is a generation directory under `v3/roots-<hash>/` in the
-//! cache dir (see `default_root` and `generation`). The TUI renders its first
-//! frame from the newest cards, searches the generation's index, and replaces
-//! the cards with fully loaded conversations once loading finishes.
+//! cache dir (see `default_root` and `generation`). The TUI lists the
+//! generation's cards, searches its index, and swaps to each newer generation
+//! that `reconcile` publishes.
 //!
 //! # Differences from upstream
 //!
@@ -16,9 +16,9 @@
 //!   `.pi/settings.json`). Upstream returned `None` under
 //!   `cfg(test)`; here tests are kept off the user's cache by
 //!   [`HistoryEnv::sandbox`] and temporary roots instead.
-//! * **Shared corpus.** [`Snapshot::locate`] and [`Snapshot::covers`]
-//!   accept any slice of `Borrow<Conversation>`, so the browser's
-//!   `Arc<Conversation>` corpus is located without copying.
+//! * **Time filter at runtime.** [`Snapshot::with_time_filter`] gives a
+//!   snapshot of the same mapped generation under another time filter: the
+//!   GUI changes the filter while it runs (upstream fixed it at launch).
 //! * **Sources from the env.** [`reconcile::Sources::from_env`] takes the
 //!   [`HistoryEnv`] (the Claude projects root and the Pi/OMP session roots
 //!   the history loader reads) instead of the process environment.
@@ -73,10 +73,10 @@ use crate::env::HistoryEnv;
 use crate::history::Conversation;
 use crate::time_filter::TimeFilter;
 use chrono::{DateTime, Local};
-use std::borrow::{Borrow, Cow};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Store root: `v3/roots-<hash>/` beside the other caches. The cache dir is
 /// namespaced by `CLAUDE_CONFIG_DIR` ([`HistoryEnv::history_cache_base_dir`]),
@@ -115,12 +115,14 @@ fn source_roots_namespace(pi: Option<&Path>, omp: Option<&Path>) -> String {
     format!("roots-{}", &hasher.finalize().to_hex()[..16])
 }
 
-/// Cards of the current generation, shown until the full corpus is loaded.
+/// Cards of one generation.
 #[derive(Clone)]
 pub struct Snapshot {
     generation: Arc<Generation>,
     show_last: bool,
     time: TimeFilter,
+    /// Doc of each `CardRow::key_hash`, built on first lookup.
+    by_key: Arc<OnceLock<HashMap<u64, u32>>>,
 }
 
 impl Snapshot {
@@ -131,11 +133,77 @@ impl Snapshot {
             generation: Arc::new(Generation::open(root)?),
             show_last,
             time,
+            by_key: Arc::default(),
         })
+    }
+
+    pub fn show_last(&self) -> bool {
+        self.show_last
+    }
+
+    /// Whether `timestamp` is inside the time filter.
+    pub fn in_time(&self, timestamp: DateTime<Local>) -> bool {
+        !self.time.is_active() || self.time.matches(timestamp)
+    }
+
+    /// `CardRow::key_hash` of card `doc`.
+    pub fn key_hash(&self, doc: u32) -> u64 {
+        self.generation.rows()[doc as usize].key_hash
+    }
+
+    /// Doc of every card by `CardRow::key_hash`.
+    pub fn docs_by_key(&self) -> &HashMap<u64, u32> {
+        self.by_key.get_or_init(|| {
+            self.generation
+                .rows()
+                .iter()
+                .enumerate()
+                .map(|(doc, row)| (row.key_hash, doc as u32))
+                .collect()
+        })
+    }
+
+    /// Whether a card has `CardRow::key_hash` `key`.
+    pub fn contains_key(&self, key: u64) -> bool {
+        self.docs_by_key().contains_key(&key)
+    }
+
+    /// Doc of the card stored at `path`.
+    pub fn find(&self, path: &Path) -> Option<u32> {
+        let path = path.to_str()?;
+        let doc = *self.docs_by_key().get(&generation::key_hash(path))?;
+        let row = &self.generation.rows()[doc as usize];
+        (self.generation.str(row.path) == path).then_some(doc)
+    }
+
+    /// Doc of the card whose session id is `session_id`, ignoring case.
+    pub fn find_session(&self, session_id: &str) -> Option<u32> {
+        self.generation
+            .rows()
+            .iter()
+            .position(|row| {
+                self.generation
+                    .str(row.session_id)
+                    .eq_ignore_ascii_case(session_id)
+            })
+            .map(|doc| doc as u32)
+    }
+
+    /// Whether the cards come from more than one source.
+    pub fn has_multiple_sources(&self) -> bool {
+        let mut rows = self.generation.rows().iter();
+        rows.next()
+            .is_some_and(|first| rows.any(|row| row.source != first.source))
     }
 
     pub fn generation_name(&self) -> &str {
         self.generation.name()
+    }
+
+    /// Identifies the generation across store roots (its directory; the
+    /// name alone repeats from root to root).
+    pub fn generation_id(&self) -> String {
+        self.generation.dir().display().to_string()
     }
 
     /// Number of cards; doc ids are `0..len()`.
@@ -193,48 +261,20 @@ impl Snapshot {
         })
     }
 
-    /// For every card, the index in `conversations` of the conversation
-    /// stored at the same path, if any.
-    pub fn locate<C: Borrow<Conversation>>(&self, conversations: &[C]) -> Vec<Option<usize>> {
-        let by_path: HashMap<&Path, usize> = conversations
-            .iter()
-            .enumerate()
-            .map(|(index, conversation)| (conversation.borrow().path.as_path(), index))
-            .collect();
-        self.generation
-            .rows()
-            .iter()
-            .map(|row| {
-                by_path
-                    .get(Path::new(self.generation.str(row.path)))
-                    .copied()
-            })
-            .collect()
+    /// This snapshot under the time filter `time` (fork: the GUI changes the
+    /// filter at runtime). The generation stays mapped once.
+    pub fn with_time_filter(&self, time: TimeFilter) -> Self {
+        Self {
+            generation: self.generation.clone(),
+            show_last: self.show_last,
+            time,
+            by_key: self.by_key.clone(),
+        }
     }
 
-    /// Whether the cards describe exactly `conversations`, given the
-    /// result of [`Self::locate`]: every conversation has a card with the
-    /// same timestamp. A newer or changed conversation makes it false.
-    pub fn covers<C: Borrow<Conversation>>(
-        &self,
-        conversations: &[C],
-        located: &[Option<usize>],
-    ) -> bool {
-        let mut matched = 0;
-        for (row, position) in self.generation.rows().iter().zip(located) {
-            if let Some(position) = position {
-                if conversations[*position]
-                    .borrow()
-                    .timestamp
-                    .timestamp_millis()
-                    != row.timestamp_ms
-                {
-                    return false;
-                }
-                matched += 1;
-            }
-        }
-        matched == conversations.len()
+    /// The time filter the snapshot applies (fork).
+    pub fn time_filter(&self) -> &TimeFilter {
+        &self.time
     }
 }
 
@@ -348,7 +388,6 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::Arc;
 
     #[test]
     fn snapshot_namespace_follows_pi_and_omp_roots() {
@@ -434,26 +473,34 @@ mod tests {
         );
         assert_eq!((outcome.scanned, outcome.parsed), (3, 3));
 
-        let loaded: Vec<Arc<Conversation>> =
-            crate::history::load_all_conversations(&env, true, None)
-                .unwrap()
-                .into_iter()
-                .map(Arc::new)
-                .collect();
+        let loaded = crate::history::load_all_conversations(&env, true, None).unwrap();
         assert_eq!(loaded.len(), 3);
         let snapshot = Snapshot::open(&root, true, TimeFilter::default()).unwrap();
-        let located = snapshot.locate(&loaded);
-        assert!(located.iter().all(Option::is_some), "{located:?}");
-        assert!(snapshot.covers(&loaded, &located));
-        for (doc, position) in located.iter().enumerate() {
-            let card = snapshot.card(doc as u32);
-            let conversation = &loaded[position.unwrap()];
+        assert_eq!(snapshot.len(), 3);
+        // The list shows cards instead of loaded conversations: each card
+        // carries what the loader gives its row.
+        for conversation in &loaded {
+            let doc = snapshot
+                .find(&conversation.path)
+                .unwrap_or_else(|| panic!("no card for {:?}", conversation.path));
+            let card = snapshot.card(doc);
             assert_eq!(card.source, conversation.source);
             assert_eq!(card.session_id, conversation.session_id);
+            assert_eq!(
+                card.timestamp.timestamp_millis(),
+                conversation.timestamp.timestamp_millis()
+            );
             assert_eq!(card.project_path, conversation.project_path);
             assert_eq!(card.project_name, conversation.project_name);
+            assert_eq!(card.cwd, conversation.cwd);
             assert_eq!(card.preview, conversation.preview);
+            assert_eq!(card.message_count, conversation.message_count);
+            assert_eq!(
+                snapshot.find_session(&conversation.session_id.to_uppercase()),
+                Some(doc)
+            );
         }
+        assert!(snapshot.has_multiple_sources(), "Claude and Pi cards");
         let index = SearchIndex::open(snapshot).expect("the pass wrote the index");
         let alpha = (0..3)
             .find(|&doc| index.text(doc).contains("alpha words"))

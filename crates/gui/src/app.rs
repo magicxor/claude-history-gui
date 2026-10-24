@@ -204,9 +204,12 @@ pub fn init_for_test(
         cx.set_global(crate::test_support::KitInitialized);
     }
     cx.set_global(persist::PersistWrites(false));
-    // No list snapshot is read or written unless a test turns it on (its
-    // store-reconcile thread must not outlive the world's temporary directory).
-    cx.set_global(crate::list::ListSnapshots(false));
+    // The list comes from the store under the world's cache root, as in the
+    // app (upstream 358becb); tests of the in-memory path turn it off
+    // (`test_support::use_memory_list`). The loader joins its threads when
+    // the window goes, before the world's temporary directory.
+    cx.set_global(crate::list::ListSnapshots(true));
+    cx.set_global(crate::test_support::WorldDir(world.tmp.clone()));
     let services = Services::recording(recording);
     // The debug sink and the core theme are process-wide: tests that need
     // them install them under `test_support::global_lock`.

@@ -118,7 +118,7 @@ impl ListPane {
                 if !browser.filtered().is_empty() {
                     return None;
                 }
-                if browser.conversations().is_empty() {
+                if browser.history_is_empty() {
                     let mut actions = vec![StateAction::Refresh];
                     if self.time_filter.is_active() {
                         actions.push(StateAction::ClearTimeFilter);

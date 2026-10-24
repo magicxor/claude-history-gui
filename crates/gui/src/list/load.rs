@@ -4,6 +4,12 @@
 //! that revert on failure, the UUID lookup and the semantic-error toast.
 //! WP1. Methods of `ListPane` that live here are private to the `list`
 //! module except the public API (`set_workspace`, `set_time_filter`).
+//!
+//! In store mode (upstream 358becb) core's loader keeps the same events: a
+//! refresh or a reload runs a reconcile pass and ends when the generation it
+//! left is shown, a time filter re-scopes the cards, and a generation swapped
+//! in outside a refresh only reports `LoaderPoll::swapped` (the corpus
+//! changed under the list).
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -110,19 +116,28 @@ impl ListPane {
             };
             self.loading_snapshots.push(snapshot);
         }
-        let installed = loader_poll.event.is_some();
+        let installed = loader_poll.event.is_some() || loader_poll.swapped;
         let span = match &loader_poll.event {
             Some(LoadEvent::Loaded { .. } | LoadEvent::NoHistory(_)) => Some(BusySpan::LoadEnd),
             Some(LoadEvent::Refreshed { .. }) => Some(BusySpan::RefreshEnd),
             _ => None,
         };
-        if let Some(event) = loader_poll.event {
-            self.on_load_event(event, window, cx);
+        match loader_poll.event {
+            Some(event) => self.on_load_event(event, window, cx),
+            // A newer generation swapped in by a background pass.
+            None if loader_poll.swapped && !self.is_loading() => self.after_corpus_load(cx),
+            None => {}
         }
         self.check_semantic_error(window, cx);
         self.check_uuid_lookup(window, cx);
         self.emit_selection(false, cx);
         self.start_queued_reload(cx);
+        let reconciling = self.is_reconciling();
+        if std::mem::replace(&mut self.was_reconciling, reconciling) && !reconciling {
+            // The pass is done, with or without a newer generation: whoever
+            // waited for the complete list (PD3 rule 3 (c)) looks again.
+            cx.emit(ListPaneEvent::CorpusChanged);
+        }
         let flags = (self.is_loading(), self.is_refreshing());
         if flags != self.load_flags {
             self.load_flags = flags;
@@ -366,6 +381,8 @@ impl ListPane {
 
     /// Change the workspace: reload with `ApplyPartial`, revert on failure (§11.20).
     /// `AppState.workspace` is already the new one (the caller updated it).
+    /// In store mode the reload is a reconcile pass (of the store of the new
+    /// workspace's Pi/OMP session roots when they differ).
     pub fn set_workspace(&mut self, workspace: Option<WorkspaceScope>, cx: &mut Context<Self>) {
         if self.browser.workspace() == workspace.as_ref() {
             return;
@@ -390,6 +407,8 @@ impl ListPane {
     }
 
     /// Change the time filter: reload with `ApplyPartial`, revert on failure (§11.21).
+    /// In store mode the cards shown are re-scoped at the next poll and the
+    /// reload is a reconcile pass.
     pub fn set_time_filter(
         &mut self,
         filter: TimeFilter,

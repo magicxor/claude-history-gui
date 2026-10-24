@@ -404,9 +404,14 @@ fn clicking_the_selected_row_previews_it_again(cx: &mut TestAppContext) {
 fn loading_gates_the_modifying_actions(cx: &mut TestAppContext) {
     let world = TestWorld::new();
     listed_corpus(&world);
+    // Store off: the in-memory loader streams batches.
+    crate::test_support::use_memory_list(cx, &world, &[]);
     let f = ListFixture::open_paused(cx, &world, &[]);
-    f.step_until(cx, "the first batch", |list| {
-        !list.loading_snapshots().is_empty()
+    // Two rows while loading (the first batch can be a single Pi row).
+    f.step_until(cx, "two rows while loading", |list| {
+        list.loading_snapshots()
+            .iter()
+            .any(|snapshot| snapshot.rows >= 2)
     });
     assert!(f.read(cx, |list, _| list.is_loading()));
     // A terminal stdout makes an ungated Ctrl+O open the print confirmation

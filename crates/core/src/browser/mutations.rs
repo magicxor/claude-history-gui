@@ -46,14 +46,18 @@ impl Browser {
     /// is not moved (addendum B3); only its corpus element and its search
     /// data change. Semantic metadata and lexical evidence are cleared.
     /// The query is re-applied (a lexical query in the background, keeping
-    /// the rows, over the loaded corpus: the store index in use holds the
-    /// old title, so it is dropped as upstream) and the renamed session
-    /// stays selected when it is shown. [`RenameError::NoTarget`] when
-    /// `path` is no longer loaded (deleted or refreshed away meanwhile).
+    /// the rows) and the renamed session stays selected when it is shown.
+    /// [`RenameError::NoTarget`] when `path` is no longer listed (deleted
+    /// or refreshed away meanwhile).
     ///
     /// The path is found through the path index and the browse rows come
     /// from the cached scope (CCR-2): the caller's thread does no work per
     /// conversation besides copying pointers and row numbers.
+    ///
+    /// In generation mode only the row's title changes, kept as an overlay
+    /// until a generation holds it, and a reconcile pass is asked for; the
+    /// index keeps the old title until then and the rows stay (upstream
+    /// 358becb).
     ///
     /// Synchronous convenience: it normalizes the session's text on the
     /// caller's thread ([`PreparedSession::new`]); a GUI prepares the
@@ -70,6 +74,10 @@ impl Browser {
         renamed: PreparedSession,
     ) -> Result<(), RenameError> {
         let index = self.position_of_path(path).ok_or(RenameError::NoTarget)?;
+        if self.snapshot.is_some() {
+            self.retitle_row(index, path, renamed.conversation.custom_title);
+            return Ok(());
+        }
         let previous = &self.conversations[index];
         let PreparedSession {
             conversation: mut renamed,
@@ -81,12 +89,9 @@ impl Browser {
         self.replace_conversation_at(index, Arc::new(renamed), body_lower);
         if self.is_loading() {
             // No search data or query results yet: the row just shows the
-            // new title (the index of snapshot cards holds the old one).
-            self.cards_edited();
+            // new title.
             return Ok(());
         }
-        // The index holds the old title.
-        self.drop_search_index();
         self.corpus_changed();
 
         let path = path.to_path_buf();

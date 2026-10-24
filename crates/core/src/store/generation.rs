@@ -81,10 +81,18 @@ impl Generation {
         Self::open_current(root).or_else(|| Self::open_current(root))
     }
 
-    fn open_current(root: &Path) -> Option<Self> {
+    /// Name of the generation `root/CURRENT` points at, without opening
+    /// it.
+    pub fn current_name(root: &Path) -> Option<String> {
         let name = fs::read_to_string(root.join(CURRENT)).ok()?;
         let name = name.trim();
         generation_number(name)?;
+        Some(name.to_string())
+    }
+
+    fn open_current(root: &Path) -> Option<Self> {
+        let name = Self::current_name(root)?;
+        let name = name.as_str();
         let dir = root.join(name);
         let file = File::open(dir.join(MANIFEST)).ok()?;
         // SAFETY: published manifests are never written again and are only
@@ -203,6 +211,12 @@ impl Generation {
     /// Directory name of this generation, e.g. `g000012`.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The generation's directory: unique across store roots, unlike
+    /// [`Generation::name`].
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     /// Opens this generation's index segments and text segments. `None`

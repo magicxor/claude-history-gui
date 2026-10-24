@@ -16,18 +16,18 @@ use crate::notify::ToastKind;
 use crate::test_support::fixtures_list::{ListFixture, SessionSpec, listed_corpus};
 use crate::test_support::{TestWorld, global_lock, recording, synth};
 
-/// L-001, L-002: rows are listed while the load runs; the first row is
-/// selected; the suffix reads `Loading… <n>`; afterwards the count is 8.
+/// L-001, L-002 (store off): rows are listed while the load runs; the first
+/// row is selected; the suffix reads `Loading…` before the first batch and
+/// `Loading… <n>` with rows; afterwards the count is 8.
 #[gpui_kit::test]
 fn rows_stream_in_while_loading(cx: &mut TestAppContext) {
     let world = TestWorld::new();
     listed_corpus(&world);
+    // Store off: the in-memory loader streams batches.
+    crate::test_support::use_memory_list(cx, &world, &[]);
     let f = ListFixture::open_paused(cx, &world, &[]);
     assert!(f.read(cx, |list, _| list.is_loading()));
-    assert_eq!(
-        f.read(cx, |list, _| list.search_status().text),
-        "Loading… 0"
-    );
+    assert_eq!(f.read(cx, |list, _| list.search_status().text), "Loading…");
     f.step_until(cx, "the first batch", |list| {
         !list.loading_snapshots().is_empty()
     });
@@ -67,6 +67,8 @@ fn a_query_typed_while_loading_is_applied_at_the_end(cx: &mut TestAppContext) {
         .summary("Alpha")
         .messages(&[("user", "alpha rollout plan"), ("assistant", "ok")])
         .write(&world);
+    // Store off: the in-memory loader streams batches.
+    crate::test_support::use_memory_list(cx, &world, &[]);
     let f = ListFixture::open_paused(cx, &world, &[]);
     f.type_text(cx, "alpha");
     assert_eq!(f.read(cx, |list, cx| list.query(cx)).as_ref(), "alpha");
@@ -151,6 +153,8 @@ fn time_filter_hides_everything_with_a_clear_button(cx: &mut TestAppContext) {
 fn a_missing_projects_dir_is_an_error_with_retry(cx: &mut TestAppContext) {
     let world = TestWorld::new();
     std::fs::remove_dir_all(world.projects_root()).unwrap();
+    // Store off: the in-memory loader reports a missing projects dir (a pass lists it as empty).
+    crate::test_support::use_memory_list(cx, &world, &[]);
     let f = ListFixture::open_loaded(cx, &world, &[]);
     let state = f
         .read(cx, |list, cx| list.empty_state(cx))
@@ -216,6 +220,8 @@ fn debug_lines_reach_the_buffer(cx: &mut TestAppContext) {
     listed_corpus(&world);
     ListFixture::init_app(cx, &world, &["--debug", "info"]);
     cx.update(|cx| crate::debug_sink::install(cx, Some(DebugLevel::Info)));
+    // Store off: the in-memory loader writes these lines.
+    crate::test_support::use_memory_list(cx, &world, &["--debug", "info"]);
     let f = ListFixture::open_loaded(cx, &world, &["--debug", "info"]);
     let lines = cx.read(|cx| cx.global::<crate::globals::DebugBufferHandle>().0.lines());
     claude_history_core::debug::reset_sink();
@@ -401,6 +407,8 @@ fn uuid_jump_loads_from_disk_in_the_background(cx: &mut TestAppContext) {
         .summary("Old session")
         .start(Utc::now() - Duration::days(400))
         .write(&world);
+    // Store off: an old session outside the time filter is not loaded (in store mode it is a card, found at once).
+    crate::test_support::use_memory_list(cx, &world, &["--since", "1d"]);
     let f = ListFixture::open_loaded(cx, &world, &["--since", "1d"]);
     let before = f.paths(cx);
     assert!(
@@ -478,6 +486,8 @@ fn an_empty_scope_offers_show_all(cx: &mut TestAppContext) {
 fn polls_stay_short_while_the_corpus_is_prepared(cx: &mut TestAppContext) {
     let world = TestWorld::new();
     synth::corpus(&world, 1_500);
+    // Store off: the in-memory loader streams batches.
+    crate::test_support::use_memory_list(cx, &world, &[]);
     let f = ListFixture::open_paused(cx, &world, &[]);
     let mut slowest = std::time::Duration::ZERO;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -509,6 +519,8 @@ fn polls_stay_short_while_the_corpus_is_prepared(cx: &mut TestAppContext) {
 fn an_incomplete_retry_returns_to_the_error_view(cx: &mut TestAppContext) {
     let world = TestWorld::new();
     std::fs::remove_dir_all(world.projects_root()).unwrap();
+    // Store off: the in-memory loader reports a missing projects dir (a pass lists it as empty).
+    crate::test_support::use_memory_list(cx, &world, &[]);
     let f = ListFixture::open_loaded(cx, &world, &[]);
     f.with_window(cx, |list, window, cx| {
         list.run_state_action(StateAction::Retry, window, cx);

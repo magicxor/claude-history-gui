@@ -23,6 +23,12 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 - Updating the startup snapshot after a load is much cheaper: only conversation files that are new or changed since
   the last update are read again and added to it, and nothing is written when no file changed. An update cut short by
   quitting keeps what it saved and continues at the next start.
+- The list no longer loads the whole history at startup: it shows and searches the conversations straight from that
+  index, which is brought up to date in the background at start, on refresh and after a rename or delete, and newer
+  results replace the list without moving the selection or clearing a search. Startup is faster and uses far less
+  memory with a large history. Rename and delete become available moments after the first rows appear; a deleted
+  conversation disappears at once. Changing the time filter no longer reads the history again. Semantic search reads
+  the full conversations the first time it is used ("sem loading conversations").
 
 ## v0.1.1
 

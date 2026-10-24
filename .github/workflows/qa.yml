@@ -49,9 +49,10 @@ jobs:
             'viewer-search-nav' = @{ Prepare = 'viewer-noperf'; Args = $tour }
             'single-file'       = @{ Prepare = 'viewer-noperf'; Args = $tour }
             'perf-viewer'       = @{ Prepare = 'viewer'; Args = '--show-tools "{0}\viewer\perf-10k.jsonl"' }
-            'perf-list'         = @{ Prepare = 'synth'; Args = '' }
+            # The 20k-row scenarios first wait for the initial reconcile pass to index every session.
+            'perf-list'         = @{ Prepare = 'synth'; Args = ''; Timeout = 900 }
             # V-094: the viewer's frame time in the main window (20k rows + the 3k perf transcript as a row).
-            'perf-viewer-main'  = @{ Prepare = 'synth-perf'; Args = ''; Timeout = 600 }
+            'perf-viewer-main'  = @{ Prepare = 'synth-perf'; Args = ''; Timeout = 900 }
             # WP3: a fork into the sandbox folder always copies; picker mode; the
             # printed line of Ctrl+O goes to the real stdout (checked below).
             'resume-fork'       = @{ Prepare = ''; Args = '--workspace "{0}"' }
@@ -61,7 +62,7 @@ jobs:
             'picker'            = @{ Prepare = ''; Args = '--show-path' }
             'picker-exit'       = @{ Prepare = ''; Args = '--show-path --qa-real-console'; Stdout = $true }
             # WP-I: the panes together on 20k rows (X-038 timings, X-007 idle).
-            'cross-pane'        = @{ Prepare = 'synth'; Args = ''; Timeout = 900 }
+            'cross-pane'        = @{ Prepare = 'synth'; Args = ''; Timeout = 1200 }
           }
           foreach ($scenario in Get-ChildItem crates/gui/qa/scenarios -Filter *.qa) {
             if ($scenario.Name -like 'semantic-*') { Write-Output "skip $($scenario.Name) (needs a model)"; continue }

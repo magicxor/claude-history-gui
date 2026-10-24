@@ -1,17 +1,19 @@
-//! G tests of the startup snapshot (L-099, L-062, L-068, L-040, A-001, L-004;
-//! upstream 3708bb6, ac7f591): the first rows are the store's snapshot cards,
-//! newest first, before any batch arrives; Resume, Fork and Ctrl+O work on
-//! them, Rename and Delete wait for the load; a query runs on the snapshot's
-//! index before the load ends; the loaded corpus replaces the cards keeping
-//! the selection, and the initial load starts a reconcile pass that brings
-//! the snapshot and its index up to date with the session files (e905169).
+//! G tests of the list in store mode (L-099…L-101, L-062, L-068, L-040,
+//! A-001, L-004, L-048, S-015; upstream 3708bb6, ac7f591, e905169, 358becb):
+//! the first rows are the newest cards of the store's generation; Resume,
+//! Fork and Ctrl+O work on them, Rename and Delete wait until the generation
+//! is shown in full; a query typed before that runs on the generation's
+//! index; the initial load is a reconcile pass whose newer generation is
+//! swapped in keeping the selection; a time filter re-scopes the cards and a
+//! UUID finds a card outside it; a delete hides the row until a generation
+//! drops it.
 //!
-//! Snapshots are off in tests (`app::init_for_test`); each test here turns
-//! them on before opening the window and joins the pass before its world
-//! goes.
+//! The store is on in tests (`app::init_for_test`); tests that end while a
+//! pass may still publish join it (`ListPane::finish_snapshot_write`).
 
 use std::path::PathBuf;
 
+use chrono::{Duration, Utc};
 use claude_history_core::maintenance::load_sorted_conversations;
 use claude_history_core::store;
 use claude_history_core::store::card::Fingerprint;
@@ -22,18 +24,17 @@ use gpui_kit::TestAppContext;
 
 use crate::actions::OpenRowContextMenu;
 use crate::list::ListPaneEvent;
-use crate::list::ListSnapshots;
 use crate::list::footer::ChipKind;
 use crate::test_support::fixtures_list::{ListFixture, SessionSpec, listed_corpus};
 use crate::test_support::fixtures_ops::{project_dir, write_gui_config};
 use crate::test_support::fixtures_viewer::{draw, wait_viewer_ready};
-use crate::test_support::{TestWorld, recording};
+use crate::test_support::{TestWorld, recording, synth};
 
-/// Publish the store snapshot of the world's corpus with every card titled
-/// `Card <n>` (newest first), so card rows are told apart from loaded rows.
-/// The fingerprints are unknown, so the reconcile pass after the load parses
-/// every session again and replaces the cards. Returns the card paths,
-/// newest first.
+/// Publish the store generation of the world's corpus with every card titled
+/// `Card <n>` (newest first), so card rows are told apart from parsed rows.
+/// The fingerprints are unknown, so the reconcile pass of the initial load
+/// parses every session again and publishes the real titles. Returns the
+/// card paths, newest first.
 fn publish_cards(world: &TestWorld) -> Vec<PathBuf> {
     let mut conversations =
         load_sorted_conversations(&world.env, true, None, &TimeFilter::default())
@@ -62,16 +63,24 @@ fn publish_cards(world: &TestWorld) -> Vec<PathBuf> {
             ignored: Vec::new(),
         },
     )
-    .expect("write the snapshot");
+    .expect("write the generation");
     assert!(matches!(publish, Publish::Published(_)), "{publish:?}");
     paths
 }
 
-/// Open the main window with snapshots on and the poll loop paused (nothing
-/// is loaded until the test steps or resumes it).
-fn open_with_snapshots(cx: &mut TestAppContext, world: &TestWorld) -> ListFixture {
-    ListFixture::init_app(cx, world, &[]);
-    cx.update(|cx| cx.set_global(ListSnapshots(true)));
+/// Hold the store's lock as another instance would: the initial pass waits
+/// (retrying every second) until the lock is dropped, so the generation
+/// published by [`publish_cards`] stays shown meanwhile.
+fn hold_store(world: &TestWorld) -> PublishLock {
+    let root = store::default_root(&world.env).expect("a store root in the sandbox");
+    PublishLock::try_acquire(&root)
+        .expect("open the lock")
+        .expect("take the lock")
+}
+
+/// Open the main window with the poll loop paused (nothing is installed
+/// until the test steps or resumes it; the first frame's cards are shown).
+fn open_paused(cx: &mut TestAppContext, world: &TestWorld) -> ListFixture {
     let f = ListFixture::open_paused(cx, world, &[]);
     f.with_window(cx, |list, window, cx| list.focus_search(window, cx));
     cx.run_until_parked();
@@ -95,20 +104,40 @@ fn settle(cx: &mut TestAppContext) {
     cx.run_until_parked();
 }
 
-/// L-099, L-040, L-068: before any batch arrives the rows are the snapshot
-/// cards, newest first, the first one selected; the suffix reads
-/// `Loading… 0`; the open, resume and fork chips are lit while rename and
-/// delete stay dimmed; the row menu enables Resume and disables Rename.
+/// Release the store (`held`), then wait until the reconcile pass has
+/// published and its generation is shown (the titles are parsed ones, not
+/// `Card <n>`).
+fn wait_for_the_reconciled_titles(f: &ListFixture, cx: &mut TestAppContext, held: PublishLock) {
+    drop(held);
+    let published = f.list.update(cx, |list, _| list.finish_snapshot_write());
+    assert!(
+        matches!(published, Some(Publish::Published(_))),
+        "the pass publishes the parsed titles: {published:?}"
+    );
+    f.wait_until(cx, "the swap to the reconciled generation", |list, _| {
+        list.browser()
+            .conversations()
+            .iter()
+            .all(|c| !c.custom_title.as_deref().unwrap_or("").starts_with("Card "))
+    });
+    f.wait_idle(cx);
+}
+
+/// L-099, L-040, L-068: the first frame lists the newest cards, the first
+/// one selected; open, resume and fork are lit while rename and delete stay
+/// dimmed until the generation is shown in full; then the pass's generation
+/// (the parsed titles) is swapped in.
 #[gpui_kit::test]
-fn snapshot_cards_are_listed_newest_first_before_the_load(cx: &mut TestAppContext) {
+fn the_first_frame_lists_the_cards_of_the_generation(cx: &mut TestAppContext) {
     let world = TestWorld::new();
     listed_corpus(&world);
     let cards = publish_cards(&world);
-    let f = open_with_snapshots(cx, &world);
+    let held = hold_store(&world);
+    let f = open_paused(cx, &world);
 
     assert!(f.read(cx, |list, _| list.is_loading()));
     assert!(f.read(cx, |list, _| list.list_ready()));
-    assert_eq!(f.paths(cx), cards, "newest first, before any batch");
+    assert_eq!(f.paths(cx), cards, "newest first, before the install");
     assert_eq!(
         f.titles(cx),
         (0..cards.len())
@@ -118,11 +147,15 @@ fn snapshot_cards_are_listed_newest_first_before_the_load(cx: &mut TestAppContex
     assert_eq!(f.selected_position(cx), Some(0));
     assert_eq!(
         f.read(cx, |list, _| list.search_status().text),
-        "Loading… 0"
+        format!("1/{}", cards.len())
     );
     assert_eq!(
         f.read(cx, |list, cx| list.qa_probe("list.ready", cx)),
         Some("true".to_string())
+    );
+    assert_eq!(
+        f.read(cx, |list, cx| list.qa_probe("list.generation", cx)),
+        Some("g000001".to_string())
     );
 
     let footer = cx
@@ -139,10 +172,10 @@ fn snapshot_cards_are_listed_newest_first_before_the_load(cx: &mut TestAppContex
             .dimmed
     };
     for kind in [ChipKind::Open, ChipKind::Resume, ChipKind::Fork] {
-        assert!(!dimmed(kind), "{kind:?} is lit on snapshot cards");
+        assert!(!dimmed(kind), "{kind:?} is lit on the first cards");
     }
     for kind in [ChipKind::Rename, ChipKind::Delete] {
-        assert!(dimmed(kind), "{kind:?} waits for the load");
+        assert!(dimmed(kind), "{kind:?} waits for the install");
     }
 
     f.with_window(cx, |list, window, cx| {
@@ -161,20 +194,34 @@ fn snapshot_cards_are_listed_newest_first_before_the_load(cx: &mut TestAppContex
 
     f.resume(cx);
     f.wait_loaded(cx);
+    assert_eq!(f.paths(cx), cards, "every card, still the published titles");
     assert!(
-        matches!(
-            f.list.update(cx, |list, _| list.finish_snapshot_write()),
-            Some(Publish::Published(_))
-        ),
-        "the loaded corpus (real titles) replaces the cards' generation"
+        f.read(cx, |list, _| list.browser().generation_open()),
+        "the generation is shown in full"
+    );
+    assert_eq!(
+        f.read(cx, |list, cx| list.qa_probe("list.index", cx)),
+        Some("g000001".to_string())
+    );
+    assert_eq!(
+        f.read(cx, |list, cx| list.qa_probe("list.reconciling", cx)),
+        Some("true".to_string()),
+        "the pass waits for the store"
+    );
+    wait_for_the_reconciled_titles(&f, cx, held);
+    assert_eq!(f.paths(cx).len(), cards.len());
+    assert_eq!(
+        f.read(cx, |list, cx| list.qa_probe("list.reconciling", cx)),
+        Some("false".to_string()),
+        "the pass's generation is shown"
     );
 }
 
-/// L-062, A-001: on snapshot cards Ctrl+R resumes and Ctrl+F forks the
+/// L-062, A-001: on the first cards Ctrl+R resumes and Ctrl+F forks the
 /// selected card's session (one recorded terminal command each) and Ctrl+O
-/// asks before printing; F2 and Ctrl+X open no dialog until the load ends.
+/// asks before printing; F2 and Ctrl+X open no dialog until the install.
 #[gpui_kit::test]
-fn snapshot_cards_resume_and_fork_but_wait_to_edit(cx: &mut TestAppContext) {
+fn the_first_cards_resume_and_fork_but_wait_to_edit(cx: &mut TestAppContext) {
     let world = TestWorld::new();
     write_gui_config(&world, "", "");
     let cwd = project_dir(&world, "proj");
@@ -189,14 +236,17 @@ fn snapshot_cards_resume_and_fork_but_wait_to_edit(cx: &mut TestAppContext) {
         .write(&world);
     let cards = publish_cards(&world);
     assert_eq!(cards[0], newest);
-    let f = open_with_snapshots(cx, &world);
+    let f = open_paused(cx, &world);
     assert!(f.read(cx, |list, _| list.is_loading()));
     let stem = newest.file_stem().unwrap().to_string_lossy().into_owned();
 
     f.press(cx, "f2");
     f.press(cx, "ctrl-x");
     cx.run_until_parked();
-    assert!(!has_dialog(&f, cx), "rename and delete wait for the load");
+    assert!(
+        !has_dialog(&f, cx),
+        "rename and delete wait for the install"
+    );
 
     f.press(cx, "ctrl-r");
     settle(cx);
@@ -234,15 +284,15 @@ fn snapshot_cards_resume_and_fork_but_wait_to_edit(cx: &mut TestAppContext) {
     f.list.update(cx, |list, _| list.finish_snapshot_write());
 }
 
-/// AD6, upstream 3708bb6: a card opened in the viewer while the load runs
+/// AD6, upstream 3708bb6: a card opened in the viewer before the install
 /// does not make Rename and Delete available there either: F2 and Ctrl+X
-/// (viewer focused) open no dialog until the load ends, then they work.
+/// (viewer focused) open no dialog until then, then they work.
 #[gpui_kit::test]
 fn the_viewer_of_a_card_waits_to_rename_and_delete(cx: &mut TestAppContext) {
     let world = TestWorld::new();
     listed_corpus(&world);
     let cards = publish_cards(&world);
-    let f = open_with_snapshots(cx, &world);
+    let f = open_paused(cx, &world);
     assert!(f.read(cx, |list, _| list.is_loading()));
     // Enter on the selected card: the target carries the source the card knows.
     f.press(cx, "enter");
@@ -256,10 +306,10 @@ fn the_viewer_of_a_card_waits_to_rename_and_delete(cx: &mut TestAppContext) {
 
     f.press(cx, "ctrl-x");
     settle(cx);
-    assert!(!has_dialog(&f, cx), "delete waits for the load");
+    assert!(!has_dialog(&f, cx), "delete waits for the install");
     f.press(cx, "f2");
     settle(cx);
-    assert!(!has_dialog(&f, cx), "rename waits for the load");
+    assert!(!has_dialog(&f, cx), "rename waits for the install");
     assert!(cx.read(|cx| viewer.read(cx).target().is_some()));
 
     f.resume(cx);
@@ -275,42 +325,30 @@ fn the_viewer_of_a_card_waits_to_rename_and_delete(cx: &mut TestAppContext) {
             break;
         }
     }
-    assert!(opened, "delete works once the load ended");
+    assert!(opened, "delete works once the generation is shown in full");
 }
 
-/// L-004, upstream ac7f591: the snapshot's search index opens off the UI
-/// thread; a query typed while the load still runs then lists the matching
-/// cards at once (the loaded corpus is not needed), and the loaded corpus
-/// keeps those rows and the index.
+/// L-004, upstream ac7f591, 358becb: a query typed over the first cards is
+/// kept (no index yet, the cards stay listed) and runs on the generation's
+/// index once it is installed; the rows are cards.
 #[gpui_kit::test]
-fn a_query_typed_over_cards_runs_on_the_snapshot_index(cx: &mut TestAppContext) {
+fn a_query_typed_over_the_first_cards_runs_on_the_index(cx: &mut TestAppContext) {
     let world = TestWorld::new();
     let written = listed_corpus(&world);
     let cards = publish_cards(&world);
-    let f = open_with_snapshots(cx, &world);
-    f.step_until(cx, "the snapshot's index", |list| {
-        list.browser().readiness().lexical
-    });
-    assert!(f.read(cx, |list, _| list.is_loading()));
+    let held = hold_store(&world);
+    let f = open_paused(cx, &world);
 
     f.type_text(cx, "deploy");
     assert!(
-        f.read(cx, |list, _| list.is_loading()
-            && list.browser().has_search_work_in_flight()),
-        "the query runs while loading"
+        f.read(cx, |list, _| !list.browser().readiness().lexical
+            && !list.browser().has_search_work_in_flight()),
+        "the query waits for the index"
     );
-    // Only the search answers: the load waits meanwhile.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while f.read(cx, |list, _| list.browser().has_search_work_in_flight()) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the index did not answer"
-        );
-        f.list.update(cx, |list, cx| list.poll_search_only(cx));
-        cx.run_until_parked();
-        std::thread::sleep(std::time::Duration::from_millis(3));
-    }
-    assert!(f.read(cx, |list, _| list.is_loading()), "still loading");
+    assert_eq!(f.paths(cx), cards, "the cards stay listed");
+
+    f.resume(cx);
+    f.wait_loaded(cx);
     let found = f.paths(cx);
     assert!(found.contains(&written[1]), "{found:?}");
     assert!(found.len() < cards.len(), "{found:?}");
@@ -319,108 +357,221 @@ fn a_query_typed_over_cards_runs_on_the_snapshot_index(cx: &mut TestAppContext) 
         "the rows are cards: {:?}",
         f.titles(cx)
     );
-
-    f.resume(cx);
-    f.wait_loaded(cx);
-    assert_eq!(f.paths(cx), found, "the loaded corpus keeps the rows");
-    assert!(
-        f.titles(cx).iter().all(|title| !title.starts_with("Card ")),
-        "{:?}",
-        f.titles(cx)
-    );
-    assert!(
-        f.read(cx, |list, _| list
-            .browser()
-            .search_index_generation()
-            .is_some()),
-        "the loaded corpus keeps an index"
-    );
-    // The cards' titles differ from the parsed ones: the reconcile pass
-    // publishes a new generation, which is swapped in, and the query runs on
-    // it again.
-    assert_eq!(
-        f.list.update(cx, |list, _| list.finish_snapshot_write()),
-        Some(Publish::Published("g000002".to_string()))
-    );
-    f.step(cx);
-    f.wait_idle(cx);
     assert_eq!(
         f.read(cx, |list, _| list
             .browser()
             .search_index_generation()
             .map(str::to_string)),
-        Some("g000002".to_string())
+        Some("g000001".to_string())
     );
+    // The pass publishes the parsed titles; the query runs on the new
+    // generation's index and keeps the rows.
+    wait_for_the_reconciled_titles(&f, cx, held);
     assert_eq!(f.paths(cx), found);
 }
 
-/// L-099, L-003: the loaded corpus replaces the cards in one step and the
-/// selected card's session stays selected (no new `SelectionChanged`, so the
+/// L-099, L-003: the install of every card and the swap to the reconciled
+/// generation keep the selected session (no new `SelectionChanged`, so the
 /// viewer keeps its conversation).
 #[gpui_kit::test]
-fn the_swap_keeps_the_selected_session(cx: &mut TestAppContext) {
+fn the_install_and_the_swap_keep_the_selected_session(cx: &mut TestAppContext) {
     let world = TestWorld::new();
     listed_corpus(&world);
     let cards = publish_cards(&world);
-    let f = open_with_snapshots(cx, &world);
+    let held = hold_store(&world);
+    let f = open_paused(cx, &world);
     f.with_window(cx, |list, _, cx| list.select_by(3, cx));
     assert_eq!(f.selected_path(cx), Some(cards[3].clone()));
     let events = f.record_events(cx);
 
     f.resume(cx);
     f.wait_loaded(cx);
-    assert!(!f.read(cx, |list, _| list.browser().shows_snapshot()));
+    assert_eq!(f.selected_path(cx), Some(cards[3].clone()));
+    wait_for_the_reconciled_titles(&f, cx, held);
     assert_eq!(f.selected_path(cx), Some(cards[3].clone()));
     assert_eq!(f.selected_position(cx), Some(3));
-    assert!(
-        f.titles(cx).iter().all(|title| !title.starts_with("Card ")),
-        "the loaded rows replaced the cards: {:?}",
-        f.titles(cx)
-    );
     assert!(events.selections().is_empty(), "{:?}", events.all());
     assert!(events.count_matching(|e| *e == ListPaneEvent::CorpusChanged) >= 1);
-    f.list.update(cx, |list, _| list.finish_snapshot_write());
 }
 
-/// L-099, L-001: without a snapshot the rows stream in as before; the
-/// reconcile pass after the complete initial load then publishes the first
-/// generation, and a second window over the same session files writes
-/// nothing new.
+/// L-099, L-101: without a generation the list waits (`Loading…`) for the
+/// first one the initial pass publishes; a second window over the same
+/// session files lists the same rows and its pass writes nothing.
 #[gpui_kit::test]
-fn the_initial_load_writes_the_snapshot(cx: &mut TestAppContext) {
+fn the_initial_pass_publishes_the_first_generation(cx: &mut TestAppContext) {
     let world = TestWorld::new();
-    listed_corpus(&world);
-    let f = open_with_snapshots(cx, &world);
+    let written = listed_corpus(&world);
+    let f = open_paused(cx, &world);
     assert!(
         !f.read(cx, |list, _| list.list_ready()),
         "nothing to list yet"
     );
-    f.step_until(cx, "the first batch", |list| {
-        !list.loading_snapshots().is_empty()
-    });
-    assert!(!f.read(cx, |list, _| list.browser().shows_snapshot()));
+    assert_eq!(f.read(cx, |list, _| list.search_status().text), "Loading…");
     f.resume(cx);
     f.wait_loaded(cx);
-    assert_eq!(
-        f.list.update(cx, |list, _| list.finish_snapshot_write()),
-        Some(Publish::Published("g000001".to_string()))
+    assert_eq!(f.paths(cx).len(), 8, "{written:?}");
+    assert!(f.read(cx, |list, _| list.browser().shows_snapshot()));
+    let published = f.list.update(cx, |list, _| list.finish_snapshot_write());
+    assert!(
+        matches!(
+            published,
+            Some(Publish::Published(_)) | Some(Publish::Unchanged)
+        ),
+        "{published:?}"
     );
     let root = store::default_root(&world.env).unwrap();
     let snapshot = store::Snapshot::open(&root, true, TimeFilter::default()).expect("CURRENT");
-    assert_eq!(snapshot.head(100, |_| true).len(), 8);
+    assert_eq!(snapshot.len(), 8);
     assert!(
         store::SearchIndex::open(snapshot).is_some(),
         "the generation carries its text and index"
     );
 
-    // A second window over the same session files loads the same rows and
+    // A second window over the same session files lists the same rows and
     // writes nothing new.
     let again = ListFixture::open(cx, &world, &[]);
     again.wait_loaded(cx);
+    assert_eq!(again.paths(cx), f.paths(cx));
     assert_eq!(
         again
             .list
             .update(cx, |list, _| list.finish_snapshot_write()),
         Some(Publish::Unchanged)
     );
+}
+
+/// L-048 (store): the CLI time filter hides the older cards; another filter
+/// re-scopes the cards of the same generation.
+#[gpui_kit::test]
+fn a_time_filter_rescopes_the_cards(cx: &mut TestAppContext) {
+    let world = TestWorld::new();
+    SessionSpec::new("proj", 1).summary("Recent").write(&world);
+    SessionSpec::new("proj", 2)
+        .summary("Old")
+        .start(Utc::now() - Duration::days(30))
+        .write(&world);
+    let f = ListFixture::open_loaded(cx, &world, &["--since", "1d"]);
+    assert_eq!(f.titles(cx), vec!["Recent".to_string()]);
+    assert_eq!(
+        f.read(cx, |list, _| list.browser().generation_len()),
+        Some(2),
+        "the generation holds both"
+    );
+    f.list.update(cx, |list, _| list.finish_snapshot_write());
+
+    let year = crate::widgets::time_range::preset_choice("1y").unwrap();
+    f.with_window(cx, |list, _, cx| {
+        list.set_time_filter(year.filter, year.label.map(|l| l.to_string()), cx)
+    });
+    f.wait_loaded(cx);
+    assert_eq!(f.titles(cx).len(), 2);
+    assert_eq!(
+        f.read(cx, |list, _| list.toolbar_model().time_label)
+            .as_ref(),
+        "Since 1y"
+    );
+    f.list.update(cx, |list, _| list.finish_snapshot_write());
+}
+
+/// L-048, §11.21 (store, review fix): a reload whose reconcile pass fails
+/// reverts the time filter, and the cards follow the reverted filter at
+/// once (the revert schedules the poll that re-scopes them).
+#[gpui_kit::test]
+fn a_failing_pass_reverts_the_time_filter_and_its_cards(cx: &mut TestAppContext) {
+    let world = TestWorld::new();
+    SessionSpec::new("proj", 1).summary("Recent").write(&world);
+    SessionSpec::new("proj", 2)
+        .summary("Old")
+        .start(Utc::now() - Duration::days(30))
+        .write(&world);
+    let f = ListFixture::open_loaded(cx, &world, &["--since", "1d"]);
+    f.list.update(cx, |list, _| list.finish_snapshot_write());
+    f.wait_idle(cx);
+    let year = crate::widgets::time_range::preset_choice("1y").unwrap();
+    f.with_window(cx, |list, _, cx| {
+        list.set_time_filter(year.filter, year.label.map(|l| l.to_string()), cx)
+    });
+    f.wait_loaded(cx);
+    assert_eq!(f.titles(cx).len(), 2);
+    f.list.update(cx, |list, _| list.finish_snapshot_write());
+    f.wait_idle(cx);
+
+    // The next pass cannot open the store's lock file: it fails.
+    let root = store::default_root(&world.env).unwrap();
+    std::fs::remove_file(root.join("LOCK")).unwrap();
+    std::fs::create_dir(root.join("LOCK")).unwrap();
+    let day = crate::widgets::time_range::preset_choice("1d").unwrap();
+    f.with_window(cx, |list, _, cx| {
+        list.set_time_filter(day.filter, day.label.map(|l| l.to_string()), cx)
+    });
+    f.wait_loaded(cx);
+    assert_eq!(
+        f.read(cx, |list, _| list.toolbar_model().time_label)
+            .as_ref(),
+        "Since 1y",
+        "the chip reverted"
+    );
+    let last = f.read(cx, |list, _| list.toasts().last().cloned()).unwrap();
+    assert!(
+        last.text.starts_with("Couldn't apply the time filter: "),
+        "{}",
+        last.text
+    );
+    assert_eq!(f.titles(cx).len(), 2, "the cards of the reverted filter");
+}
+
+/// S-015 (store): a session outside the time filter is a card of the
+/// generation, so its UUID finds it at once (no disk lookup).
+#[gpui_kit::test]
+fn a_uuid_outside_the_time_filter_is_found_among_the_cards(cx: &mut TestAppContext) {
+    let world = TestWorld::new();
+    listed_corpus(&world);
+    let old = SessionSpec::new("proj", 70)
+        .summary("Old session")
+        .start(Utc::now() - Duration::days(400))
+        .write(&world);
+    let f = ListFixture::open_loaded(cx, &world, &["--since", "1d"]);
+    assert!(!f.paths(cx).contains(&old));
+    f.type_text(cx, &synth::uuid(70));
+    assert!(
+        matches!(
+            f.read(cx, |list, _| list.uuid_lookup().cloned()),
+            Some(claude_history_core::browser::UuidLookup::Found {
+                loaded_from_disk: false,
+                ..
+            })
+        ),
+        "found at once"
+    );
+    assert_eq!(f.paths(cx), vec![old]);
+    f.list.update(cx, |list, _| list.finish_snapshot_write());
+}
+
+/// Upstream 358becb: a deleted conversation's row is hidden at once and its
+/// card is gone from the generation the pass the delete asked for publishes.
+#[gpui_kit::test]
+fn a_delete_hides_the_row_until_a_generation_drops_it(cx: &mut TestAppContext) {
+    let world = TestWorld::new();
+    let written = listed_corpus(&world);
+    let f = ListFixture::open_loaded(cx, &world, &[]);
+    f.list.update(cx, |list, _| list.finish_snapshot_write());
+    f.wait_idle(cx);
+    let cards = f
+        .read(cx, |list, _| list.browser().generation_len())
+        .expect("a generation");
+    let gone = written[2].clone();
+    std::fs::remove_file(&gone).unwrap();
+    f.list.update(cx, |list, cx| {
+        list.remove_paths(std::slice::from_ref(&gone), cx)
+    });
+    assert!(!f.paths(cx).contains(&gone));
+    assert!(
+        f.read(cx, |list, _| list.conversation(&gone)).is_none(),
+        "a hidden row is not in the list"
+    );
+    f.wait_until(cx, "a generation without the session", |list, _| {
+        list.browser().generation_len() == Some(cards - 1)
+    });
+    assert_eq!(f.paths(cx).len(), cards - 1);
+    f.list.update(cx, |list, _| list.finish_snapshot_write());
 }

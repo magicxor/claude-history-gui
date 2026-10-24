@@ -68,6 +68,9 @@ pub fn query_has_literals(query: &str) -> bool {
 pub enum SemanticProgress {
     #[default]
     Idle,
+    /// Loading the full conversations semantic search ranks (generation
+    /// mode, where rows are cards without text).
+    LoadingSessions,
     InitializingModel,
     CacheReady,
     Embedding {
@@ -93,14 +96,14 @@ pub struct SemanticResultMetadata {
 /// Which parts of the list are usable. Each part becomes ready on its own.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Readiness {
-    /// Rows are shown newest first and can be opened, resumed and forked.
-    /// They are snapshot cards until loading finishes.
+    /// Rows are shown newest first and can be acted on.
     pub list: bool,
-    /// Lexical queries run against the loaded corpus.
+    /// Lexical queries run, against the generation index or the loaded
+    /// conversations.
     pub lexical: bool,
-    /// Progress of loading conversations from native history.
+    /// Whether the store is being reconciled with the session files.
     pub reconcile: ReconcileState,
-    /// The semantic worker can rank the loaded corpus.
+    /// The semantic worker can rank its corpus.
     pub semantic: bool,
 }
 
@@ -115,20 +118,13 @@ impl Readiness {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum ReconcileState {
-    /// Loading; `loaded` conversations have arrived so far (including
-    /// excluded ones).
-    Running {
-        loaded: usize,
-    },
+    /// A reconcile pass may publish a newer generation (or, without a
+    /// store, the history is still loading).
+    #[default]
+    Running,
     Done,
-}
-
-impl Default for ReconcileState {
-    fn default() -> Self {
-        Self::Running { loaded: 0 }
-    }
 }
 
 /// Result of [`super::Browser::escape`] (upstream: Esc in the list).
@@ -306,7 +302,7 @@ mod tests {
     fn readiness_starts_loading_and_becomes_ready_at_once() {
         let loading = Readiness::default();
         assert!(!loading.list && !loading.lexical && !loading.semantic);
-        assert_eq!(loading.reconcile, ReconcileState::Running { loaded: 0 });
+        assert_eq!(loading.reconcile, ReconcileState::Running);
         let ready = Readiness::ready();
         assert!(ready.list && ready.lexical && ready.semantic);
         assert_eq!(ready.reconcile, ReconcileState::Done);

@@ -347,7 +347,7 @@ artifact names, toolchain pinned.
 | AD3 | `Home`/`End` in the list = first/last row (TUI), via `ConversationList > Input` duplicates. Caret home/end: `ctrl-home`/`ctrl-end`. | TUI parity. |
 | AD4 | PageUp/PageDown move by the number of visible rows; Ctrl+D by half of that. | LIST quirk 4 [fix]. |
 | AD5 | Mouse wheel scrolls the list viewport (does not move the selection). | Desktop convention; virtual list (LIST quirk 5 [fix]). |
-| AD6 | Viewing (click/Enter → viewer) is allowed while loading. Resume/Fork/Ctrl+O work once the rows are listed newest first (`Readiness::list`: the startup snapshot's cards, §11.2, upstream 3708bb6), else they wait for the load; Rename/Delete stay disabled until the load ends. Hints and row-menu items are dimmed/disabled accordingly. | Capture-at-open makes viewing safe; cards carry the path, source and project resume needs; edits wait like upstream's (the loader may be reading the files). |
+| AD6 | Viewing (click/Enter → viewer) is allowed while loading. Resume/Fork/Ctrl+O work once the rows are listed newest first (`Readiness::list`: the first cards of the store's generation, §11.2, upstream 3708bb6), else they wait for the load; Rename/Delete stay disabled until the load ends (store mode: until the generation is shown in full; upstream 358becb allows them on the first cards). Hints and row-menu items are dimmed/disabled accordingly. | Capture-at-open makes viewing safe; cards carry the path, source and project resume needs; edits wait like upstream's (the loader may be reading the files). |
 | AD7 | In-viewer search matches over the rendered segment text (no ledger chrome) and counts occurrences, `i/n` = occurrence index; state machine = core `view::ViewSearch<SegMatch>`. | PD7; fixes VIEW quirk 12. |
 | AD8 | Rename (F2) and Refresh also work from the viewer (additive). | Menus work everywhere; no conflict. |
 | AD9 | Generate semantic cache always uses the whole corpus (fresh load, no time filter), so core's `GENERATE_WITH_TIME_FILTER_ERROR` never triggers. | The GUI loads independently of the list filter. |
@@ -417,13 +417,16 @@ Single-file window: Root ─► SingleFileWindow (Entity, key_context "SingleFil
 ```
 
 Background work (all threads named, 8 MiB stack via `std::thread::Builder::stack_size`):
-* core-owned: `history-loader` + `history-loader-forwarder` (streaming load), `corpus-prepare` (K1: sort, dedupe,
-  search index off the UI thread), `corpus-release` (drops a replaced corpus off the UI thread), `search-worker`
-  (lexical), `semantic-search-worker` (spawned by `core::browser::Browser`), `index-open` (opens the
-  startup snapshot's search index), `store-reconcile` (the reconcile pass: parses new or changed session files into
-  delta generations, retries a store locked by another instance every second); rayon pools
-  (`lexical-rank-worker`, `index-search-*` up to 8 threads, `store-reconcile-*` up to 4) use rayon's default
-  stack size, not 8 MiB;
+* core-owned: `history-loader` + `history-loader-forwarder` (streaming load without the store), `corpus-prepare`
+  (K1: sort, dedupe, search index off the UI thread), `corpus-release` (drops a replaced corpus off the UI thread),
+  `search-worker` (lexical), `semantic-search-worker` (spawned by `core::browser::Browser`), `generation-open`
+  (materializes every card of a store generation and opens its search index), `store-reconcile` (the reconcile pass:
+  parses new or changed session files into delta generations, retries a store locked by another instance every
+  second) with its `store-watch` thread (checks `CURRENT` every 200 ms while the pass runs), `semantic-corpus` (loads
+  the conversations semantic search ranks in store mode, or maps them to a newer generation's docs; a load gives up
+  between projects when its browser is dropped), `row-evidence` (reads the literal context of visible rows from their
+  text frames); the browser joins its `semantic-corpus` and `row-evidence` threads when it is dropped; rayon pools (`lexical-rank-worker`, `index-search-*` up to 8 threads,
+  `store-reconcile-*` up to 4) use rayon's default stack size, not 8 MiB;
 * GUI-owned: `viewer-worker` (one per ViewerPane: single-flight parse + document + items + segments, §7.5),
   `agent-worker` (Deep Search + agent panel, single-flight per request kind with cancellation), short-lived tool
   threads (`semantic-cache-gen`, `update-check`, `delete-empty-scan`, `uuid-load`, `rename-write`, `delete-exec`,
@@ -446,7 +449,7 @@ truth.
 | `env` | `HistoryEnv { home_dir, claude_config_dir, pi_coding_agent_dir, pi_coding_agent_session_dir, pi_config_dir, omp_profile, pi_profile, xdg_data_home, path_var, pathext, workspace_dir, cache_root, config_file, gui_config_file, debug_log_file }` (+ `env_path_base`, K16: `with_env_path_base`, `launch_base_dir()`, `env_value_base_dir()`; `main` sets it to the launch cwd), `from_process_env()` (main only), `sandbox(root)`, `with_workspace`, `claude_dir()`, `claude_projects_root()`, `claude_projects_dir_for(dir)`, `cache_root()`, `semantic_cache_dir()`, `embedding_cache_file()`, `semantic_model_dir()`, `config_file()`, `gui_config_file()`, `debug_log_file()`, `workspace()`, `resolve_program(name, override)`; `WorkspaceScope { dir, project_dir_name }`, `WorkspaceScope::new`, `canonical_dir()`; `STATE_DIR_NAME`, `CACHE_DIR_NAME` |
 | `config` | `ConfigFile`, `GuiConfigFile`, `GuiSettings { theme, terminal, claude_path, pi_path, omp_path, default_workspace, restore_session }`, `LayeredConfig { cli, gui_file, effective, gui }`, `load_config_from(path)`, `load_gui_config_from(path)` (loaded **independently**, §11.1), `ConfigFile::overlaid_with(&GuiConfigFile)`, `save_gui_config_changes` (K12), `KeyChord::{short_label, help_label, gpui_keystroke, config_string}`, `parse_key_binding`, `KeyBindings { resume, fork, rename, delete, refresh }` + `from_config`, `conflicts_with_ctrl_t`, `AgentScopeConfig`, `AgentConfig` |
 | `settings` | `parse_launch_args(args) -> Result<LaunchCommand, LaunchArgsError>` (`LaunchCommand::{Run(GuiLaunchArgs), Help, Version, DeleteEmpty { local, all, yes }, Update, Agent(AgentCli), SubcommandHelp(String)}`; K14/K15, `SubcommandHelp` added by WP-C: `update --help`, `delete-empty -h`, `help <subcommand>` → print the text, exit 0), `GuiLaunchArgs` (+`display_flags`, `search_mode_override`, `picker`, `time_filter`, `settings`, `validate`), `help_text(program)`, `effective_settings(config, flags, mode_override) -> EffectiveSettings { show_last, show_tools, tool_display, show_thinking, search_mode, list_search_mode, exclude_projects, keys, semantic_toggle_enabled, resume_default_args }`, `EffectiveSettings::initial_view_prefs()`, `initial_tool_display`, `PickerAction::{ShowPath, ShowId, Resume{fork}}`, `picker_output(action, conv)`, `session_id_from_path(path)` |
-| `browser` | `Browser` (`new_loading`, `append_conversations`, `set_query`, `escape -> EscapeOutcome`, `toggle_workspace_filter`, `set_workspace_filter`, `set_workspace`, `set_excluded_projects`, `toggle_list_search_mode`, `set_list_search_mode`, `poll`, `has_search_work_in_flight`, `filtered`, `row`, `selected`, `select*`, `select_half_page_down(viewport_rows)`, `selected_path`, `selected_conversation`, `has_multiple_sources`, `conversation_by_path`, `count_text`, `search_status_text`, `semantic_status_text`, `semantic_activity_status_text`, `semantic_error`, `semantic_progress`, `semantic_result_metadata[_for_selection]`, `lexical_evidence`, `row_preview_input`, `row_header_input`, `uuid_lookup`, `rename_prefill`, `workspace`, `has_project_context`, `list_search_mode`, `is_loading` (`reconcile != Done`, ac7f591), `readiness() -> Readiness { list, lexical, reconcile: ReconcileState::{Running { loaded }, Done}, semantic }`, `show_snapshot(store::Snapshot)`, `shows_snapshot`; upstream 3708bb6 replaced `loading_state`; `use_search_index(Arc<store::SearchIndex>)`, `open_search_index`, `search_index_generation`: lexical queries on the store generation's index, ac7f591), `SNAPSHOT_ROWS`, `BrowserOptions` (+ builders, `embedder_factory`, `waker`, `semantic_available`), `HistoryLoader` (`new`, `reconfigure`, `start_initial_load`, `start_refresh`, `set_time_filter`, `is_running`, `is_refreshing`, `open_snapshot` (`&mut self`: also opens the snapshot's search index on `index-open`, handed over by a later `poll`), `finish_snapshot_write` (waits for the reconcile pass, returns the last `store::generation::Publish` it made, e905169), `poll(&mut Browser) -> LoaderPoll` incl. `pending`; `BUSY_RETRY`), `LoaderOptions` (incl. `drain_budget`, default `DEFAULT_DRAIN_BUDGET` = 8 ms, upstream 93e17a5; `snapshot`, default off, 3708bb6), `LoadEvent::{Loaded, NoHistory, LoadFailed, Refreshed, RefreshIncomplete, RefreshFailed, RefreshInterrupted}` (+`status_message`), `ListSearchMode`, `SemanticProgress`, `SemanticResultMetadata`, `UuidLookup`, `PreparedSession` (`Send`; `PreparedSession::new(Conversation)` normalizes the lexical body of a re-parsed session, the O(text) step for a background task; consumed by `Browser::apply_renamed_session` and `Browser::resolve_uuid_lookup_session`, 503fe42), `RenameError`, `DeleteError`, `Waker`, `SemanticEmbedderFactory`, `query_has_literals`; K1–K4, K6, K18 additions |
+| `browser` | `Browser` (`new_loading`, `append_conversations`, `set_query`, `escape -> EscapeOutcome`, `toggle_workspace_filter`, `set_workspace_filter`, `set_workspace`, `set_excluded_projects`, `toggle_list_search_mode`, `set_list_search_mode`, `poll`, `has_search_work_in_flight`, `filtered`, `row`, `selected`, `select*`, `select_half_page_down(viewport_rows)`, `selected_path`, `selected_conversation`, `has_multiple_sources`, `conversation_by_path`, `count_text`, `search_status_text`, `semantic_status_text`, `semantic_activity_status_text`, `semantic_error`, `semantic_progress`, `semantic_result_metadata[_for_selection]`, `lexical_evidence`, `row_preview_input`, `row_header_input`, `uuid_lookup`, `rename_prefill`, `workspace`, `has_project_context`, `list_search_mode`, `is_loading` (`!readiness.list`, 358becb), `readiness() -> Readiness { list, lexical, reconcile: ReconcileState::{Running, Done}, semantic }`; generation mode (358becb): `show_snapshot(store::Snapshot)` (the first `SNAPSHOT_ROWS` cards), `shows_snapshot`, `generation_open`, `generation_len`, `generation_name`, `generation_is_empty`, `history_is_empty`, `is_hidden(index)`, `time_filter`, `set_time_filter(TimeFilter)`, `open_search_index` and `swap_generation(store::Snapshot)` (synchronous; the loader installs a generation opened off the UI thread), `search_index_generation`, `take_reconcile_request`, `set_reconciling`, `fill_visible_evidence(Range)`, `conversation_at`; upstream 3708bb6 replaced `loading_state`), `SNAPSHOT_ROWS`, `BrowserOptions` (+ builders, `embedder_factory`, `waker`, `semantic_available`), `HistoryLoader` (`new`, `reconfigure` (store mode: moves to the store root of the new env), `start_initial_load` (store mode: a reconcile pass), `start_refresh` (store mode: a pass, then `Refreshed` from the generation sizes), `set_time_filter` (store mode: re-scopes the cards at the next poll), `is_running`, `is_refreshing`, `uses_store`, `open_snapshot` (`&mut self`: enters store mode; every card and the index are opened on `generation-open` and installed by a later `poll`), `finish_snapshot_write` (waits for the running pass and the ones asked for after it, returns the last `store::generation::Publish`, e905169), `poll(&mut Browser) -> LoaderPoll` incl. `pending`, `swapped`; `BUSY_RETRY`, `GENERATION_POLL`), `LoaderOptions` (incl. `drain_budget`, default `DEFAULT_DRAIN_BUDGET` = 8 ms, upstream 93e17a5; `snapshot` = store mode, default off, 3708bb6, 358becb), `LoadEvent::{Loaded, NoHistory, LoadFailed, Refreshed, RefreshIncomplete, RefreshFailed, RefreshInterrupted}` (+`status_message`), `ListSearchMode`, `SemanticProgress`, `SemanticResultMetadata`, `UuidLookup`, `PreparedSession` (`Send`; `PreparedSession::new(Conversation)` normalizes the lexical body of a re-parsed session, the O(text) step for a background task; consumed by `Browser::apply_renamed_session` and `Browser::resolve_uuid_lookup_session`, 503fe42), `RenameError`, `DeleteError`, `Waker`, `SemanticEmbedderFactory`, `query_has_literals`; K1–K4, K6, K18 additions |
 | `display_format` | `build_row_header(&RowHeaderInput) -> RowHeader { project, custom_title, summary, message_count, semantic_score, duration, timestamp, recency, .. }`, `build_row_preview(&RowPreviewInput) -> RowPreview { preview, source, context }`, `HighlightQuery` (`parse`, `needs_literal_context`, `match_ranges`), `HighlightedText`, `Recency`, `format_model_name`, `format_tokens`, `format_tokens_long`, `format_msg_count_long`, `format_duration_minutes`, `format_header_timestamp`, `semantic_row_metadata`, `semantic_rationale_label`, `sanitize_preview` |
 | `view` | `ViewerModel { path, entries, prefs, expanded }` (`open`, `from_entries`, `cycle_tool_display`, `toggle_thinking`, `toggle_timing`, `toggle_expanded`, `document`, `export_options`, `session_id`, `message_text`, `plain_display`), `ViewPrefs`, `ToolDisplayMode` (+`next`, `status_label`), `ConversationDocument` (`navigable_indices`, `navigable_entry_indices`, `nav_position`, `message_at_nav_position`), `DocMessage`, `DocMessageKind`, `DocBlock` (`toggle_id`, `tool_output_id`, `plain_text`), `DocBlockKind`, `DocTiming`, `Fold`, `DocToolCall`, `DocToolResult`, `DocSubagentToolResult`, `ToolBodyLine`, `BodyLineKind`, `LabelRole` (+`color`), `ToolOutputId`, `fitted_name`, `NAME_WIDTH`, `TRUNCATED_BODY_LINES`, `TRUNCATED_RESULT_LINES`, `MessageNav`, `ViewSearch<M>`, `ViewSearchMode`, `escape -> ViewEscape`, `capture_anchor_entry`, `find_entry_or_prev`; K5, K9 additions |
 | `export` | `ExportFormat::{ALL, from_index, index, label, extension}`, `ExportOptions`, `generate_export`, `export_to_path -> Result<(), ExportError>`, `default_export_file_name`, `plain_display(path, options)`, `exported_status`, constants `COPIED_TO_CLIPBOARD`, `MESSAGE_COPIED_TO_CLIPBOARD`, `NO_TEXT_CONTENT`, `MESSAGE_NOT_FOUND`, `PATH_COPIED_TO_CLIPBOARD`, `SESSION_ID_COPIED_TO_CLIPBOARD`; K11 |
@@ -663,7 +666,7 @@ selection (A1). Right-click also selects and previews the row (the list keeps fo
 ```
 Shortcut labels come from the live keymap. Items that need a known source (Resume, Fork, Rename, Delete) are
 disabled for targets with an unknown source. While loading, Rename and Delete are disabled, and Resume and Fork until
-the rows are listed newest first (snapshot cards, AD6).
+the rows are listed newest first (the first cards of the store's generation, AD6).
 
 ### 5.3 Workspace picker and time filter dropdowns
 ```
@@ -1409,7 +1412,7 @@ program override is configured or `CHG_ALLOW_REAL_LAUNCH=1` (§15.4).
 |---|---|---|---|
 | Initial load / refresh / reload | core `HistoryLoader` (`LoaderOptions::with_waker`), K1 off-thread preparation, K18 policy | waker → `async_channel::bounded::<()>(1)` → ListPane `_poll_task` → `loader.poll(&mut browser)` then `browser.poll()`, then one yield to the executor | core |
 | Lexical + semantic search | core `Browser` workers, same waker; the lexical worker ranks the loaded corpus on a one-thread pool or the store index on `index-search-*` (≤ 8 threads, top page first, ac7f591) | same task → `browser.poll()` → `on_results` | core generations; index answers by `Arc` identity |
-| Store search index and list snapshot (ac7f591, e905169) | core `HistoryLoader`: `index-open` thread opens the startup generation's index; `store-reconcile` thread (own `store-reconcile-*` pool, ≤ 4 threads) runs a reconcile pass (`store::reconcile::reconcile_cancellable` over the env's sources: one stat per session file, only new or changed files parsed, delta generations, merges), retried every `BUSY_RETRY` (1 s) while another instance holds `LOCK`, then opens and locates the current generation; each sends its result before calling the waker; dropping the loader gives up a running pass (or its wait for the lock), then joins both | waker → `loader.poll` → `Browser::use_search_index` / swap | generation name, corpus `Arc` identity |
+| Store generations (ac7f591, e905169, 358becb) | core `HistoryLoader` in store mode: `generation-open` thread materializes every card of a generation and opens its index (and maps the semantic corpus to it); `store-reconcile` thread (own `store-reconcile-*` pool, ≤ 4 threads) runs a reconcile pass (`store::reconcile::reconcile_cancellable` over the env's sources: one stat per session file, only new or changed files parsed, delta generations, merges), retried every `BUSY_RETRY` (1 s) while another instance holds `LOCK`, with a `store-watch` thread that reads `CURRENT` every `GENERATION_POLL` (200 ms) and wakes the poll when it names a newer generation; each sends its result before calling the waker; dropping the loader gives up a running pass (or its wait for the lock), then joins both | waker → `loader.poll` → `Browser::install_generation` | generation name |
 | UUID lookup (K2) | `cx.background_spawn(history::load_session_by_uuid)` when `uuid_lookup() == Pending` | `browser.resolve_uuid_lookup_session(uuid, conv)`; the task is `load_session_by_uuid(..).map(PreparedSession::new)` | core ignores a stale UUID |
 | Rename (K3) | `cx.background_spawn(history::rename_session(..).map(PreparedSession::new))` | `list.apply_renamed(path, prepared)` → `browser.apply_renamed_session` | dialog id + path |
 | Delete (K4) | `background_spawn(plan_session_delete)` → dialog → `background_spawn(execute_session_delete)` | `CorpusNotice::Deleted(plan files)` | dialog disabled while running |
@@ -1762,7 +1765,7 @@ Five actions — **Resume, Fork, Rename, Delete, Refresh** — take their keystr
 Input` and `Viewer && !Input` (`keymap::USER_BINDING_CONTEXTS`; AD8 adds Rename/Refresh in the viewer). Single-file windows have no handler for
 Resume/Fork/Rename/Delete → menu items disabled (parity). While loading, the Rename/Delete handlers return early and
 their hints are dimmed; Resume/Fork/SelectAndExit (and the open hint) only until the rows are listed newest first
-(`ListPane::list_ready`, snapshot cards; AD6).
+(`ListPane::list_ready`, the first cards of the store's generation; AD6).
 
 Validation and warnings (Settings → Keys, also applied at startup):
 * Errors (binding rejected, previous value kept): core `parse_key_binding` messages (`Unknown modifier: …`,
@@ -2125,7 +2128,9 @@ row), taken from the handle LRU (§9.7).
   timestamp (`format_header_timestamp`); summary (only if set) on the same line when it fits, else on a second line
   (header_summary role). Conversation not in the corpus → file stem only (V-006). `parse_error_count > 0` → warning
   badge `⚠ N` with tooltip `1 malformed line` / `N malformed lines` that opens Tools → Debug log → Parse errors (V-008). Header is bound to
-  the live corpus (V-007): Workspace pushes `set_header` on `CorpusChanged`.
+  the live corpus (V-007): Workspace pushes `set_header` on `CorpusChanged`. A card's header (store mode) carries no
+  parse errors: the viewer counts the file's malformed lines in the background once per file and modification time,
+  and the headers of later corpus changes keep that count (no badge flicker while generations are swapped in).
 * Toolbar (toolbar.rs): segmented `Summary | Truncated | Full` (SetTools*), toggles `Thinking`, `Timing`
   (`.selected(bool)`), spacer, find bar (when active), `Outline`, `Resume`, `Fork`, `⋯` dropdown (Export…, Copy to
   clipboard ▸, Copy message, Copy path, Copy session ID, Copy header session ID, Show file path, Reveal in file
@@ -2180,7 +2185,7 @@ A literal matches only where it starts at a word start (the start of the text or
 agent retrieval, highlights); `"Config"` does not match inside `AppConfig`.
 
 ### 10.4 Search input status (L-032)
-`Browser::search_status_text()` (`Loading… <n>` after the `…` substitution of §12, `<i>/<n>`, `0/<n>`, `sem …`,
+`Browser::search_status_text()` (`Loading…`, or `Loading… <n>` while loading in memory, after the `…` substitution of §12, `<i>/<n>`, `0/<n>`, `sem …`,
 ` sem failed` with the full error in a tooltip (`semantic_error()`), ` sem no text`, ` sem paused`), plus the spinner
 while `has_search_work_in_flight()`.
 
@@ -2228,82 +2233,103 @@ recorded each frame (for the keyboard context menu position).
 4. After the first frame (`cx.defer`): one configuration-error dialog per failing file (§5.20); startup tool (AD14:
    `run_startup_tool`); QA runner start (feature `qa`); `login-shell-path` probe (macOS/Linux when not started from a
    terminal, §14.2).
-5. `ListPane::new` opens the store's list snapshot and starts the initial load (§11.2) immediately: with a usable
-   generation the first frame already lists the newest conversations.
+5. `ListPane::new` opens the store's current generation and starts the initial load (§11.2) immediately: with a
+   usable generation the first frame already lists the newest conversations.
 
-### 11.2 Initial load (streaming)
+### 11.2 Initial load (store mode; in memory without a store)
 1. `ListPane::new`: `browser = Browser::new_loading(BrowserOptions::new(env).with_show_last(settings.show_last)
    .with_default_mode(app.list_mode).with_exclude_projects(settings.exclude_projects).with_workspace(workspace)
    .with_workspace_filter(args.local && workspace.is_some()).with_waker(waker).with_embedder_factory(shared.browser_factory()))`;
    `loader = HistoryLoader::new(env, LoaderOptions::new(show_last).with_debug_level(level).with_time_filter(launch.time_filter).with_waker(waker).with_snapshot(true))`;
    `if let Some(s) = loader.open_snapshot() { browser.show_snapshot(s) }`; `loader.start_initial_load()`. `level` =
-   `--debug` level, else the Debug log dialog's selector (default Info). The snapshot option is on unless the
-   `ListSnapshots(false)` global says otherwise (G tests; see §13.4 for the store).
-   * **Startup snapshot (upstream 3708bb6).** `open_snapshot` maps the store's `CURRENT` generation (`None` on the
-     first run, after corruption or a format change: the rows then stream in as below). `show_snapshot` lists at most
-     `SNAPSHOT_ROWS` (500) cards, newest first, in the current scope (exclusions; Claude directory name or canonical
-     Pi/OMP project path, W1) and the launch time filter, and selects the first: `Readiness::list` is set, so Open,
-     Resume, Fork and Ctrl+O work on them (AD6), while the view stays `Loading` (Rename/Delete wait; the suffix reads
-     `Loading… <n>` from `Readiness::reconcile`). Batches are held back behind the cards (`Browser::pending`) instead of
-     being appended; Tab and workspace/exclusion changes decide every card's scope again (from the generation's
-     projects). The K1 preparation prepares the held-back batches, and the install swaps them in at once keeping the
-     selected card's session (no new `SelectionChanged`, so the viewer keeps its conversation; `CorpusChanged`
-     refreshes its header).
-   * **Search before the load ends (upstream ac7f591).** `open_snapshot` also opens the generation's search index
-     (`base.fst/post/short` and the zstd text frames, §13.4) on an `index-open` thread; a later poll hands it to the
-     browser (`use_search_index`), which sets `Readiness::lexical`. From then on a lexical query typed over the cards
-     runs on the index: the worker answers the top 50 rows with their evidence (windows of the text decompressed from
-     the frames) and then every result, abandoning the rest when a newer query arrives; it builds the cards of the
-     docs it returns, so the UI thread only appends them. A selection made on the first page survives the complete
-     answer. Without index files (an older generation) a query waits for the load, as before; a semantic query always
-     waits. A rename or delete made on a card stops the index until the load ends (the GUI offers neither while
-     loading). The corpus preparation locates the index's cards in the loaded corpus, so after the swap the shown
-     results stay and queries keep running on the index; a rename or a refresh drops it (queries then run in memory). When the cards do not cover the loaded corpus (a newer conversation, a changed timestamp) the index is
-     dropped at once and queries run in memory, so a quit before the rebuilt generation ends cannot carry a stale
-     index into the next session.
-   * After `Loaded` of a complete initial load (no project error, not interrupted, no time filter) core runs a
-     reconcile pass on a `store-reconcile` thread (upstream e905169 ran a detached `--reconcile` process); refreshes
-     and reloads start none. The pass takes `LOCK` without waiting, stats every Claude, Pi and OMP session file of the
-     env's sources and compares size and mtime with the fingerprints in `CURRENT`; only new or changed files are
-     parsed (as the history loader parses them) and published as delta generations (newest 200 files first, then
-     every 2 s of parsing; unchanged text and index segments hard-linked from the previous generation, deltas merged
-     past the thresholds); files that hold no conversation are remembered as ignored; a source or directory that
-     cannot be listed keeps its cards; nothing is written when no file changed. When another instance holds the lock
-     the pass tries again every second (`BUSY_RETRY`) until it gets it. The thread then opens the current generation
-     and locates its cards in the installed corpus; the next poll swaps it in and reruns a lexical query keeping the
-     selection, unless the corpus changed meanwhile (then the older index is dropped and queries run in memory).
-     Reloads reconfigure the loader (`HistoryLoader::reconfigure`) instead of replacing it, so the UI thread never
-     waits for the pass. At quit gpui drops the list pane, and with it the loader, on the main thread before the
+   `--debug` level, else the Debug log dialog's selector (default Info). The store (`with_snapshot`) is on unless the
+   `ListSnapshots(false)` global says otherwise (G tests of the in-memory path, `test_support::use_memory_list`);
+   with it on and a store root (`store::default_root`, §13.4) the loader is in **store mode** (upstream 358becb: the
+   list never holds the loaded history).
+   * **First rows (upstream 3708bb6).** `open_snapshot` maps the store's `CURRENT` generation (`None` on the first
+     run, after corruption or a format change: the rows then wait for the first generation the initial pass
+     publishes, `Loading…`). `show_snapshot` lists at most `SNAPSHOT_ROWS` (500) cards, newest first, in the current
+     scope (exclusions; Claude directory name or canonical Pi/OMP project path, W1) and the time filter, and selects
+     the first: `Readiness::list` is set, so Open, Resume, Fork and Ctrl+O work on them (AD6), while the view stays
+     `Loading` (Rename/Delete wait). Tab and workspace/exclusion changes decide every card's scope again (from the
+     generation's projects). A query typed meanwhile is kept; the cards stay listed.
+   * **The generation in full (upstream ac7f591, 358becb).** `open_snapshot` also starts a `generation-open` thread
+     that materializes every card (list-only conversations: no text, no parse errors), builds their path and session
+     lookups and opens the generation's search index (`base.fst/post/short` and the zstd text frames, §13.4); a later
+     poll installs them (`Browser::install_generation`): row `r` is card `r`, the browse list holds every card in
+     scope, `Readiness::lexical` is set and the loader reports `Loaded { conversations: <cards>, .. }`, keeping the
+     selected session (no new `SelectionChanged`). A lexical query then runs on the index: the worker answers the top
+     50 rows with their evidence (windows of the text decompressed from the frames) and then every result,
+     abandoning the rest when a newer query arrives; a selection made on the first page survives the complete
+     answer. The literal context of visible rows the worker left without evidence is read from their frames on a
+     `row-evidence` thread (`fill_visible_evidence`, called with the rows `uniform_list` draws). Without index files
+     (an older generation) every card is listed and queries browse until a generation has them.
+   * **Reconcile passes (upstream e905169, 358becb).** `start_initial_load` starts a reconcile pass on a
+     `store-reconcile` thread (upstream ran a detached `--reconcile` process at launch). The pass takes `LOCK`
+     without waiting, stats every Claude, Pi and OMP session file of the env's sources and compares size and mtime
+     with the fingerprints in `CURRENT`; only new or changed files are parsed (as the history loader parses them) and
+     published as delta generations (newest 200 files first, then every 2 s of parsing; unchanged text and index
+     segments hard-linked from the previous generation, deltas merged past the thresholds); files that hold no
+     conversation are remembered as ignored; a source or directory that cannot be listed keeps its cards; nothing is
+     written when no file changed. When another instance holds the lock the pass tries again every second
+     (`BUSY_RETRY`) until it gets it. While it runs, its `store-watch` thread reads `CURRENT` every 200 ms and wakes
+     the poll when it names a newer generation, which is opened on `generation-open` and swapped in: the query, the
+     scope, the time filter and the selected session are kept, a query's rows stay (moved by path) until it answers
+     on the new index (quirk 16; upstream 7ec719a), and `LoaderPoll::swapped` makes the pane emit `CorpusChanged`
+     (header, project paths). A refresh (§11.3), a rename or a delete asks for another pass, run after the one
+     running. Reloads reconfigure the loader (`HistoryLoader::reconfigure`) instead of replacing it, so the UI thread
+     never waits for a pass. At quit gpui drops the list pane, and with it the loader, on the main thread before the
      process exits: the drop sets a flag that the pass checks after the scan, per file while parsing, while it writes
      text frames, builds or merges index segments and before each manifest
      (`store::reconcile::reconcile_cancellable`), and that wakes a pass waiting for the lock, so a pass still running
      is given up within moments (its `gNNN.tmp` removed) and the window closes without waiting; the generations it
-     published before stay, and the next complete initial load's pass goes on from them (upstream's detached process
-     outlived the TUI). The `index-open` and `store-reconcile` threads send their result before they call the waker,
-     so the poll it schedules always finds it.
-2. Waker → `_poll_task` → `poll_all(cx)`: `let p = loader.poll(&mut browser)` (appends batches; at the end the K1
-   preparation runs on `corpus-prepare` and a later poll installs it) then `browser.poll()`; notify once. One poll
-   appends batches for at most `LoaderOptions::drain_budget` (8 ms, upstream 93e17a5; at least one batch): a batch
-   left over is held for the next poll (`p.pending`) and core calls the waker for it. After each poll the task yields
-   once to the executor, so a frame can be drawn before the next wake is handled. Core loads Claude projects (parallel,
-   one batch per project) concurrently with Pi then OMP (first row alone, then batches of 32, deduplicated Pi-first);
-   batches from both arrive interleaved.
+     published before stay, and the next start's pass goes on from them (upstream's detached process outlived the
+     TUI). Every loader thread sends its result before it calls the waker, so the poll it schedules always finds it.
+   * **Edits (upstream 358becb).** Rename and delete work on cards once the generation is shown in full. A delete
+     hides the rows of the deleted session (by its key hash) from the list and the index's scope until a generation
+     without it is shown; a hidden row is no longer in the list (`ListPane::conversation`). A rename shows the new
+     title on its row (the index keeps the old one) until a generation holds it. Both ask for a reconcile pass
+     (`Browser::take_reconcile_request`, which wakes the poll); the swap drops the overlays the new generation
+     reflects.
+   * **Semantic search (upstream 358becb, until ecc2f2f).** Cards carry no text: the first semantic use loads the
+     full conversations on a `semantic-corpus` thread (`SemanticProgress::LoadingSessions`, footer
+     `sem loading conversations`), maps them to the generation's docs by path, and ranks those whose card is in scope
+     (time filter included, deleted ones out); results are shown as cards. The scope uses only docs of the
+     generation shown: a generation swapped in while the corpus loaded (or opened before it arrived) has the corpus
+     mapped to it again on a `semantic-corpus` thread, and a semantic query waits for that (a swap opened after the
+     corpus arrived maps it on `generation-open`).
+   * **In memory (store off).** Without a store the rows stream in: `loader.poll` appends batches as they arrive
+     (suffix `Loading… <n>`), and at the end the K1 preparation (§4.3) runs on `corpus-prepare` and a later poll
+     installs it. Upstream 358becb loaded in memory synchronously before the first frame; the fork keeps its
+     background streaming loader for this case.
+2. Waker → `_poll_task` → `poll_all(cx)`: `let p = loader.poll(&mut browser)` then `browser.poll()`; notify once. In
+   memory one poll appends batches for at most `LoaderOptions::drain_budget` (8 ms, upstream 93e17a5; at least one
+   batch): a batch left over is held for the next poll (`p.pending`) and core calls the waker for it. After each poll
+   the task yields once to the executor, so a frame can be drawn before the next wake is handled. Core loads Claude
+   projects (parallel, one batch per project) concurrently with Pi then OMP (first row alone, then batches of 32,
+   deduplicated Pi-first); batches from both arrive interleaved.
 3. On `p.event`:
-   * `Loaded { project_errors }` → selection row 0 (the selected card's session after snapshot cards) →
+   * `Loaded { project_errors }` → selection row 0 (the selected card's session in store mode) →
      `SelectionChanged` when it changed; `project_errors > 0` → warning toast
      `N project(s) could not be loaded. See Tools → Debug log.`; `CorpusChanged`, `LoadStateChanged`; project paths
      for the workspace picker recomputed in the background.
    * `NoHistory(e)` → empty view with `e` text (`No conversation history found in selected scope[ within the
-     requested time range]`) + [Refresh] [Clear time filter] (if active).
-   * `LoadFailed(e)` → error view `Couldn't load history` + `e` + [Retry] (`start_refresh`) [Show debug log].
-4. A query typed while loading is kept in the Input and passed to `browser.set_query` (core runs it on the snapshot's
-   index when one is open, else applies it at the end).
+     requested time range]`) + [Refresh] [Clear time filter] (if active). In store mode: the first pass ended with
+     no card inside the time filter (`Browser::history_is_empty`).
+   * `LoadFailed(e)` → error view `Couldn't load history` + `e` + [Retry] (`start_refresh`) [Show debug log]. In
+     store mode: the first pass failed and there is no generation (a missing projects directory is no error there:
+     the pass lists it as empty).
+4. A query typed while loading is kept in the Input and passed to `browser.set_query` (core runs it on the
+   generation's index once it is open, or in memory applies it at the end).
 
 ### 11.3 Refresh (Ctrl+L, F5, toolbar, menu, palette; also after delete-empty / delete-by-ID if the viewer is unaffected)
 1. `loader.start_refresh()` returns false while a load runs (no-op, parity). Else the footer shows the persistent
    indicator `Refreshing conversations…` (no start toast, PD16).
-2. Core loads into a hidden buffer; the current list stays interactive; preparation off-thread (K1). Rows renamed or
-   removed while the load streams or prepares are replayed onto the installed corpus by core (K1 as built, §4.3).
+2. Store mode (upstream 358becb): core runs a reconcile pass (after the one running, if any); the list stays
+   interactive and the generation the pass leaves is swapped in (§11.2); `Refreshed { old, new }` reports the
+   generation sizes before and after. In memory: core loads into a hidden buffer; the current list stays interactive;
+   preparation off-thread (K1). Rows renamed or removed while the load streams or prepares are replayed onto the
+   installed corpus by core (K1 as built, §4.3).
 3. `Refreshed { old, new, .. }` → toast `Refreshed conversations: <old> → <new>` (replaces the previous refresh toast,
    `id1::<RefreshToast>`); `CorpusChanged`. `RefreshIncomplete` → warning toast `Refresh incomplete; keeping the
    current list` + action "Show debug log". `RefreshFailed(e)` → error toast `Refresh failed: <e>` + "Retry".
@@ -2332,6 +2358,9 @@ After `set_query`, `uuid_lookup()`:
   previous rows stay.
 * After a refresh or reload (K2 as built, §4.3) a UUID result stays `Found` (core re-appends the session when the new
   corpus lacks it) or `NotFound`; it is `Pending` only while the GUI's lookup is in flight. No GUI handling needed.
+* Store mode (upstream 358becb): the generation's cards are looked up first (all of them, also outside the time
+  filter or the first cards), so only a session the store does not hold yet is read from disk; a session read from
+  disk that a swapped-in generation lacks stays as a row after the cards.
 
 ### 11.6 Open in viewer (preview / Enter / double-click / deep-search hit / agent reveal)
 1. Workspace → `viewer.open(OpenRequest { target, focus, reveal })`.
@@ -2521,13 +2550,18 @@ Picker selection / Choose folder… / Clear → validate dir → `AppState.works
 `loader.start_refresh_with(RefreshPolicy::ApplyPartial)` (K18): the rows always match the new workspace;
 `project_errors > 0` → warning toast `N project(s) could not be loaded. See Tools → Debug log.`; `RefreshFailed(e)`
 → the workspace, title and scope revert to the previous values (and the env/browser too) + error toast
-`Couldn't switch the workspace: <e>`. If a load is already running, the change waits for it and then reloads.
+`Couldn't switch the workspace: <e>`. If a load is already running, the change waits for it and then reloads. In store
+mode the reload is a reconcile pass; a workspace whose Pi/OMP session roots differ (`.pi/settings.json`) moves the
+loader to that store root (`roots-<hash>`), whose generation is swapped in once open (the rows shown stay until then).
 
 ### 11.21 Time filter change
 Dropdown preset or custom dialog → `TimePoint::from_str` + `TimeFilter::resolve` (errors inline) →
 `loader.set_time_filter(filter)` → reload with `RefreshPolicy::ApplyPartial` as in §11.20; success → chip label
 updated; `RefreshFailed` → chip and loader filter revert + error toast `Couldn't apply the time filter: <e>`. The
-filter is not persisted (PD17).
+filter is not persisted (PD17). In store mode the next poll re-scopes the cards of the generation shown under the new
+filter (`Browser::set_time_filter`, no file is read; upstream fixed the filter at launch) and the reload is a
+reconcile pass; `HistoryLoader::set_time_filter` (and `reconfigure`) wake the poll, so a filter or workspace reverted
+after a failed pass re-scopes the cards at once.
 
 ### 11.22 Quit, window close and persistence
 * `exit::quit(cx)`: picker mode → `quit_without_output`; else `persist::flush`, `cx.quit()`.
@@ -2567,15 +2601,15 @@ W warning, E error. Every error state offers a recovery action (DG §9.13).
 
 | Where | Condition | UI | Text (in-app) | TUI / core origin |
 |---|---|---|---|---|
-| List area | initial load, 0 rows yet | centered Spinner + text | `Reading history…`; suffix `Loading… 0` | `Loading... 0` |
+| List area | initial load, 0 rows yet | centered Spinner + text | `Reading history…`; suffix `Loading…` (in memory `Loading… <n>` once rows stream in) | `Loading...` (358becb) |
 | List area | `LoadFailed(e)` | Empty (error icon) + [Retry] [Show debug log] | title `Couldn't load history`; body `e` (e.g. `Claude projects directory not found at <path>`) | TUI exited with `e` |
 | List area | `NoHistory(e)` | Empty + [Refresh] [Clear time filter] (if active) | `No conversation history found in selected scope` (+ ` within the requested time range`) | (TUI, verbatim) |
 | List area | query has no matches | Empty (muted) + [Clear search] | `No matching conversations` | blank list |
 | List area | everything excluded / out of scope | Empty + [Show all] | `No conversations in this scope` + `Switch to All or change the workspace.` | blank list |
 | List area | semantic failed | list cleared (TUI) + Empty + [Switch to lexical] [Retry] | `Semantic search failed` + `semantic_error()` text | suffix `sem failed` |
 | List area | semantic no text | Empty + [Switch to lexical] | `No text to search semantically` | suffix `sem no text` |
-| Search suffix | states | label | `Loading… <n>` / `<i>/<n>` / `0/<n>` / `sem <i>/<n>` / `sem failed` / `sem no text` / `sem paused` | `Browser::search_status_text` |
-| Footer | semantic init / embedding | spinner / progress | `sem preparing embeddings` / `sem embedding <p>%  <d>/<t> chunks` | `semantic_activity_status_text` (verbatim) |
+| Search suffix | states | label | `Loading…` / `Loading… <n>` (in memory) / `<i>/<n>` / `0/<n>` / `sem <i>/<n>` / `sem failed` / `sem no text` / `sem paused` | `Browser::search_status_text` |
+| Footer | semantic corpus load (store mode) / init / embedding | spinner / progress | `sem loading conversations` / `sem preparing embeddings` / `sem embedding <p>%  <d>/<t> chunks` | `semantic_activity_status_text` (verbatim; `sem loading conversations` is fork wording for upstream 358becb's `LoadingSessions`, which upstream shows no text for) |
 | Footer | refresh/reload running | spinner (persistent) | `Refreshing conversations…` | `Refreshing sessions...` (`REFRESHING_STATUS`) |
 | Toast S | refresh done | replaces previous | `Refreshed conversations: <old> → <new>` | `Refreshed sessions: <old> -> <new>` |
 | Toast W | refresh with project errors | + [Show debug log] | `Refresh incomplete; keeping the current list` | `Refresh incomplete; keeping existing sessions` |
@@ -2739,7 +2773,7 @@ ignored).
 | Claude data | `$CLAUDE_CONFIG_DIR` or `<home>/.claude` (read; written by rename/delete/fork-copy/delete-empty) |
 | Pi / OMP sessions | per core loaders (`PI_*`, `OMP_PROFILE`, `XDG_DATA_HOME`, relative values against the launch cwd (K16), workspace `.pi/settings.json`) |
 | GUI caches | `<home>/.cache/claude-history-gui/{projects,config-<hash>/projects,pi,omp,semantic,launch}` |
-| List snapshot (store) | `<home>/.cache/claude-history-gui[/config-<hash>]/v3/roots-<hash>/` (`store::default_root`; `roots-<hash>` covers the resolved Pi and OMP session roots, so another workspace `.pi/settings.json` or `PI_*` value reads and writes its own generations): `LOCK`, `CURRENT`, `gNNNNNN/manifest` (cards newest first with their file fingerprints, index locations, the index segment table and the ignored files; manifest version 3), `gNNNNNN/text-NNNN.zst` (each conversation's text as one checksummed zstd frame), `gNNNNNN/base.fst`, `base.post`, `base.short` (word-start suffix index segment 0) and `delta-NNNN.fst/post/short` (further index segments); segments a generation shares with the previous one are hard links (copies where links fail), one generation is kept behind `CURRENT`; read for the first frame and searched before the load ends, updated by the reconcile pass after a complete initial load, §11.2; upstream's format (e905169) |
+| List snapshot (store) | `<home>/.cache/claude-history-gui[/config-<hash>]/v3/roots-<hash>/` (`store::default_root`; `roots-<hash>` covers the resolved Pi and OMP session roots, so another workspace `.pi/settings.json` or `PI_*` value reads and writes its own generations): `LOCK`, `CURRENT`, `gNNNNNN/manifest` (cards newest first with their file fingerprints, index locations, the index segment table and the ignored files; manifest version 3), `gNNNNNN/text-NNNN.zst` (each conversation's text as one checksummed zstd frame), `gNNNNNN/base.fst`, `base.post`, `base.short` (word-start suffix index segment 0) and `delta-NNNN.fst/post/short` (further index segments); segments a generation shares with the previous one are hard links (copies where links fail), one generation is kept behind `CURRENT`; in store mode the list's rows and its search index (358becb), updated by the reconcile passes at start, on refresh and after a rename or delete, §11.2; upstream's format (e905169) |
 | Embedding model | `<home>/.cache/claude-history-gui/semantic/fastembed` |
 | CLI config | `<home>/.config/claude-history/config.toml` (read-only) |
 | GUI config | `<home>/.config/claude-history/gui.toml` |
@@ -2847,9 +2881,13 @@ Absolute rules:
   `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`,
   `XDG_STATE_HOME` inside it and removes `OMP_PROFILE`, `PI_PROFILE`, `TERMINAL`, `CLAUDE_HISTORY_CLIPBOARD`.
 * `app::init_for_test` installs `RecordingServices`, a refusing embedder (`embedder::install_fake` to opt in),
-  disables state.json writes, and uses an empty config unless the test writes one into its `TestWorld`.
+  disables state.json writes, and uses an empty config unless the test writes one into its `TestWorld`. The list's
+  store is on (`ListSnapshots(true)`, store mode as in the app, upstream 358becb; `use_memory_list(cx, world, args)`
+  before the window opens turns it off for tests of the in-memory loader), and the world's directory is held by every
+  list pane (`WorldDir`), so it is removed only after the pane's loader gave up and joined its reconcile pass (the app
+  outlives the test function's locals).
 ```rust
-pub struct TestWorld { pub tmp: tempfile::TempDir, pub env: HistoryEnv }   // HistoryEnv::sandbox(tmp)
+pub struct TestWorld { pub tmp: Arc<tempfile::TempDir>, pub env: HistoryEnv }   // HistoryEnv::sandbox(tmp)
 impl TestWorld {
     pub fn new() -> Self;
     pub fn add_claude_session(&self, project_dir: &str, uuid: &str, lines: &[&str]) -> PathBuf;
@@ -2929,8 +2967,11 @@ resize 1280 820
 quit 0
 ```
   Probe keys (`qa/probe.rs`, read-only accessors on the panes): `list.count`, `list.loaded`, `list.loading`,
-  `list.ready` (rows listed newest first and actionable: snapshot cards while loading), `list.snapshot` (the rows are
-  snapshot cards), `list.index` (the store generation lexical queries run on, empty without one), `list.query`, `list.mode`, `list.scope`, `list.selected_title`, `list.selected_path`, `list.ui_busy_max`,
+  `list.ready` (rows listed newest first and actionable: the first cards while loading), `list.snapshot` (the rows are
+  cards of a store generation), `list.generation` (the generation shown, empty without one), `list.index` (the store
+  generation lexical queries run on, empty without one), `list.reconciling` (store mode: a reconcile pass runs or is
+  due, or a generation it published is still being opened; `false` once the newest generation is shown in full),
+  `list.query`, `list.mode`, `list.scope`, `list.selected_title`, `list.selected_path`, `list.ui_busy_max`,
   `viewer.path`, `viewer.items`, `viewer.messages`, `viewer.nav_focus`, `viewer.indicator`, `viewer.search.count`,
   `viewer.search.current`, `viewer.tool_display`, `viewer.thinking`, `viewer.timing`, `viewer.frame_p95`,
   `focus` (list|viewer|agent|deep|dialog|none), `dialog` (open dialog id or none), `toast.last`, `clipboard`,
@@ -2978,6 +3019,10 @@ quit 0
   3. Semantic QA: the model downloads into the sandbox cache on first use unless `--qa-model-dir
      <scratchpad>\qa-model-cache` points at a pre-downloaded copy (feature `qa` only).
   4. Plain dev runs use the same script without `-Scenario`.
+  5. A fresh sandbox has no store (upstream 358becb): the first launch lists nothing until the initial reconcile pass
+     publishes its first generation (the newest sessions), and the list is ready (`wait-loaded`) from then on while
+     the pass goes on publishing. A scenario that needs every session listed, or a quiet app, waits for
+     `list.total` and `list.reconciling == false` first (`perf-list.qa`, `cross-pane.qa`, `perf-viewer-main.qa`).
 
 ### 15.5 Screenshot QA procedure (Windows; macOS/Linux screenshots are D items)
 For each scenario with `shot` steps: run with `-Shots` in light and dark (`set-theme`), collect PNGs, review against
@@ -3006,13 +3051,18 @@ precondition (no O(corpus) work on the UI thread: e.g. K1/K2/K3 paths are async,
 * **List** (`perf-list.qa`, synthetic 20k-row sandbox via `synth::corpus`): UI-thread time ≤ 16 ms at load end
   (install), ≤ 16 ms at refresh end, ≤ 5 ms for rename apply, ≤ 5 ms for delete removal, ≤ 2 ms for a UUID paste,
   ≤ 2 ms per typed key; idle CPU ≈ 0 over 60 s (no timer besides the 30 s ticker).
-* **First rows** (upstream 3708bb6; not gated yet): with a snapshot, the first frame lists the newest cards.
+* **First rows** (upstream 3708bb6; not gated yet): with a generation, the first frame lists the newest cards.
   `ListPane::new` maps and validates the manifest (linear in its rows, memory only) and builds at most 500 cards on
   the UI thread before the first frame (upstream measured 7.7 ms to the populated first frame); re-reading the cards
-  on a scope change decides every card's scope from its project (memory only). The swap at load end is the K1 install
-  (the target above); the reconcile pass runs on `store-reconcile`. Opening the search index (it normalizes every
-  title) runs on `index-open`, locating its cards in the loaded corpus on `corpus-prepare` and `store-reconcile`; an
-  index answer costs the UI thread one pointer push per new card (the worker builds the cards) and a lookup per row.
+  on a scope change or a new time filter decides every card's scope from its project (memory only). **Store mode**
+  (upstream 358becb, not gated yet): materializing every card, their path and session lookups, opening the index (it
+  normalizes every title) and mapping the rows shown to the new cards run on `generation-open`; the install (load
+  end, refresh end, each swap) swaps pointers and computes every card's scope (a flag per card, the same "install"
+  target); a delete hides rows (a flag per row, the "delete removal" target) and a rename sets one title (the
+  "rename apply" target). Upstream measured a 64 MB peak footprint for a warm launch on 5,983 sessions, against
+  2.5 GB+ with the loaded corpus. The reconcile pass runs on `store-reconcile`, the semantic corpus loads on
+  `semantic-corpus`, visible-row evidence is read on `row-evidence`; an index answer costs the UI thread a lookup
+  per row.
 * **Viewer** (`perf-viewer.qa`, synthetic 10k messages with 20 tool outputs of 5,000 lines, opened in Full mode):
   first content ≤ 3.5 s after open; install ≤ 50 ms UI time; page-through avg ≤ 12 ms, p95 ≤ 20 ms; idle frame ≤ 3 ms;
   toggle `t`/`T` ≤ 60 ms UI time; first search ≤ 60 ms; working set ≤ 400 MB, and within ±10% after opening 20
@@ -3028,6 +3078,13 @@ precondition (no O(corpus) work on the UI thread: e.g. K1/K2/K3 paths are async,
   `perf-viewer-main.qa` gates the viewer's idle frame in the main window with 20k rows (median of nine < 12 ms; the
   probe spans the whole window's layout and paint there) and reports its page-through (V-094). Measured values and
   their stability: §17.11 "Fix round".
+* **As built (store mode, upstream 358becb)**: the QA sandboxes start without a store, so the load end is the install
+  of the first generation the initial reconcile pass publishes (the newest sessions, a few hundred cards):
+  `busy.load_end` (cross-pane) times that install. The rest of the 20k rows arrive as swaps of newer generations;
+  each swap is an install for `list.install_busy_max` (the whole poll, core's share included: gated `< 16ms` by
+  `perf-list.qa`), `list.install_pane_max` (the pane's share, gated too) and `list.loader_install_max` (core's share,
+  reported), read once the pass has listed every session (`list.total`) and is done (`list.reconciling == false`). The 20k-row scenarios
+  measure nothing before that, so the X-007 idle window and the frame and keystroke gates run in a quiet app.
 
 ### 15.9 Deferred manual checks (D) — the user runs them before a release
 * **Windows**: release zip on a clean VM starts (VC++ DLLs app-local); real terminal launch through Windows Terminal
@@ -3688,7 +3745,9 @@ changes below (commits `integrator: …` on master). Contract changes a Phase-B 
 * **Title bar (`workspace/title_bar.rs`, screenshot review)**: gpui-kit's title-bar row never shrinks below its
   content's min-content width, so the window title is laid out absolutely between the menu bar and the window
   controls and truncates there (at 640 px the single-file window had clipped its close button).
-* **PD3 rule 3 (c) (L-082, WP7 request)**: after the first completed load the main window calls
+* **PD3 rule 3 (c) (L-082, WP7 request)**: after the first completed load (in store mode also the first
+  reconcile pass, `ListPane::is_reconciling()` false: a fresh store first lists only its newest delta generation) the
+  main window calls
   `startup::apply_recorded_cwd_workspace(cx, ListPane::recorded_agent_cwds())` once (new `ListPane` method: the
   distinct cwds of the loaded Pi/OMP conversations); on a match `AppState.workspace` is set and the list re-scopes
   through `ListPane::set_workspace` (a background reload).

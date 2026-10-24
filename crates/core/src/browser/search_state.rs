@@ -29,18 +29,28 @@
 //!   background task in the GUI), reused by the replay of an edit at an
 //!   install and by a carried UUID result: only its title, summary and
 //!   project are normalized on the UI thread.
-//! * **Cards built by the worker.** While snapshot cards are the rows, an
-//!   index answer carries the cards of the documents the browser has not
-//!   materialized yet ([`IndexScope::cards`], [`SearchResponse::cards`]),
-//!   built on the index pool, so the UI thread only appends them (upstream
-//!   built them on the TUI thread).
 //! * **Waker.** The worker calls the waker after each answer (upstream's TUI
 //!   polled).
+//! * **Semantic corpus in generation mode.** Upstream 358becb loads the full
+//!   conversations for semantic search on first use with the blocking
+//!   loader; here too, on a `semantic-corpus` thread, which also maps them
+//!   to the generation's docs (upstream mapped them on the TUI thread at the
+//!   first result). The scope is the conversations whose card is in scope,
+//!   so it is computed only from docs of the generation shown: a generation
+//!   swapped in while the corpus loads, or opened before it arrived, has
+//!   them mapped again on a `semantic-corpus` thread (a swap opened after
+//!   it arrived maps them on `generation-open`, see `cards`), and a
+//!   semantic query waits meanwhile (`sem loading conversations`, shown
+//!   also after a scope change during the load). The semantic worker gets
+//!   them as its corpus; a swap changes only the scope it ranks, not that
+//!   corpus. The load gives up between projects when the browser is
+//!   dropped, which waits for its thread (upstream detached it).
 
 use super::corpus::{CorpusSnapshot, SearchSnapshot};
 use super::{
     Browser, ListSearchMode, PreparedSession, SemanticProgress, SemanticResultMetadata, UuidLookup,
 };
+use crate::env::HistoryEnv;
 use crate::history::Conversation;
 use crate::search;
 use crate::search::query::ParsedQuery;
@@ -51,7 +61,7 @@ use crate::semantic_worker::{
 };
 use crate::store;
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -73,6 +83,89 @@ pub(super) struct SemanticSearchState {
     pub(super) worker_thread: Option<std::thread::JoinHandle<()>>,
     /// Suspended by [`Browser::suspend_semantic`]: no worker is started
     pub(super) suspended: bool,
+}
+
+/// Full conversations that semantic search ranks in generation mode, where
+/// rows are cards without text.
+#[derive(Default)]
+pub(super) enum SemanticCorpus {
+    #[default]
+    Unloaded,
+    Loading(SemanticJob),
+    Loaded {
+        conversations: CorpusSnapshot,
+        /// Generation doc of each conversation, for the generation named.
+        /// Only docs of the generation shown are used.
+        docs: Option<(String, Arc<Vec<Option<u32>>>)>,
+        /// Maps `conversations` to the docs of the generation shown, while
+        /// `docs` are another one's.
+        mapping: Option<SemanticJob>,
+    },
+}
+
+/// What a `semantic-corpus` thread sends: the conversations and their docs
+/// in the generation shown when it started.
+pub(super) struct LoadedSemantic {
+    pub(super) conversations: CorpusSnapshot,
+    pub(super) docs: Option<(String, Arc<Vec<Option<u32>>>)>,
+}
+
+/// A `semantic-corpus` thread: it loads the semantic corpus, or maps a
+/// loaded one to the docs of the generation shown. Its handle goes to the
+/// browser's helper threads once it answered or was given up, so the
+/// browser joins it when dropped.
+pub(super) struct SemanticJob {
+    result: mpsc::Receiver<LoadedSemantic>,
+    thread: std::thread::JoinHandle<()>,
+    /// Set to give the job up: a load stops before its next project.
+    cancel: Arc<AtomicBool>,
+}
+
+impl SemanticJob {
+    /// Runs `work` on a `semantic-corpus` thread (8 MiB stack); it sends
+    /// the result before it calls `waker`. `work` gets the job's cancel
+    /// flag.
+    pub(super) fn spawn(
+        waker: Option<Waker>,
+        work: impl FnOnce(&AtomicBool) -> LoadedSemantic + Send + 'static,
+    ) -> std::io::Result<Self> {
+        let (tx, result) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancelled = cancel.clone();
+        let thread = std::thread::Builder::new()
+            .name("semantic-corpus".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let loaded = work(&cancelled);
+                if tx.send(loaded).is_ok()
+                    && let Some(waker) = waker
+                {
+                    waker();
+                }
+            })?;
+        Ok(Self {
+            result,
+            thread,
+            cancel,
+        })
+    }
+
+    /// The answer once the thread sent it: `Some(None)` when the thread
+    /// died without one.
+    fn answer(&self) -> Option<Option<LoadedSemantic>> {
+        match self.result.try_recv() {
+            Ok(loaded) => Some(Some(loaded)),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => Some(None),
+        }
+    }
+
+    /// Gives the job up (a load stops before its next project) and hands
+    /// its thread to `helpers`, joined when the browser is dropped.
+    fn retire(self, helpers: &mut super::HelperThreads) {
+        self.cancel.store(true, Ordering::Relaxed);
+        helpers.push(self.thread);
+    }
 }
 
 /// A query for the lexical worker, with the browser's corpus and search data
@@ -98,11 +191,6 @@ pub(super) struct IndexScope {
     pub(super) index: Arc<store::SearchIndex>,
     /// Whether each document is in scope, by doc id.
     pub(super) docs: Arc<Vec<bool>>,
-    /// While snapshot cards are the rows (fork): which docs the browser has
-    /// materialized as cards, by doc id. The worker builds the cards of the
-    /// other docs it returns, so the browser only appends them. Only a hint:
-    /// the browser builds a card that is missing and drops a duplicate.
-    pub(super) cards: Option<Arc<[AtomicBool]>>,
 }
 
 pub(super) struct SearchResponse {
@@ -117,9 +205,6 @@ pub(super) struct SearchResponse {
     pub(super) mode: ListSearchMode,
     /// Evidence keyed like `filtered`.
     pub(super) evidence: HashMap<usize, search::LexicalEvidence>,
-    /// Cards of docs in `filtered` that were not materialized yet
-    /// ([`IndexScope::cards`]).
-    pub(super) cards: Vec<(u32, Arc<Conversation>)>,
 }
 
 /// Results ranked before the first response of an index search: more than
@@ -192,7 +277,7 @@ struct SearchWorker {
     /// Ranks loaded conversations one query at a time, leaving the other
     /// cores to the UI and loader.
     memory_pool: rayon::ThreadPool,
-    /// Ranks index queries, reads their evidence and builds their cards.
+    /// Ranks index queries and reads their evidence.
     index_pool: rayon::ThreadPool,
 }
 
@@ -259,7 +344,6 @@ impl SearchWorker {
             generation,
             mode,
             evidence,
-            cards: Vec::new(),
         });
     }
 
@@ -276,8 +360,6 @@ impl SearchWorker {
         let in_scope = |doc: u32| scope.docs.get(doc as usize).copied().unwrap_or(false);
         let parsed = ParsedQuery::parse(query);
         let mut evidence = HashMap::new();
-        // Docs whose cards an earlier response of this search carried.
-        let mut carded = HashSet::new();
         let mut ranking = self
             .index_pool
             .install(|| index.search(query, chrono::Local::now(), &in_scope));
@@ -293,7 +375,7 @@ impl SearchWorker {
             mode,
         };
         let complete = top.len() < TOP_PAGE;
-        self.send_index(&reply, &top, complete, &evidence, &mut carded);
+        self.send_index(&reply, &top, complete, &evidence);
         if complete {
             return;
         }
@@ -316,51 +398,24 @@ impl SearchWorker {
         let shown = &docs[..docs.len().min(MAX_EVIDENCE_ROWS)];
         self.index_pool
             .install(|| add_index_evidence(index, shown, &parsed, &mut evidence));
-        self.send_index(&reply, &docs, true, &evidence, &mut carded);
+        self.send_index(&reply, &docs, true, &evidence);
     }
 
-    /// Answers with `docs` of the query's index, and the cards of those the
-    /// browser has not materialized (while cards are the rows).
+    /// Answers with `docs` of the query's index.
     fn send_index(
         &self,
         reply: &IndexReply,
         docs: &[u32],
         complete: bool,
         evidence: &HashMap<usize, search::LexicalEvidence>,
-        carded: &mut HashSet<u32>,
     ) {
-        let scope = reply.scope;
-        let cards = match &scope.cards {
-            Some(materialized) => {
-                let missing: Vec<u32> = docs
-                    .iter()
-                    .copied()
-                    .filter(|&doc| {
-                        !carded.contains(&doc)
-                            && !materialized
-                                .get(doc as usize)
-                                .is_some_and(|flag| flag.load(Ordering::Relaxed))
-                    })
-                    .collect();
-                carded.extend(missing.iter().copied());
-                let snapshot = scope.index.cards();
-                self.index_pool.install(|| {
-                    missing
-                        .par_iter()
-                        .map(|&doc| (doc, Arc::new(snapshot.card(doc))))
-                        .collect()
-                })
-            }
-            None => Vec::new(),
-        };
         self.send(SearchResponse {
             filtered: docs.iter().map(|&doc| doc as usize).collect(),
-            index: Some(scope.index.clone()),
+            index: Some(reply.scope.index.clone()),
             complete,
             generation: reply.generation,
             mode: reply.mode,
             evidence: evidence.clone(),
-            cards,
         });
     }
 }
@@ -419,6 +474,7 @@ impl Browser {
         self.search_in_flight = false;
         self.search_page_shown = false;
         self.lexical_evidence.clear();
+        self.clear_evidence_checked();
         self.semantic_search.pending_generation = None;
         self.semantic_search.pending_status = None;
         self.semantic_search.prewarm_generation = None;
@@ -447,12 +503,326 @@ impl Browser {
     }
 
     /// The rows in scope for the semantic worker: the cached scope (shared,
-    /// no copy) when current.
+    /// no copy) when current. In generation mode, the semantic corpus's
+    /// conversations whose card is in scope (time filter included, deleted
+    /// ones out).
     pub(super) fn semantic_scope_indices(&self) -> Arc<Vec<usize>> {
+        if self.snapshot.is_some() {
+            // Docs of another generation would index this one's scope.
+            let Some(docs) = self.semantic_docs_shown() else {
+                return Arc::default();
+            };
+            return Arc::new(
+                docs.iter()
+                    .enumerate()
+                    .filter(|(_, doc)| {
+                        doc.is_some_and(|doc| {
+                            self.cards.scope.get(doc as usize).copied().unwrap_or(false)
+                        })
+                    })
+                    .map(|(index, _)| index)
+                    .collect(),
+            );
+        }
         if self.scope_is_current() {
             return self.index.scope.rows().clone();
         }
         Arc::new(self.filter_indices(0..self.conversations.len()))
+    }
+
+    /// The conversations the semantic worker ranks: the loaded corpus, or
+    /// the semantic corpus in generation mode (empty until it is loaded).
+    fn semantic_conversations(&self) -> CorpusSnapshot {
+        if self.snapshot.is_none() {
+            return self.conversations.clone();
+        }
+        self.semantic_conversations_loaded().unwrap_or_default()
+    }
+
+    /// The semantic corpus of generation mode, once loaded.
+    pub(super) fn semantic_conversations_loaded(&self) -> Option<CorpusSnapshot> {
+        match &self.semantic_corpus {
+            SemanticCorpus::Loaded { conversations, .. } => Some(conversations.clone()),
+            _ => None,
+        }
+    }
+
+    /// The docs of the semantic corpus in the generation shown, once mapped
+    /// to it.
+    fn semantic_docs_shown(&self) -> Option<&Arc<Vec<Option<u32>>>> {
+        let shown = self.generation_id()?;
+        match &self.semantic_corpus {
+            SemanticCorpus::Loaded {
+                docs: Some((id, docs)),
+                ..
+            } if *id == shown => Some(docs),
+            _ => None,
+        }
+    }
+
+    /// Takes the docs of the semantic corpus in the generation just
+    /// installed (mapped off the UI thread), when they belong to the corpus
+    /// loaded.
+    pub(super) fn adopt_semantic_docs(
+        &mut self,
+        corpus: &CorpusSnapshot,
+        mapped: Arc<Vec<Option<u32>>>,
+    ) {
+        let name = self.generation_id();
+        if let (
+            SemanticCorpus::Loaded {
+                conversations,
+                docs,
+                ..
+            },
+            Some(name),
+        ) = (&mut self.semantic_corpus, name)
+            && Arc::ptr_eq(conversations, corpus)
+        {
+            *docs = Some((name, mapped));
+            self.semantic_sent_scope_signature = None;
+        }
+    }
+
+    /// Makes the full conversations semantic search needs in generation
+    /// mode ready: starts loading them on a `semantic-corpus` thread, or
+    /// mapping them to the docs of the generation shown when they were
+    /// mapped to another one. Returns whether they are ready (always
+    /// outside generation mode); until then semantic mode shows
+    /// [`SemanticProgress::LoadingSessions`], and the poll that receives
+    /// them dispatches the query.
+    pub(super) fn ensure_semantic_corpus(&mut self) -> bool {
+        let Some(snapshot) = self.snapshot.clone() else {
+            return true;
+        };
+        let stale = match &self.semantic_corpus {
+            SemanticCorpus::Loaded { mapping, .. } => {
+                if self.semantic_docs_shown().is_some() {
+                    return true;
+                }
+                // Loaded for another generation: mapped to this one, once.
+                mapping.is_none()
+            }
+            SemanticCorpus::Loading(_) => false,
+            SemanticCorpus::Unloaded => {
+                if !self.semantic_search.available {
+                    return false;
+                }
+                let env = self.env.clone();
+                let show_last = snapshot.show_last();
+                let snapshot = snapshot.clone();
+                match SemanticJob::spawn(self.waker.clone(), move |cancel| {
+                    let cancelled = || cancel.load(Ordering::Relaxed);
+                    let conversations: CorpusSnapshot = Arc::new(
+                        crate::history::load_all_conversations_cancellable(
+                            &env, show_last, None, &cancelled,
+                        )
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(Arc::new)
+                        .collect(),
+                    );
+                    let docs = super::cards::semantic_docs(&snapshot, &conversations);
+                    LoadedSemantic {
+                        docs: Some((snapshot.generation_id(), Arc::new(docs))),
+                        conversations,
+                    }
+                }) {
+                    Ok(job) => self.semantic_corpus = SemanticCorpus::Loading(job),
+                    Err(_) => {
+                        self.semantic_search.error =
+                            Some("semantic corpus unavailable".to_string());
+                        return false;
+                    }
+                }
+                false
+            }
+        };
+        if stale && let Some(corpus) = self.semantic_conversations_loaded() {
+            let job = SemanticJob::spawn(self.waker.clone(), move |_| LoadedSemantic {
+                docs: Some((
+                    snapshot.generation_id(),
+                    Arc::new(super::cards::semantic_docs(&snapshot, &corpus)),
+                )),
+                conversations: corpus,
+            });
+            match job {
+                Ok(job) => {
+                    if let SemanticCorpus::Loaded { mapping, .. } = &mut self.semantic_corpus {
+                        *mapping = Some(job);
+                    }
+                }
+                Err(_) => {
+                    self.semantic_search.error = Some("semantic corpus unavailable".to_string());
+                    return false;
+                }
+            }
+        }
+        if self.list_search_mode == ListSearchMode::Semantic {
+            self.semantic_search.pending_status = Some(SemanticProgress::LoadingSessions);
+        }
+        false
+    }
+
+    /// Takes the semantic corpus once it has loaded, or its docs once they
+    /// are mapped to the generation shown; a semantic query waiting for
+    /// them is dispatched (an empty one prewarms). Returns whether anything
+    /// arrived.
+    fn receive_semantic_corpus(&mut self) -> bool {
+        let shown = self.generation_id();
+        match &mut self.semantic_corpus {
+            SemanticCorpus::Unloaded => return false,
+            SemanticCorpus::Loading(job) => {
+                let Some(answer) = job.answer() else {
+                    return false;
+                };
+                let SemanticCorpus::Loading(job) = std::mem::take(&mut self.semantic_corpus) else {
+                    unreachable!("matched above");
+                };
+                self.helpers.push(job.thread);
+                let loaded = answer.unwrap_or(LoadedSemantic {
+                    conversations: Arc::default(),
+                    docs: None,
+                });
+                self.semantic_corpus = SemanticCorpus::Loaded {
+                    conversations: loaded.conversations,
+                    docs: loaded.docs,
+                    mapping: None,
+                };
+                self.readiness.semantic = true;
+                self.semantic_corpus_version += 1;
+                self.semantic_sent_scope_signature = None;
+            }
+            SemanticCorpus::Loaded {
+                conversations,
+                docs,
+                mapping,
+            } => {
+                let Some(answer) = mapping.as_ref().and_then(SemanticJob::answer) else {
+                    return false;
+                };
+                if let Some(job) = mapping.take() {
+                    self.helpers.push(job.thread);
+                }
+                let Some(loaded) = answer else {
+                    // The mapping died: the next semantic query tries again.
+                    self.semantic_search.error = Some("semantic corpus unavailable".to_string());
+                    return true;
+                };
+                if docs.as_ref().map(|(name, _)| name) == shown.as_ref() {
+                    // Mapped meanwhile by the open of the generation shown.
+                    return false;
+                }
+                if Arc::ptr_eq(conversations, &loaded.conversations) {
+                    *docs = loaded.docs;
+                }
+                self.semantic_sent_scope_signature = None;
+            }
+        }
+        // Mapped to another generation than the one shown now (swapped in
+        // meanwhile): mapped again, and the query waits for that.
+        if !self.ensure_semantic_corpus() {
+            return true;
+        }
+        if matches!(
+            self.semantic_search.pending_status,
+            Some(SemanticProgress::LoadingSessions)
+        ) {
+            self.semantic_search.pending_status = None;
+        }
+        if self.list_search_mode == ListSearchMode::Semantic {
+            if self.query.trim().is_empty() {
+                self.prewarm_semantic_cache();
+            } else {
+                self.dispatch_semantic_search(self.query.trim().to_string(), false);
+            }
+        }
+        true
+    }
+
+    /// Uses `env` from now on (the loader moved to another set of session
+    /// roots). The semantic corpus was loaded from the previous sources:
+    /// it is retired and loaded again by the next semantic use.
+    pub fn set_env(&mut self, env: Arc<HistoryEnv>) {
+        if Arc::ptr_eq(&self.env, &env) {
+            return;
+        }
+        self.env = env;
+        if self.snapshot.is_some() && !matches!(self.semantic_corpus, SemanticCorpus::Unloaded) {
+            self.retire_semantic_corpus();
+            self.readiness.semantic = false;
+            self.corpus_changed();
+            if self.list_search_mode == ListSearchMode::Semantic {
+                self.ensure_semantic_corpus();
+            }
+        }
+    }
+
+    /// Gives up the semantic corpus (generation mode ends, or the browser
+    /// is dropped): a load or a mapping still running stops, and its thread
+    /// is joined when the browser is dropped.
+    pub(super) fn retire_semantic_corpus(&mut self) {
+        match std::mem::take(&mut self.semantic_corpus) {
+            SemanticCorpus::Loading(job)
+            | SemanticCorpus::Loaded {
+                mapping: Some(job), ..
+            } => job.retire(&mut self.helpers),
+            _ => {}
+        }
+    }
+
+    /// Rows of semantic corpus conversations `indices`, in order, with
+    /// `metadata` re-keyed by row. In generation mode conversations map to
+    /// cards by path; others, and deleted cards, are dropped.
+    pub(super) fn semantic_rows(
+        &mut self,
+        indices: Vec<usize>,
+        metadata: HashMap<usize, SemanticResultMetadata>,
+    ) -> (Vec<usize>, HashMap<usize, SemanticResultMetadata>) {
+        let Some(snapshot) = self.snapshot.clone() else {
+            return (self.filter_indices(indices), metadata);
+        };
+        let SemanticCorpus::Loaded {
+            conversations,
+            docs,
+            ..
+        } = &mut self.semantic_corpus
+        else {
+            return (Vec::new(), HashMap::new());
+        };
+        if docs
+            .as_ref()
+            .is_none_or(|(id, _)| *id != snapshot.generation_id())
+        {
+            // Mapped off this thread (the corpus load, a generation open, a
+            // mapping job) before a query is sent; an answer computed for
+            // another generation is mapped here (upstream mapped at every
+            // first answer), and the scope sent goes with it.
+            let mapped = super::cards::semantic_docs(&snapshot, conversations);
+            *docs = Some((snapshot.generation_id(), Arc::new(mapped)));
+            self.semantic_sent_scope_signature = None;
+        }
+        let doc_of = docs
+            .as_ref()
+            .map(|(_, docs)| docs.clone())
+            .unwrap_or_default();
+        let mut rows = Vec::with_capacity(indices.len());
+        let mut by_row = HashMap::new();
+        let mut metadata = metadata;
+        for index in indices {
+            let Some(doc) = doc_of.get(index).copied().flatten() else {
+                continue;
+            };
+            if !self.cards.scope.get(doc as usize).copied().unwrap_or(false) {
+                continue;
+            }
+            let row = self.card_row(doc);
+            rows.push(row);
+            if let Some(meta) = metadata.remove(&index) {
+                by_row.insert(row, meta);
+            }
+        }
+        (rows, by_row)
     }
 
     fn reset_semantic_worker(&mut self) {
@@ -537,9 +907,10 @@ impl Browser {
 
     fn send_semantic_state(&mut self) -> Option<(u64, u64)> {
         if self.semantic_sent_corpus_version != self.semantic_corpus_version {
+            let conversations = self.semantic_conversations();
             if !self.send_semantic_command(SemanticWorkerCommand::UpdateCorpus {
                 corpus_version: self.semantic_corpus_version,
-                conversations: self.conversations.clone(),
+                conversations,
             }) {
                 return None;
             }
@@ -615,6 +986,13 @@ impl Browser {
             return;
         }
 
+        if self.snapshot.is_some() && !self.readiness.lexical {
+            // The query runs once the generation's index opens.
+            self.invalidate_search_generation();
+            self.update_filter();
+            return;
+        }
+
         self.semantic_search.results.clear();
         self.semantic_search.error = None;
         self.dispatch_lexical_search(query);
@@ -665,6 +1043,12 @@ impl Browser {
         }
         if self.semantic_search.suspended {
             self.dispatch_while_suspended(query, prewarm);
+            return;
+        }
+        if !self.ensure_semantic_corpus() {
+            // Dispatched again once the corpus arrives.
+            self.invalidate_search_generation();
+            self.semantic_search.pending_status = Some(SemanticProgress::LoadingSessions);
             return;
         }
         self.search_generation += 1;
@@ -772,7 +1156,8 @@ impl Browser {
     /// [`super::BrowserOptions::waker`] fires (or periodically while
     /// [`Browser::has_search_work_in_flight`]).
     pub fn poll(&mut self) -> bool {
-        let mut applied = false;
+        let mut applied = self.receive_semantic_corpus();
+        applied |= self.receive_row_evidence();
         self.ensure_scope();
         while let Ok(response) = self.search_rx.try_recv() {
             let semantic_fallback_pending = response.mode == ListSearchMode::Semantic
@@ -790,7 +1175,7 @@ impl Browser {
                 && index_current
             {
                 let (filtered, evidence) = if response.index.is_some() {
-                    let filtered = self.rows_of_docs(&response.filtered, response.cards);
+                    let filtered = self.rows_of_docs(&response.filtered);
                     (filtered, self.evidence_of_docs(response.evidence))
                 } else {
                     (self.filter_indices(response.filtered), response.evidence)
@@ -870,7 +1255,9 @@ impl Browser {
                                     self.semantic_search.pending_status = None;
                                     self.semantic_search.last_status = response.progress;
                                     self.semantic_search.error = response.error;
-                                    self.semantic_search.results = response.metadata;
+                                    let (_, metadata) =
+                                        self.semantic_rows(Vec::new(), response.metadata);
+                                    self.semantic_search.results = metadata;
                                     if !self.query.trim().is_empty() {
                                         self.dispatch_semantic_search(
                                             self.query.trim().to_string(),
@@ -885,8 +1272,9 @@ impl Browser {
                                 self.semantic_search.pending_status = None;
                                 self.semantic_search.last_status = response.progress;
                                 self.semantic_search.error = response.error;
-                                self.semantic_search.results = response.metadata;
-                                let filtered = self.filter_indices(response.filtered);
+                                let (filtered, metadata) =
+                                    self.semantic_rows(response.filtered, response.metadata);
+                                self.semantic_search.results = metadata;
                                 self.apply_filtered(filtered);
                                 applied = true;
                             }
@@ -899,11 +1287,26 @@ impl Browser {
         applied
     }
 
-    /// Whether a lexical search, a semantic search or a prewarm is running.
+    /// Whether a lexical search, a semantic search or a prewarm is running,
+    /// or the semantic corpus is loading (or being mapped to a generation).
     pub fn has_search_work_in_flight(&self) -> bool {
-        self.search_in_flight
+        self.semantic_corpus_pending()
+            || self.search_in_flight
             || self.semantic_search.pending_generation.is_some()
             || self.semantic_search.prewarm_generation.is_some()
+    }
+
+    /// Whether the semantic corpus is loading or being mapped to the
+    /// generation shown.
+    fn semantic_corpus_pending(&self) -> bool {
+        matches!(
+            self.semantic_corpus,
+            SemanticCorpus::Loading(_)
+                | SemanticCorpus::Loaded {
+                    mapping: Some(_),
+                    ..
+                }
+        )
     }
 
     /// Semantic scores and evidence of a conversation in the current results.
@@ -955,19 +1358,25 @@ impl Browser {
         }
     }
 
-    /// Activity text while the model loads or the corpus is embedded:
-    /// `"sem preparing embeddings"` or `"sem embedding <p>%  <d>/<t> chunks"`.
+    /// Activity text while the conversations load, the model loads or the
+    /// corpus is embedded: `"sem loading conversations"`, `"sem preparing
+    /// embeddings"` or `"sem embedding <p>%  <d>/<t> chunks"`.
     pub fn semantic_activity_status_text(&self) -> Option<String> {
         if self.list_search_mode != ListSearchMode::Semantic || self.semantic_search.error.is_some()
         {
             return None;
         }
+        // A query or scope change clears the pending status while the
+        // corpus loads: the load still shows.
+        let loading = SemanticProgress::LoadingSessions;
         let status = self
             .semantic_search
             .prewarm_status
             .as_ref()
-            .or(self.semantic_search.pending_status.as_ref())?;
+            .or(self.semantic_search.pending_status.as_ref())
+            .or(self.semantic_corpus_pending().then_some(&loading))?;
         match status {
+            SemanticProgress::LoadingSessions => Some("sem loading conversations".to_string()),
             SemanticProgress::InitializingModel => Some("sem preparing embeddings".to_string()),
             SemanticProgress::Embedding { completed, total } => {
                 let percent = if *total == 0 {
@@ -1003,10 +1412,11 @@ impl Browser {
     }
 
     /// Replace the query. Like any query edit in the TUI: clears the
-    /// selection anchor and searches immediately, except while loading (the
-    /// query is applied when loading finishes) unless a lexical query can
-    /// run on the snapshot's index ([`super::Readiness::lexical`]).
-    /// Unchanged text is a no-op.
+    /// selection anchor and searches immediately, except before there are
+    /// rows (the query is applied when loading finishes or the first
+    /// generation is shown). In generation mode a lexical query waits for
+    /// the generation's index ([`super::Readiness::lexical`]); the cards
+    /// stay listed meanwhile. Unchanged text is a no-op.
     pub fn set_query(&mut self, query: impl Into<String>) {
         let query = query.into();
         if query == self.query {
@@ -1082,8 +1492,7 @@ impl Browser {
         self.semantic_sent_scope_signature = None;
         self.invalidate_search_generation();
         if self.snapshot.is_some() {
-            // The cards' scope is decided again; a lexical query on their
-            // index runs again.
+            // The cards' scope is decided again; the query runs again.
             self.rescope_cards();
             return;
         }
@@ -1104,13 +1513,8 @@ impl Browser {
     }
 
     /// While loading: every loaded row that passes the exclusions and the
-    /// scope, in arrival order (over snapshot cards, the browse list of the
-    /// newest cards).
+    /// scope, in arrival order.
     fn apply_scope_only_filter(&mut self) {
-        if self.snapshot.is_some() {
-            self.show_snapshot_cards();
-            return;
-        }
         let filtered = self.scope_rows();
         self.apply_filtered(filtered);
     }
@@ -1124,16 +1528,12 @@ impl Browser {
         self.list_search_mode = self.list_search_mode.toggled();
         self.invalidate_search_generation();
         if self.is_loading() {
-            if self.readiness.lexical && self.list_search_mode == ListSearchMode::Lexical {
-                // Back to lexical over the snapshot's index.
-                self.update_filter();
-            } else {
-                // Quirk 14 fix: the mode is applied when loading finishes.
-                self.apply_scope_only_filter();
-            }
+            // Quirk 14 fix: the mode is applied when loading finishes.
+            self.apply_scope_only_filter();
             return;
         }
         if self.list_search_mode == ListSearchMode::Semantic && self.query.trim().is_empty() {
+            self.ensure_semantic_corpus();
             self.prewarm_semantic_cache();
         } else {
             self.dispatch_search();
@@ -1176,8 +1576,18 @@ impl Browser {
 
     /// Index of the first loaded session with this id (ignoring ASCII
     /// case): an indexed lookup, no scan of the corpus (X-038 UUID paste).
-    fn find_loaded_uuid(&self, uuid: &str) -> Option<usize> {
-        self.index.first_session(&self.conversations, uuid)
+    /// While only the first cards of a generation are shown, a card beyond
+    /// them is found in the generation (a scan of its rows) and
+    /// materialized.
+    fn find_loaded_uuid(&mut self, uuid: &str) -> Option<usize> {
+        if let Some(index) = self.index.first_session(&self.conversations, uuid) {
+            return Some(index);
+        }
+        if self.generation_open() {
+            return None;
+        }
+        let doc = self.snapshot.as_ref()?.find_session(uuid)?;
+        Some(self.card_row(doc))
     }
 
     /// Finish a [`UuidLookup::Pending`] jump with the result of
@@ -1261,10 +1671,10 @@ impl Browser {
     }
 
     /// The browse list: every conversation that passes the exclusions and
-    /// the scope, in corpus order (newest first once loaded); over snapshot
-    /// cards, the newest cards.
+    /// the scope, in corpus order (newest first once loaded); before a
+    /// generation is open, its newest cards.
     fn apply_browse_filter(&mut self) {
-        if self.snapshot.is_some() {
+        if self.snapshot.is_some() && !self.generation_open() {
             self.show_snapshot_cards();
             return;
         }

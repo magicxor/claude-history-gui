@@ -59,7 +59,12 @@ impl Browser {
     /// in a way an incremental update could not follow (O(n)).
     pub(super) fn ensure_scope(&mut self) {
         if !self.scope_is_current() {
-            self.index.scope = ScopeIndex::compute(&self.conversations, self.scope_settings());
+            if self.snapshot.is_some() {
+                // Generation mode: from the cards' scope.
+                self.set_generation_scope();
+            } else {
+                self.index.scope = ScopeIndex::compute(&self.conversations, self.scope_settings());
+            }
         }
     }
 
@@ -216,9 +221,13 @@ impl Browser {
             .map(|index| self.conversations[index].as_ref())
     }
 
-    /// Whether the loaded corpus mixes Claude, Pi and OMP sessions (rows
-    /// then show a `CC`/`Pi`/`OMP` source label).
+    /// Whether the loaded corpus (or the generation shown) mixes Claude, Pi
+    /// and OMP sessions (rows then show a `CC`/`Pi`/`OMP` source label).
     pub fn has_multiple_sources(&self) -> bool {
+        if self.snapshot.is_some() && !self.generation_open() {
+            // Only the first cards are rows: ask the generation (upstream).
+            return self.cards_mixed_sources();
+        }
         self.index.mixed_sources()
     }
 
