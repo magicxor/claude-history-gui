@@ -390,6 +390,10 @@ fn newer_generation_swaps_in_and_reruns_the_query_keeping_selection() {
         listed_paths(&app),
         vec!["/p/-tmp-alpha/c.jsonl", "/p/-tmp-alpha/a.jsonl"]
     );
+    assert_eq!(
+        app.selected_path(),
+        Some(PathBuf::from("/p/-tmp-alpha/a.jsonl"))
+    );
     wait_for_search(&mut app);
     assert_eq!(
         listed_paths(&app),
