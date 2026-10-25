@@ -422,9 +422,10 @@ Background work (all threads named, 8 MiB stack via `std::thread::Builder::stack
   `search-worker` (lexical), `semantic-search-worker` (spawned by `core::browser::Browser`), `generation-open`
   (materializes every card of a store generation and opens its search index), `store-reconcile` (the reconcile pass:
   parses new or changed session files into delta generations, retries a store locked by another instance every
-  second) with its `store-watch` thread (checks `CURRENT` every 200 ms while the pass runs), `semantic-corpus` (loads
-  the conversations semantic search ranks in store mode, or maps them to a newer generation's docs; a load gives up
-  between projects when its browser is dropped), `row-evidence` (reads the literal context of visible rows from their
+  second) with its `store-watch` thread (checks `CURRENT` every 200 ms while the pass runs), `semantic-corpus` (reads
+  the semantic data of a generation's cards for semantic search in store mode, on rayon's global pool, or maps
+  cards read before to a newer generation's docs; a read gives up before its next card when its browser is
+  dropped), `row-evidence` (reads the literal context of visible rows from their
   text frames); the browser joins its `semantic-corpus` and `row-evidence` threads when it is dropped; rayon pools (`lexical-rank-worker`, `index-search-*` up to 8 threads,
   `store-reconcile-*` up to 4) use rayon's default stack size, not 8 MiB;
 * GUI-owned: `viewer-worker` (one per ViewerPane: single-flight parse + document + items + segments, §7.5),
@@ -2296,13 +2297,21 @@ recorded each frame (for the keyboard context menu position).
      title on its row (the index keeps the old one) until a generation holds it. Both ask for a reconcile pass
      (`Browser::take_reconcile_request`, which wakes the poll); the swap drops the overlays the new generation
      reflects.
-   * **Semantic search (upstream 358becb, until ecc2f2f).** Cards carry no text: the first semantic use loads the
-     full conversations on a `semantic-corpus` thread (`SemanticProgress::LoadingSessions`, footer
-     `sem loading conversations`), maps them to the generation's docs by path, and ranks those whose card is in scope
-     (time filter included, deleted ones out); results are shown as cards. The scope uses only docs of the
-     generation shown: a generation swapped in while the corpus loaded (or opened before it arrived) has the corpus
-     mapped to it again on a `semantic-corpus` thread, and a semantic query waits for that (a swap opened after the
-     corpus arrived maps it on `generation-open`).
+   * **Semantic search (upstream ecc2f2f).** Cards carry no text: semantic search ranks the cards with their
+     semantic data (`store::SemanticCards`: turns, message ranges, route and agent text from the generation's
+     `sem-*.zst` segments), read on a `semantic-corpus` thread the first time semantic mode needs them
+     (`SemanticProgress::LoadingSessions`, footer `sem loading conversations`), and ranks those whose card is in
+     scope (time filter included, deleted ones out); results are shown as cards. After a swap, semantic mode reads
+     the new generation's cards in the background (cards whose semantic data is unchanged keep the earlier
+     allocation, so the resident semantic index matches them by pointer and re-chunks only changed cards), and the
+     older cards serve meanwhile once mapped to the new docs by path (on `generation-open` for the swap, else on a
+     `semantic-corpus` thread; a semantic query waits for that mapping). A read of a generation no longer shown is
+     given up. A generation whose semantic data cannot be read keeps the cards read before (mapped to it); with
+     none, semantic search fails with `semantic corpus unavailable`. It is not read again until semantic mode is
+     entered again (Retry does that) or a newer generation is shown. Quoted-only
+     semantic queries find their matches in the generation's lexical index, newest first, and read the text of the
+     first 200 for their evidence (later rows show their preview); the cards are sent to the semantic worker again
+     once their generation's index is open.
    * **In memory (store off).** Without a store the rows stream in: `loader.poll` appends batches as they arrive
      (suffix `Loading… <n>`), and at the end the K1 preparation (§4.3) runs on `corpus-prepare` and a later poll
      installs it. Upstream 358becb loaded in memory synchronously before the first frame; the fork keeps its
@@ -2614,7 +2623,7 @@ W warning, E error. Every error state offers a recovery action (DG §9.13).
 | List area | semantic failed | list cleared (TUI) + Empty + [Switch to lexical] [Retry] | `Semantic search failed` + `semantic_error()` text | suffix `sem failed` |
 | List area | semantic no text | Empty + [Switch to lexical] | `No text to search semantically` | suffix `sem no text` |
 | Search suffix | states | label | `Loading…` / `Loading… <n>` (in memory) / `<i>/<n>` / `0/<n>` / `sem <i>/<n>` / `sem failed` / `sem no text` / `sem paused` | `Browser::search_status_text` |
-| Footer | semantic corpus load (store mode) / init / embedding | spinner / progress | `sem loading conversations` / `sem preparing embeddings` / `sem embedding <p>%  <d>/<t> chunks` | `semantic_activity_status_text` (verbatim; `sem loading conversations` is fork wording for upstream 358becb's `LoadingSessions`, which upstream shows no text for) |
+| Footer | semantic data read (store mode) / init / embedding | spinner / progress | `sem loading conversations` / `sem preparing embeddings` / `sem embedding <p>%  <d>/<t> chunks` | `semantic_activity_status_text` (verbatim; `sem loading conversations` is fork wording for upstream 358becb's `LoadingSessions`, which upstream shows no text for) |
 | Footer | refresh/reload running | spinner (persistent) | `Refreshing conversations…` | `Refreshing sessions...` (`REFRESHING_STATUS`) |
 | Toast S | refresh done | replaces previous | `Refreshed conversations: <old> → <new>` | `Refreshed sessions: <old> -> <new>` |
 | Toast W | refresh with project errors | + [Show debug log] | `Refresh incomplete; keeping the current list` | `Refresh incomplete; keeping existing sessions` |
@@ -3066,8 +3075,8 @@ precondition (no O(corpus) work on the UI thread: e.g. K1/K2/K3 paths are async,
   end, refresh end, each swap) swaps pointers and computes every card's scope (a flag per card, the same "install"
   target); a delete hides rows (a flag per row, the "delete removal" target) and a rename sets one title (the
   "rename apply" target). Upstream measured a 64 MB peak footprint for a warm launch on 5,983 sessions, against
-  2.5 GB+ with the loaded corpus. The reconcile pass runs on `store-reconcile`, the semantic corpus loads on
-  `semantic-corpus`, visible-row evidence is read on `row-evidence`; an index answer costs the UI thread a lookup
+  2.5 GB+ with the loaded corpus. The reconcile pass runs on `store-reconcile`, the cards' semantic data is
+  read on `semantic-corpus`, visible-row evidence is read on `row-evidence`; an index answer costs the UI thread a lookup
   per row.
 * **Viewer** (`perf-viewer.qa`, synthetic 10k messages with 20 tool outputs of 5,000 lines, opened in Full mode):
   first content ≤ 3.5 s after open; install ≤ 50 ms UI time; page-through avg ≤ 12 ms, p95 ≤ 20 ms; idle frame ≤ 3 ms;

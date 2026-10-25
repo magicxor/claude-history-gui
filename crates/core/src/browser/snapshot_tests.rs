@@ -610,14 +610,11 @@ fn semantic_results_map_to_cards_by_path() {
         &format!("/p/{alpha}/unpublished.jsonl"),
         9 * HOUR_MS,
     ));
-    let loaded: CorpusSnapshot = Arc::new(loaded.into_iter().map(Arc::new).collect());
-    let docs = cards::semantic_docs(app.snapshot.as_ref().unwrap(), &loaded);
+    let cards = crate::store::SemanticCards::from_conversations("loaded", loaded);
+    let docs = cards::semantic_docs(app.snapshot.as_ref().unwrap(), cards.conversations());
     assert_eq!(docs, vec![Some(2), Some(1), Some(0), None]);
-    app.semantic_corpus = search_state::SemanticCorpus::Loaded {
-        conversations: loaded,
-        docs: Some((app.generation_id().unwrap(), Arc::new(docs))),
-        mapping: None,
-    };
+    app.semantic_corpus.loaded = Some(Arc::new(cards));
+    app.semantic_corpus.docs = Some((app.generation_id().unwrap(), Arc::new(docs)));
 
     // In scope: the alpha conversations that have a card.
     assert_eq!(*app.semantic_scope_indices(), vec![0, 2]);
@@ -636,34 +633,145 @@ fn semantic_results_map_to_cards_by_path() {
     assert_eq!(*app.semantic_scope_indices(), vec![0]);
 }
 
-/// A semantic corpus load that plays the `semantic-corpus` thread: it
-/// waits for `gate`, then answers with `corpus` mapped to the docs of
-/// `shown` (the generation shown when it started).
-fn gated_semantic_load(
-    shown: crate::store::Snapshot,
-    corpus: CorpusSnapshot,
+#[test]
+fn semantic_corpus_is_read_from_the_generation_and_follows_swaps() {
+    let sandbox = Sandbox::new();
+    let mut corpus = corpus();
+    corpus[0].semantic_turns = vec!["alpha turn".to_string()].into();
+    corpus[1].semantic_turns = vec!["beta turn".to_string()].into();
+    let root = publish(&corpus);
+    let mut app = loading_app(&sandbox, None, vec![]);
+    show(&mut app, &root, TimeFilter::default());
+    app.remove_paths(&[PathBuf::from("/p/-tmp-beta/b.jsonl")]);
+
+    assert!(!app.ensure_semantic_corpus());
+    wait_for_search(&mut app);
+    let first = app.semantic_corpus.loaded.clone().unwrap();
+    let turns = |cards: &crate::store::SemanticCards, name: &str| {
+        cards
+            .conversations()
+            .iter()
+            .find(|card| card.path.ends_with(name))
+            .map(|card| card.semantic_turns.clone())
+            .unwrap()
+    };
+    assert_eq!(&*turns(&first, "a.jsonl"), ["alpha turn".to_string()]);
+    assert!(Arc::ptr_eq(
+        &app.semantic_conversations_loaded().unwrap(),
+        first.conversations()
+    ));
+    let scope = app.semantic_scope_indices();
+    let scoped: Vec<_> = scope
+        .iter()
+        .map(|&index| first.conversations()[index].path.display().to_string())
+        .collect();
+    assert_eq!(
+        scoped,
+        vec!["/p/-tmp-alpha/c.jsonl", "/p/-tmp-alpha/a.jsonl"]
+    );
+
+    corpus[2].semantic_turns = vec!["gamma turn".to_string()].into();
+    assert!(app.swap_generation(republish(&root, &corpus)));
+    assert!(
+        app.ensure_semantic_corpus(),
+        "the older corpus serves meanwhile"
+    );
+    wait_for_search(&mut app);
+    let second = app.semantic_corpus.loaded.clone().unwrap();
+    assert_ne!(second.generation_name(), first.generation_name());
+    assert_eq!(&*turns(&second, "c.jsonl"), ["gamma turn".to_string()]);
+    assert!(Arc::ptr_eq(
+        &turns(&second, "a.jsonl"),
+        &turns(&first, "a.jsonl")
+    ));
+}
+
+/// Fork: the `semantic-corpus` thread wakes the poll once the cards are
+/// read, so a GUI that polls only when woken receives them.
+#[test]
+fn the_semantic_corpus_read_wakes_the_poll() {
+    let sandbox = Sandbox::new();
+    let root = publish(&corpus());
+    let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let waker: Waker = {
+        let woken = woken.clone();
+        Arc::new(move || {
+            woken.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+    };
+    let mut app = Browser::new_loading(sandbox.options().with_waker(waker));
+    show(&mut app, &root, TimeFilter::default());
+    let before = woken.load(std::sync::atomic::Ordering::SeqCst);
+
+    assert!(!app.ensure_semantic_corpus());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while woken.load(std::sync::atomic::Ordering::SeqCst) == before {
+        assert!(Instant::now() < deadline, "the read never woke the poll");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(app.poll(), "the woken poll receives the cards");
+    assert!(app.semantic_corpus.loaded.is_some());
+    assert!(!app.has_search_work_in_flight());
+}
+
+/// Fork: cards read before the generation's index opened are sent to the
+/// semantic worker again with that index, which quoted-only queries read.
+#[test]
+fn the_semantic_corpus_is_sent_again_with_its_generation_index() {
+    let sandbox = Sandbox::new();
+    let root = publish(&corpus());
+    let mut app = loading_app(&sandbox, None, vec![]);
+    show(&mut app, &root, TimeFilter::default());
+    assert!(!app.ensure_semantic_corpus());
+    wait_for_search(&mut app);
+    let (_request_tx, request_rx, _response_tx) = connect_semantic_search_channels(&mut app);
+    let sent_texts = |rx: &mpsc::Receiver<crate::semantic_worker::SemanticWorkerCommand>| {
+        rx.try_iter()
+            .filter_map(|command| match command {
+                crate::semantic_worker::SemanticWorkerCommand::UpdateCorpus { texts, .. } => {
+                    Some(texts.map(|index| index.cards().generation_id()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    app.set_list_search_mode(ListSearchMode::Semantic);
+    assert_eq!(sent_texts(&request_rx), vec![None], "no index yet");
+    assert!(app.open_search_index());
+    assert_eq!(
+        sent_texts(&request_rx),
+        vec![Some(app.generation_id().unwrap())]
+    );
+}
+
+/// A read of the semantic data that plays the `semantic-corpus` thread: it
+/// waits for `gate`, then answers with the cards of `snapshot`.
+fn gated_semantic_read(
+    snapshot: crate::store::Snapshot,
     gate: mpsc::Receiver<()>,
-) -> search_state::SemanticCorpus {
+) -> (String, search_state::SemanticJob) {
+    let id = snapshot.generation_id();
     let job = search_state::SemanticJob::spawn(None, move |_| {
         let _ = gate.recv();
+        let cards = crate::store::SemanticCards::load(&snapshot, None).map(Arc::new);
         search_state::LoadedSemantic {
-            docs: Some((
-                shown.generation_name().to_owned(),
-                Arc::new(cards::semantic_docs(&shown, &corpus)),
-            )),
-            conversations: corpus,
+            docs: cards.as_ref().map(|cards| {
+                let docs = (0..cards.conversations().len() as u32).map(Some).collect();
+                (cards.generation_id().to_owned(), Arc::new(docs))
+            }),
+            cards,
         }
     })
     .unwrap();
-    search_state::SemanticCorpus::Loading(job)
+    (id, job)
 }
 
-/// Review fix: a generation swapped in while the semantic corpus loads
-/// (its open could not map a corpus not loaded yet) gets the corpus mapped
-/// to its docs before the semantic worker is sent a scope, so a session new
-/// since the load started is ranked.
+/// A generation swapped in while the semantic data of the one shown before
+/// is read gets its own read, which ranks a session new since the first
+/// read started; the first is given up.
 #[test]
-fn a_semantic_corpus_loaded_under_an_older_generation_ranks_the_one_shown() {
+fn a_semantic_read_of_an_older_generation_gives_way_to_the_one_shown() {
     let sandbox = Sandbox::new();
     let published = corpus();
     let root = publish(&published);
@@ -671,19 +779,23 @@ fn a_semantic_corpus_loaded_under_an_older_generation_ranks_the_one_shown() {
     show(&mut app, &root, TimeFilter::default());
     assert!(app.open_search_index());
     let (_request_tx, request_rx, _response_tx) = connect_semantic_search_channels(&mut app);
-    let added = conversation("/p/-tmp-beta/d.jsonl", 4 * HOUR_MS);
-    let mut on_disk = published.clone();
-    on_disk.push(added.clone());
-    let on_disk: CorpusSnapshot = Arc::new(on_disk.into_iter().map(Arc::new).collect());
     let (release, gate) = mpsc::channel();
-    app.semantic_corpus = gated_semantic_load(app.snapshot.clone().unwrap(), on_disk, gate);
+    app.semantic_corpus.loading = Some(gated_semantic_read(app.snapshot.clone().unwrap(), gate));
     app.set_list_search_mode(ListSearchMode::Semantic);
     type_query(&mut app, "needle");
 
     let mut newer = published.clone();
-    newer.push(added);
+    newer.push(conversation("/p/-tmp-beta/d.jsonl", 4 * HOUR_MS));
     assert!(app.swap_generation(republish(&root, &newer)));
     assert_eq!(app.generation_name(), Some("g000002"));
+    assert_eq!(
+        app.semantic_corpus
+            .loading
+            .as_ref()
+            .map(|(id, _)| id.clone()),
+        app.generation_id(),
+        "the generation shown is read"
+    );
     assert_eq!(
         app.semantic_activity_status_text().as_deref(),
         Some("sem loading conversations")
@@ -703,17 +815,23 @@ fn a_semantic_corpus_loaded_under_an_older_generation_ranks_the_one_shown() {
         }
         std::thread::sleep(Duration::from_millis(5));
     };
-    // d is doc 0 of g000002; with docs of g000001 it had none.
+    // d is doc 0 of g000002.
     assert_eq!(*scope, vec![0, 1, 2, 3], "the new session is ranked");
-    assert_eq!(*app.semantic_scope_indices(), vec![0, 1, 2, 3]);
+    assert_eq!(
+        app.semantic_corpus
+            .loaded
+            .as_ref()
+            .map(|cards| cards.generation_name()),
+        Some("g000002")
+    );
     assert_eq!(app.semantic_activity_status_text(), None);
 }
 
-/// Review fix: while the semantic corpus loads, a scope change (which
-/// clears the pending status) still shows the load; dropping the browser
-/// gives the load up and waits for its thread.
+/// While the semantic data is read, a scope change (which clears the
+/// pending status) still shows the read; dropping the browser gives the
+/// read up and waits for its thread.
 #[test]
-fn a_semantic_corpus_load_shows_until_it_arrives_and_stops_with_the_browser() {
+fn a_semantic_read_shows_until_it_arrives_and_stops_with_the_browser() {
     let sandbox = Sandbox::new();
     let root = publish(&corpus());
     let mut app = loading_app(&sandbox, None, vec![]);
@@ -729,13 +847,13 @@ fn a_semantic_corpus_load_shows_until_it_arrives_and_stops_with_the_browser() {
             std::thread::sleep(Duration::from_millis(50));
             ended.store(true, std::sync::atomic::Ordering::Relaxed);
             search_state::LoadedSemantic {
-                conversations: Arc::default(),
+                cards: None,
                 docs: None,
             }
         })
         .unwrap()
     };
-    app.semantic_corpus = search_state::SemanticCorpus::Loading(job);
+    app.semantic_corpus.loading = Some((app.generation_id().unwrap(), job));
     app.set_list_search_mode(ListSearchMode::Semantic);
     assert_eq!(
         app.semantic_activity_status_text().as_deref(),
@@ -748,14 +866,112 @@ fn a_semantic_corpus_load_shows_until_it_arrives_and_stops_with_the_browser() {
     assert_eq!(
         app.semantic_activity_status_text().as_deref(),
         Some("sem loading conversations"),
-        "a re-scope keeps the load shown"
+        "a re-scope keeps the read shown"
     );
     assert!(app.has_search_work_in_flight());
     drop(app);
     assert!(
         ended.load(std::sync::atomic::Ordering::Relaxed),
-        "the browser waited for the given-up load"
+        "the browser waited for the given-up read"
     );
+}
+
+/// Removes the semantic segments of the generation `id` names (none is
+/// mapped before a read opens them).
+fn remove_semantic_segments(id: &str) {
+    let mut removed = 0;
+    for entry in std::fs::read_dir(id).unwrap() {
+        let path = entry.unwrap().path();
+        if path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("sem-"))
+        {
+            std::fs::remove_file(path).unwrap();
+            removed += 1;
+        }
+    }
+    assert!(removed > 0, "the generation has semantic segments");
+}
+
+/// Fork: cards read before keep serving a generation whose semantic data
+/// cannot be read, mapped to its docs on a `semantic-corpus` thread (the
+/// open of the generation came before the cards).
+#[test]
+fn older_cards_serve_a_generation_whose_semantic_data_cannot_be_read() {
+    let sandbox = Sandbox::new();
+    let mut published = corpus();
+    published[0].semantic_turns = vec!["alpha turn".to_string()].into();
+    let root = publish(&published);
+    let mut app = loading_app(&sandbox, None, vec![]);
+    show(&mut app, &root, TimeFilter::default());
+    assert!(app.open_search_index());
+    assert!(!app.ensure_semantic_corpus());
+    wait_for_search(&mut app);
+    let first = app.semantic_corpus.loaded.clone().unwrap();
+
+    // g000002 drops b and adds d: docs d, c, a (g000001: c, b, a).
+    let newer = vec![
+        published[0].clone(),
+        published[2].clone(),
+        conversation("/p/-tmp-beta/d.jsonl", 4 * HOUR_MS),
+    ];
+    let snapshot = republish(&root, &newer);
+    remove_semantic_segments(&snapshot.generation_id());
+    let open = cards::GenerationOpen::build(snapshot, Some(app.corpus_snapshot()), None);
+    app.install_generation(open);
+    let (_request_tx, request_rx, _response_tx) = connect_semantic_search_channels(&mut app);
+    app.set_list_search_mode(ListSearchMode::Semantic);
+    type_query(&mut app, "needle");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let scope = 'sent: loop {
+        assert!(Instant::now() < deadline, "no scope was sent");
+        app.poll();
+        while let Ok(command) = request_rx.try_recv() {
+            if let crate::semantic_worker::SemanticWorkerCommand::UpdateScope { indices, .. } =
+                command
+            {
+                break 'sent indices;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    // c and a of the cards read before; b has no card any more.
+    assert_eq!(*scope, vec![0, 2]);
+    assert!(Arc::ptr_eq(
+        app.semantic_corpus.loaded.as_ref().unwrap(),
+        &first
+    ));
+    assert_eq!(app.semantic_corpus.failed, app.generation_id());
+    assert_eq!(app.semantic_error(), None);
+}
+
+/// Fork: a generation whose semantic data cannot be read fails semantic
+/// search once (no read loop); entering semantic mode again retries.
+#[test]
+fn semantic_data_that_cannot_be_read_fails_until_semantic_mode_is_entered_again() {
+    let sandbox = Sandbox::new();
+    let mut corpus = corpus();
+    corpus[0].semantic_turns = vec!["alpha turn".to_string()].into();
+    let root = publish(&corpus);
+    let mut app = loading_app(&sandbox, None, vec![]);
+    show(&mut app, &root, TimeFilter::default());
+    assert!(app.open_search_index());
+    remove_semantic_segments(&app.generation_id().unwrap());
+
+    app.set_list_search_mode(ListSearchMode::Semantic);
+    type_query(&mut app, "needle");
+    wait_for_search(&mut app);
+    assert_eq!(app.semantic_error(), Some("semantic corpus unavailable"));
+    assert_eq!(app.semantic_status_text().as_deref(), Some("sem failed"));
+    assert!(!app.poll(), "nothing is read again");
+    assert!(!app.has_search_work_in_flight());
+
+    app.set_list_search_mode(ListSearchMode::Lexical);
+    app.set_list_search_mode(ListSearchMode::Semantic);
+    assert!(app.has_search_work_in_flight(), "read again");
+    wait_for_search(&mut app);
+    assert_eq!(app.semantic_error(), Some("semantic corpus unavailable"));
 }
 
 /// `count` conversations that all match `needle`, the newest last.

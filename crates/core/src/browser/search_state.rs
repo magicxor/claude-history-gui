@@ -31,20 +31,25 @@
 //!   project are normalized on the UI thread.
 //! * **Waker.** The worker calls the waker after each answer (upstream's TUI
 //!   polled).
-//! * **Semantic corpus in generation mode.** Upstream 358becb loads the full
-//!   conversations for semantic search on first use with the blocking
-//!   loader; here too, on a `semantic-corpus` thread, which also maps them
-//!   to the generation's docs (upstream mapped them on the TUI thread at the
-//!   first result). The scope is the conversations whose card is in scope,
-//!   so it is computed only from docs of the generation shown: a generation
-//!   swapped in while the corpus loads, or opened before it arrived, has
-//!   them mapped again on a `semantic-corpus` thread (a swap opened after
-//!   it arrived maps them on `generation-open`, see `cards`), and a
-//!   semantic query waits meanwhile (`sem loading conversations`, shown
-//!   also after a scope change during the load). The semantic worker gets
-//!   them as its corpus; a swap changes only the scope it ranks, not that
-//!   corpus. The load gives up between projects when the browser is
-//!   dropped, which waits for its thread (upstream detached it).
+//! * **Semantic corpus in generation mode.** As upstream ecc2f2f, semantic
+//!   search ranks the generation's cards with their semantic data
+//!   ([`store::SemanticCards`], read from the `sem-*.zst` segments on a
+//!   `semantic-corpus` thread), and a swap reads the new generation's cards
+//!   while the older ones serve. The scope is the cards whose card in the
+//!   generation shown is in scope (upstream re-filtered the corpus by
+//!   project, workspace, time and deletion), so the older cards serve only
+//!   once mapped to the docs of the generation shown: by `generation-open`
+//!   for a swap (see `cards`), else on a `semantic-corpus` thread (upstream
+//!   mapped them on the TUI thread at the first result); a semantic query
+//!   waits meanwhile (`sem loading conversations`, shown also after a scope
+//!   change). Generations are told apart by their directory (store roots
+//!   repeat names). A read of a generation no longer shown is given up, a
+//!   read that fails is not retried for that generation until semantic
+//!   mode is entered again (upstream read it again at every dispatch), and
+//!   the corpus is sent to the semantic worker again once the index of its
+//!   generation opens, so quoted-only queries read their text from it. The
+//!   browser waits for a read it gave up when it is dropped (upstream
+//!   detached it).
 
 use super::corpus::{CorpusSnapshot, SearchSnapshot};
 use super::{
@@ -85,39 +90,46 @@ pub(super) struct SemanticSearchState {
     pub(super) suspended: bool,
 }
 
-/// Full conversations that semantic search ranks in generation mode, where
-/// rows are cards without text.
+/// Conversations with semantic data that semantic search ranks in
+/// generation mode, where rows are cards without it (upstream ecc2f2f).
+/// Generations are named by [`store::Snapshot::generation_id`].
 #[derive(Default)]
-pub(super) enum SemanticCorpus {
-    #[default]
-    Unloaded,
-    Loading(SemanticJob),
-    Loaded {
-        conversations: CorpusSnapshot,
-        /// Generation doc of each conversation, for the generation named.
-        /// Only docs of the generation shown are used.
-        docs: Option<(String, Arc<Vec<Option<u32>>>)>,
-        /// Maps `conversations` to the docs of the generation shown, while
-        /// `docs` are another one's.
-        mapping: Option<SemanticJob>,
-    },
+pub(super) struct SemanticCorpus {
+    /// Cards of the newest generation read so far.
+    pub(super) loaded: Option<Arc<store::SemanticCards>>,
+    /// The generation being read and its `semantic-corpus` thread, while
+    /// one is.
+    pub(super) loading: Option<(String, SemanticJob)>,
+    /// Generation doc of each loaded conversation, for the generation
+    /// named. Only docs of the generation shown are used.
+    pub(super) docs: Option<(String, Arc<Vec<Option<u32>>>)>,
+    /// Maps `loaded` to the docs of the generation shown, while `docs` are
+    /// another one's.
+    mapping: Option<SemanticJob>,
+    /// A generation whose semantic data could not be read: it is not read
+    /// again until semantic mode is entered again.
+    pub(super) failed: Option<String>,
+    /// Whether the corpus last sent to the semantic worker went with the
+    /// index of its generation.
+    sent_texts: bool,
 }
 
-/// What a `semantic-corpus` thread sends: the conversations and their docs
-/// in the generation shown when it started.
+/// What a `semantic-corpus` thread sends: the cards it read (`None` when
+/// the generation's semantic data could not be read) or mapped, and their
+/// docs in a generation.
 pub(super) struct LoadedSemantic {
-    pub(super) conversations: CorpusSnapshot,
+    pub(super) cards: Option<Arc<store::SemanticCards>>,
     pub(super) docs: Option<(String, Arc<Vec<Option<u32>>>)>,
 }
 
-/// A `semantic-corpus` thread: it loads the semantic corpus, or maps a
-/// loaded one to the docs of the generation shown. Its handle goes to the
-/// browser's helper threads once it answered or was given up, so the
-/// browser joins it when dropped.
+/// A `semantic-corpus` thread: it reads the cards of the generation shown,
+/// or maps cards read before to its docs. Its handle goes to the browser's
+/// helper threads once it answered or was given up, so the browser joins
+/// it when dropped.
 pub(super) struct SemanticJob {
     result: mpsc::Receiver<LoadedSemantic>,
     thread: std::thread::JoinHandle<()>,
-    /// Set to give the job up: a load stops before its next project.
+    /// Set to give the job up: a read stops before its next card.
     cancel: Arc<AtomicBool>,
 }
 
@@ -160,8 +172,8 @@ impl SemanticJob {
         }
     }
 
-    /// Gives the job up (a load stops before its next project) and hands
-    /// its thread to `helpers`, joined when the browser is dropped.
+    /// Gives the job up (a read stops before its next card) and hands its
+    /// thread to `helpers`, joined when the browser is dropped.
     fn retire(self, helpers: &mut super::HelperThreads) {
         self.cancel.store(true, Ordering::Relaxed);
         helpers.push(self.thread);
@@ -531,7 +543,8 @@ impl Browser {
     }
 
     /// The conversations the semantic worker ranks: the loaded corpus, or
-    /// the semantic corpus in generation mode (empty until it is loaded).
+    /// the cards with their semantic data in generation mode (empty until
+    /// they are read).
     fn semantic_conversations(&self) -> CorpusSnapshot {
         if self.snapshot.is_none() {
             return self.conversations.clone();
@@ -539,25 +552,34 @@ impl Browser {
         self.semantic_conversations_loaded().unwrap_or_default()
     }
 
-    /// The semantic corpus of generation mode, once loaded.
+    /// The cards semantic search ranks in generation mode, once read.
     pub(super) fn semantic_conversations_loaded(&self) -> Option<CorpusSnapshot> {
-        match &self.semantic_corpus {
-            SemanticCorpus::Loaded { conversations, .. } => Some(conversations.clone()),
-            _ => None,
-        }
+        self.semantic_corpus
+            .loaded
+            .as_ref()
+            .map(|cards| cards.conversations().clone())
+    }
+
+    /// The generation index whose docs are the semantic corpus's cards:
+    /// quoted-only semantic queries read their matches and text from it
+    /// (upstream ecc2f2f).
+    fn semantic_texts(&self) -> Option<Arc<store::SearchIndex>> {
+        let cards = self.semantic_corpus.loaded.as_ref()?;
+        self.search_index
+            .clone()
+            .filter(|index| index.cards().generation_id() == cards.generation_id())
     }
 
     /// The docs of the semantic corpus in the generation shown, once mapped
     /// to it.
     fn semantic_docs_shown(&self) -> Option<&Arc<Vec<Option<u32>>>> {
         let shown = self.generation_id()?;
-        match &self.semantic_corpus {
-            SemanticCorpus::Loaded {
-                docs: Some((id, docs)),
-                ..
-            } if *id == shown => Some(docs),
-            _ => None,
-        }
+        self.semantic_corpus
+            .loaded
+            .as_ref()
+            .and(self.semantic_corpus.docs.as_ref())
+            .filter(|(id, _)| *id == shown)
+            .map(|(_, docs)| docs)
     }
 
     /// Takes the docs of the semantic corpus in the generation just
@@ -569,159 +591,171 @@ impl Browser {
         mapped: Arc<Vec<Option<u32>>>,
     ) {
         let name = self.generation_id();
-        if let (
-            SemanticCorpus::Loaded {
-                conversations,
-                docs,
-                ..
-            },
-            Some(name),
-        ) = (&mut self.semantic_corpus, name)
-            && Arc::ptr_eq(conversations, corpus)
+        if let (Some(cards), Some(name)) = (&self.semantic_corpus.loaded, name)
+            && Arc::ptr_eq(cards.conversations(), corpus)
         {
-            *docs = Some((name, mapped));
+            self.semantic_corpus.docs = Some((name, mapped));
             self.semantic_sent_scope_signature = None;
         }
     }
 
-    /// Makes the full conversations semantic search needs in generation
-    /// mode ready: starts loading them on a `semantic-corpus` thread, or
-    /// mapping them to the docs of the generation shown when they were
-    /// mapped to another one. Returns whether they are ready (always
-    /// outside generation mode); until then semantic mode shows
-    /// [`SemanticProgress::LoadingSessions`], and the poll that receives
-    /// them dispatches the query.
+    /// Whether no semantic corpus serves the generation shown, nor will:
+    /// its semantic data could not be read, and no cards read before are
+    /// being mapped to it.
+    fn semantic_corpus_failed(&self) -> bool {
+        self.semantic_docs_shown().is_none()
+            && self.semantic_corpus.mapping.is_none()
+            && self.semantic_corpus.failed.is_some()
+            && self.semantic_corpus.failed == self.generation_id()
+    }
+
+    /// Makes the semantic corpus of the generation shown ready (upstream
+    /// ecc2f2f): starts reading the semantic data of its cards on a
+    /// `semantic-corpus` thread unless they are read or being read (cards
+    /// unchanged since the cards read before keep their data), and maps
+    /// cards of another generation, which serve meanwhile, to the docs of
+    /// the one shown, also off this thread. Returns whether a corpus serves
+    /// the generation shown (always outside generation mode); until then
+    /// semantic mode shows [`SemanticProgress::LoadingSessions`], and the
+    /// poll that receives the corpus dispatches the query.
     pub(super) fn ensure_semantic_corpus(&mut self) -> bool {
         let Some(snapshot) = self.snapshot.clone() else {
             return true;
         };
-        let stale = match &self.semantic_corpus {
-            SemanticCorpus::Loaded { mapping, .. } => {
-                if self.semantic_docs_shown().is_some() {
-                    return true;
-                }
-                // Loaded for another generation: mapped to this one, once.
-                mapping.is_none()
+        if !self.semantic_search.available {
+            return false;
+        }
+        let shown = snapshot.generation_id();
+        let corpus = &mut self.semantic_corpus;
+        let current = corpus
+            .loaded
+            .as_ref()
+            .is_some_and(|cards| cards.generation_id() == shown)
+            || corpus
+                .loading
+                .as_ref()
+                .is_some_and(|(loading, _)| *loading == shown)
+            || corpus.failed.as_ref() == Some(&shown);
+        if !current {
+            // A read of a generation no longer shown is given up.
+            if let Some((_, job)) = corpus.loading.take() {
+                job.retire(&mut self.helpers);
             }
-            SemanticCorpus::Loading(_) => false,
-            SemanticCorpus::Unloaded => {
-                if !self.semantic_search.available {
-                    return false;
+            let previous = corpus.loaded.clone();
+            let cards = snapshot.clone();
+            let read = SemanticJob::spawn(self.waker.clone(), move |cancel| {
+                let cancelled = || cancel.load(Ordering::Relaxed);
+                let cards =
+                    store::SemanticCards::load_cancellable(&cards, previous.as_deref(), &cancelled);
+                let docs = cards.as_ref().map(|cards| {
+                    let docs = (0..cards.conversations().len() as u32).map(Some);
+                    (cards.generation_id().to_owned(), Arc::new(docs.collect()))
+                });
+                LoadedSemantic {
+                    cards: cards.map(Arc::new),
+                    docs,
                 }
-                let env = self.env.clone();
-                let show_last = snapshot.show_last();
-                let snapshot = snapshot.clone();
-                match SemanticJob::spawn(self.waker.clone(), move |cancel| {
-                    let cancelled = || cancel.load(Ordering::Relaxed);
-                    let conversations: CorpusSnapshot = Arc::new(
-                        crate::history::load_all_conversations_cancellable(
-                            &env, show_last, None, &cancelled,
-                        )
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(Arc::new)
-                        .collect(),
-                    );
-                    let docs = super::cards::semantic_docs(&snapshot, &conversations);
-                    LoadedSemantic {
-                        docs: Some((snapshot.generation_id(), Arc::new(docs))),
-                        conversations,
-                    }
-                }) {
-                    Ok(job) => self.semantic_corpus = SemanticCorpus::Loading(job),
-                    Err(_) => {
-                        self.semantic_search.error =
-                            Some("semantic corpus unavailable".to_string());
-                        return false;
-                    }
-                }
-                false
+            });
+            match read {
+                Ok(job) => self.semantic_corpus.loading = Some((shown, job)),
+                Err(_) => self.semantic_corpus.failed = Some(shown),
             }
-        };
-        if stale && let Some(corpus) = self.semantic_conversations_loaded() {
-            let job = SemanticJob::spawn(self.waker.clone(), move |_| LoadedSemantic {
+        }
+        if self.semantic_docs_shown().is_some() {
+            return true;
+        }
+        if self.semantic_corpus.mapping.is_none()
+            && let Some(cards) = self.semantic_corpus.loaded.clone()
+        {
+            // Cards of another generation: mapped to this one, once.
+            let mapping = SemanticJob::spawn(self.waker.clone(), move |_| LoadedSemantic {
                 docs: Some((
                     snapshot.generation_id(),
-                    Arc::new(super::cards::semantic_docs(&snapshot, &corpus)),
+                    Arc::new(super::cards::semantic_docs(
+                        &snapshot,
+                        cards.conversations(),
+                    )),
                 )),
-                conversations: corpus,
+                cards: Some(cards),
             });
-            match job {
-                Ok(job) => {
-                    if let SemanticCorpus::Loaded { mapping, .. } = &mut self.semantic_corpus {
-                        *mapping = Some(job);
-                    }
-                }
+            match mapping {
+                Ok(job) => self.semantic_corpus.mapping = Some(job),
                 Err(_) => {
                     self.semantic_search.error = Some("semantic corpus unavailable".to_string());
                     return false;
                 }
             }
         }
-        if self.list_search_mode == ListSearchMode::Semantic {
+        if self.list_search_mode == ListSearchMode::Semantic && !self.semantic_corpus_failed() {
             self.semantic_search.pending_status = Some(SemanticProgress::LoadingSessions);
         }
         false
     }
 
-    /// Takes the semantic corpus once it has loaded, or its docs once they
-    /// are mapped to the generation shown; a semantic query waiting for
-    /// them is dispatched (an empty one prewarms). Returns whether anything
-    /// arrived.
+    /// Takes the cards read for a generation once they arrive, or their
+    /// docs once mapped to the generation shown; in semantic mode a query
+    /// waiting for them is dispatched (an empty one prewarms). Returns
+    /// whether anything arrived.
     fn receive_semantic_corpus(&mut self) -> bool {
-        let shown = self.generation_id();
-        match &mut self.semantic_corpus {
-            SemanticCorpus::Unloaded => return false,
-            SemanticCorpus::Loading(job) => {
-                let Some(answer) = job.answer() else {
-                    return false;
-                };
-                let SemanticCorpus::Loading(job) = std::mem::take(&mut self.semantic_corpus) else {
-                    unreachable!("matched above");
-                };
-                self.helpers.push(job.thread);
-                let loaded = answer.unwrap_or(LoadedSemantic {
-                    conversations: Arc::default(),
-                    docs: None,
-                });
-                self.semantic_corpus = SemanticCorpus::Loaded {
-                    conversations: loaded.conversations,
-                    docs: loaded.docs,
-                    mapping: None,
-                };
-                self.readiness.semantic = true;
-                self.semantic_corpus_version += 1;
-                self.semantic_sent_scope_signature = None;
-            }
-            SemanticCorpus::Loaded {
-                conversations,
-                docs,
-                mapping,
-            } => {
-                let Some(answer) = mapping.as_ref().and_then(SemanticJob::answer) else {
-                    return false;
-                };
-                if let Some(job) = mapping.take() {
-                    self.helpers.push(job.thread);
+        let mut arrived = false;
+        if let Some((_, job)) = &self.semantic_corpus.loading
+            && let Some(answer) = job.answer()
+        {
+            let (id, job) = self.semantic_corpus.loading.take().expect("matched above");
+            self.helpers.push(job.thread);
+            arrived = true;
+            match answer.and_then(|read| Some((read.cards?, read.docs))) {
+                Some((cards, docs)) => {
+                    self.semantic_corpus.loaded = Some(cards);
+                    self.semantic_corpus.docs = docs;
+                    // Mapping the cards read before is no use any more.
+                    if let Some(job) = self.semantic_corpus.mapping.take() {
+                        job.retire(&mut self.helpers);
+                    }
+                    self.readiness.semantic = true;
+                    self.semantic_corpus_version += 1;
+                    self.semantic_sent_scope_signature = None;
                 }
-                let Some(loaded) = answer else {
-                    // The mapping died: the next semantic query tries again.
-                    self.semantic_search.error = Some("semantic corpus unavailable".to_string());
-                    return true;
-                };
-                if docs.as_ref().map(|(name, _)| name) == shown.as_ref() {
-                    // Mapped meanwhile by the open of the generation shown.
-                    return false;
-                }
-                if Arc::ptr_eq(conversations, &loaded.conversations) {
-                    *docs = loaded.docs;
-                }
-                self.semantic_sent_scope_signature = None;
+                // Cards read before keep serving (mapped to this one).
+                None => self.semantic_corpus.failed = Some(id),
             }
         }
-        // Mapped to another generation than the one shown now (swapped in
-        // meanwhile): mapped again, and the query waits for that.
+        if let Some(job) = &self.semantic_corpus.mapping
+            && let Some(answer) = job.answer()
+        {
+            if let Some(job) = self.semantic_corpus.mapping.take() {
+                self.helpers.push(job.thread);
+            }
+            let Some(mapped) = answer else {
+                // The mapping died: the next semantic query tries again.
+                self.semantic_search.error = Some("semantic corpus unavailable".to_string());
+                return true;
+            };
+            let shown = self.generation_id();
+            let corpus = &mut self.semantic_corpus;
+            let mapped_meanwhile = corpus.docs.as_ref().map(|(id, _)| id) == shown.as_ref();
+            if !mapped_meanwhile {
+                if let (Some(loaded), Some(cards)) = (&corpus.loaded, &mapped.cards)
+                    && Arc::ptr_eq(loaded, cards)
+                {
+                    corpus.docs = mapped.docs;
+                }
+                self.semantic_sent_scope_signature = None;
+                arrived = true;
+            }
+        }
+        if !arrived || self.list_search_mode != ListSearchMode::Semantic {
+            return arrived;
+        }
+        // Read or mapped for another generation than the one shown now
+        // (swapped in meanwhile): read or mapped again, and the query waits
+        // for that.
         if !self.ensure_semantic_corpus() {
+            if self.semantic_corpus_failed() {
+                self.semantic_search.pending_status = None;
+                self.semantic_search.error = Some("semantic corpus unavailable".to_string());
+                self.semantic_search.last_status = SemanticProgress::Failed;
+            }
             return true;
         }
         if matches!(
@@ -730,50 +764,40 @@ impl Browser {
         ) {
             self.semantic_search.pending_status = None;
         }
-        if self.list_search_mode == ListSearchMode::Semantic {
-            if self.query.trim().is_empty() {
-                self.prewarm_semantic_cache();
-            } else {
-                self.dispatch_semantic_search(self.query.trim().to_string(), false);
-            }
+        if self.query.trim().is_empty() {
+            self.prewarm_semantic_cache();
+        } else {
+            self.dispatch_semantic_search(self.query.trim().to_string(), false);
         }
         true
     }
 
     /// Uses `env` from now on (the loader moved to another set of session
-    /// roots). The semantic corpus was loaded from the previous sources:
-    /// it is retired and loaded again by the next semantic use.
+    /// roots). The semantic corpus follows the generation shown, not the
+    /// env.
     pub fn set_env(&mut self, env: Arc<HistoryEnv>) {
-        if Arc::ptr_eq(&self.env, &env) {
-            return;
-        }
-        self.env = env;
-        if self.snapshot.is_some() && !matches!(self.semantic_corpus, SemanticCorpus::Unloaded) {
-            self.retire_semantic_corpus();
-            self.readiness.semantic = false;
-            self.corpus_changed();
-            if self.list_search_mode == ListSearchMode::Semantic {
-                self.ensure_semantic_corpus();
-            }
+        if !Arc::ptr_eq(&self.env, &env) {
+            self.env = env;
         }
     }
 
     /// Gives up the semantic corpus (generation mode ends, or the browser
-    /// is dropped): a load or a mapping still running stops, and its thread
+    /// is dropped): a read or a mapping still running stops, and its thread
     /// is joined when the browser is dropped.
     pub(super) fn retire_semantic_corpus(&mut self) {
-        match std::mem::take(&mut self.semantic_corpus) {
-            SemanticCorpus::Loading(job)
-            | SemanticCorpus::Loaded {
-                mapping: Some(job), ..
-            } => job.retire(&mut self.helpers),
-            _ => {}
+        let corpus = std::mem::take(&mut self.semantic_corpus);
+        if let Some((_, job)) = corpus.loading {
+            job.retire(&mut self.helpers);
+        }
+        if let Some(job) = corpus.mapping {
+            job.retire(&mut self.helpers);
         }
     }
 
     /// Rows of semantic corpus conversations `indices`, in order, with
     /// `metadata` re-keyed by row. In generation mode conversations map to
-    /// cards by path; others, and deleted cards, are dropped.
+    /// cards by doc when the corpus is the generation shown's, by path
+    /// otherwise; others, and deleted cards, are dropped.
     pub(super) fn semantic_rows(
         &mut self,
         indices: Vec<usize>,
@@ -782,24 +806,26 @@ impl Browser {
         let Some(snapshot) = self.snapshot.clone() else {
             return (self.filter_indices(indices), metadata);
         };
-        let SemanticCorpus::Loaded {
-            conversations,
+        let SemanticCorpus {
+            loaded: Some(cards),
             docs,
             ..
         } = &mut self.semantic_corpus
         else {
             return (Vec::new(), HashMap::new());
         };
-        if docs
-            .as_ref()
-            .is_none_or(|(id, _)| *id != snapshot.generation_id())
-        {
-            // Mapped off this thread (the corpus load, a generation open, a
-            // mapping job) before a query is sent; an answer computed for
-            // another generation is mapped here (upstream mapped at every
-            // first answer), and the scope sent goes with it.
-            let mapped = super::cards::semantic_docs(&snapshot, conversations);
-            *docs = Some((snapshot.generation_id(), Arc::new(mapped)));
+        let shown = snapshot.generation_id();
+        if docs.as_ref().is_none_or(|(id, _)| *id != shown) {
+            // Mapped off this thread (a read, a generation open, a mapping
+            // job) before a query is sent; an answer computed for another
+            // generation is mapped here (upstream mapped at every first
+            // answer), and the scope sent goes with it.
+            let mapped = if cards.generation_id() == shown {
+                (0..cards.conversations().len() as u32).map(Some).collect()
+            } else {
+                super::cards::semantic_docs(&snapshot, cards.conversations())
+            };
+            *docs = Some((shown, Arc::new(mapped)));
             self.semantic_sent_scope_signature = None;
         }
         let doc_of = docs
@@ -906,14 +932,22 @@ impl Browser {
     }
 
     fn send_semantic_state(&mut self) -> Option<(u64, u64)> {
-        if self.semantic_sent_corpus_version != self.semantic_corpus_version {
+        let texts = self.semantic_texts();
+        // Fork: the cards are sent again once their generation's index is
+        // open (they may be read before it).
+        if self.semantic_sent_corpus_version != self.semantic_corpus_version
+            || (texts.is_some() && !self.semantic_corpus.sent_texts)
+        {
+            let sent_texts = texts.is_some();
             let conversations = self.semantic_conversations();
             if !self.send_semantic_command(SemanticWorkerCommand::UpdateCorpus {
                 corpus_version: self.semantic_corpus_version,
                 conversations,
+                texts,
             }) {
                 return None;
             }
+            self.semantic_corpus.sent_texts = sent_texts;
             self.semantic_sent_corpus_version = self.semantic_corpus_version;
             self.semantic_sent_scope_signature = None;
         } else if self
@@ -1048,7 +1082,12 @@ impl Browser {
         if !self.ensure_semantic_corpus() {
             // Dispatched again once the corpus arrives.
             self.invalidate_search_generation();
-            self.semantic_search.pending_status = Some(SemanticProgress::LoadingSessions);
+            if self.semantic_corpus_failed() {
+                self.semantic_search.error = Some("semantic corpus unavailable".to_string());
+                self.semantic_search.last_status = SemanticProgress::Failed;
+            } else {
+                self.semantic_search.pending_status = Some(SemanticProgress::LoadingSessions);
+            }
             return;
         }
         self.search_generation += 1;
@@ -1288,25 +1327,21 @@ impl Browser {
     }
 
     /// Whether a lexical search, a semantic search or a prewarm is running,
-    /// or the semantic corpus is loading (or being mapped to a generation).
+    /// or the semantic corpus is being read (also while an older one
+    /// serves, as upstream) or mapped to a generation.
     pub fn has_search_work_in_flight(&self) -> bool {
-        self.semantic_corpus_pending()
+        self.semantic_corpus.loading.is_some()
+            || self.semantic_corpus.mapping.is_some()
             || self.search_in_flight
             || self.semantic_search.pending_generation.is_some()
             || self.semantic_search.prewarm_generation.is_some()
     }
 
-    /// Whether the semantic corpus is loading or being mapped to the
-    /// generation shown.
+    /// Whether semantic queries wait for the semantic corpus: it is being
+    /// read or mapped, and none serves the generation shown yet.
     fn semantic_corpus_pending(&self) -> bool {
-        matches!(
-            self.semantic_corpus,
-            SemanticCorpus::Loading(_)
-                | SemanticCorpus::Loaded {
-                    mapping: Some(_),
-                    ..
-                }
-        )
+        (self.semantic_corpus.loading.is_some() || self.semantic_corpus.mapping.is_some())
+            && self.semantic_docs_shown().is_none()
     }
 
     /// Semantic scores and evidence of a conversation in the current results.
@@ -1526,6 +1561,11 @@ impl Browser {
             return;
         }
         self.list_search_mode = self.list_search_mode.toggled();
+        if self.list_search_mode == ListSearchMode::Semantic {
+            // Entering semantic mode retries semantic data that could not
+            // be read.
+            self.semantic_corpus.failed = None;
+        }
         self.invalidate_search_generation();
         if self.is_loading() {
             // Quirk 14 fix: the mode is applied when loading finishes.

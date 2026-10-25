@@ -43,6 +43,12 @@
 //!   sandbox named by `CHG_SEARCH_CORPUS_HOME` (it must contain
 //!   `.qa-sandbox`) through [`HistoryEnv::sandbox`], never the process home,
 //!   and skips when the variable is unset. The code under test is upstream's.
+//! * **Semantic cards.** [`SemanticCards::load_cancellable`] gives up when
+//!   a flag is set (the browser joins the thread that reads them when it is
+//!   dropped), and [`SemanticCards::generation_id`] names the generation
+//!   across store roots like [`Snapshot::generation_id`].
+//!   [`Snapshot::show_last`] stays: the browser's generation opens use it
+//!   (upstream ecc2f2f removed it with its last TUI user).
 //!
 //! The format, the publish protocol and the collection rules are upstream's.
 //! On Windows (NTFS) `std::fs` removes and renames over files that another
@@ -74,6 +80,7 @@ use crate::env::HistoryEnv;
 use crate::history::Conversation;
 use crate::time_filter::TimeFilter;
 use chrono::{DateTime, Local};
+use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -327,6 +334,112 @@ impl SearchIndex {
     }
 }
 
+/// Every card of a generation, in doc order, as a conversation carrying its
+/// semantic data, for semantic search.
+pub struct SemanticCards {
+    generation: String,
+    /// [`Snapshot::generation_id`] of the generation (fork).
+    id: String,
+    conversations: Arc<Vec<Arc<Conversation>>>,
+    /// `(CardRow::key_hash, SemRow::hash)` of each card.
+    hashes: Vec<(u64, u64)>,
+}
+
+impl SemanticCards {
+    /// Reads the semantic data of every card of `cards`. Data a card shares
+    /// with the same card in `previous` is reused rather than read, so equal
+    /// turns stay the same allocation. `None` when the generation's semantic
+    /// segments are missing or invalid.
+    pub fn load(cards: &Snapshot, previous: Option<&SemanticCards>) -> Option<Self> {
+        Self::load_cancellable(cards, previous, &|| false)
+    }
+
+    /// [`SemanticCards::load`] that gives up, with `None`, soon after
+    /// `cancelled` returns true (fork: the browser waits for the thread
+    /// that reads the cards when it is dropped).
+    pub fn load_cancellable(
+        cards: &Snapshot,
+        previous: Option<&SemanticCards>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Option<Self> {
+        let generation = &cards.generation;
+        let segments = generation.open_semantic_files()?;
+        let reusable: HashMap<u64, (u64, &Arc<Conversation>)> = previous
+            .map(|previous| {
+                previous
+                    .hashes
+                    .iter()
+                    .zip(previous.conversations.iter())
+                    .map(|(&(key, sem), conversation)| (key, (sem, conversation)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let hashes: Vec<(u64, u64)> = generation
+            .rows()
+            .iter()
+            .zip(generation.sems())
+            .map(|(row, sem)| (row.key_hash, sem.hash))
+            .collect();
+        let conversations = (0..hashes.len())
+            .into_par_iter()
+            .map(|doc| {
+                if cancelled() {
+                    return None;
+                }
+                let mut card = cards.card(doc as u32);
+                let (key, hash) = hashes[doc];
+                match reusable.get(&key) {
+                    Some(&(previous_hash, previous)) if previous_hash == hash => {
+                        card.semantic_turns = previous.semantic_turns.clone();
+                        card.semantic_turn_ranges = previous.semantic_turn_ranges.clone();
+                        card.semantic_route_text = previous.semantic_route_text.clone();
+                        card.agent_search_text = previous.agent_search_text.clone();
+                    }
+                    _ if hash == 0 => {}
+                    _ => {
+                        let bytes = segments.read_bytes(generation.sems()[doc].blob)?;
+                        semantic::SemanticDoc::decode(&bytes)?.apply(&mut card);
+                    }
+                }
+                Some(Arc::new(card))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            generation: generation.name().to_owned(),
+            id: cards.generation_id(),
+            conversations: Arc::new(conversations),
+            hashes,
+        })
+    }
+
+    /// Cards named as generation `generation`, without one on disk (its id
+    /// is the name too).
+    #[cfg(test)]
+    pub fn from_conversations(generation: &str, conversations: Vec<Conversation>) -> Self {
+        Self {
+            generation: generation.to_owned(),
+            id: generation.to_owned(),
+            hashes: vec![(0, 0); conversations.len()],
+            conversations: Arc::new(conversations.into_iter().map(Arc::new).collect()),
+        }
+    }
+
+    pub fn generation_name(&self) -> &str {
+        &self.generation
+    }
+
+    /// Identifies the generation across store roots, like
+    /// [`Snapshot::generation_id`] (fork).
+    pub fn generation_id(&self) -> &str {
+        &self.id
+    }
+
+    /// Conversation of each card; the index of card `doc` is `doc`.
+    pub fn conversations(&self) -> &Arc<Vec<Arc<Conversation>>> {
+        &self.conversations
+    }
+}
+
 impl search::TextSource for SearchIndex {
     fn full_text(&self, doc: u32) -> Cow<'_, str> {
         Cow::Owned(self.text(doc))
@@ -389,6 +502,69 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn semantic_cards_carry_semantic_data_and_reuse_unchanged_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conversations: Vec<_> = (0..3)
+            .map(|i| test_support::conversation(&format!("/p/-a/s{i}.jsonl"), 1_000 - i))
+            .collect();
+        conversations[0].semantic_turns = vec!["zero".to_owned()].into();
+        conversations[0].semantic_turn_ranges = vec![crate::agent::refs::MessageRange::single(1)];
+        conversations[1].semantic_turns = vec!["one".to_owned()].into();
+        conversations[1].semantic_route_text = "route".into();
+        conversations[1].agent_search_text = "agent".into();
+        generation::publish(dir.path(), &conversations).unwrap();
+        let open = || Snapshot::open(dir.path(), false, TimeFilter::default()).unwrap();
+
+        let first = SemanticCards::load(&open(), None).unwrap();
+        let cards = first.conversations();
+        assert_eq!(cards.len(), 3);
+        for (doc, card) in cards.iter().enumerate() {
+            assert_eq!(card.index, doc);
+            assert_eq!(card.path, conversations[doc].path);
+            assert_eq!(card.semantic_turns, conversations[doc].semantic_turns);
+            assert_eq!(
+                card.semantic_turn_ranges,
+                conversations[doc].semantic_turn_ranges
+            );
+            assert_eq!(
+                card.semantic_route_text,
+                conversations[doc].semantic_route_text
+            );
+            assert_eq!(card.agent_search_text, conversations[doc].agent_search_text);
+        }
+
+        conversations[0].semantic_turns = vec!["changed".to_owned()].into();
+        conversations[1].custom_title = Some("renamed".to_owned());
+        generation::publish(dir.path(), &conversations).unwrap();
+        let next = SemanticCards::load(&open(), Some(&first)).unwrap();
+        assert_ne!(next.generation_name(), first.generation_name());
+        let cards = next.conversations();
+        assert_eq!(&*cards[0].semantic_turns, ["changed".to_owned()]);
+        assert!(Arc::ptr_eq(
+            &cards[1].semantic_turns,
+            &first.conversations()[1].semantic_turns
+        ));
+        assert_eq!(cards[1].custom_title.as_deref(), Some("renamed"));
+    }
+
+    /// Fork: the id names the generation's directory, and a cancelled read
+    /// gives up.
+    #[test]
+    fn semantic_cards_name_their_generation_and_give_up_when_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let conversations: Vec<_> = (0..3)
+            .map(|i| test_support::conversation(&format!("/p/-a/s{i}.jsonl"), 1_000 - i))
+            .collect();
+        generation::publish(dir.path(), &conversations).unwrap();
+        let snapshot = Snapshot::open(dir.path(), false, TimeFilter::default()).unwrap();
+
+        let cards = SemanticCards::load(&snapshot, None).unwrap();
+        assert_eq!(cards.generation_name(), snapshot.generation_name());
+        assert_eq!(cards.generation_id(), snapshot.generation_id());
+        assert!(SemanticCards::load_cancellable(&snapshot, None, &|| true).is_none());
+    }
 
     #[test]
     fn snapshot_namespace_follows_pi_and_omp_roots() {

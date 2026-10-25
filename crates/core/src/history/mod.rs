@@ -41,8 +41,8 @@ pub use loader::{
     DeleteEmptyScope, DeleteEmptySummary, EmptyTranscript, EmptyTranscriptDeletion,
     delete_empty_transcript, delete_empty_transcripts, delete_session_by_uuid, delete_transcripts,
     find_all_jsonl_by_uuid, find_empty_transcripts, find_jsonl_by_uuid, list_projects,
-    load_all_conversations, load_all_conversations_cancellable, load_all_conversations_streaming,
-    load_conversations, session_artifact_dir,
+    load_all_conversations, load_all_conversations_streaming, load_conversations,
+    session_artifact_dir,
 };
 pub(crate) use messages::{extract_skill_preview, retained_user_text};
 pub use parser::process_conversation_file;

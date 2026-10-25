@@ -56,22 +56,6 @@ pub fn load_all_conversations(
     show_last: bool,
     debug_level: Option<DebugLevel>,
 ) -> Result<Vec<Conversation>> {
-    load_all_conversations_cancellable(env, show_last, debug_level, &|| false)
-}
-
-/// [`load_all_conversations`] that gives up once `cancelled` returns true
-/// (fork: checked before the Pi and OMP histories and before each Claude
-/// project, so a browser dropped while its semantic corpus loads does not
-/// wait for the whole history). What a cancelled load returns is partial.
-pub fn load_all_conversations_cancellable(
-    env: &HistoryEnv,
-    show_last: bool,
-    debug_level: Option<DebugLevel>,
-    cancelled: &(dyn Fn() -> bool + Sync),
-) -> Result<Vec<Conversation>> {
-    if cancelled() {
-        return Ok(Vec::new());
-    }
     let pi_root = super::pi_loader::session_root(env).ok();
     let pi_available = pi_root.as_ref().is_some_and(|root| root.path.exists());
     let (mut pi_conversations, pi_error) =
@@ -79,9 +63,6 @@ pub fn load_all_conversations_cancellable(
             Ok(conversations) => (conversations, None),
             Err(error) => (Vec::new(), Some(error)),
         };
-    if cancelled() {
-        return Ok(Vec::new());
-    }
     let omp_root = super::omp_loader::session_root(env).ok();
     let omp_available = omp_root.as_ref().is_some_and(|root| root.path.exists());
     let (mut omp_conversations, omp_error) =
@@ -129,9 +110,6 @@ pub fn load_all_conversations_cancellable(
     let mut all_conversations: Vec<Conversation> = projects
         .par_iter()
         .flat_map(|project| {
-            if cancelled() {
-                return Vec::new();
-            }
             let project_dir = root.join(&project.name);
             match load_conversations(env, &project_dir, show_last, &project.name, debug_level) {
                 Ok(mut convs) => {

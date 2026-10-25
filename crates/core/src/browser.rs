@@ -50,8 +50,9 @@
 //! installs every card with the generation's search index (opened off the
 //! UI thread) and swaps in each newer generation a reconcile pass publishes,
 //! keeping the query, the scope and the selected session. Cards carry no
-//! text: lexical queries run on the index, and semantic search loads the
-//! full conversations on first use. Deletes and renames are overlays until
+//! text: lexical queries run on the index, and semantic search ranks the
+//! cards with their semantic data, read from the generation on first use
+//! and again after each swap. Deletes and renames are overlays until
 //! a generation holds them (see `cards`).
 //!
 //! # Differences from upstream
@@ -320,8 +321,8 @@ pub struct Browser {
     doc_rows: Vec<Option<usize>>,
     /// Generation mode's cards, overlays and reconcile request
     cards: cards::CardRows,
-    /// Full conversations for semantic search in generation mode, loaded
-    /// on first use
+    /// Cards with their semantic data for semantic search in generation
+    /// mode, read on first use
     semantic_corpus: SemanticCorpus,
     /// Batches of the in-memory loader are being appended
     streaming: bool,
@@ -363,7 +364,7 @@ pub struct Browser {
 
 /// Helper threads of a browser that may outlive the call that started them
 /// (`row-evidence`, a `semantic-corpus` job given up): they read the store's
-/// mapped files or write history caches, so the browser joins them when it
+/// mapped files, so the browser joins them when it
 /// is dropped and none outlives it (in a test, its sandbox directory).
 #[derive(Default)]
 struct HelperThreads(Vec<std::thread::JoinHandle<()>>);
@@ -383,8 +384,8 @@ impl HelperThreads {
 }
 
 impl Drop for Browser {
-    /// Gives up a semantic corpus still loading (it stops before its next
-    /// project) and waits for the helper threads.
+    /// Gives up a semantic corpus still being read (it stops before its
+    /// next card) and waits for the helper threads.
     fn drop(&mut self) {
         self.retire_semantic_corpus();
         self.helpers.join_all();

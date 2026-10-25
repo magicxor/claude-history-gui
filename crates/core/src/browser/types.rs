@@ -68,8 +68,8 @@ pub fn query_has_literals(query: &str) -> bool {
 pub enum SemanticProgress {
     #[default]
     Idle,
-    /// Loading the full conversations semantic search ranks (generation
-    /// mode, where rows are cards without text).
+    /// Reading the semantic data of the cards semantic search ranks
+    /// (generation mode, where rows are cards without it).
     LoadingSessions,
     InitializingModel,
     CacheReady,

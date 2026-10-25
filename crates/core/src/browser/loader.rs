@@ -1018,7 +1018,7 @@ impl HistoryLoader {
         let mut result = LoaderPoll::default();
         // The cards shown follow the time filter of the options.
         browser.set_time_filter(self.options.time_filter);
-        // The sources of the semantic corpus follow the settings' env.
+        // The browser's env follows the settings'.
         browser.set_env(self.env.clone());
         if browser.take_reconcile_request() {
             self.start_pass();
