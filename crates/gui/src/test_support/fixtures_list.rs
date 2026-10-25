@@ -181,15 +181,61 @@ impl<'a> SessionSpec<'a> {
     }
 }
 
-/// Set a transcript's modification time (core's conversation timestamp and
-/// time filter both use it).
+/// Make a transcript last used at `at`: core dates a conversation by its
+/// newest message (ccec847), so the records' timestamps are shifted to end
+/// at `at` (their spacing is kept; records without a timestamp stay), and
+/// the file's modification time is set too (reconcile's change detection and
+/// the file-based tools use it).
 pub fn set_mtime(path: &std::path::Path, at: chrono::DateTime<chrono::Utc>) {
+    shift_records(path, at);
     let time: std::time::SystemTime = at.into();
     let file = std::fs::OpenOptions::new()
         .write(true)
         .open(path)
         .expect("open the transcript");
     file.set_modified(time).expect("set the modification time");
+}
+
+/// Shift the top-level `timestamp` of every JSONL record of `path` so that
+/// the newest one is `at`.
+fn shift_records(path: &std::path::Path, at: chrono::DateTime<chrono::Utc>) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let mut records: Vec<Result<serde_json::Value, &str>> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).map_err(|_| line))
+        .collect();
+    let stamp = |record: &serde_json::Value| {
+        record
+            .get("timestamp")
+            .and_then(|value| value.as_str())
+            .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+    };
+    let Some(newest) = records
+        .iter()
+        .filter_map(|record| record.as_ref().ok().and_then(stamp))
+        .max()
+    else {
+        return;
+    };
+    let delta = at.fixed_offset() - newest;
+    let mut out = String::new();
+    for record in &mut records {
+        match record {
+            Ok(value) => {
+                if let Some(old) = stamp(value) {
+                    let shifted =
+                        (old + delta).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                    value["timestamp"] = serde_json::Value::String(shifted);
+                }
+                out.push_str(&value.to_string());
+            }
+            Err(line) => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    std::fs::write(path, out).expect("rewrite the transcript");
 }
 
 /// A corpus with real workspace folders (`--workspace` needs an existing

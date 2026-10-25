@@ -4,6 +4,10 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 ## Unreleased
 
+- Conversations are dated by their last message, not the file's modified time: a session that Claude touched on
+  reopening, or whose Codex rollout got a settings record, no longer jumps to the top of the list as just used. This
+  also moves the time column, the time filter and the viewer's date; sessions last used long ago can leave a recent
+  time range. The index is rebuilt once.
 - While the conversation index is being built (the first start, or after an update changed its format), the list
   footer shows its progress ("Indexing conversations… 2,345 / 7,185") and says that search results may be
   incomplete while you type; a message says when it is done. A failed index update is reported ("Indexing

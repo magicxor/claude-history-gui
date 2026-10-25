@@ -2255,23 +2255,31 @@ mod tests {
     fn load_sorted_conversations_filters_and_sorts() {
         let sandbox = Sandbox::new();
         let project = sandbox.project("-tmp-p");
+        // Conversations are dated by their last message, not the file's mtime.
+        let message = |role: &str, content: serde_json::Value, days_ago: i64| {
+            serde_json::json!({
+                "type": role,
+                "timestamp": (chrono::Utc::now() - chrono::Duration::days(days_ago))
+                    .to_rfc3339(),
+                "message": {"role": role, "content": content}
+            })
+            .to_string()
+        };
+        let reply = serde_json::json!([{"type": "text", "text": "a"}]);
         write(
             &project.join("old.jsonl"),
-            &[user_jsonl_line("old"), assistant_jsonl_line("a")],
+            &[
+                message("user", "old".into(), 10),
+                message("assistant", reply.clone(), 10),
+            ],
         );
         write(
             &project.join("new.jsonl"),
-            &[user_jsonl_line("new"), assistant_jsonl_line("a")],
+            &[
+                message("user", "new".into(), 0),
+                message("assistant", reply, 0),
+            ],
         );
-        let old = std::fs::File::options()
-            .write(true)
-            .open(project.join("old.jsonl"))
-            .unwrap();
-        old.set_modified(
-            std::time::SystemTime::now() - std::time::Duration::from_secs(86_400 * 10),
-        )
-        .unwrap();
-        drop(old);
 
         let all =
             load_sorted_conversations(&sandbox.env, true, None, &TimeFilter::default()).unwrap();

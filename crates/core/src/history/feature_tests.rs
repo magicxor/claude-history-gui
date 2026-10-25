@@ -147,14 +147,29 @@ fn l092_transcripts_without_listable_parts_parse_to_none() {
 }
 
 #[test]
-fn l093_row_timestamps_follow_the_mtime_or_the_latest_record() {
+fn l093_row_timestamps_follow_the_latest_message() {
     let dir = tempfile::tempdir().unwrap();
     let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_650_000_000);
 
-    // Claude: the file's modification time, whatever the records say.
+    // Claude: the latest user/assistant record (ccec847), whatever the file's
+    // modification time says ...
     let claude = dir.path().join("claude.jsonl");
     write_lines(&claude, &[user("hello", "2030-01-01T00:00:00Z")]);
     let conversation = process_conversation_file(claude, Some(mtime), None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        conversation.timestamp.to_utc().to_rfc3339(),
+        "2030-01-01T00:00:00+00:00"
+    );
+
+    // ... else the modification time.
+    let untimed = dir.path().join("claude-untimed.jsonl");
+    write_lines(
+        &untimed,
+        &[serde_json::json!({"type":"user","message":{"role":"user","content":"hello"}})],
+    );
+    let conversation = process_conversation_file(untimed, Some(mtime), None)
         .unwrap()
         .unwrap();
     assert_eq!(conversation.timestamp.timestamp(), 1_650_000_000);

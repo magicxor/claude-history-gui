@@ -1197,10 +1197,10 @@ fn edits_reuse_the_body_normalized_off_the_ui_thread() {
 }
 
 #[test]
-fn rename_clears_semantic_metadata_keeps_the_row_and_stamps_claude_time() {
+fn rename_clears_semantic_metadata_keeps_the_row_and_the_last_message_time() {
     // A-021: re-parse keeps index and project, the row does not move, the
-    // Claude timestamp becomes "now" (re-parsed without an mtime), semantic
-    // metadata is cleared.
+    // Claude timestamp stays the last message's (ccec847: not the file's
+    // mtime, which the rename moves), semantic metadata is cleared.
     let sandbox = Sandbox::new();
     let (conversations, target) = rename_fixture(&sandbox);
     let mut app = Browser::new(
@@ -1210,12 +1210,14 @@ fn rename_clears_semantic_metadata_keeps_the_row_and_stamps_claude_time() {
             .with_default_mode(ListSearchMode::Semantic),
     );
     app.semantic_search.results = HashMap::from([(1, test_semantic_metadata(1, "old evidence"))]);
-    let before = Local::now();
     app.rename_conversation(&target, "titled").unwrap();
     assert!(app.semantic_result_metadata(1).is_none());
     assert_eq!(app.filtered(), &[0, 1]);
     assert_eq!(app.selected_path(), Some(target.clone()));
-    assert!(app.conversations()[1].timestamp >= before - ChronoDuration::seconds(1));
+    assert_eq!(
+        app.conversations()[1].timestamp.to_utc().to_rfc3339(),
+        "2024-01-01T00:02:00+00:00"
+    );
 }
 
 #[test]
