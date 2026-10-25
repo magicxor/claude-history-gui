@@ -2493,7 +2493,8 @@ recorded each frame (for the keyboard context menu position).
    background, in slices of about 2 s between commands (a new command cancels the running slice; the cache is
    written at most every 30 s and when indexing ends), then ranks the latest search again and the list refreshes,
    keeping a row the user moved to (upstream c6d0421). A search that nothing embedded so far matches keeps its
-   lexical rows and shows `sem embedding` until indexing ends (or gets the embedding error: fork). Every report wakes
+   lexical rows and shows `sem embedding` until a slice makes an indexed conversation match: it is then answered
+   (upstream 960281f) and refreshed once when indexing ends (or gets the embedding error while still unanswered: fork). Every report wakes
    the poller (upstream's TUI polled every 250 ms).
 4. Mode toggle (Ctrl+T / toolbar / menu): `browser.toggle_list_search_mode()`; remembered in state.json
    `search_mode` (used next launch only when no config key is set, PD17). Scope toggle (Tab / toolbar):

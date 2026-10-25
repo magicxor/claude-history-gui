@@ -44,7 +44,8 @@
 //!   until the next query).
 //! * When embedding fails while indexing, a search still waiting for it is
 //!   answered with the error (upstream left it waiting, showing `sem
-//!   embedding` for good). An embedder whose model loads at its first call
+//!   embedding` for good); a search an earlier slice already answered keeps
+//!   its results. An embedder whose model loads at its first call
 //!   (the GUI's shared model) fails there.
 //!
 //! Everything else is unchanged: the command protocol, corpus/scope version
@@ -504,7 +505,7 @@ fn run_semantic_worker(
                     outbox.post(SemanticSearchMessage::Indexing(Some(progress)));
                     if unanswered {
                         // Nothing embedded so far matches; the search is
-                        // answered again once indexing finishes.
+                        // answered once something does.
                         outbox.post(SemanticSearchMessage::Progress {
                             generation: request.generation,
                             progress: SemanticProgress::Embedding {
@@ -610,39 +611,63 @@ fn index_slice(
         outbox.post(SemanticSearchMessage::Indexing(Some(
             indexing.progress(response.missing_chunk_count),
         )));
+        if !indexing.answered
+            && let Some(response) =
+                rank_current(worker, state, model, &indexing.request, cancellation)
+            && !response.filtered.is_empty()
+        {
+            indexing.answered = true;
+            outbox.post(SemanticSearchMessage::Complete(response));
+        }
         return false;
     }
 
     save_cache(&state.cache);
-    let request = &indexing.request;
-    if !request.prewarm
-        && worker
-            .version_state_for(request)
-            .is_some_and(|version| matches!(version, VersionState::Current))
-    {
-        let scope = worker.semantic_candidates();
-        let index_request = SemanticIndexRequest {
-            query: request.query.semantic_text(),
-            literal_filters: request.query.literals(),
-            full_corpus: &full_corpus,
-            scope: &scope,
-            corpus_version: request.corpus_version,
-            prewarm: false,
-            include_chunk_hits: false,
-        };
-        if let Ok((response, _)) = rank_embedded(
-            request.generation,
-            &index_request,
-            &request.query,
-            state,
-            model,
-            cancellation,
-        ) {
-            outbox.post(SemanticSearchMessage::Complete(response));
-        }
+    if let Some(response) = rank_current(worker, state, model, &indexing.request, cancellation) {
+        outbox.post(SemanticSearchMessage::Complete(response));
     }
     outbox.post(SemanticSearchMessage::Indexing(None));
     true
+}
+
+/// Ranks `request` over the passages embedded so far, unless it is a
+/// prewarm or the corpus or scope has moved on from it.
+fn rank_current(
+    worker: &SemanticWorkerState,
+    state: &mut SemanticIndexState,
+    model: &mut dyn SemanticEmbedder,
+    request: &SemanticSearchRequest,
+    cancellation: &SemanticCancellationToken,
+) -> Option<SemanticSearchResponse> {
+    if request.prewarm
+        || !matches!(
+            worker.version_state_for(request),
+            Some(VersionState::Current)
+        )
+    {
+        return None;
+    }
+    let full_corpus = worker.full_corpus_candidates();
+    let scope = worker.semantic_candidates();
+    let index_request = SemanticIndexRequest {
+        query: request.query.semantic_text(),
+        literal_filters: request.query.literals(),
+        full_corpus: &full_corpus,
+        scope: &scope,
+        corpus_version: request.corpus_version,
+        prewarm: false,
+        include_chunk_hits: false,
+    };
+    rank_embedded(
+        request.generation,
+        &index_request,
+        &request.query,
+        state,
+        model,
+        cancellation,
+    )
+    .ok()
+    .map(|(response, _)| response)
 }
 
 #[derive(Default)]
@@ -1465,6 +1490,47 @@ mod tests {
         assert_eq!(responses[0].generation, 3);
         assert_eq!(responses[0].filtered, vec![0]);
         assert_eq!(responses[0].error, None);
+    }
+
+    #[test]
+    fn search_is_answered_once_indexed_conversations_match() {
+        let root = tempfile::tempdir().unwrap();
+        let (tx, rx, _hold) = spawn_fake_worker(root.path());
+        let mut conversations = vec![conversation(
+            "/projects/a/session-a.jsonl",
+            vec!["alpha notes"],
+        )];
+        conversations.extend((1..=DEFAULT_EMBEDDING_BATCH_SIZE * 2).map(|index| {
+            let text = format!("beta {index}");
+            conversation(&format!("/projects/b/session-{index}.jsonl"), vec![&text])
+        }));
+        send_corpus(&tx, 1, conversations);
+        send_search(&tx, 1, 1, "alpha", false);
+
+        let mut indexing = None;
+        let mut first_answer_during = None;
+        let mut responses = Vec::new();
+        loop {
+            match recv(&rx) {
+                SemanticSearchMessage::Complete(response) => {
+                    first_answer_during = first_answer_during.or(indexing);
+                    responses.push(response);
+                }
+                SemanticSearchMessage::Indexing(Some(progress)) => indexing = Some(progress),
+                SemanticSearchMessage::Indexing(None) => break,
+                SemanticSearchMessage::Progress { .. } => {}
+            }
+        }
+        let first_answer_during: SemanticIndexing =
+            first_answer_during.expect("answered while indexing");
+        assert!(first_answer_during.completed > 0);
+        assert!(first_answer_during.completed < first_answer_during.total);
+        assert_eq!(responses.len(), 2, "answered, then refreshed");
+        assert!(
+            responses
+                .iter()
+                .all(|response| response.generation == 1 && response.filtered[0] == 0)
+        );
     }
 
     #[test]

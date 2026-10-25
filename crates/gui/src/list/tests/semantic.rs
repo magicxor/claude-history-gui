@@ -205,8 +205,9 @@ fn embedding_progress_and_scores(cx: &mut TestAppContext) {
 }
 
 /// S-040, S-025: a search that nothing embedded so far matches keeps its
-/// lexical rows and shows the indexing progress as `sem embedding`; it is
-/// answered with scores once indexing finishes.
+/// lexical rows; the first slice that makes a conversation match answers it
+/// with scores while `sem indexing` continues (upstream 960281f), and the
+/// list is refreshed once indexing ends.
 #[gpui_kit::test]
 fn a_search_waits_for_indexing_with_its_lexical_rows(cx: &mut TestAppContext) {
     let world = semantic_world(MORE_THAN_A_BATCH);
@@ -228,24 +229,34 @@ fn a_search_waits_for_indexing_with_its_lexical_rows(cx: &mut TestAppContext) {
     f.wait_until(cx, "the lexical fallback", |list, cx| {
         list.query(cx).as_ref() == "synthetic" && !list.browser().filtered().is_empty()
     });
-    init.open();
-    f.wait_until(cx, "the search waiting for indexing", |list, _| {
-        list.browser()
-            .semantic_activity_status_text()
-            .is_some_and(|text| text.starts_with("sem embedding "))
-    });
-    let model = footer(&f, cx);
-    let text = model.semantic_activity.clone().unwrap();
-    let (_, done, total) = activity_counts(&text, "sem embedding ");
-    assert!(done < total, "{text}");
-    assert!(model.semantic_percent.is_some());
     assert!(f.read(cx, |list, _| list.browser().has_search_work_in_flight()));
     let pending = f.read(cx, |list, _| list.row_models(0..3, 480.0));
     assert!(!pending.is_empty());
     assert!(pending.iter().all(|row| row.score.is_none()), "{pending:?}");
 
+    // Upstream 960281f: the first slice embeds conversations that match, so
+    // the search is answered at once while the rest is still indexed.
+    init.open();
+    f.wait_until(cx, "the search answered while indexing", |list, _| {
+        !list.browser().has_search_work_in_flight()
+            && list
+                .browser()
+                .semantic_activity_status_text()
+                .is_some_and(|text| text.starts_with("sem indexing "))
+    });
+    let model = footer(&f, cx);
+    let text = model.semantic_activity.clone().unwrap();
+    let (_, done, total) = activity_counts(&text, "sem indexing ");
+    assert!(done < total, "{text}");
+    assert!(model.semantic_percent.is_some());
+    let answered = f.read(cx, |list, _| list.row_models(0..3, 480.0));
+    assert!(
+        answered.iter().all(|row| row.score.is_some()),
+        "{answered:?}"
+    );
+
     batch.open();
-    f.wait_until(cx, "the semantic result", |list, _| {
+    f.wait_until(cx, "the refreshed result", |list, _| {
         !list.browser().has_search_work_in_flight()
             && list.browser().semantic_indexing().is_none()
             && list
