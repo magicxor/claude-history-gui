@@ -24,7 +24,7 @@
 //!   [`Adapter::capabilities`]).
 
 use super::actions::{Capabilities, Target};
-use super::model::{ConversationKey, SourceInstance, Transcript};
+use super::model::{ConversationKey, Event, SourceInstance, Transcript};
 use crate::env::{HistoryEnv, WorkspaceScope};
 use crate::resume::ResumePlan;
 use std::collections::HashSet;
@@ -138,9 +138,25 @@ pub trait Adapter: Send + Sync {
     /// `discover` would list it.
     fn resolve(&self, native_id: &str, scan_started: SystemTime) -> crate::error::Result<Located>;
 
+    /// Decodes the history `located` selects, passing each event to
+    /// `events` in order as it is decoded; the transcript returned holds
+    /// no events. `None` when the artifacts hold no conversation.
+    fn decode_into(
+        &self,
+        located: &Located,
+        events: &mut dyn FnMut(Event),
+    ) -> crate::error::Result<Option<Transcript>>;
+
     /// Decodes the history `located` selects; `None` when its artifacts
     /// hold no conversation.
-    fn decode(&self, located: &Located) -> crate::error::Result<Option<Transcript>>;
+    fn decode(&self, located: &Located) -> crate::error::Result<Option<Transcript>> {
+        let mut decoded = Vec::new();
+        let transcript = self.decode_into(located, &mut |event| decoded.push(event))?;
+        Ok(transcript.map(|mut transcript| {
+            transcript.events = decoded;
+            transcript
+        }))
+    }
 
     fn capabilities(&self) -> Capabilities;
 

@@ -17,8 +17,7 @@ pub fn process_conversation_file(
     modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
 ) -> Result<Option<Conversation>> {
-    let transcript = super::sources::decode_path(&path, modified, false)?;
-    Ok(index_transcript(&transcript, debug_level))
+    stream_conversation(&path, modified, false, debug_level)
 }
 
 pub fn process_omp_conversation_file(
@@ -26,8 +25,22 @@ pub fn process_omp_conversation_file(
     modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
 ) -> Result<Option<Conversation>> {
-    let transcript = super::sources::decode_path(&path, modified, true)?;
-    Ok(index_transcript(&transcript, debug_level))
+    stream_conversation(&path, modified, true, debug_level)
+}
+
+/// Decodes `path` straight into an incremental indexer. Upstream collects the
+/// events here (its list no longer loads files this way); the fork's loaders
+/// still do, so the events are not all held at once.
+fn stream_conversation(
+    path: &std::path::Path,
+    modified: Option<SystemTime>,
+    omp: bool,
+    debug_level: Option<DebugLevel>,
+) -> Result<Option<Conversation>> {
+    let mut indexer = super::index::Indexer::default();
+    let transcript =
+        super::sources::decode_path_into(path, modified, omp, &mut |event| indexer.push(&event))?;
+    Ok(index_with(&transcript, debug_level, |t| indexer.finish(t)))
 }
 
 /// Process a Claude conversation from any BufRead source (for testability)
@@ -45,16 +58,25 @@ pub fn process_conversation_reader<R: std::io::BufRead>(
         },
         native_id: path.to_string_lossy().into_owned(),
     };
-    let transcript = super::sources::claude::decode_reader(key, &path, reader, modified)?;
-    Ok(index_transcript(&transcript, debug_level))
+    let mut events = Vec::new();
+    let mut transcript =
+        super::sources::claude::decode_reader(key, &path, reader, modified, &mut |event| {
+            events.push(event)
+        })?;
+    transcript.events = events;
+    Ok(index_with(&transcript, debug_level, super::index::index))
 }
 
 /// Indexes `transcript`, logging its parse errors and why it was skipped.
 /// Claude conversations are left without a project: callers list them under
 /// the project directory they found the file in.
-pub(crate) fn index_transcript(
+///
+/// `finish` does the indexing: `index::index` for a collected transcript, an
+/// [`Indexer`](super::index::Indexer)'s `finish` for a streamed one.
+fn index_with(
     transcript: &super::model::Transcript,
     debug_level: Option<DebugLevel>,
+    finish: impl FnOnce(&super::model::Transcript) -> std::result::Result<Conversation, Skipped>,
 ) -> Option<Conversation> {
     let filename = transcript
         .path()
@@ -70,7 +92,7 @@ pub(crate) fn index_transcript(
             ),
         );
     }
-    match super::index::index(transcript) {
+    match finish(transcript) {
         Ok(mut conversation) => {
             if conversation.source == super::Source::Claude {
                 conversation.project_name = None;

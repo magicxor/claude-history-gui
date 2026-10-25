@@ -222,10 +222,7 @@ fn agent_ordinals(entries: &[RenderableEntry]) -> Vec<(usize, usize)> {
     let mut records = Records::default();
     let mut placed = Vec::new();
     for parsed in entries {
-        records.push(parsed.entry().clone(), Origin::default());
-        let Some(event) = records.events.pop() else {
-            continue;
-        };
+        let event = records.push(parsed.entry().clone(), Origin::default());
         match ordinals.place(&event) {
             Placement::Message(ordinal) | Placement::Replaces(ordinal) => {
                 placed.push((parsed.entry_index, ordinal));
