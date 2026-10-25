@@ -48,9 +48,11 @@ pub fn resolve_bool_setting(
 /// `Truncated`, which is only reachable by cycling inside the viewer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum InitialToolDisplay {
+    /// No tool calls, results or summaries (upstream d0aca95).
+    Off,
     /// Summary mode ("Searched for 2 patterns, read 1 file").
     #[default]
-    Hidden,
+    Summary,
     /// Every tool call and result in full.
     Full,
 }
@@ -58,7 +60,8 @@ pub enum InitialToolDisplay {
 impl From<InitialToolDisplay> for crate::view::ToolDisplayMode {
     fn from(display: InitialToolDisplay) -> Self {
         match display {
-            InitialToolDisplay::Hidden => Self::Hidden,
+            InitialToolDisplay::Off => Self::Off,
+            InitialToolDisplay::Summary => Self::Summary,
             InitialToolDisplay::Full => Self::Full,
         }
     }
@@ -134,8 +137,9 @@ impl EffectiveSettings {
 }
 
 /// The viewer's initial tool display (`main.rs:193-205`): `--show-tools`
-/// gives Full, `--no-tools` gives Hidden; otherwise `[display].no_tools`
-/// `true` gives Hidden, `false` gives **Full**, unset gives Hidden.
+/// gives Full, `--no-tools` gives Off; otherwise `[display].no_tools`
+/// `true` gives Off, `false` gives **Full**, unset gives Summary (upstream
+/// d0aca95; `true` and `--no-tools` gave Summary before).
 pub fn initial_tool_display(
     flags: &DisplayFlags,
     no_tools_config: Option<bool>,
@@ -143,12 +147,12 @@ pub fn initial_tool_display(
     if flags.show_tools {
         InitialToolDisplay::Full
     } else if flags.no_tools {
-        InitialToolDisplay::Hidden
+        InitialToolDisplay::Off
     } else {
         match no_tools_config {
-            Some(true) => InitialToolDisplay::Hidden,
+            Some(true) => InitialToolDisplay::Off,
             Some(false) => InitialToolDisplay::Full,
-            None => InitialToolDisplay::Hidden,
+            None => InitialToolDisplay::Summary,
         }
     }
 }
@@ -577,7 +581,7 @@ Options:
       --first                   Preview the first messages of each conversation
   -l, --last                    Preview the last messages of each conversation (default)
   -t, --show-tools              Start the viewer with tool calls shown in full
-      --no-tools                Start the viewer with tool calls summarized (default)
+      --no-tools                Start the viewer with tool calls hidden
       --show-thinking           Show thinking blocks and subagent internals
       --hide-thinking           Hide thinking blocks and subagent internals (default)
   -p, --show-path               Picker mode: print the selected conversation's path and exit
@@ -1088,7 +1092,7 @@ mod tests {
             EffectiveSettings {
                 show_last: true,
                 show_tools: false,
-                tool_display: InitialToolDisplay::Hidden,
+                tool_display: InitialToolDisplay::Summary,
                 show_thinking: false,
                 search_mode: SearchMode::Lexical,
                 list_search_mode: TuiSearchMode::Lexical,
@@ -1107,11 +1111,12 @@ mod tests {
         let none = DisplayFlags::default();
         assert_eq!(
             initial_tool_display(&none, None),
-            InitialToolDisplay::Hidden
+            InitialToolDisplay::Summary
         );
+        // Upstream d0aca95: no_tools = true turns tools off.
         assert_eq!(
             initial_tool_display(&none, Some(true)),
-            InitialToolDisplay::Hidden
+            InitialToolDisplay::Off
         );
         // Upstream quirk kept: no_tools = false starts in Full, not summary.
         assert_eq!(
@@ -1132,8 +1137,9 @@ mod tests {
         };
         assert_eq!(
             initial_tool_display(&hide, Some(false)),
-            InitialToolDisplay::Hidden
+            InitialToolDisplay::Off
         );
+        assert_eq!(initial_tool_display(&hide, None), InitialToolDisplay::Off);
 
         let config = ConfigFile {
             display: Some(DisplayConfig {
@@ -1154,8 +1160,12 @@ mod tests {
         use crate::view::{ToolDisplayMode, ViewPrefs};
 
         assert_eq!(
-            ToolDisplayMode::from(InitialToolDisplay::Hidden),
-            ToolDisplayMode::Hidden
+            ToolDisplayMode::from(InitialToolDisplay::Off),
+            ToolDisplayMode::Off
+        );
+        assert_eq!(
+            ToolDisplayMode::from(InitialToolDisplay::Summary),
+            ToolDisplayMode::Summary
         );
         assert_eq!(
             ToolDisplayMode::from(InitialToolDisplay::Full),
@@ -1187,7 +1197,7 @@ mod tests {
         assert_eq!(
             settings.initial_view_prefs(),
             ViewPrefs {
-                tool_display: ToolDisplayMode::Hidden,
+                tool_display: ToolDisplayMode::Summary,
                 show_thinking: settings.show_thinking,
                 show_timing: false,
             }
@@ -1533,7 +1543,7 @@ mod tests {
     fn launch_args_feed_settings() {
         let parsed = run(&["--no-tools", "--first", "--show-thinking", "--semantic"]);
         let settings = parsed.settings(&ConfigFile::default());
-        assert_eq!(settings.tool_display, InitialToolDisplay::Hidden);
+        assert_eq!(settings.tool_display, InitialToolDisplay::Off);
         assert!(!settings.show_last);
         assert!(settings.show_thinking);
         assert_eq!(settings.list_search_mode, TuiSearchMode::Semantic);

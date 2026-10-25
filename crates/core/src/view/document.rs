@@ -14,7 +14,9 @@
 //!   blocks joined with a blank line, then tool results) and the assistant
 //!   template in fixed order regardless of the JSON block order (text blocks,
 //!   tool summary in summary mode, tool calls in truncated/full mode,
-//!   thinking for top-level assistants);
+//!   thinking for top-level assistants); off mode (upstream d0aca95) has no
+//!   tool summary, call or result, so a tool-only message has no block and
+//!   is left out (see below);
 //! - summary-mode grouping of consecutive tool-only assistant entries with
 //!   the same parent and speaker, absorbing tool-result-only user entries, and
 //!   the summary sentence (`"Searched for 2 patterns, read 1 file"`);
@@ -260,7 +262,7 @@ impl Fold {
         match mode {
             ToolDisplayMode::Truncated if expanded => Fold::Expanded,
             ToolDisplayMode::Truncated => Fold::Collapsed { limit },
-            ToolDisplayMode::Full | ToolDisplayMode::Hidden => Fold::Full,
+            ToolDisplayMode::Full | ToolDisplayMode::Summary | ToolDisplayMode::Off => Fold::Full,
         }
     }
 

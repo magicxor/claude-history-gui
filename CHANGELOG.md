@@ -4,6 +4,12 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 ## Unreleased
 
+- The viewer has a new **Off** tool display (toolbar, View > Tool display, and first in the `t` cycle: Off, Summary,
+  Truncated, Full) that shows only the conversation text: tool calls, results and summaries are hidden, messages
+  that hold only tools disappear, and message navigation skips them. `--no-tools` and `no_tools = true` now start
+  the viewer with tools off (they used to start in Summary); Settings > Display > Default tool display offers Off,
+  Summary and Full. If you chose Summary in Settings with an earlier version, it was saved as `no_tools = true` and
+  now starts in Off; choose Summary again to remove the key (the remembered mode or config.toml then applies).
 - On Windows the Workspace scope, Deep search local scope and `exclude_paths` ignore letter case in project paths, so
   `C:\Users\Foo\myproject` finds sessions recorded under `MyProject`.
 - Deep search lists conversations in the same order as the list search and no longer drops conversations that match

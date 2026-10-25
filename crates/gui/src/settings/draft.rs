@@ -16,6 +16,7 @@ use claude_history_core::config::{
     TuiOverrides, parse_key_binding,
 };
 use claude_history_core::search::mode::SearchMode;
+use claude_history_core::settings::InitialToolDisplay;
 use claude_history_core::theme::ThemePreference;
 
 use crate::model::{KeyAction, SettingsPage};
@@ -269,6 +270,10 @@ pub enum Value {
     Mode(SearchMode),
     Scope(AgentScopeConfig),
     Key(KeyChord),
+    /// `[display] no_tools` as the tool display it starts the viewer in
+    /// (upstream d0aca95): `true` = Off, `false` = Full. Summary has no key
+    /// (unset = Summary), so setting it removes the key.
+    Tools(InitialToolDisplay),
 }
 
 impl Value {
@@ -290,6 +295,17 @@ fn text_or_unset(text: Option<&String>) -> Value {
     text.map_or(Value::Unset, |text| Value::Text(text.clone()))
 }
 
+/// `[display] no_tools` as a [`Value::Tools`].
+fn no_tools_value(no_tools: Option<bool>) -> Value {
+    opt(no_tools, |no_tools| {
+        Value::Tools(if no_tools {
+            InitialToolDisplay::Off
+        } else {
+            InitialToolDisplay::Full
+        })
+    })
+}
+
 /// The value of `field` in a gui.toml model.
 pub fn get(field: Field, gui: &GuiConfigFile) -> Value {
     let settings = gui.gui_settings();
@@ -306,7 +322,7 @@ pub fn get(field: Field, gui: &GuiConfigFile) -> Value {
         Field::DefaultWorkspace => some_text(&settings.default_workspace),
         Field::RestoreSession => opt(settings.restore_session, Value::Bool),
         Field::PreviewLast => opt(display.last, Value::Bool),
-        Field::ToolDisplay => opt(display.no_tools, Value::Bool),
+        Field::ToolDisplay => no_tools_value(display.no_tools),
         Field::ShowThinking => opt(display.show_thinking, Value::Bool),
         Field::Plain => opt(display.plain, Value::Bool),
         Field::SearchMode => opt(gui.search.as_ref().and_then(|s| s.mode), Value::Mode),
@@ -422,7 +438,14 @@ pub fn set(field: Field, gui: &mut GuiConfigFile, value: Value) {
         Field::CodexPath => gui_table(gui).codex_path = path(&value),
         Field::DefaultWorkspace => gui_table(gui).default_workspace = path(&value),
         Field::PreviewLast => display(gui).last = flag(&value),
-        Field::ToolDisplay => display(gui).no_tools = flag(&value),
+        Field::ToolDisplay => {
+            display(gui).no_tools = match value {
+                Value::Tools(InitialToolDisplay::Off) => Some(true),
+                Value::Tools(InitialToolDisplay::Full) => Some(false),
+                // Summary is what an absent key means.
+                _ => None,
+            }
+        }
         Field::ShowThinking => display(gui).show_thinking = flag(&value),
         Field::Plain => display(gui).plain = flag(&value),
         Field::SearchMode => {
@@ -491,7 +514,7 @@ pub fn cli_value(field: Field, cli: &ConfigFile) -> Value {
     };
     match field {
         Field::PreviewLast => opt(display.last, Value::Bool),
-        Field::ToolDisplay => opt(display.no_tools, Value::Bool),
+        Field::ToolDisplay => no_tools_value(display.no_tools),
         Field::ShowThinking => opt(display.show_thinking, Value::Bool),
         Field::Plain => opt(display.plain, Value::Bool),
         Field::SearchMode => opt(cli.search.as_ref().and_then(|s| s.mode), Value::Mode),
@@ -547,7 +570,7 @@ pub fn default_value(field: Field) -> Value {
         Field::Theme => Value::Theme(ThemePreference::System),
         Field::RestoreSession => Value::Bool(true),
         Field::PreviewLast => Value::Bool(true),
-        Field::ToolDisplay => Value::Bool(true),
+        Field::ToolDisplay => Value::Tools(InitialToolDisplay::Summary),
         Field::ShowThinking | Field::Plain => Value::Bool(false),
         Field::SearchMode => Value::Mode(SearchMode::Lexical),
         Field::Key(KeyAction::Resume) => Value::Key(keys.resume),
@@ -583,8 +606,6 @@ pub fn describe(field: Field, value: &Value) -> String {
         },
         Value::Bool(flag) => match field {
             Field::PreviewLast => if *flag { "Last" } else { "First" }.into(),
-            // `no_tools = true` shows the summary.
-            Field::ToolDisplay => if *flag { "Summary" } else { "Full" }.into(),
             _ => if *flag { "on" } else { "off" }.into(),
         },
         Value::Text(text) => text.clone(),
@@ -609,6 +630,12 @@ pub fn describe(field: Field, value: &Value) -> String {
         }
         .into(),
         Value::Key(chord) => chord.config_string(),
+        Value::Tools(tools) => match tools {
+            InitialToolDisplay::Off => "Off",
+            InitialToolDisplay::Summary => "Summary",
+            InitialToolDisplay::Full => "Full",
+        }
+        .into(),
     }
 }
 
@@ -633,12 +660,17 @@ pub struct Source {
 
 fn remembered(field: Field, ui: &UiState) -> Value {
     match field {
-        Field::ToolDisplay => match ui.view.tool_display {
-            // The Settings control is Summary/Full; Truncated reads as Summary.
-            Some(RememberedToolDisplay::Full) => Value::Bool(false),
-            Some(_) => Value::Bool(true),
-            None => Value::Unset,
-        },
+        Field::ToolDisplay => opt(ui.view.tool_display, |tools| {
+            Value::Tools(match tools {
+                RememberedToolDisplay::Off => InitialToolDisplay::Off,
+                RememberedToolDisplay::Full => InitialToolDisplay::Full,
+                // The Settings control is Off/Summary/Full; Truncated reads
+                // as Summary.
+                RememberedToolDisplay::Summary | RememberedToolDisplay::Truncated => {
+                    InitialToolDisplay::Summary
+                }
+            })
+        }),
         Field::ShowThinking => opt(ui.view.show_thinking, Value::Bool),
         Field::SearchMode => match ui.search_mode {
             Some(RememberedSearchMode::Lexical) => Value::Mode(SearchMode::Lexical),
@@ -724,6 +756,23 @@ pub fn source_of(field: Field, config: &LayeredConfig, ui: &UiState) -> Source {
         value,
         text,
     }
+}
+
+/// [`source_of`] as the draft would leave it: a key the draft removes from
+/// gui.toml (Reset, or Summary of the tool display, which has no key) no
+/// longer counts, so the control shows what applies without it before Save.
+pub fn draft_source_of(
+    field: Field,
+    draft: &SettingsDraft,
+    config: &LayeredConfig,
+    ui: &UiState,
+) -> Source {
+    if draft.value(field).is_unset() && !get(field, &config.gui_file).is_unset() {
+        let mut without = config.clone();
+        set(field, &mut without.gui_file, Value::Unset);
+        return source_of(field, &without, ui);
+    }
+    source_of(field, config, ui)
 }
 
 /// The value a control shows: the draft's own value, else the effective one.

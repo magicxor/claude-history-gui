@@ -1366,11 +1366,7 @@ impl ViewerPane {
         if remember {
             update_app_state(cx, |state, _| {
                 state.view_defaults = prefs;
-                state.ui.view.tool_display = Some(match prefs.tool_display {
-                    ToolDisplayMode::Hidden => crate::persist::RememberedToolDisplay::Summary,
-                    ToolDisplayMode::Truncated => crate::persist::RememberedToolDisplay::Truncated,
-                    ToolDisplayMode::Full => crate::persist::RememberedToolDisplay::Full,
-                });
+                state.ui.view.tool_display = Some(prefs.tool_display.into());
                 state.ui.view.show_thinking = Some(prefs.show_thinking);
                 state.ui.view.show_timing = Some(prefs.show_timing);
             });
@@ -1465,7 +1461,7 @@ impl ViewerPane {
         };
         if let Some(hint) = hint {
             let mut prefs = self.prefs;
-            if (hint.tools || hint.tool_results) && prefs.tool_display == ToolDisplayMode::Hidden {
+            if (hint.tools || hint.tool_results) && !prefs.tool_display.shows_details() {
                 prefs.tool_display = ToolDisplayMode::Truncated;
             }
             if hint.thinking || hint.subagents {
@@ -2051,8 +2047,11 @@ impl ViewerPane {
         if a.is::<CycleToolDisplay>() {
             prefs.tool_display = prefs.tool_display.next();
             self.set_prefs(prefs, true, cx);
+        } else if a.is::<SetToolsOff>() {
+            prefs.tool_display = ToolDisplayMode::Off;
+            self.set_prefs(prefs, true, cx);
         } else if a.is::<SetToolsSummary>() {
-            prefs.tool_display = ToolDisplayMode::Hidden;
+            prefs.tool_display = ToolDisplayMode::Summary;
             self.set_prefs(prefs, true, cx);
         } else if a.is::<SetToolsTruncated>() {
             prefs.tool_display = ToolDisplayMode::Truncated;
@@ -2889,6 +2888,7 @@ impl Render for ViewerPane {
             Self::on_viewer_action,
             [
                 CycleToolDisplay,
+                SetToolsOff,
                 SetToolsSummary,
                 SetToolsTruncated,
                 SetToolsFull,

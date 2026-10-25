@@ -7,6 +7,7 @@ use claude_history_core::config::{
     load_gui_config_from, load_layered_config_from, parse_key_binding, save_gui_config_changes,
 };
 use claude_history_core::search::mode::SearchMode;
+use claude_history_core::settings::InitialToolDisplay;
 use claude_history_core::theme::ThemePreference;
 
 use crate::keymap;
@@ -163,9 +164,8 @@ fn sample(field: Field) -> Value {
             Value::Text(std::env::temp_dir().join("somewhere").display().to_string())
         }
         Field::RestoreSession => Value::Bool(false),
-        Field::PreviewLast | Field::ToolDisplay | Field::ShowThinking | Field::Plain => {
-            Value::Bool(true)
-        }
+        Field::PreviewLast | Field::ShowThinking | Field::Plain => Value::Bool(true),
+        Field::ToolDisplay => Value::Tools(InitialToolDisplay::Off),
         Field::SearchMode | Field::AgentMode => Value::Mode(SearchMode::Hybrid),
         Field::ExcludeProjects
         | Field::ExcludePaths
@@ -309,7 +309,7 @@ fn remembered_values_never_mask_a_config_key() {
     );
     assert_eq!(
         source_of(Field::ToolDisplay, &configured, &ui).text,
-        "From config.toml: Summary"
+        "From config.toml: Off"
     );
     let off = layered("", "[gui]\nrestore_session = false\n");
     assert_eq!(
@@ -317,6 +317,72 @@ fn remembered_values_never_mask_a_config_key() {
         "Default: lexical",
         "restore_session off: nothing is remembered"
     );
+}
+
+/// Upstream d0aca95: Default tool display is Off (`no_tools = true`) /
+/// Summary (no key) / Full (`no_tools = false`); picking Summary removes the
+/// key, and the control then shows what applies without it.
+#[test]
+fn tool_display_is_off_summary_or_full() {
+    use InitialToolDisplay::{Full, Off, Summary};
+    let ui = UiState::default();
+    let mut gui = GuiConfigFile::default();
+    for (tools, no_tools) in [(Off, Some(true)), (Full, Some(false)), (Summary, None)] {
+        set(Field::ToolDisplay, &mut gui, Value::Tools(tools));
+        assert_eq!(
+            gui.display.as_ref().unwrap().no_tools,
+            no_tools,
+            "{tools:?}"
+        );
+    }
+    assert_eq!(get(Field::ToolDisplay, &gui), Value::Unset);
+    assert_eq!(default_value(Field::ToolDisplay), Value::Tools(Summary));
+    assert_eq!(
+        source_of(Field::ToolDisplay, &layered("", ""), &ui).text,
+        "Default: Summary"
+    );
+    assert_eq!(
+        source_of(
+            Field::ToolDisplay,
+            &layered("", "[display]\nno_tools = true\n"),
+            &ui
+        )
+        .value,
+        Value::Tools(Off)
+    );
+    let mut remembered = UiState::default();
+    for (tools, shown) in [
+        (RememberedToolDisplay::Off, "Off"),
+        (RememberedToolDisplay::Summary, "Summary"),
+        (RememberedToolDisplay::Truncated, "Summary"),
+        (RememberedToolDisplay::Full, "Full"),
+    ] {
+        remembered.view.tool_display = Some(tools);
+        assert_eq!(
+            source_of(Field::ToolDisplay, &layered("", ""), &remembered).text,
+            format!("Remembered from last session: {shown}")
+        );
+    }
+
+    // gui.toml says Off; the draft picks Summary (removes the key).
+    let saved = layered("", "[display]\nno_tools = true\n");
+    let mut draft = SettingsDraft::new(&saved.gui_file);
+    let shown = |draft: &SettingsDraft, config: &LayeredConfig, ui: &UiState| {
+        let source = draft_source_of(Field::ToolDisplay, draft, config, ui);
+        shown_value(Field::ToolDisplay, &draft.edited, &source)
+    };
+    assert_eq!(shown(&draft, &saved, &ui), Value::Tools(Off));
+    draft.set(Field::ToolDisplay, Value::Tools(Summary));
+    assert!(draft.is_edited(Field::ToolDisplay));
+    assert_eq!(shown(&draft, &saved, &ui), Value::Tools(Summary));
+    // Without the key, config.toml and the remembered mode apply again.
+    let both = layered(
+        "[display]\nno_tools = false\n",
+        "[display]\nno_tools = true\n",
+    );
+    assert_eq!(shown(&draft, &both, &ui), Value::Tools(Full));
+    remembered.view.tool_display = Some(RememberedToolDisplay::Off);
+    assert_eq!(shown(&draft, &saved, &remembered), Value::Tools(Off));
 }
 
 /// C-024: deprecated config.toml keys are listed read-only with their notes.

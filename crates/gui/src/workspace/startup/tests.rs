@@ -159,6 +159,11 @@ fn display_flags_map_and_conflict() {
         ToolDisplayMode::from(tools.tool_display),
         ToolDisplayMode::Full
     );
+    let no_tools = gui(&["--no-tools"]).launch().args.settings(&config);
+    assert_eq!(
+        ToolDisplayMode::from(no_tools.tool_display),
+        ToolDisplayMode::Off
+    );
     assert!(
         gui(&["--show-thinking"])
             .launch()
@@ -1029,24 +1034,30 @@ fn remembered(
 /// C-066 / V-049: tool display precedence.
 #[test]
 fn initial_tool_display_precedence() {
-    use RememberedToolDisplay::{Full, Summary, Truncated};
+    use RememberedToolDisplay::{Full, Off, Summary, Truncated};
     let full = remembered(Some(Full), None, None, None);
     let summary = remembered(Some(Summary), None, None, None);
     let none = UiState::default();
-    let hidden = ToolDisplayMode::Hidden;
+    let hidden = ToolDisplayMode::Summary;
+    let off = ToolDisplayMode::Off;
     let tool = |args: &[&str], config: Option<&str>, gui: Option<&str>, ui: &UiState| {
         view_of(args, config, gui, ui).0.tool_display
     };
     // Defaults.
     assert_eq!(tool(&[], None, None, &none), hidden);
-    // `no_tools = false` beats remembered Summary; `true` beats remembered Full.
+    // `no_tools = false` beats remembered Summary; `true` (Off since
+    // upstream d0aca95) beats remembered Full.
     assert_eq!(
         tool(&[], Some("[display]\nno_tools = false"), None, &summary),
         ToolDisplayMode::Full
     );
     assert_eq!(
         tool(&[], Some("[display]\nno_tools = true"), None, &full),
-        hidden
+        off
+    );
+    assert_eq!(
+        tool(&[], None, Some("[display]\nno_tools = true"), &summary),
+        off
     );
     // gui.toml beats config.toml.
     assert_eq!(
@@ -1070,7 +1081,11 @@ fn initial_tool_display_precedence() {
         ToolDisplayMode::Truncated
     );
     assert_eq!(tool(&[], None, None, &summary), hidden);
-    // Flags beat both.
+    assert_eq!(
+        tool(&[], None, None, &remembered(Some(Off), None, None, None)),
+        off
+    );
+    // Flags beat both; `--no-tools` turns tools off (upstream d0aca95).
     assert_eq!(
         tool(
             &["--no-tools"],
@@ -1078,13 +1093,13 @@ fn initial_tool_display_precedence() {
             None,
             &full
         ),
-        hidden
+        off
     );
     assert_eq!(
         tool(&["-t"], Some("[display]\nno_tools = true"), None, &summary),
         ToolDisplayMode::Full
     );
-    assert_eq!(tool(&["--no-tools"], None, None, &full), hidden);
+    assert_eq!(tool(&["--no-tools"], None, None, &full), off);
     // restore_session = false ignores the state.
     assert_eq!(
         tool(&[], None, Some("[gui]\nrestore_session = false"), &full),

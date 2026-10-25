@@ -14,6 +14,7 @@ use claude_history_core::resume::terminal::{
     BuildOptions, LaunchSpec, Platform, TerminalLauncher, build_terminal_command, detect_launcher,
 };
 use claude_history_core::search::mode::SearchMode;
+use claude_history_core::settings::InitialToolDisplay;
 use claude_history_core::theme::ThemePreference;
 use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants as _};
 use gpui_kit::component::input::{Input, Textarea};
@@ -269,9 +270,10 @@ impl SettingsDialog {
     // -----------------------------------------------------------------
 
     /// The effective value a control shows: the draft's own, else the saved
-    /// configuration's (config.toml, remembered, default).
+    /// configuration's (config.toml, remembered, default) without the keys
+    /// the draft removes.
     pub fn shown(&self, field: Field, cx: &App) -> Value {
-        let source = draft::source_of(field, &self.config, &app_state(cx).ui);
+        let source = draft::draft_source_of(field, &self.draft, &self.config, &app_state(cx).ui);
         draft::shown_value(field, &self.draft.edited, &source)
     }
 
@@ -539,7 +541,11 @@ impl SettingsDialog {
         let tools = self.shown(Field::ToolDisplay, cx);
         let tool_display = self.segmented(
             Field::ToolDisplay,
-            vec![("Summary", Value::Bool(true)), ("Full", Value::Bool(false))],
+            vec![
+                ("Off", Value::Tools(InitialToolDisplay::Off)),
+                ("Summary", Value::Tools(InitialToolDisplay::Summary)),
+                ("Full", Value::Tools(InitialToolDisplay::Full)),
+            ],
             &tools,
             cx,
         );

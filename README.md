@@ -60,7 +60,9 @@ All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-h
 
 **Viewer**
 * Native rendering of messages, markdown, tables and syntax-highlighted code; text selection and copy.
-* Tool display modes **Summary / Truncated / Full**, thinking and subagent blocks, timestamps, tool outputs.
+* Tool display modes **Off / Summary / Truncated / Full** (Off shows only the conversation text: messages that
+  hold only tool calls or results disappear and message navigation skips them), thinking and subagent blocks,
+  timestamps, tool outputs.
 * In-conversation search (`/`, `n`/`N`), message navigation, outline, per-message copy, focus-viewer mode.
 * Single-file mode: open any `.jsonl` transcript (`FILE`, `--render FILE`, File > Open JSONL file).
 
@@ -164,7 +166,7 @@ cancelled picker exits 0.
 | `--since <WHEN>`, `--after <WHEN>` | only conversations this recent (`2d`, `1d6h`, `6mo`, `2026-07-20`) |
 | `--before <WHEN>` | only conversations older than this |
 | `--first` / `-l, --last` | preview first / last messages (default last) |
-| `-t, --show-tools` / `--no-tools` | start the viewer with tools in full / summarized |
+| `-t, --show-tools` / `--no-tools` | start the viewer with tools in full / off |
 | `--show-thinking` / `--hide-thinking` | show / hide thinking blocks and subagent internals |
 | `--semantic` / `--lexical` | start the list in semantic / lexical mode |
 | `-p, --show-path` | picker mode: print the selected conversation's path and exit |
@@ -295,7 +297,7 @@ command palette.
 | Shift+J or `]`, Shift+K or `[` | Next / previous message |
 | `/` | Find in conversation (words match like the list search); Enter commits, Esc cancels, Ctrl+U clears |
 | n / Shift+N, F3 / Shift+F3 (Cmd+G / Cmd+Shift+G on macOS) | Next / previous match |
-| t | Cycle tool display (Summary, Truncated, Full) |
+| t | Cycle tool display (Off, Summary, Truncated, Full) |
 | Shift+T | Toggle thinking and subagents |
 | i | Toggle timestamps |
 | x | Toggle tool outputs |
@@ -345,6 +347,10 @@ is not remembered. An invalid file shows a dialog naming it (Quit / Continue wit
 `osascript`, a Linux emulator name, or a template with `{cwd}`, `{args}`, `{cmd}`), `claude_path`, `pi_path`,
 `omp_path`, `codex_path`, `default_workspace`, `restore_session`. `[resume] default_args` (Claude) and
 `[resume.codex] default_args` (Codex) hold extra arguments for Resume and Fork.
+
+`[display] no_tools` sets the viewer's starting tool display: `true` = Off, `false` = Full, unset = Summary (or the
+remembered mode). Settings → Display offers Off / Summary / Full; Summary removes the key from `gui.toml`, so a
+`config.toml` value or the remembered mode applies again.
 
 `[tui] exclude_projects` hides exact project names from the list, its searches and Deep search (`agent search`) (`repo` also hides `repo/<worktree>`).
 `[tui] exclude_paths` hides the conversations whose recorded working directory starts with a listed prefix, from the

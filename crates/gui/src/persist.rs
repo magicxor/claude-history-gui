@@ -29,6 +29,7 @@ use std::time::Duration;
 use claude_history_core::HistoryEnv;
 use claude_history_core::config::load_gui_config_from;
 use claude_history_core::debug::DebugLevel;
+use claude_history_core::view::ToolDisplayMode;
 use gpui_kit::{App, Bounds, Global, Pixels, Task, Window, WindowBounds, point, px, size};
 use serde::{Deserialize, Serialize};
 
@@ -269,21 +270,62 @@ pub enum RememberedSearchMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RememberedToolDisplay {
+    /// Upstream d0aca95's off mode. Builds before it cannot read `"off"`
+    /// (their state.json goes to `.bad`); this one reads a mode it does not
+    /// know as never remembered ([`RememberedView::tool_display`]).
+    Off,
     Summary,
     Truncated,
     Full,
+}
+
+impl From<ToolDisplayMode> for RememberedToolDisplay {
+    fn from(mode: ToolDisplayMode) -> Self {
+        match mode {
+            ToolDisplayMode::Off => Self::Off,
+            ToolDisplayMode::Summary => Self::Summary,
+            ToolDisplayMode::Truncated => Self::Truncated,
+            ToolDisplayMode::Full => Self::Full,
+        }
+    }
+}
+
+impl From<RememberedToolDisplay> for ToolDisplayMode {
+    fn from(remembered: RememberedToolDisplay) -> Self {
+        match remembered {
+            RememberedToolDisplay::Off => Self::Off,
+            RememberedToolDisplay::Summary => Self::Summary,
+            RememberedToolDisplay::Truncated => Self::Truncated,
+            RememberedToolDisplay::Full => Self::Full,
+        }
+    }
 }
 
 /// Remembered viewer toggles (unset = never remembered).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RememberedView {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// A mode this build does not know (written by a newer one) reads as
+    /// `None` instead of making the whole file corrupt.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "known_or_none"
+    )]
     pub tool_display: Option<RememberedToolDisplay>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub show_thinking: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub show_timing: Option<bool>,
+}
+
+/// `Some(value)` when the JSON value deserializes as `T`, else `None`.
+fn known_or_none<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
 }
 
 /// Whether state.json writes are enabled (tests and QA disable them).
@@ -825,6 +867,30 @@ pub fn remember_deep_options(open: bool, cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Upstream d0aca95: the off mode is remembered as `"off"` and every
+    /// remembered value maps back to the mode it came from.
+    #[test]
+    fn tool_display_off_is_remembered() {
+        let state = parse(r#"{ "view": { "tool_display": "off" } }"#).unwrap();
+        assert_eq!(state.view.tool_display, Some(RememberedToolDisplay::Off));
+        // A mode of a newer build is forgotten; the rest of the file stays.
+        let state =
+            parse(r#"{ "view": { "tool_display": "calls", "show_thinking": true } }"#).unwrap();
+        assert_eq!(state.view.tool_display, None);
+        assert_eq!(state.view.show_thinking, Some(true));
+        for mode in [
+            ToolDisplayMode::Off,
+            ToolDisplayMode::Summary,
+            ToolDisplayMode::Truncated,
+            ToolDisplayMode::Full,
+        ] {
+            let remembered = RememberedToolDisplay::from(mode);
+            assert_eq!(ToolDisplayMode::from(remembered), mode);
+            let text = serde_json::to_string(&remembered).unwrap();
+            assert_eq!(text, format!("\"{}\"", format!("{mode:?}").to_lowercase()));
+        }
+    }
 
     #[test]
     fn defaults_and_round_trip() {

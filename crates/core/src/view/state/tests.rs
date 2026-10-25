@@ -152,10 +152,14 @@ fn view_click_uses_cached_entries_after_file_removed() {
         "Bash: one\ntwo\nthree\nfour\nfive"
     );
     assert!(model.plain_display().contains("Claude: Bash: one"));
-    // Summary mode hides tools from copies.
-    model.cycle_tool_display();
+    // Off mode (after Full, upstream d0aca95) shows nothing of a tool-only
+    // conversation and hides tools from copies, like summary mode.
+    assert_eq!(model.cycle_tool_display(), ToolDisplayMode::Off);
+    assert!(model.document().messages.is_empty());
     assert_eq!(model.message_text(0).unwrap(), "");
     assert_eq!(model.plain_display(), "");
+    assert_eq!(model.cycle_tool_display(), ToolDisplayMode::Summary);
+    assert_eq!(model.message_text(0).unwrap(), "");
 }
 
 #[test]
@@ -176,10 +180,10 @@ fn preference_toggles_cycle_and_survive_expansion() {
     let path = write_tool_conversation(dir.path());
     let mut model = ViewerModel::open(&history(), &path, ViewPrefs::default()).unwrap();
 
-    let labels: Vec<&str> = (0..4)
+    let labels: Vec<&str> = (0..5)
         .map(|_| model.cycle_tool_display().status_label())
         .collect();
-    assert_eq!(labels, ["trn", "all", "sum", "trn"]);
+    assert_eq!(labels, ["trn", "all", "off", "sum", "trn"]);
     assert!(model.toggle_thinking());
     assert!(!model.toggle_thinking());
     assert!(model.toggle_timing());
@@ -188,9 +192,9 @@ fn preference_toggles_cycle_and_survive_expansion() {
     let id = first_clickable_id(&model.ledger(80));
     model.toggle_expanded(&id);
     model.toggle_timing();
-    model.cycle_tool_display();
-    model.cycle_tool_display();
-    model.cycle_tool_display();
+    for _ in 0..4 {
+        model.cycle_tool_display();
+    }
     // Back in truncated mode, the expansion is still applied.
     assert_eq!(model.prefs.tool_display, ToolDisplayMode::Truncated);
     assert!(ledger_text(&model.ledger(80)).contains("five"));
@@ -471,6 +475,59 @@ fn document_anchor_survives_tool_mode_changes() {
         doc.messages[doc.message_at_nav_position(position).unwrap()].entry_index,
         4
     );
+}
+
+/// Upstream d0aca95's `cycling_tools_to_off_keeps_focus_on_a_visible_message`
+/// (a TUI interaction test): focus the tool summary, cycle summary →
+/// truncated → full → off; the tool-only messages are gone from the
+/// document and the ledger, and the anchor falls back to the previous
+/// visible message.
+#[test]
+fn cycling_tools_to_off_keeps_focus_on_a_visible_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write(
+        dir.path(),
+        "tools.jsonl",
+        &[
+            r#"{"type":"user","timestamp":"2024-01-01T00:00:00Z","message":{"role":"user","content":"please check"}}"#,
+            r#"{"type":"assistant","timestamp":"2024-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"cargo test"}}]}}"#,
+            r#"{"type":"user","timestamp":"2024-01-01T00:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}}"#,
+            r#"{"type":"assistant","timestamp":"2024-01-01T00:00:03Z","message":{"role":"assistant","content":[{"type":"text","text":"all good"}]}}"#,
+        ],
+    );
+    let mut model = ViewerModel::open(&history(), &path, ViewPrefs::default()).unwrap();
+
+    let doc = model.document();
+    let entries = doc.navigable_entry_indices();
+    assert_eq!(entries[1], 1);
+    assert!(doc_text(&doc).contains("Ran 1 shell command"));
+    // The tool summary row has the focus.
+    let anchor = capture_anchor_entry(&entries, Some(1), true, None).unwrap();
+    let ledger = model.ledger(80);
+    let ledger_anchor = capture_anchor(&ledger.messages, 0, Some(1), true);
+    for _ in 0..3 {
+        model.cycle_tool_display();
+    }
+
+    assert_eq!(model.prefs.tool_display, ToolDisplayMode::Off);
+    let doc = model.document();
+    let text = doc_text(&doc);
+    assert!(text.contains("please check"));
+    assert!(text.contains("all good"));
+    assert!(!text.contains("cargo test"));
+    assert!(!text.contains("shell command"));
+    let entries = doc.navigable_entry_indices();
+    assert_eq!(entries, [0, 3]);
+    let position = find_entry_or_prev(&entries, anchor).unwrap();
+    assert_eq!(entries[position], 0);
+    // The ledger agrees.
+    let ledger = model.ledger(80);
+    assert_eq!(ledger.messages.len(), 2);
+    let (focused, _) = resolve_scroll(&ledger.messages, ledger_anchor, 0, 20, ledger.lines.len());
+    assert_eq!(ledger.messages[focused.unwrap()].entry_index, 0);
+
+    assert_eq!(model.cycle_tool_display(), ToolDisplayMode::Summary);
+    assert!(doc_text(&model.document()).contains("Ran 1 shell command"));
 }
 
 // -----------------------------------------------------------------

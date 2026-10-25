@@ -202,6 +202,7 @@ macro_rules! on_fallback_actions {
                 $crate::actions::Refresh,
                 // viewer
                 $crate::actions::CycleToolDisplay,
+                $crate::actions::SetToolsOff,
                 $crate::actions::SetToolsSummary,
                 $crate::actions::SetToolsTruncated,
                 $crate::actions::SetToolsFull,
@@ -256,6 +257,7 @@ pub fn is_list_action(action: &dyn Action) -> bool {
 pub fn is_viewer_action(action: &dyn Action) -> bool {
     let a = action.as_any();
     a.is::<CycleToolDisplay>()
+        || a.is::<SetToolsOff>()
         || a.is::<SetToolsSummary>()
         || a.is::<SetToolsTruncated>()
         || a.is::<SetToolsFull>()

@@ -36,7 +36,7 @@ use claude_history_core::settings::{
     EffectiveSettings, GuiLaunchArgs, LaunchArgsError, LaunchCommand, help_text, parse_launch_args,
 };
 use claude_history_core::time_filter::TimeFilter;
-use claude_history_core::view::{ToolDisplayMode, ViewPrefs};
+use claude_history_core::view::ViewPrefs;
 use claude_history_core::{AppError, HistoryEnv, WorkspaceScope};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{Icon, IconName, WindowExt as _, h_flex};
@@ -47,7 +47,7 @@ use crate::exit::{EXIT_ERROR, EXIT_OK, EXIT_REFUSED, EXIT_USAGE};
 use crate::globals::{app_state, same_path, update_app_state};
 use crate::model::{ConfigErrors, LaunchContext, QaArgs, StartupTool, StdoutKind};
 use crate::notify::Toast;
-use crate::persist::{RememberedSearchMode, RememberedToolDisplay, UiState};
+use crate::persist::{RememberedSearchMode, UiState};
 use crate::services::{PlatformServices, services};
 
 /// The program name in help, usage and version texts.
@@ -952,12 +952,8 @@ pub fn resolve_initial_view(
 
     let tool_display = if args.show_tools || args.no_tools || display.no_tools.is_some() {
         settings.tool_display.into()
-    } else if remembered(&|ui| ui.view.tool_display.is_some()) {
-        match ui.view.tool_display {
-            Some(RememberedToolDisplay::Full) => ToolDisplayMode::Full,
-            Some(RememberedToolDisplay::Truncated) => ToolDisplayMode::Truncated,
-            _ => ToolDisplayMode::Hidden,
-        }
+    } else if let Some(tools) = ui.view.tool_display.filter(|_| restore) {
+        tools.into()
     } else {
         settings.tool_display.into()
     };

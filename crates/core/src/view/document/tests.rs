@@ -131,6 +131,34 @@ fn tool_summary_entries() -> Vec<Owned> {
     ]
 }
 
+/// Upstream d0aca95's `conversation_with_tool_only_turns`: a user message,
+/// the tool-only entries of [`tool_summary_entries`] (shifted to 1..=4), an
+/// assistant message with text and a tool call, its result, and a text
+/// answer.
+fn conversation_with_tool_only_turns() -> Vec<Owned> {
+    let mut entries = vec![entry(
+        0,
+        r#"{"type":"user","message":{"role":"user","content":"please check the build"}}"#,
+    )];
+    entries.extend(tool_summary_entries().into_iter().map(|mut owned| {
+        owned.entry_index = owned.entry_index.map(|index| index + 1);
+        owned
+    }));
+    entries.push(entry(
+        5,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Running the tests now."},{"type":"tool_use","id":"toolu_4","name":"Bash","input":{"command":"cargo build"}}]}}"#,
+    ));
+    entries.push(entry(
+        6,
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_4","content":"build output"}]}}"#,
+    ));
+    entries.push(entry(
+        7,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The build passes."}]}}"#,
+    ));
+    entries
+}
+
 fn pi_thinking_entries() -> Vec<Owned> {
     vec![
         entry(
@@ -504,8 +532,9 @@ fn assert_ledger_parity(
     doc
 }
 
-const MODES: [ToolDisplayMode; 3] = [
-    ToolDisplayMode::Hidden,
+const MODES: [ToolDisplayMode; 4] = [
+    ToolDisplayMode::Off,
+    ToolDisplayMode::Summary,
     ToolDisplayMode::Truncated,
     ToolDisplayMode::Full,
 ];
@@ -551,6 +580,7 @@ fn parity_with_ledger_for_all_fixtures_and_preferences() {
             user_entry(0, "Hello", None),
             assistant_text_entry(1, "Hi there", None),
         ],
+        conversation_with_tool_only_turns(),
     ];
     for entries in fixtures {
         assert_parity_everywhere(&entries);
@@ -574,12 +604,12 @@ fn parity_with_ledger_for_pi_and_omp_fixture_files() {
 // -----------------------------------------------------------------
 
 #[test]
-fn hidden_tool_mode_renders_activity_summary() {
+fn summary_tool_mode_renders_activity_summary() {
     let entries = [entry(
         0,
         r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Grep","input":{"pattern":"one"}},{"type":"tool_use","id":"toolu_2","name":"Grep","input":{"pattern":"two"}},{"type":"tool_use","id":"toolu_3","name":"Read","input":{"file_path":"src/main.rs"}}]}}"#,
     )];
-    let doc = build(&entries, &prefs(ToolDisplayMode::Hidden));
+    let doc = build(&entries, &prefs(ToolDisplayMode::Summary));
 
     assert_eq!(doc.messages.len(), 1);
     let message = &doc.messages[0];
@@ -597,8 +627,8 @@ fn hidden_tool_mode_renders_activity_summary() {
 }
 
 #[test]
-fn hidden_tool_mode_coalesces_tool_only_entries_across_results() {
-    let doc = build(&tool_summary_entries(), &prefs(ToolDisplayMode::Hidden));
+fn summary_tool_mode_coalesces_tool_only_entries_across_results() {
+    let doc = build(&tool_summary_entries(), &prefs(ToolDisplayMode::Summary));
 
     assert_eq!(doc.messages.len(), 1);
     let message = &doc.messages[0];
@@ -613,6 +643,64 @@ fn hidden_tool_mode_coalesces_tool_only_entries_across_results() {
     assert!(!doc_text(&doc).contains("Result"));
 }
 
+/// Upstream d0aca95: off mode renders no tool call, result or summary.
+#[test]
+fn off_tool_mode_hides_tool_calls_results_and_summaries() {
+    let entries = conversation_with_tool_only_turns();
+    let doc = assert_ledger_parity(&entries, &prefs(ToolDisplayMode::Off), &BTreeSet::new());
+    let text = doc_text(&doc);
+
+    assert!(text.contains("please check the build"));
+    assert!(text.contains("Running the tests now."));
+    assert!(text.contains("The build passes."));
+    for hidden in [
+        "Searched",
+        "Grep",
+        "Bash",
+        "cargo",
+        "grep result",
+        "bash result",
+        "build output",
+    ] {
+        assert!(!text.contains(hidden), "{hidden:?} leaked into:\n{text}");
+    }
+    assert!(
+        all_blocks(&doc)
+            .iter()
+            .all(|block| matches!(block.kind, DocBlockKind::Markdown { .. })),
+        "{doc:#?}"
+    );
+}
+
+/// Upstream d0aca95: tool-only entries leave no empty message behind, so
+/// message navigation skips them.
+#[test]
+fn off_tool_mode_leaves_no_empty_messages() {
+    let entries = conversation_with_tool_only_turns();
+    let doc = assert_ledger_parity(&entries, &prefs(ToolDisplayMode::Off), &BTreeSet::new());
+
+    let entry_indices: Vec<usize> = doc.messages.iter().map(|m| m.entry_index).collect();
+    assert_eq!(entry_indices, [0, 5, 7]);
+    assert_eq!(doc.navigable_entry_indices(), [0, 5, 7]);
+    assert!(doc.messages.iter().all(|m| !m.blocks.is_empty()));
+    assert_eq!(
+        doc.messages.iter().filter(|m| m.label == "Claude").count(),
+        2
+    );
+    assert!(doc_toggle_ids(&doc).is_empty());
+
+    // Thinking stays visible without its tool calls.
+    let mut thinking = prefs(ToolDisplayMode::Off);
+    thinking.show_thinking = true;
+    let doc = assert_ledger_parity(&[reordered_blocks_entry()], &thinking, &BTreeSet::new());
+    let texts: Vec<String> = doc.messages[0]
+        .blocks
+        .iter()
+        .map(|block| block.plain_text())
+        .collect();
+    assert_eq!(texts, ["TEXT_BLOCK", "THINK_BLOCK"]);
+}
+
 #[test]
 fn collapsed_tool_summary_uses_fixed_timestamp_format() {
     let timestamp = Local.with_ymd_and_hms(2026, 9, 4, 13, 59, 0).unwrap();
@@ -623,7 +711,7 @@ fn collapsed_tool_summary_uses_fixed_timestamp_format() {
             timestamp.to_rfc3339()
         ),
     )];
-    let mut prefs = prefs(ToolDisplayMode::Hidden);
+    let mut prefs = prefs(ToolDisplayMode::Summary);
     prefs.show_timing = true;
 
     let doc = assert_ledger_parity(&entries, &prefs, &BTreeSet::new());
@@ -649,7 +737,7 @@ fn tool_summary_uses_source_agent_label() {
     ];
     let summary_id = make_tool_summary_output_id(0, None);
 
-    let collapsed = build(&entries, &prefs(ToolDisplayMode::Hidden));
+    let collapsed = build(&entries, &prefs(ToolDisplayMode::Summary));
     assert_eq!(collapsed.messages.len(), 1);
     assert_eq!(collapsed.messages[0].label, "Pi");
     assert_eq!(
@@ -659,7 +747,7 @@ fn tool_summary_uses_source_agent_label() {
 
     let expanded = build_document(
         &renderable(&entries),
-        &prefs(ToolDisplayMode::Hidden),
+        &prefs(ToolDisplayMode::Summary),
         &BTreeSet::from([summary_id.clone()]),
     );
     assert_eq!(expanded.messages[0].label, "Pi");
@@ -677,7 +765,7 @@ fn hidden_pi_thinking_allows_clickable_grouped_tool_summary() {
     let entries = pi_thinking_entries();
     let summary_id = make_tool_summary_output_id(0, None);
 
-    let collapsed = build(&entries, &prefs(ToolDisplayMode::Hidden));
+    let collapsed = build(&entries, &prefs(ToolDisplayMode::Summary));
     assert_eq!(collapsed.messages.len(), 1);
     assert_eq!(collapsed.messages[0].label, "Pi");
     assert_eq!(
@@ -691,7 +779,7 @@ fn hidden_pi_thinking_allows_clickable_grouped_tool_summary() {
 
     let expanded = build_document(
         &renderable(&entries),
-        &prefs(ToolDisplayMode::Hidden),
+        &prefs(ToolDisplayMode::Summary),
         &BTreeSet::from([summary_id]),
     );
     let text = doc_text(&expanded);
@@ -709,7 +797,7 @@ fn expanded_tool_summary_renders_truncated_details() {
     let summary_id = make_tool_summary_output_id(0, None);
     let doc = build_document(
         &renderable(&entries),
-        &prefs(ToolDisplayMode::Hidden),
+        &prefs(ToolDisplayMode::Summary),
         &BTreeSet::from([summary_id.clone()]),
     );
 
@@ -748,7 +836,7 @@ fn expanded_tool_summary_renders_truncated_details() {
 fn subagent_summary_label_parity() {
     let entries = subagent_entries();
     let summary_id = make_tool_summary_output_id(0, Some("toolu_parent_abc"));
-    let mut prefs = prefs(ToolDisplayMode::Hidden);
+    let mut prefs = prefs(ToolDisplayMode::Summary);
     prefs.show_thinking = true;
 
     let collapsed = build(&entries, &prefs);
@@ -793,7 +881,7 @@ fn tool_output_ids_use_stable_literal_format() {
         ]
     );
 
-    let grouped = build(&entries[..1], &self::prefs(ToolDisplayMode::Hidden));
+    let grouped = build(&entries[..1], &self::prefs(ToolDisplayMode::Summary));
     assert_eq!(
         grouped.messages[0].blocks[0].tool_output_id().unwrap().0,
         "entry:0:parent:top:kind:summary"
@@ -826,7 +914,7 @@ fn entries_are_numbered_as_shown() {
         entry_index: None,
         transcript,
     }];
-    let doc = build(&entries, &prefs(ToolDisplayMode::Hidden));
+    let doc = build(&entries, &prefs(ToolDisplayMode::Summary));
 
     let indices: Vec<usize> = doc.messages.iter().map(|m| m.entry_index).collect();
     assert_eq!(indices, [0, 1]);
@@ -850,10 +938,10 @@ fn show_thinking_controls_subagent_entries() {
             r#"{"type":"progress","data":{"type":"agent_progress","agentId":"agent-abcdef123456","message":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"agent progress text"}]}}}}"#,
         ),
     ];
-    let hidden = build(&entries, &prefs(ToolDisplayMode::Hidden));
+    let hidden = build(&entries, &prefs(ToolDisplayMode::Summary));
     assert!(hidden.messages.is_empty());
 
-    let mut prefs = prefs(ToolDisplayMode::Hidden);
+    let mut prefs = prefs(ToolDisplayMode::Summary);
     prefs.show_thinking = true;
     let shown = build(&entries, &prefs);
     assert_eq!(shown.messages.len(), 2);
@@ -1055,7 +1143,7 @@ fn message_ranges_track_user_and_assistant_entries() {
         user_entry(0, "Hello", None),
         assistant_text_entry(1, "Hi there", None),
     ];
-    let doc = build(&entries, &prefs(ToolDisplayMode::Hidden));
+    let doc = build(&entries, &prefs(ToolDisplayMode::Summary));
     assert_eq!(doc.messages.len(), 2);
     assert_eq!(doc.messages[0].entry_index, 0);
     assert_eq!(doc.messages[0].kind, DocMessageKind::User);
@@ -1071,7 +1159,7 @@ fn message_ranges_skip_non_message_entries() {
         entry(0, r#"{"type":"summary","summary":"ignored"}"#),
         user_entry(1, "Hello", None),
     ];
-    let doc = build(&entries, &prefs(ToolDisplayMode::Hidden));
+    let doc = build(&entries, &prefs(ToolDisplayMode::Summary));
     assert_eq!(doc.messages.len(), 1);
     assert_eq!(doc.messages[0].entry_index, 1);
 }
@@ -1080,7 +1168,7 @@ fn message_ranges_skip_non_message_entries() {
 fn timing_enabled_stamps_first_block_and_disabled_omits_it() {
     let timestamp = Local.with_ymd_and_hms(2026, 9, 4, 12, 34, 56).unwrap();
     let entries = [user_entry(0, "Hello", Some(&timestamp.to_rfc3339()))];
-    let mut timed = prefs(ToolDisplayMode::Hidden);
+    let mut timed = prefs(ToolDisplayMode::Summary);
     timed.show_timing = true;
 
     let doc = build(&entries, &timed);
@@ -1090,7 +1178,7 @@ fn timing_enabled_stamps_first_block_and_disabled_omits_it() {
         DocTiming::Stamp("Sep 04 12:34".to_string())
     );
 
-    let doc = build(&entries, &prefs(ToolDisplayMode::Hidden));
+    let doc = build(&entries, &prefs(ToolDisplayMode::Summary));
     assert_eq!(doc.messages[0].timestamp, None);
     assert_eq!(doc.messages[0].blocks[0].timing, DocTiming::Disabled);
     assert!(doc.messages[0].raw_timestamp.is_some());
@@ -1099,7 +1187,7 @@ fn timing_enabled_stamps_first_block_and_disabled_omits_it() {
 #[test]
 fn invalid_timestamp_disables_timing_column() {
     let entries = [user_entry(0, "Hello", Some("not-a-timestamp"))];
-    let mut prefs = prefs(ToolDisplayMode::Hidden);
+    let mut prefs = prefs(ToolDisplayMode::Summary);
     prefs.show_timing = true;
     let doc = assert_ledger_parity(&entries, &prefs, &BTreeSet::new());
     assert_eq!(doc.messages[0].timestamp, None);
@@ -1156,7 +1244,7 @@ fn user_and_assistant_label_roles() {
             user_entry(0, "Hello", None),
             assistant_text_entry(1, "Hi", None),
         ],
-        &prefs(ToolDisplayMode::Hidden),
+        &prefs(ToolDisplayMode::Summary),
     );
     assert_eq!(doc.messages[0].label, "You");
     assert_eq!(doc.messages[0].label_role, LabelRole::TextPrimary);
@@ -1172,7 +1260,7 @@ fn user_and_assistant_label_roles() {
 
 #[test]
 fn assistant_block_order_hidden_mode_text_then_summary_then_thinking() {
-    let mut prefs = prefs(ToolDisplayMode::Hidden);
+    let mut prefs = prefs(ToolDisplayMode::Summary);
     prefs.show_thinking = true;
     let doc = build(&[reordered_blocks_entry()], &prefs);
     let kinds: Vec<String> = doc.messages[0]
@@ -1238,7 +1326,7 @@ fn skill_marker_user_message_renders_dimmed_but_top_level() {
         0,
         r#"{"type":"user","message":{"role":"user","content":"Base directory for this skill: /tmp/x"}}"#,
     )];
-    let doc = build(&entries, &prefs(ToolDisplayMode::Hidden));
+    let doc = build(&entries, &prefs(ToolDisplayMode::Summary));
     let message = &doc.messages[0];
     assert_eq!(message.label, "You");
     assert!(message.dimmed);
@@ -1331,7 +1419,7 @@ fn agent_progress_user_with_text_and_result_keeps_template_order() {
 
 #[test]
 fn agent_progress_assistant_has_summary_calls_and_no_thinking() {
-    let mut prefs = prefs(ToolDisplayMode::Hidden);
+    let mut prefs = prefs(ToolDisplayMode::Summary);
     prefs.show_thinking = true;
     let doc = build(&agent_progress_entries(), &prefs);
     // Agent-progress entries are never grouped.
@@ -1369,7 +1457,7 @@ fn agent_progress_never_stamps() {
         r#"{"type":"progress","timestamp":"2026-09-04T12:34:56Z","data":{"type":"agent_progress","agentId":"agent-1","message":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}}}"#,
     )];
     let prefs = ViewPrefs {
-        tool_display: ToolDisplayMode::Hidden,
+        tool_display: ToolDisplayMode::Summary,
         show_thinking: true,
         show_timing: true,
     };
@@ -1415,7 +1503,7 @@ fn pending_summary_flushes_at_eof() {
         0,
         r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Grep","input":{"pattern":"x"}}]}}"#,
     )];
-    let doc = build(&entries, &prefs(ToolDisplayMode::Hidden));
+    let doc = build(&entries, &prefs(ToolDisplayMode::Summary));
     assert_eq!(doc.messages.len(), 1);
     assert_eq!(doc.messages[0].entry_index, 0);
     assert_eq!(
@@ -1433,7 +1521,7 @@ fn pending_summary_flushes_before_non_tool_message() {
         ),
         user_entry(1, "follow up", None),
     ];
-    let doc = build(&entries, &prefs(ToolDisplayMode::Hidden));
+    let doc = build(&entries, &prefs(ToolDisplayMode::Summary));
     let indices: Vec<usize> = doc.messages.iter().map(|m| m.entry_index).collect();
     assert_eq!(indices, [0, 1]);
     assert_eq!(doc.messages[0].kind, DocMessageKind::ToolSummaryGroup);
@@ -1464,7 +1552,7 @@ fn groups_split_on_parent_or_agent_change_and_absorb_results() {
             r#"{"type":"assistant","agent":"Pi","message":{"role":"assistant","content":[{"type":"tool_use","id":"c","name":"Write","input":{}}]}}"#,
         ),
     ];
-    let doc = assert_ledger_parity(&entries, &prefs(ToolDisplayMode::Hidden), &BTreeSet::new());
+    let doc = assert_ledger_parity(&entries, &prefs(ToolDisplayMode::Summary), &BTreeSet::new());
     let summary: Vec<(usize, &str, String)> = doc
         .messages
         .iter()
@@ -1481,7 +1569,7 @@ fn groups_split_on_parent_or_agent_change_and_absorb_results() {
 
 #[test]
 fn user_text_blocks_are_command_processed_and_joined() {
-    let doc = build(&mixed_entries(), &prefs(ToolDisplayMode::Hidden));
+    let doc = build(&mixed_entries(), &prefs(ToolDisplayMode::Summary));
     let texts: Vec<(usize, String)> = doc
         .messages
         .iter()
@@ -1650,7 +1738,7 @@ fn markdown_plain_text_hides_markup_like_the_ledger() {
 
 #[test]
 fn nav_positions_map_between_document_and_ledger() {
-    let doc = build(&mixed_entries(), &prefs(ToolDisplayMode::Hidden));
+    let doc = build(&mixed_entries(), &prefs(ToolDisplayMode::Summary));
     let navigable = doc.navigable_indices();
     for (position, &index) in navigable.iter().enumerate() {
         assert_eq!(doc.nav_position(index), Some(position));
@@ -1937,7 +2025,7 @@ fn v026_image_and_document_blocks_produce_no_rows() {
             ]}}"#,
         ),
     ];
-    for mode in [ToolDisplayMode::Hidden, ToolDisplayMode::Full] {
+    for mode in [ToolDisplayMode::Summary, ToolDisplayMode::Full] {
         let doc = build(&entries, &prefs(mode));
         let text = doc_text(&doc);
         assert_eq!(doc.messages.len(), 1, "{text}");
@@ -1956,7 +2044,7 @@ fn v030_warmup_exchange_is_rendered_in_the_viewer() {
         assistant_text_entry(1, "Ready to help", None),
         user_entry(2, "real question", None),
     ];
-    let doc = build(&entries, &prefs(ToolDisplayMode::Hidden));
+    let doc = build(&entries, &prefs(ToolDisplayMode::Summary));
     assert_eq!(doc.messages.len(), 3);
     let text = doc_text(&doc);
     assert!(

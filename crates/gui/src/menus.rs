@@ -23,6 +23,7 @@ use crate::list::ListPane;
 use crate::model::PaneFocus;
 use crate::single_file::SingleFileWindow;
 use crate::viewer::ViewerPane;
+use crate::viewer::toolbar::{TOOL_DISPLAY_MODES, set_tools_action};
 
 /// The menu names, in order (Windows/Linux menu bar).
 pub const MENU_NAMES: [&str; 6] = ["File", "Edit", "View", "Session", "Tools", "Help"];
@@ -42,8 +43,8 @@ const MAC: bool = cfg!(target_os = "macos");
 pub struct MenuChecks {
     pub theme: ThemePreference,
     pub list_collapsed: bool,
-    /// 0 = Summary, 1 = Truncated, 2 = Full (None: no conversation open).
-    pub tool_display: Option<u8>,
+    /// The viewer's tool display (None: no conversation open).
+    pub tool_display: Option<ToolDisplayMode>,
     pub show_thinking: bool,
     pub show_timing: bool,
     pub semantic_mode: bool,
@@ -75,11 +76,7 @@ pub fn current_checks(cx: &App) -> MenuChecks {
     let (window, viewer, list) = active_panes(cx);
     checks.header_session_id = active_target_has_header_id(cx, window, &viewer, &list);
     if let Some(prefs) = viewer.and_then(|viewer| viewer.read(cx).prefs()) {
-        checks.tool_display = Some(match prefs.tool_display {
-            ToolDisplayMode::Hidden => 0,
-            ToolDisplayMode::Truncated => 1,
-            ToolDisplayMode::Full => 2,
-        });
+        checks.tool_display = Some(prefs.tool_display);
         checks.show_thinking = prefs.show_thinking;
         checks.show_timing = prefs.show_timing;
     }
@@ -304,16 +301,13 @@ pub fn build_tree_with(checks: &MenuChecks, app_menu_items: bool) -> Vec<Menu> {
         item("Find in all conversations…", FocusDeepSearch),
     ];
 
-    let tools_display = [("Summary", 0u8), ("Truncated", 1u8), ("Full", 2u8)]
-        .into_iter()
-        .map(|(name, value)| {
-            let checked = checks.tool_display == Some(value);
-            match value {
-                0 => item(name, SetToolsSummary).checked(checked),
-                1 => item(name, SetToolsTruncated).checked(checked),
-                _ => item(name, SetToolsFull).checked(checked),
-            }
-        });
+    let tools_display = TOOL_DISPLAY_MODES.map(|(mode, _, name)| MenuItem::Action {
+        name: name.into(),
+        action: set_tools_action(mode),
+        os_action: None,
+        checked: checks.tool_display == Some(mode),
+        disabled: false,
+    });
 
     let view = vec![
         item("Conversations", FocusConversations),

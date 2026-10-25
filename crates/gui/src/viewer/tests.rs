@@ -421,7 +421,7 @@ mod pure {
         assert_eq!(items::LABEL_LANE_CELLS, 9);
         let items = items_for(
             &pi_note_session("q", "Branch summary", "summary text"),
-            prefs(ToolDisplayMode::Hidden, false, false),
+            prefs(ToolDisplayMode::Summary, false, false),
             80,
         );
         assert!(
@@ -437,7 +437,7 @@ mod pure {
     fn v022_notes_render_dimmed_with_their_label() {
         let items = items_for(
             &pi_note_session("q", "notice", "custom note"),
-            prefs(ToolDisplayMode::Hidden, false, false),
+            prefs(ToolDisplayMode::Summary, false, false),
             80,
         );
         let meta = items
@@ -466,7 +466,7 @@ mod pure {
                     1,
                 ),
             ],
-            prefs(ToolDisplayMode::Hidden, true, false),
+            prefs(ToolDisplayMode::Summary, true, false),
             80,
         );
         let item = &items[1];
@@ -498,7 +498,7 @@ mod pure {
             ),
             skill_user("dimmed"),
         ];
-        let items = items_for(&lines, prefs(ToolDisplayMode::Hidden, false, true), 80);
+        let items = items_for(&lines, prefs(ToolDisplayMode::Summary, false, true), 80);
         let stamps: Vec<Option<&str>> = items
             .iter()
             .map(|item| item.lanes.timestamp.as_deref())
@@ -508,7 +508,7 @@ mod pure {
         assert!(stamps[2].is_none(), "second text block loses the stamp");
         assert!(stamps[3].is_none(), "dimmed blocks are never stamped");
         // Without timing no stamp at all.
-        let items = items_for(&lines, prefs(ToolDisplayMode::Hidden, false, false), 80);
+        let items = items_for(&lines, prefs(ToolDisplayMode::Summary, false, false), 80);
         assert!(items.iter().all(|i| i.lanes.timestamp.is_none()));
     }
 
@@ -522,7 +522,7 @@ mod pure {
             ),
             tool_result("a", "content", 1),
         ];
-        let items = items_for(&lines, prefs(ToolDisplayMode::Hidden, false, false), 80);
+        let items = items_for(&lines, prefs(ToolDisplayMode::Summary, false, false), 80);
         let summary = items
             .iter()
             .find(|i| i.kind == ItemKind::ToolSummary)
@@ -639,7 +639,7 @@ mod pure {
             r#"{"type":"assistant","parent_tool_use_id":"p1","message":{"role":"assistant","content":[{"type":"thinking","thinking":"sub thinking","signature":""},{"type":"text","text":"sub answer"}]}}"#
                 .to_string(),
         ];
-        let items = items_for(&lines, prefs(ToolDisplayMode::Hidden, true, false), 80);
+        let items = items_for(&lines, prefs(ToolDisplayMode::Summary, true, false), 80);
         let thinking: Vec<_> = items
             .iter()
             .filter(|i| i.kind == ItemKind::Thinking)
@@ -687,7 +687,7 @@ mod pure {
             user("q"),
             agent_progress("agent-abc1234567", "working on it"),
         ];
-        let items = items_for(&lines, prefs(ToolDisplayMode::Hidden, true, true), 80);
+        let items = items_for(&lines, prefs(ToolDisplayMode::Summary, true, true), 80);
         let progress = items
             .iter()
             .find(|i| i.lanes.label.as_deref().is_some_and(|l| l.starts_with('↳')))
@@ -745,7 +745,7 @@ mod pure {
     #[test]
     fn ids_are_stable_across_rebuilds() {
         let lines = roles_fixture();
-        let (_dir, mut model) = model_for(&lines, prefs(ToolDisplayMode::Hidden, false, false));
+        let (_dir, mut model) = model_for(&lines, prefs(ToolDisplayMode::Summary, false, false));
         let before = items_of(&model, 80);
         model.prefs.show_timing = true;
         let after = items_of(&model, 80);
@@ -1066,7 +1066,7 @@ mod pure {
     #[test]
     fn nav_helpers_map_items_and_positions() {
         let lines = long_conversation(6);
-        let (_dir, model) = model_for(&lines, prefs(ToolDisplayMode::Hidden, false, false));
+        let (_dir, model) = model_for(&lines, prefs(ToolDisplayMode::Summary, false, false));
         let doc = model.document();
         let (items, info) = items::build_with_info(&doc, &model, 80, &|| false).unwrap();
         assert_eq!(nav::indicator(&items, &info, 0), "[1/6]");
@@ -1633,6 +1633,9 @@ mod gui {
         assert_eq!(texts(cx)[0], "tools·trn");
         keys(cx, handle, &viewer, "t");
         assert_eq!(texts(cx)[0], "tools·all");
+        // Upstream d0aca95: full → off → summary.
+        keys(cx, handle, &viewer, "t");
+        assert_eq!(texts(cx)[0], "tools·off");
         keys(cx, handle, &viewer, "t");
         assert_eq!(texts(cx)[0], "tools·sum");
         keys(cx, handle, &viewer, "shift-t");
@@ -1713,6 +1716,57 @@ mod gui {
         );
         let viewer = open_in_main(cx, handle, &ws, &other, true);
         assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Truncated);
+    }
+
+    /// V-048 / upstream d0aca95: cycling to Off removes the tool-only
+    /// messages (nothing of them is shown or navigable) and the focus moves
+    /// from the tool summary to the previous visible message.
+    #[gpui_kit::test]
+    fn v048_cycling_tools_to_off_keeps_focus_on_a_visible_message(cx: &mut TestAppContext) {
+        let world = TestWorld::new();
+        let lines = vec![
+            user("please check"),
+            bash_call("toolu_1", "cargo test", 1),
+            tool_result("toolu_1", "ok", 2),
+            assistant("all good"),
+        ];
+        let (handle, viewer, _) = open_viewer(cx, &world, &lines, &[]);
+        let nav_entries = |cx: &mut TestAppContext| {
+            read(cx, &viewer, |v| v.build_info().unwrap().nav_entries.clone())
+        };
+        let text = |cx: &mut TestAppContext| {
+            read(cx, &viewer, |v| {
+                v.items()
+                    .unwrap()
+                    .iter()
+                    .map(crate::viewer::items::item_text)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+        };
+        assert_eq!(nav_entries(cx), [0, 1, 3]);
+        assert!(text(cx).contains("Ran 1 shell command"), "{}", text(cx));
+        keys(cx, handle, &viewer, "shift-j");
+        assert_eq!(read(cx, &viewer, |v| v.nav().focused()), Some(1));
+
+        keys(cx, handle, &viewer, "t t t");
+        assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Off);
+        assert_eq!(nav_entries(cx), [0, 3]);
+        let shown = text(cx);
+        assert!(
+            shown.contains("please check") && shown.contains("all good"),
+            "{shown}"
+        );
+        assert!(
+            !shown.contains("cargo test") && !shown.contains("shell command"),
+            "{shown}"
+        );
+        assert_eq!(read(cx, &viewer, |v| v.nav().focused()), Some(0));
+        assert!(read(cx, &viewer, |v| v.nav().is_active()));
+
+        keys(cx, handle, &viewer, "t");
+        assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Summary);
+        assert!(text(cx).contains("Ran 1 shell command"));
     }
 
     /// V-062: `T` shows thinking.
@@ -2984,6 +3038,7 @@ mod gui {
         let controls: Vec<(&str, Box<dyn gpui_kit::Action>)> = vec![
             ("tools-truncated", Box::new(SetToolsTruncated)),
             ("tools-full", Box::new(SetToolsFull)),
+            ("tools-off", Box::new(SetToolsOff)),
             ("tools-summary", Box::new(SetToolsSummary)),
             ("toggle-thinking", Box::new(ToggleThinking)),
             ("toggle-timing", Box::new(ToggleTiming)),
@@ -3436,6 +3491,45 @@ mod gui {
         assert_eq!(
             cx.read(last_toast).as_ref(),
             "Message m999 is not shown in the viewer"
+        );
+    }
+
+    /// §9.9 with upstream d0aca95's off mode: a hint that needs tools shows
+    /// them truncated in this view only, as from summary mode.
+    #[gpui_kit::test]
+    fn reveal_with_a_tools_hint_leaves_off_mode(cx: &mut TestAppContext) {
+        let world = TestWorld::new();
+        let lines = vec![
+            user("please check"),
+            bash_call("toolu_1", "cargo test", 1),
+            tool_result("toolu_1", "ok", 2),
+            assistant("all good"),
+        ];
+        let (handle, _ws, viewer, path) = open_main_viewer(cx, &world, &lines, &[]);
+        cx.dispatch_action(handle, SetToolsOff);
+        wait_viewer_ready(cx, handle, &viewer);
+        assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Off);
+        let reveal = RevealRequest {
+            path,
+            full_ref: None,
+            kind: RevealKind::AgentOrdinal {
+                ordinal: 1,
+                hint: ContentVisibilityHint {
+                    tools: true,
+                    ..Default::default()
+                },
+            },
+        };
+        cx.update_window(handle, |_, window, cx| {
+            viewer.update(cx, |v, cx| assert!(v.reveal(reveal, window, cx)))
+        })
+        .unwrap();
+        wait_viewer_ready(cx, handle, &viewer);
+        assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Truncated);
+        assert_eq!(
+            cx.read(|cx| crate::globals::app_state(cx).view_defaults.tool_display),
+            ToolDisplayMode::Off,
+            "not remembered"
         );
     }
 

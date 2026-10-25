@@ -1,4 +1,4 @@
-//! The viewer toolbar (DESIGN §9.10): Summary|Truncated|Full, Thinking,
+//! The viewer toolbar (DESIGN §9.10): Off|Summary|Truncated|Full, Thinking,
 //! Timing, find bar, Outline, Resume, Fork, ⋯ menu. WP2.
 //!
 //! Every control dispatches the same action as its key (V-096) from the
@@ -28,6 +28,26 @@ use crate::qa_ext::QaExt as _;
 
 /// The disabled tooltip of actions that need a known source.
 pub const UNKNOWN_SOURCE_TOOLTIP: &str = crate::model::UNKNOWN_SOURCE;
+
+/// The tool display modes in cycle order (upstream d0aca95 put Off first),
+/// with the toolbar button id and the label of the toolbar button and of
+/// View → Tool display. The toolbar and the menu are built from this table.
+pub const TOOL_DISPLAY_MODES: [(ToolDisplayMode, &str, &str); 4] = [
+    (ToolDisplayMode::Off, "tools-off", "Off"),
+    (ToolDisplayMode::Summary, "tools-summary", "Summary"),
+    (ToolDisplayMode::Truncated, "tools-truncated", "Truncated"),
+    (ToolDisplayMode::Full, "tools-full", "Full"),
+];
+
+/// The `SetTools*` action that selects `mode`.
+pub fn set_tools_action(mode: ToolDisplayMode) -> Box<dyn Action> {
+    match mode {
+        ToolDisplayMode::Off => Box::new(SetToolsOff),
+        ToolDisplayMode::Summary => Box::new(SetToolsSummary),
+        ToolDisplayMode::Truncated => Box::new(SetToolsTruncated),
+        ToolDisplayMode::Full => Box::new(SetToolsFull),
+    }
+}
 
 /// Why Resume, Fork, Rename and Delete are unavailable for the open
 /// conversation (`None`: available): [`ConversationTarget::refusal`].
@@ -98,19 +118,19 @@ pub fn render_toolbar(
 ) -> impl IntoElement + use<> {
     let tool = model.prefs.tool_display;
     let enabled = model.has_target;
-    let mode_button =
-        |id: &'static str, label: &'static str, value: ToolDisplayMode, action: Box<dyn Action>| {
-            let focus = focus.clone();
-            Button::new(id)
-                .label(label)
-                .xsmall()
-                .selected(tool == value)
-                .disabled(!enabled)
-                .on_click(move |_, window, cx| {
-                    focus.focus(window, cx);
-                    window.dispatch_action(action.boxed_clone(), cx);
-                })
-        };
+    let mode_button = |(value, id, label): (ToolDisplayMode, &'static str, &'static str)| {
+        let focus = focus.clone();
+        let action = set_tools_action(value);
+        Button::new(id)
+            .label(label)
+            .xsmall()
+            .selected(tool == value)
+            .disabled(!enabled)
+            .on_click(move |_, window, cx| {
+                focus.focus(window, cx);
+                window.dispatch_action(action.boxed_clone(), cx);
+            })
+    };
     let toggle_button =
         |id: &'static str, label: &'static str, on: bool, action: Box<dyn Action>| {
             let focus = focus.clone();
@@ -146,24 +166,7 @@ pub fn render_toolbar(
                     ButtonGroup::new("viewer-tools")
                         .outline()
                         .compact()
-                        .child(mode_button(
-                            "tools-summary",
-                            "Summary",
-                            ToolDisplayMode::Hidden,
-                            Box::new(SetToolsSummary),
-                        ))
-                        .child(mode_button(
-                            "tools-truncated",
-                            "Truncated",
-                            ToolDisplayMode::Truncated,
-                            Box::new(SetToolsTruncated),
-                        ))
-                        .child(mode_button(
-                            "tools-full",
-                            "Full",
-                            ToolDisplayMode::Full,
-                            Box::new(SetToolsFull),
-                        )),
+                        .children(TOOL_DISPLAY_MODES.map(mode_button)),
                 ),
         )
         .child(toggle_button(

@@ -100,7 +100,7 @@ impl ViewerModel {
         renderable_entries(&self.transcript)
     }
 
-    /// `t`: summary → truncated → full → summary. Returns the new mode
+    /// `t`: off → summary → truncated → full → off. Returns the new mode
     /// (its status label is [`ToolDisplayMode::status_label`]).
     pub fn cycle_tool_display(&mut self) -> ToolDisplayMode {
         self.prefs.tool_display = self.prefs.tool_display.next();

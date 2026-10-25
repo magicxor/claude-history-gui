@@ -81,7 +81,7 @@ pub use state::{
 /// always starts off there.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ViewPrefs {
-    /// Summary (`Hidden`) / truncated / full tool display.
+    /// Off / summary / truncated / full tool display.
     pub tool_display: ToolDisplayMode,
     /// Thinking blocks, subagent entries and `agent_progress` entries.
     pub show_thinking: bool,
