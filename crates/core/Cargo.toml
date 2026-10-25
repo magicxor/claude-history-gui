@@ -19,7 +19,7 @@ path = "src/lib.rs"
 default = []
 # Same semantics as upstream: load onnxruntime dynamically from the directory
 # of the executable instead of linking the downloaded static ONNX Runtime.
-release-dynamic-ort = ["dep:ort", "fastembed/ort-load-dynamic"]
+release-dynamic-ort = ["ort/load-dynamic", "fastembed/ort-load-dynamic"]
 # The guard rails of this crate's own unit tests, for other crates' tests:
 # HistoryEnv::from_process_env panics, the default (fastembed) embedders
 # refuse to load, update::check_latest_release panics and the terminal spawn
@@ -46,7 +46,9 @@ tempfile.workspace = true
 fastembed.workspace = true
 # Model download into HistoryEnv::semantic_model_dir (see semantic::fastembed).
 hf-hub.workspace = true
-ort = { workspace = true, optional = true }
+# The ONNX Runtime environment: the background inference thread pool, and the
+# bundled library with release-dynamic-ort (see semantic::fastembed).
+ort.workspace = true
 # GitHub release check (core::update).
 ureq.workspace = true
 # Format-preserving gui.toml edits (config::save_gui_config_changes). The

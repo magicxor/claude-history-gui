@@ -7,15 +7,25 @@
 //!   [`crate::env::HistoryEnv::semantic_model_dir`]), fetched with hf-hub
 //!   directly (see `new_in`), and refused in tests and `hermetic` builds
 //!   ([`HERMETIC_REFUSAL`]).
-//! * [`EmbedPriority`] (upstream 8322afe) only sizes the inference thread
-//!   pool here. Upstream's `new_quiet(Background)` also lowered the
-//!   scheduling priority of the thread making the embedder; the GUI's one
-//!   shared model may be made on the agent worker or a Tools thread, so the
-//!   semantic worker lowers its own thread instead
+//! * [`EmbedPriority`] (upstream 8322afe, 9ee0a03) sizes the inference
+//!   threads and, as upstream, a process whose first embedder is a
+//!   background one runs ONNX Runtime's inference threads in one global pool
+//!   whose threads lower their own priority (`init_onnx_runtime`).
+//!   Upstream's `new_quiet(Background)` also lowered the scheduling priority
+//!   of the thread making the embedder, which takes part in inference; the
+//!   GUI's one shared model may be made on the agent worker or a Tools
+//!   thread, so the semantic worker lowers its own thread instead
 //!   ([`lower_background_thread_priority`]), and so does the store's
 //!   reconcile pool (upstream ran reconcile in a child process at nice 10).
 //!   Lowering also covers Windows (`THREAD_PRIORITY_BELOW_NORMAL`), which
-//!   upstream left out, and is skipped in tests and `hermetic` builds.
+//!   upstream left out; the worker and reconcile threads skip it in tests
+//!   and `hermetic` builds (which never load the model).
+//! * ONNX Runtime's background threads (`BackgroundThreads`) get an 8 MiB
+//!   stack, and on Windows their join waits for the thread handle rather
+//!   than using std's join, which panics, aborting the process, for the
+//!   threads Windows ends before ort releases the environment at exit.
+//! * [`verify_onnx_runtime`] (the release self-test) sets ONNX Runtime up
+//!   for background embedding, as the GUI's shared embedder does.
 
 use crate::error::{AppError, Result};
 use crate::semantic::embed::SemanticEmbedder;
@@ -27,9 +37,10 @@ use fastembed::{
 use hf_hub::Cache;
 use hf_hub::api::sync::{ApiBuilder, ApiRepo};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 #[cfg(feature = "release-dynamic-ort")]
-use std::{path::Path, sync::OnceLock};
+use std::path::Path;
 
 /// The embedding model: snowflake-arctic-embed-xs (6 layers, 384 dims,
 /// 512-token window; upstream 2e618bd, replacing bge-small-en-v1.5).
@@ -47,9 +58,10 @@ pub struct FastembedEmbedder {
 pub enum EmbedPriority {
     /// A command the person is waiting on: every core.
     Foreground,
-    /// Indexing behind the list: half the cores (fork: at a lower
-    /// scheduling priority where the semantic worker runs it, see the
-    /// module notes), so the list and lexical search stay responsive.
+    /// Indexing behind the list: half the cores at a lower scheduling
+    /// priority (the inference threads, and the semantic worker's own
+    /// thread; see the module notes), so the list and lexical search stay
+    /// responsive.
     Background,
 }
 
@@ -78,8 +90,12 @@ impl FastembedEmbedder {
     ///
     /// GUI callers must pass `show_download_progress = false`: `true` makes
     /// hf-hub draw an indicatif progress bar on stderr (upstream CLI only).
-    /// `priority` sizes the inference thread pool; it never changes the
-    /// calling thread's scheduling priority (see the module notes).
+    /// `priority` sizes the inference thread pool, and the first embedder of
+    /// the process sets ONNX Runtime up for its priority (upstream 9ee0a03):
+    /// with `Background`, one global pool of half the cores at a lower
+    /// scheduling priority, which every later embedder of the process
+    /// shares. It never changes the calling thread's scheduling priority
+    /// (see the module notes).
     ///
     /// Guard rail (K13): in this crate's tests and in every `hermetic` build
     /// (the GUI's tests) it fails with [`HERMETIC_REFUSAL`] before touching
@@ -100,7 +116,7 @@ impl FastembedEmbedder {
         show_download_progress: bool,
         priority: EmbedPriority,
     ) -> Result<Self> {
-        init_onnx_runtime()?;
+        init_onnx_runtime(priority)?;
         let info = TextEmbedding::get_model_info(&MODEL).map_err(to_config_error)?;
         if !info.additional_files.is_empty() {
             // External weight files must sit next to an on-disk model; the
@@ -262,7 +278,8 @@ pub(crate) fn lower_background_thread_priority() {
 /// Lowers the scheduling priority of the calling thread: the utility QoS
 /// class on macOS, nice 10 on Linux, and (fork) `THREAD_PRIORITY_BELOW_NORMAL`
 /// on Windows. Threads the calling thread creates afterwards inherit it on
-/// Linux only.
+/// Linux only, so ONNX Runtime's background threads lower their own
+/// ([`BackgroundThreads`]).
 fn lower_current_thread_priority() {
     #[cfg(target_os = "macos")]
     // SAFETY: changes only the calling thread's QoS class.
@@ -302,36 +319,108 @@ pub fn prefixed_passages(passages: &[&str]) -> Vec<String> {
         .collect()
 }
 
-#[cfg(feature = "release-dynamic-ort")]
-fn init_onnx_runtime() -> Result<()> {
+/// Sets up the ONNX Runtime environment, once per process, for embedders of
+/// `priority`; later embedders share it.
+fn init_onnx_runtime(priority: EmbedPriority) -> Result<()> {
     static INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
-    match INIT.get_or_init(initialize_bundled_onnx_runtime) {
+    match INIT.get_or_init(|| initialize_onnx_runtime(priority)) {
         Ok(()) => Ok(()),
         Err(message) => Err(AppError::ConfigError(message.clone())),
     }
 }
 
-#[cfg(not(feature = "release-dynamic-ort"))]
-fn init_onnx_runtime() -> Result<()> {
+fn initialize_onnx_runtime(priority: EmbedPriority) -> std::result::Result<(), String> {
+    #[cfg(feature = "release-dynamic-ort")]
+    let builder = bundled_onnx_runtime()?;
+    #[cfg(not(feature = "release-dynamic-ort"))]
+    let builder = ort::init();
+    let builder = match priority {
+        EmbedPriority::Foreground => builder,
+        EmbedPriority::Background => builder.with_global_thread_pool(
+            background_thread_pool(priority.threads())
+                .map_err(|error| format!("Failed to configure ONNX Runtime threads: {error}"))?,
+        ),
+    };
+    if !builder.commit() {
+        return Err(
+            "Failed to initialize ONNX Runtime: an environment is already configured".to_string(),
+        );
+    }
     Ok(())
 }
 
+/// A pool of `threads` inference threads at background priority, which
+/// sessions use instead of creating their own. Its threads sleep rather
+/// than spin when out of work, since background embedding comes in bursts.
+fn background_thread_pool(
+    threads: usize,
+) -> ort::Result<ort::environment::GlobalThreadPoolOptions> {
+    ort::environment::GlobalThreadPoolOptions::default()
+        .with_intra_threads(threads)?
+        .with_inter_threads(1)?
+        .with_spin_control(false)?
+        .with_thread_manager(BackgroundThreads)
+}
+
+/// Spawns ONNX Runtime's threads with lowered scheduling priority. Threads
+/// it creates do not inherit the QoS class of the thread creating them on
+/// macOS, so each lowers its own. Fork: nor the priority on Windows, where
+/// [`lower_current_thread_priority`] sets below normal; it is called
+/// directly, not through [`lower_background_thread_priority`], since tests
+/// never load the model.
+struct BackgroundThreads;
+
+impl ort::environment::ThreadManager for BackgroundThreads {
+    type Thread = std::thread::JoinHandle<()>;
+
+    fn create(&self, work: impl FnOnce() + Send + 'static) -> ort::Result<Self::Thread> {
+        std::thread::Builder::new()
+            .name("semantic-embed".to_string())
+            // Fork: the 8 MiB of every named thread (DESIGN §7.5); ONNX
+            // Runtime's own threads got the executable's default, which is
+            // 8 MB in the GUI on Windows.
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                lower_current_thread_priority();
+                work();
+            })
+            .map_err(|error| ort::Error::new(error.to_string()))
+    }
+
+    #[cfg(not(windows))]
+    fn join(thread: Self::Thread) -> ort::Result<()> {
+        let _ = thread.join();
+        Ok(())
+    }
+
+    /// Fork: ort releases the environment, and with it this pool, when the
+    /// process exits, after Windows has ended every other thread. Joining
+    /// such a thread through std panics (its result never arrived), and a
+    /// panic in ONNX Runtime's callback aborts the exiting process, so this
+    /// waits for the thread's handle instead and then lets it go.
+    #[cfg(windows)]
+    fn join(thread: Self::Thread) -> ort::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+        // SAFETY: the handle belongs to `thread`, which keeps it open until
+        // it is dropped after the wait.
+        unsafe {
+            WaitForSingleObject(thread.as_raw_handle(), INFINITE);
+        }
+        drop(thread);
+        Ok(())
+    }
+}
+
 #[cfg(feature = "release-dynamic-ort")]
-fn initialize_bundled_onnx_runtime() -> std::result::Result<(), String> {
+fn bundled_onnx_runtime() -> std::result::Result<ort::environment::EnvironmentBuilder, String> {
     let path = bundled_onnx_runtime_path().ok_or_else(missing_runtime_message)?;
-    let builder = ort::init_from(&path).map_err(|error| {
+    ort::init_from(&path).map_err(|error| {
         format!(
             "Failed to load bundled ONNX Runtime from {}: {error}",
             path.display()
         )
-    })?;
-    if !builder.commit() {
-        return Err(format!(
-            "Failed to initialize bundled ONNX Runtime from {}: an ONNX Runtime environment is already configured",
-            path.display()
-        ));
-    }
-    Ok(())
+    })
 }
 
 #[cfg(feature = "release-dynamic-ort")]
@@ -400,11 +489,15 @@ fn is_versioned_runtime_name(path: &Path, unversioned_name: &str) -> bool {
     }
 }
 
-/// Load the bundled ONNX Runtime library now (a no-op without the
-/// `release-dynamic-ort` feature). Release verify steps call this, so a missing
-/// or incompatible library fails before the first semantic search does.
+/// Set ONNX Runtime up now as the GUI's shared embedder does
+/// ([`EmbedPriority::Background`]): with the `release-dynamic-ort` feature
+/// this loads the bundled library and configures the background thread pool
+/// through it. Release verify steps call this, so a missing or incompatible
+/// library fails before the first semantic search does. It decides the
+/// process's ONNX Runtime environment, so only a process that exits
+/// afterwards (the self-test) or embeds in the background may call it.
 pub fn verify_onnx_runtime() -> Result<()> {
-    init_onnx_runtime()
+    init_onnx_runtime(EmbedPriority::Background)
 }
 
 fn to_config_error(err: impl std::fmt::Display) -> AppError {
@@ -607,8 +700,50 @@ mod tests {
 
     #[cfg(not(feature = "release-dynamic-ort"))]
     #[test]
-    fn non_release_runtime_initialization_is_a_noop() {
-        assert!(init_onnx_runtime().is_ok());
+    fn non_release_runtime_initialization_needs_no_bundled_runtime() {
+        assert!(init_onnx_runtime(EmbedPriority::Foreground).is_ok());
+    }
+
+    /// Fork: the options of the background pool are accepted by the linked
+    /// ONNX Runtime (nothing is committed, no thread is started).
+    #[cfg(not(feature = "release-dynamic-ort"))]
+    #[test]
+    fn background_thread_pool_options_are_accepted() {
+        assert!(background_thread_pool(EmbedPriority::Background.threads()).is_ok());
+    }
+
+    /// Fork: ONNX Runtime's background threads are named and lower their
+    /// own priority before they run its work, on Windows too; the creating
+    /// thread keeps its priority, and joining one waits until it is done.
+    #[test]
+    fn background_inference_threads_lower_their_own_priority() {
+        use ort::environment::ThreadManager;
+        let before = current_thread_priority();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let thread = BackgroundThreads
+            .create(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let name = std::thread::current().name().map(str::to_owned);
+                sender.send((name, current_thread_priority())).unwrap();
+            })
+            .unwrap();
+        BackgroundThreads::join(thread).unwrap();
+        let (name, lowered) = receiver.try_recv().expect("the join waited for the work");
+        assert_eq!(name.as_deref(), Some("semantic-embed"));
+        #[cfg(target_os = "linux")]
+        assert!(lowered >= 10, "nice {lowered}");
+        #[cfg(windows)]
+        assert_eq!(
+            lowered,
+            windows_sys::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL
+        );
+        #[cfg(not(any(target_os = "linux", windows)))]
+        let _ = lowered;
+        assert_eq!(
+            current_thread_priority(),
+            before,
+            "this thread is unchanged"
+        );
     }
 
     #[cfg(feature = "release-dynamic-ort")]

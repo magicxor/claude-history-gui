@@ -38,7 +38,10 @@ tempfile = "3"
 # stay OFF (fastembed disables them), which avoids the esaxx-rs static CRT
 # mismatch on Windows MSVC.
 fastembed = { version = "=6.0.2", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
-ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic"] }
+# The version fastembed uses, with no features of its own (upstream 9ee0a03):
+# core configures the ONNX Runtime environment in every build;
+# release-dynamic-ort adds load-dynamic.
+ort = { version = "=2.0.0-rc.13", default-features = false }
 # Used directly (same version and features fastembed's hf-hub-rustls-tls
 # resolves, so it adds no crates) to fetch the model into the HistoryEnv
 # model dir without fastembed's HF_HOME / HF_ENDPOINT / real-home token reads.

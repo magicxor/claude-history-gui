@@ -452,7 +452,9 @@ Background work (all threads named, 8 MiB stack via `std::thread::Builder::stack
   dropped), `row-evidence` (reads the literal context of visible rows from their
   text frames); the browser joins its `semantic-corpus` and `row-evidence` threads when it is dropped; rayon pools (`lexical-rank-worker`, `index-search-*` up to 8 threads,
   `store-reconcile-*` up to 4, which lower their scheduling priority when they start, as upstream's reconcile
-  child ran at nice 10; not in tests) use rayon's default stack size, not 8 MiB;
+  child ran at nice 10; not in tests) use rayon's default stack size, not 8 MiB; ONNX Runtime's inference pool
+  (`semantic-embed`, half the cores, started by ONNX Runtime through core's thread manager when the GUI's model
+  loads; each lowers its scheduling priority when it starts, §7.6);
 * GUI-owned: `viewer-worker` (one per ViewerPane: single-flight parse + document + items + segments, §7.5),
   `agent-worker` (Deep Search + agent panel, single-flight per request kind with cancellation), short-lived tool
   threads (`semantic-cache-gen`, `update-check`, `delete-empty-scan`, `uuid-load`, `rename-write`, `delete-exec`,
@@ -1499,13 +1501,20 @@ channel closes; every named thread uses an 8 MiB stack.
   indexing (upstream c6d0421). The list worker's background indexing locks the model per call of 64 passages
   (`DEFAULT_EMBEDDING_BATCH_SIZE`; unlocking between calls), so a Deep Search query embedding usually waits about
   one call; the mutex is not fair, so it may wait longer. Result: one model in memory; Clear can drop it.
-  Threads (upstream 8322afe): the model runs ONNX inference on half the cores (`EmbedPriority::Background`) for
+  Threads (upstream 8322afe, 9ee0a03): the model runs ONNX inference on half the cores (`EmbedPriority::Background`) for
   every consumer, so Tools > Generate semantic cache uses half the cores where upstream's CLI command uses every
-  core; a call sorts its passages by length and runs the model on batches of 8 (`MODEL_BATCH_SIZE`). The list's semantic
-  worker lowers its own thread's scheduling priority before it makes its embedder (below normal on Windows, nice
-  10 on Linux, utility QoS on macOS; not in tests or `hermetic` builds), and the store's reconcile pool does the
-  same; on Linux the inference threads of a model loaded by the list worker inherit it, elsewhere they keep the
-  normal priority. The agent worker and Tools threads are not lowered. Tests/QA
+  core; a call sorts its passages by length and runs the model on batches of 8 (`MODEL_BATCH_SIZE`). The process's
+  first (and only) model is a Background one, so core sets ONNX Runtime up once with a global intra-op pool of half
+  the cores (one inter-op thread; idle threads sleep instead of spinning) whose `semantic-embed` threads lower their
+  own scheduling priority when they start (below normal on Windows, nice 10 on Linux, utility QoS on macOS). Every
+  consumer's inference runs on that pool, Deep Search's query embeddings included, so on a busy machine they wait
+  for a core like indexing does. The thread calling the model takes part in inference at its own priority: the
+  list's semantic worker lowers its own thread before it makes its embedder (not in tests or `hermetic` builds);
+  the agent worker and Tools threads are not. (The store's reconcile pool, which does not embed, lowers its
+  threads the same way.) Windows
+  ends the pool's threads before ort releases the environment at exit, so the pool's join waits for their
+  handles (std's join would panic there and abort the exit). The headless `agent` subcommand embeds in the
+  foreground (`Foreground`: per-session pools on every core, normal priority). Tests/QA
   install a fake through `embedder::install_fake(cx, factory)`; `init_for_test` installs a refusing factory by
   default (`semantic model is not available in tests`). `--qa-model-dir` points the real factory at a pre-downloaded model dir (feature `qa`).
   If `FastembedEmbedder` turns out not to be `Send`, WP7 falls back to per-consumer instances and records it (risk
@@ -3363,7 +3372,8 @@ precondition (no O(corpus) work on the UI thread: e.g. K1/K2/K3 paths are async,
 * **All OSes, first semantic search (S-030)**: with an empty GUI model cache and network access, run the first real
   semantic search; the model downloads into the GUI cache with no console output (the GUI passes `progress: false`),
   the toast/progress shows in the window, and the search completes. Then repeat offline: it uses the cache.
-  `CLAUDE_HISTORY_GUI_ORT_SELFTEST=1 <exe>` prints `onnxruntime ok` in release builds with the bundled library (S-032).
+  `CLAUDE_HISTORY_GUI_ORT_SELFTEST=1 <exe>` prints `onnxruntime ok` in release builds with the bundled library (S-032;
+  it loads the library and configures the background inference pool through it, as the GUI's embedder does).
 
 ### 15.10 Failure fixtures per OS (`test_support::fault`)
 * `undeletable(path)`: Windows — open the file with `share_mode(0)` (deletion fails with a sharing violation) and keep

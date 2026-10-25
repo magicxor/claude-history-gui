@@ -16,7 +16,9 @@
 //! first consumer. It embeds on half the cores (`EmbedPriority::Background`,
 //! upstream 8322afe) for every consumer, Tools included (upstream's CLI
 //! commands used every core); the list's semantic worker also lowers its own
-//! thread's scheduling priority (core). Tests get a refusing factory from
+//! thread's scheduling priority (core). As the process's first embedder it also sets ONNX Runtime up
+//! with core's low-priority global inference pool (upstream 9ee0a03), so every consumer's inference
+//! runs on `semantic-embed` threads below normal priority (DESIGN §7.6). Tests get a refusing factory from
 //! `init_for_test` and opt in to a fake with [`install_fake`].
 
 use std::path::PathBuf;
@@ -162,7 +164,8 @@ pub fn refusing_factory(message: &'static str) -> ModelFactory {
 
 /// The production factory: the fastembed snowflake-arctic-embed-xs model, downloaded on first
 /// use into `model_dir` (`HistoryEnv::semantic_model_dir`, or the QA run's
-/// pre-downloaded `--qa-model-dir`), embedding on half the cores. Without a
+/// pre-downloaded `--qa-model-dir`), embedding on half the cores on the global low-priority
+/// inference pool (every consumer, Deep Search queries included). Without a
 /// model directory (no home) it fails with a readable message.
 pub fn fastembed_factory(model_dir: Option<PathBuf>) -> ModelFactory {
     Arc::new(move || {

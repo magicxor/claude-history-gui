@@ -8,8 +8,9 @@ Release notes are taken from the `## v<version>` section of this file by the rel
   previous one at half the indexing cost. After the update the history is re-embedded in the background, ranking
   what is indexed so far meanwhile, and the old model download is removed once the new one loads.
 - Semantic indexing is several times faster: the embedding model now runs on half of the processor cores instead of
-  one, and embeds passages of similar length together. The background pass that updates the list index runs at a
-  lower priority, so the app and other programs stay responsive meanwhile.
+  one, and embeds passages of similar length together. The embedding threads and the background pass that updates
+  the list index run at a lower priority, also on Windows, and the embedding threads sleep while there is nothing to
+  embed, so the app and other programs stay responsive meanwhile.
 - Semantic search answers right away from the conversations it has already embedded, and embeds new ones in the
   background ("sem indexing 40%  1200/3000 chunks" with a progress bar in the list footer) instead of making every
   search wait until all of them are embedded. When indexing finishes, the results are refreshed, keeping the row you
