@@ -5,11 +5,8 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 ## Unreleased
 
 - First rows appear sooner with large Pi or OMP histories: Claude, Pi and OMP conversations load at the same time
-  and stream into the list in small batches, and the list keeps drawing while they arrive. Unchanged Pi and OMP
-  caches are no longer rewritten on every start, and empty Pi/OMP files are no longer parsed again each time.
+  and stream into the list in small batches, and the list keeps drawing while they arrive.
 - Lower memory use: conversation text is shared instead of copied, and search no longer keeps a second copy of it.
-- History caches are smaller: they no longer store a normalized copy of every conversation's text. The caches are
-  rewritten once on the first start after the update.
 - The list shows the newest conversations right away at startup, taken from a snapshot of the previous complete
   load, and they can be opened, resumed and forked at once; rename and delete become available when loading
   finishes, which swaps in the loaded list without moving the selection. The snapshot is kept per workspace and
@@ -39,6 +36,9 @@ Release notes are taken from the `## v<version>` section of this file by the rel
   instead of parsing every session file again. Deep search still warns about malformed transcripts: the index now
   keeps their parse errors, so it is rebuilt once on the first start after the update. When the Pi and OMP session
   folders are the same folder, its OMP conversations are no longer left out of the list.
+- The per-project and Pi/OMP conversation caches of earlier versions are no longer used: the first index update of
+  this version removes them from `~/.cache/claude-history-gui` (only files the app wrote there, never the
+  claude-history CLI's cache), freeing their disk space.
 
 ## v0.1.1
 

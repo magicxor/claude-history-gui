@@ -404,24 +404,11 @@ impl ClearReport {
     }
 }
 
-/// The installed CLI's cache root (`<home>/.cache/claude-history`), which
-/// this crate must never delete from.
-fn cli_cache_root(env: &HistoryEnv) -> Option<PathBuf> {
-    env.home_dir
-        .as_ref()
-        .map(|home| home.join(".cache").join("claude-history"))
-}
-
+/// Refuses `path` when it lies in the installed CLI's cache root
+/// ([`HistoryEnv::is_in_cli_cache`]), which this crate must never delete
+/// from.
 fn ensure_own_namespace(env: &HistoryEnv, path: &Path) -> Result<()> {
-    let Some(cli_root) = cli_cache_root(env) else {
-        return Ok(());
-    };
-    let inside_cli = path.starts_with(&cli_root)
-        || matches!(
-            (path.canonicalize(), cli_root.canonicalize()),
-            (Ok(path), Ok(cli_root)) if path.starts_with(&cli_root)
-        );
-    if inside_cli {
+    if env.is_in_cli_cache(path) {
         return Err(AppError::ConfigError(format!(
             "refusing to clear {}: it belongs to the claude-history CLI's cache",
             path.display()

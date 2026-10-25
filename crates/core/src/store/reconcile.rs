@@ -12,15 +12,20 @@
 //! A source or directory that cannot be listed is degraded: its cards and
 //! ignored files are kept as they are rather than dropped.
 //!
+//! A pass that published removes the caches older versions kept beside the
+//! store (`legacy`).
+//!
 //! Fork: the sources come from a [`HistoryEnv`] ([`Sources::from_env`]),
 //! and [`reconcile_cancellable`] gives a pass up soon after a flag is set,
 //! because the GUI runs it in-process (see `store`'s differences from
-//! upstream).
+//! upstream). Old caches are never removed from the installed CLI's cache
+//! dir ([`Sources::cli_cache`]), nor once the pass is given up.
 
 use super::card::Fingerprint;
 use super::generation::{
     self, Doc, Generation, MergePolicy, Publish, PublishLock, Update, Written,
 };
+use super::legacy;
 use crate::env::HistoryEnv;
 use crate::history::omp_loader::{self, OmpSessionRoot};
 use crate::history::parser::{process_conversation_file, process_omp_conversation_file};
@@ -46,6 +51,11 @@ pub struct Sources {
     pub claude: Option<PathBuf>,
     pub pi: Option<PiSessionRoot>,
     pub omp: Option<OmpSessionRoot>,
+    /// Fork: the installed CLI's cache root
+    /// ([`HistoryEnv::cli_cache_root`]). A pass never removes old caches
+    /// from a cache dir inside it, even when the env's cache root was
+    /// pointed there.
+    pub cli_cache: Option<PathBuf>,
 }
 
 impl Sources {
@@ -56,6 +66,7 @@ impl Sources {
             claude: env.claude_projects_root().ok(),
             pi: pi_loader::session_root(env).ok(),
             omp: omp_loader::session_root(env).ok(),
+            cli_cache: env.cli_cache_root(),
         }
     }
 }
@@ -73,6 +84,8 @@ pub struct Outcome {
     pub scanned: usize,
     /// Files parsed because they were new or changed.
     pub parsed: usize,
+    /// Old caches removed after publishing.
+    pub removed: legacy::Removed,
 }
 
 /// Runs one pass over `sources` into the store at `root`.
@@ -92,7 +105,9 @@ pub fn reconcile_with(root: &Path, sources: &Sources, policy: MergePolicy) -> io
 /// ([`generation::publish_update_cancellable`],
 /// [`generation::compact_cancellable`]). A pass given up returns
 /// [`generation::cancelled_build`]; the generations it published before
-/// stay, and the next pass goes on from them.
+/// stay, and the next pass goes on from them. A flag set after the last
+/// merge only skips removing old caches, which the next pass that
+/// publishes does.
 pub fn reconcile_cancellable(
     root: &Path,
     sources: &Sources,
@@ -105,6 +120,7 @@ pub fn reconcile_cancellable(
         written: Written::default(),
         scanned: 0,
         parsed: 0,
+        removed: legacy::Removed::default(),
     };
     let Some(lock) = PublishLock::try_acquire(root)? else {
         return Ok(outcome);
@@ -177,6 +193,17 @@ pub fn reconcile_cancellable(
             generation::compact_cancellable(&lock, &current, policy, cancelled)?;
         add_written(&mut outcome, publish, written);
     }
+    if outcome.published > 0
+        && let Some(cache) = legacy::cache_dir_of(root)
+        && !sources
+            .cli_cache
+            .as_deref()
+            .is_some_and(|cli_cache| crate::env::is_within(cache, cli_cache))
+        && !cancelled()
+    {
+        outcome.removed = legacy::remove_old_caches(cache);
+    }
+    drop(lock);
     Ok(outcome)
 }
 
@@ -640,6 +667,7 @@ mod tests {
                         path: omp,
                         flat: false,
                     }),
+                    cli_cache: None,
                 },
                 projects,
                 _dir: dir,

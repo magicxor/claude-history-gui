@@ -959,8 +959,8 @@ fn initial_load_streams_sessions_from_the_sandbox() {
     let conv = &browser.conversations()[0];
     assert_eq!(conv.project_name.as_deref(), Some("demo"));
     assert!(conv.preview.starts_with("last question"));
-    // Caches are written inside the sandbox.
-    assert!(sandbox.env.history_cache_dir().unwrap().exists());
+    // The in-memory load writes no cache (upstream 75df2d4).
+    assert!(!sandbox.env.cache_root().unwrap().exists());
 }
 
 #[test]

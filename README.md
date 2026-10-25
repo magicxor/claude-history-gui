@@ -302,7 +302,7 @@ Ctrl+W deletes a word in text fields and never closes a window.
 | `~/.config/claude-history/gui.toml` | the GUI's settings: a `[gui]` table plus overrides of `[display]`, `[resume]`, `[keys]`, `[tui]`, `[search]`, `[agent]`; written only by the Settings dialog (changed keys only, comments kept) |
 | `~/.local/state/claude-history-gui/state.json` | window bounds, pane widths, last workspace and recent folders, view defaults |
 | `~/.local/state/claude-history-gui/debug.log` | debug log |
-| `~/.cache/claude-history-gui/` | conversation caches, the list's index (`v3/roots-<hash>/`: the cards and search index the list reads), and the semantic cache and embedding model |
+| `~/.cache/claude-history-gui/` | the list's index (`v3/roots-<hash>/`: the cards and search index the list reads), and the semantic cache and embedding model (the conversation caches of v0.1.1 and earlier are removed after the first index update) |
 
 On Windows `~` is `%USERPROFILE%`. The effective value of a setting is: command-line flag, then `gui.toml`, then
 `config.toml`, then (when `[gui] restore_session` is on) the remembered value, then the default. The time filter

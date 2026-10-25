@@ -11,7 +11,6 @@
 //! - `parser` - Parsing individual JSONL files
 //! - `path` - Path encoding/decoding utilities
 
-pub mod cache;
 #[cfg(test)]
 mod feature_tests;
 mod loader;

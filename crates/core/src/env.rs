@@ -20,7 +20,7 @@
 //! | What | Default |
 //! |---|---|
 //! | Claude data | `$CLAUDE_CONFIG_DIR` (absolute only) or `~/.claude` |
-//! | caches (history, Pi/OMP, semantic embeddings, fastembed model) | `~/.cache/claude-history-gui` |
+//! | caches (the list's store, semantic embeddings, fastembed model) | `~/.cache/claude-history-gui` |
 //! | CLI config (read-only, shared settings) | `~/.config/claude-history/config.toml` |
 //! | GUI config (GUI settings and overrides) | `~/.config/claude-history/gui.toml` |
 //! | debug log | `~/.local/state/claude-history-gui/debug.log` |
@@ -32,6 +32,9 @@ use std::path::{Component, Path, PathBuf, Prefix};
 
 /// Directory name of this crate's cache root under `~/.cache`.
 pub const CACHE_DIR_NAME: &str = "claude-history-gui";
+/// Directory name of the installed CLI's cache root under `~/.cache`, which
+/// core never deletes from ([`HistoryEnv::cli_cache_root`]).
+pub const CLI_CACHE_DIR_NAME: &str = "claude-history";
 /// Directory name of the debug-log state directory under `~/.local/state`.
 pub const STATE_DIR_NAME: &str = "claude-history-gui";
 /// Directory name of the (CLI-shared) config directory under `~/.config`.
@@ -58,8 +61,9 @@ pub struct HistoryEnv {
     /// Home directory (`home::home_dir()`, i.e. `%USERPROFILE%` on Windows).
     pub home_dir: Option<PathBuf>,
     /// Value of `CLAUDE_CONFIG_DIR`, taken verbatim (it also namespaces the
-    /// per-project history cache, as upstream did). A blank value counts as
-    /// unset and a relative one is an error ([`HistoryEnv::claude_dir`]).
+    /// store, [`HistoryEnv::cache_base_dir`], as upstream does). A blank
+    /// value counts as unset and a relative one is an error
+    /// ([`HistoryEnv::claude_dir`]).
     pub claude_config_dir: Option<PathBuf>,
     /// `PI_CODING_AGENT_DIR`
     pub pi_coding_agent_dir: Option<PathBuf>,
@@ -251,13 +255,12 @@ impl HistoryEnv {
     }
 
     /// Cache directory of this Claude config root (upstream
-    /// `history::cache::cache_base_dir`): the cache root, or a
-    /// `config-{hash}` directory inside it when `CLAUDE_CONFIG_DIR` is set,
-    /// to avoid cross-config cache collisions. A blank value uses the default
-    /// namespace, like [`Self::claude_dir`]. Holds the per-project history
-    /// caches ([`Self::history_cache_dir`]) and the store
+    /// `store::cache_base_dir`): the cache root, or a `config-{hash}`
+    /// directory inside it when `CLAUDE_CONFIG_DIR` is set, to avoid
+    /// cross-config cache collisions. A blank value uses the default
+    /// namespace, like [`Self::claude_dir`]. Holds the store
     /// ([`crate::store::default_root`]).
-    pub fn history_cache_base_dir(&self) -> Option<PathBuf> {
+    pub fn cache_base_dir(&self) -> Option<PathBuf> {
         let base = self.cache_root()?;
         if let Some(config_dir) = self.claude_config_override() {
             // Upstream hashed the `String` value of CLAUDE_CONFIG_DIR; hashing
@@ -271,28 +274,21 @@ impl HistoryEnv {
         }
     }
 
-    /// Directory of the per-project Claude history caches
-    /// (`<history cache base dir>/projects`). Namespaced by
-    /// `CLAUDE_CONFIG_DIR` exactly like upstream (`config-{hash}/projects`).
-    pub fn history_cache_dir(&self) -> Option<PathBuf> {
-        self.history_cache_base_dir()
-            .map(|base| base.join("projects"))
+    /// The installed CLI's cache root (`<home>/.cache/claude-history`),
+    /// which this crate never deletes from, even when [`Self::cache_root`]
+    /// was pointed into it.
+    pub fn cli_cache_root(&self) -> Option<PathBuf> {
+        self.home_dir
+            .as_ref()
+            .map(|home| home.join(".cache").join(CLI_CACHE_DIR_NAME))
     }
 
-    /// Cache file of a Pi/OMP session root:
-    /// `<cache root>/<source>/root-{hash}/sessions.bin`.
-    pub fn source_cache_path(&self, root: &Path, source: &str) -> Option<PathBuf> {
-        use std::hash::{Hash, Hasher};
-
-        let resolved = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        resolved.hash(&mut hasher);
-        Some(
-            self.cache_root()?
-                .join(source)
-                .join(format!("root-{:016x}", hasher.finish()))
-                .join("sessions.bin"),
-        )
+    /// Whether `path` lies in the installed CLI's cache root
+    /// ([`Self::cli_cache_root`]), as written or once both are
+    /// canonicalized (a link into it).
+    pub fn is_in_cli_cache(&self, path: &Path) -> bool {
+        self.cli_cache_root()
+            .is_some_and(|cli_root| is_within(path, &cli_root))
     }
 
     /// Semantic cache directory (`<cache root>/semantic`): holds the
@@ -566,6 +562,16 @@ fn uppercase_drive_letter(path: &Path) -> PathBuf {
     }
 }
 
+/// Whether `path` is `dir` or lies inside it, as written or once both are
+/// canonicalized.
+pub fn is_within(path: &Path, dir: &Path) -> bool {
+    path.starts_with(dir)
+        || matches!(
+            (path.canonicalize(), dir.canonicalize()),
+            (Ok(path), Ok(dir)) if path.starts_with(&dir)
+        )
+}
+
 /// `X:\` or `X:/` at the start of the string.
 fn has_drive_prefix(text: &str) -> bool {
     let bytes = text.as_bytes();
@@ -593,10 +599,8 @@ mod tests {
             env.claude_dir().unwrap(),
             env.claude_projects_root().unwrap(),
             env.cache_root().unwrap(),
-            env.history_cache_base_dir().unwrap(),
-            env.history_cache_dir().unwrap(),
+            env.cache_base_dir().unwrap(),
             crate::store::default_root(&env).unwrap(),
-            env.source_cache_path(root.path(), "pi").unwrap(),
             env.semantic_cache_dir().unwrap(),
             env.embedding_cache_file().unwrap(),
             env.semantic_model_dir().unwrap(),
@@ -626,8 +630,12 @@ mod tests {
         );
         let cache = home.join(".cache").join("claude-history-gui");
         assert_eq!(env.cache_root().unwrap(), cache);
-        assert_eq!(env.history_cache_base_dir().unwrap(), cache);
-        assert_eq!(env.history_cache_dir().unwrap(), cache.join("projects"));
+        assert_eq!(env.cache_base_dir().unwrap(), cache);
+        assert_eq!(
+            env.cli_cache_root().unwrap(),
+            home.join(".cache").join("claude-history")
+        );
+        assert!(!env.is_in_cli_cache(&cache));
         let store = crate::store::default_root(&env).unwrap();
         assert_eq!(store.parent().unwrap(), cache.join("v3"));
         assert!(
@@ -685,12 +693,12 @@ mod tests {
         assert_eq!(env.config_file().unwrap(), PathBuf::from("c.toml"));
         assert_eq!(env.gui_config_file().unwrap(), PathBuf::from("g.toml"));
         assert_eq!(env.debug_log_file().unwrap(), PathBuf::from("d.log"));
-        // CLAUDE_CONFIG_DIR namespaces the history cache like upstream.
-        let history = env.history_cache_dir().unwrap();
-        assert!(history.starts_with("cache"));
-        assert!(history.ends_with("projects"));
-        let namespace = history
+        // CLAUDE_CONFIG_DIR namespaces the store like upstream.
+        let store = crate::store::default_root(&env).unwrap();
+        assert!(store.starts_with("cache"));
+        let namespace = store
             .parent()
+            .and_then(Path::parent)
             .and_then(Path::file_name)
             .and_then(|name| name.to_str())
             .unwrap();
@@ -719,7 +727,7 @@ mod tests {
                 env.claude_projects_root().unwrap(),
                 home.path().join(".claude").join("projects")
             );
-            assert_eq!(env.history_cache_dir(), default.history_cache_dir());
+            assert_eq!(env.cache_base_dir(), default.cache_base_dir());
         }
         for relative in ["rel", ".claude-work", "."] {
             let env = HistoryEnv::sandbox(home.path()).with_claude_config_dir(relative);
@@ -764,12 +772,8 @@ mod tests {
             ..HistoryEnv::default()
         };
         assert_eq!(
-            env.history_cache_base_dir().unwrap(),
+            env.cache_base_dir().unwrap(),
             PathBuf::from("cache").join(&expected)
-        );
-        assert_eq!(
-            env.history_cache_dir().unwrap(),
-            PathBuf::from("cache").join(&expected).join("projects")
         );
         assert_eq!(
             crate::store::default_root(&env).unwrap().parent().unwrap(),

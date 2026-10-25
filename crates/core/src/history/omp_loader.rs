@@ -184,13 +184,10 @@ pub(super) fn stream_omp_conversations(
     let root = session_root(env)?;
     let files = discover_files(&root)?;
     super::session_loader::load(
-        &root.path,
         files,
         Source::Omp,
         show_last,
         debug_level,
-        super::cache::read_omp_cache(env, &root.path),
-        |entries| super::cache::write_omp_cache(env, &root.path, entries),
         |path, modified| {
             let root_is_omp_owned = root
                 .path

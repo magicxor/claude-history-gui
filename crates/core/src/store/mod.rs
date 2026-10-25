@@ -9,7 +9,7 @@
 //! # Differences from upstream
 //!
 //! * **Root (hermetic).** [`default_root`] takes the [`HistoryEnv`] and
-//!   derives `v3/roots-<hash>/` from [`HistoryEnv::history_cache_base_dir`]
+//!   derives `v3/roots-<hash>/` from [`HistoryEnv::cache_base_dir`]
 //!   (the fork's own cache root, `~/.cache/claude-history-gui`, namespaced by
 //!   `CLAUDE_CONFIG_DIR` like upstream) and the Pi/OMP session roots resolved
 //!   from the same env (the Pi root also follows the workspace's
@@ -63,6 +63,10 @@
 //!   every [`generation::LOCK_WAIT_POLL`]) and the card reads up once a flag
 //!   is set. Each pass's outcome goes to the debug sink at the caller's
 //!   level (upstream used the level only when it parsed the files instead).
+//! * **Old caches.** [`legacy`] cleans the GUI's own cache dir, where fork
+//!   releases wrote the same per-project and Pi/OMP caches as upstream; a
+//!   pass never cleans a cache dir inside the installed CLI's
+//!   ([`reconcile::Sources::cli_cache`]), and a pass given up skips it.
 //!
 //! The format, the publish protocol and the collection rules are upstream's.
 //! On Windows (NTFS) `std::fs` removes and renames over files that another
@@ -81,6 +85,7 @@
 
 pub mod card;
 pub mod generation;
+pub mod legacy;
 pub mod lexindex;
 pub mod reconcile;
 pub mod search;
@@ -101,7 +106,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 /// Store root: `v3/roots-<hash>/` beside the other caches. The cache dir is
-/// namespaced by `CLAUDE_CONFIG_DIR` ([`HistoryEnv::history_cache_base_dir`]),
+/// namespaced by `CLAUDE_CONFIG_DIR` ([`HistoryEnv::cache_base_dir`]),
 /// and the hash covers the Pi and OMP session roots resolved from `env`, so a
 /// snapshot is only read by runs that load the same sources. `None` without a
 /// cache root.
@@ -112,7 +117,7 @@ pub fn default_root(env: &HistoryEnv) -> Option<PathBuf> {
         pi.as_ref().map(|root| root.path.as_path()),
         omp.as_ref().map(|root| root.path.as_path()),
     );
-    env.history_cache_base_dir()
+    env.cache_base_dir()
         .map(|base| base.join("v3").join(namespace))
 }
 
@@ -966,16 +971,12 @@ mod tests {
             "loading waits while the lock is held"
         );
         cancel.store(true, Ordering::SeqCst);
+        // An error rather than the parsed session files: no fallback parse.
         let error = loading.join().unwrap().unwrap_err();
         assert!(
             matches!(&error, crate::error::AppError::Io(error)
                 if error.kind() == std::io::ErrorKind::Interrupted),
             "{error:?}"
-        );
-        let history_cache = env.history_cache_dir().unwrap();
-        assert!(
-            !history_cache.join("-tmp-work.bin").exists(),
-            "no fallback parse of the session files"
         );
 
         drop(lock);
@@ -1003,5 +1004,75 @@ mod tests {
                 .all(|conversation| !conversation.full_text.is_empty()),
             "parsed, not read from cards"
         );
+    }
+
+    /// Writes the caches fork releases before the store kept in `cache`:
+    /// one Claude project cache and one Pi session-root cache.
+    fn old_caches(cache: &Path) -> [PathBuf; 2] {
+        let project = cache.join("projects").join("-tmp-work.bin");
+        let pi = cache
+            .join("pi")
+            .join("root-0123456789abcdef")
+            .join("sessions.bin");
+        for (path, magic) in [(&project, b"CLHIST01"), (&pi, b"PIHIST01")] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, magic).unwrap();
+        }
+        [project, pi]
+    }
+
+    /// Fork (upstream 75df2d4 tests `legacy` alone): a pass over the env's
+    /// store root that publishes removes the old caches of its cache dir,
+    /// and a pass that publishes nothing leaves them.
+    #[test]
+    fn a_publishing_pass_removes_the_old_caches_of_its_cache_dir() {
+        let home = tempfile::tempdir().unwrap();
+        let env = sessions_with_a_parse_error(home.path());
+        let cache = env.cache_root().unwrap();
+        let [project, pi] = old_caches(&cache);
+        let launch = cache.join("launch").join("resume-1.command");
+        fs::create_dir_all(launch.parent().unwrap()).unwrap();
+        fs::write(&launch, "x").unwrap();
+        let root = default_root(&env).unwrap();
+        let sources = reconcile::Sources::from_env(&env);
+
+        let outcome = reconcile::reconcile(&root, &sources).unwrap();
+        assert!(outcome.published > 0, "{outcome:?}");
+        assert_eq!(
+            outcome.removed,
+            legacy::Removed {
+                files: 2,
+                bytes: 16,
+                dirs: 3
+            }
+        );
+        assert!(!project.exists() && !pi.exists());
+        assert!(!cache.join("projects").exists() && !cache.join("pi").exists());
+        assert!(launch.exists(), "the launcher's scripts stay");
+        assert!(root.join("CURRENT").is_file());
+
+        let [project, pi] = old_caches(&cache);
+        let outcome = reconcile::reconcile(&root, &sources).unwrap();
+        assert_eq!(outcome.published, 0, "{outcome:?}");
+        assert_eq!(outcome.removed, legacy::Removed::default());
+        assert!(project.exists() && pi.exists());
+    }
+
+    /// Fork: a pass never removes old caches from the installed CLI's cache
+    /// dir, even when the env's cache root points there.
+    #[test]
+    fn a_pass_keeps_the_old_caches_of_the_cli_cache_dir() {
+        let home = tempfile::tempdir().unwrap();
+        let cli_cache = home.path().join(".cache").join("claude-history");
+        let env = sessions_with_a_parse_error(home.path()).with_cache_root(&cli_cache);
+        assert_eq!(env.cli_cache_root().unwrap(), cli_cache);
+        let [project, pi] = old_caches(&cli_cache);
+        let root = default_root(&env).unwrap();
+        assert_eq!(legacy::cache_dir_of(&root), Some(cli_cache.as_path()));
+
+        let outcome = reconcile::reconcile(&root, &reconcile::Sources::from_env(&env)).unwrap();
+        assert!(outcome.published > 0, "{outcome:?}");
+        assert_eq!(outcome.removed, legacy::Removed::default());
+        assert!(project.exists() && pi.exists());
     }
 }
