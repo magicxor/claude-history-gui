@@ -64,6 +64,25 @@ fn mixed_sources_are_identified_and_pi_local_filter_uses_header_cwd() {
     assert_eq!(filtered, vec![1]);
 }
 
+#[cfg(windows)]
+#[test]
+fn workspace_scope_ignores_path_case_for_pi_rows_on_windows() {
+    let sandbox = Sandbox::new();
+    let workspace_dir = sandbox.path().join("workspace");
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+    let mut pi = conversation(Some("project"), "ignored", "pi-id", "pi");
+    pi.source = crate::history::model::SourceKind::Pi;
+    pi.project_path = Some(PathBuf::from(
+        workspace_dir.display().to_string().to_uppercase(),
+    ));
+    pi.path = PathBuf::from("/tmp/flat-pi-sessions/session.jsonl");
+
+    let mut app = app(&sandbox, vec![pi], vec![]);
+    app.workspace_filter = true;
+    app.workspace = Some(WorkspaceScope::new(&workspace_dir).unwrap());
+    assert_eq!(app.filter_indices(0..app.conversations.len()), vec![0]);
+}
+
 #[test]
 fn workspace_scope_matches_claude_rows_whatever_the_workspace_spelling() {
     // A trailing separator or `.` component used to be encoded verbatim

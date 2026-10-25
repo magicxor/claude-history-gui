@@ -323,7 +323,9 @@ impl<'a> ScopeFilter<'a> {
                 .project_path
                 .as_ref()
                 .or(conversation.cwd.as_ref())
-                .is_some_and(|path| comparable_canonical(path) == *current);
+                .is_some_and(|path| {
+                    crate::history::path::same_path(&comparable_canonical(path), current)
+                });
         }
         conversation
             .path
@@ -381,8 +383,12 @@ impl<'a> CardScope<'a> {
         };
         if project.key_is_path {
             !project.workspace_key.is_empty()
-                && self.workspace_dir.as_deref()
-                    == Some(comparable_dir(Path::new(project.workspace_key)).as_path())
+                && self.workspace_dir.as_deref().is_some_and(|dir| {
+                    crate::history::path::same_path(
+                        dir,
+                        &comparable_dir(Path::new(project.workspace_key)),
+                    )
+                })
         } else {
             crate::history::path::is_same_project(
                 project.workspace_key,
@@ -882,6 +888,16 @@ mod tests {
         assert!(
             scoped.project_visible(&project(Some("app"), r"\\?\C:\no-such-dir\app", true)),
             "W1: the writer's canonical spelling matches"
+        );
+        #[cfg(windows)]
+        assert!(
+            scoped.project_visible(&project(Some("app"), r"C:\No-Such-Dir\APP", true)),
+            "a path-keyed project that differs only in case"
+        );
+        #[cfg(not(windows))]
+        assert!(
+            !scoped.project_visible(&project(Some("app"), "/No-Such-Dir/APP", true)),
+            "paths are case sensitive off Windows"
         );
     }
 

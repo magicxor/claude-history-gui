@@ -4,6 +4,8 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 ## Unreleased
 
+- On Windows the Workspace scope, Deep search local scope and `exclude_paths` ignore letter case in project paths, so
+  `C:\Users\Foo\myproject` finds sessions recorded under `MyProject`.
 - Deep search lists conversations in the same order as the list search and no longer drops conversations that match
   only through their title, summary or project, or whose words are spread over several messages; such a
   conversation shows one hit at its first message. Queries with Chinese characters (also kanji) match anywhere in a message,

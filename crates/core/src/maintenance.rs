@@ -974,7 +974,12 @@ pub fn conversation_in_workspace(conversation: &Conversation, workspace: &Worksp
             .project_path
             .as_ref()
             .or(conversation.cwd.as_ref())
-            .is_some_and(|path| path.canonicalize().unwrap_or_else(|_| path.clone()) == current);
+            .is_some_and(|path| {
+                crate::history::path::same_path(
+                    &path.canonicalize().unwrap_or_else(|_| path.clone()),
+                    &current,
+                )
+            });
     }
     conversation
         .path

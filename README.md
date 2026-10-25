@@ -52,7 +52,7 @@ All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-h
   footer says `you only: not in semantic`). The query and selection stay when you toggle it. In Deep search,
   **Only my messages** (`agent search --user-only`) does the same; its semantic and hybrid modes search lexically
   instead.
-* Scope **All** or **Workspace** (project folder), a workspace picker with recent folders, a time filter
+* Scope **All** or **Workspace** (project folder; on Windows the match ignores letter case, so `C:\Users\Foo\myproject` also finds `C:\Users\Foo\MyProject`), a workspace picker with recent folders, a time filter
   (`--since`/`--before` grammar such as `2d`, `1d6h`, `6mo`, `2026-07-20`), excluded projects and working
   directories.
 * Paste a session UUID to jump to that conversation. Preview shows the first or last messages.
@@ -348,7 +348,8 @@ is not remembered. An invalid file shows a dialog naming it (Quit / Continue wit
 
 `[tui] exclude_projects` hides exact project names from the list, its searches and Deep search (`agent search`) (`repo` also hides `repo/<worktree>`).
 `[tui] exclude_paths` hides the conversations whose recorded working directory starts with a listed prefix, from the
-list, its searches and Deep search (`agent search`), for every source. Matching is literal and case-sensitive: `/tmp/`
+list, its searches and Deep search (`agent search`), for every source. Matching is literal and case-sensitive (case-insensitive on
+Windows, where paths differing only in case are the same directory): `/tmp/`
 matches `/tmp/eval-123` but not `/tmp` or `/tmp-other`; nothing is resolved or expanded (`~`, variables, globs), empty
 entries are ignored, and a conversation without a recorded working directory stays listed. On Windows write the prefix
 as Claude Code records it, in a TOML literal string: `exclude_paths = ['C:\Users\me\AppData\Local\Temp\']`. Excluded

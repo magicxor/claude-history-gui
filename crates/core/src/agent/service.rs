@@ -896,7 +896,10 @@ pub fn discover_agent_keys(
                     .cwd
                     .canonicalize()
                     .unwrap_or_else(|_| header.cwd.clone());
-                if current.as_ref() != Some(&cwd) {
+                if !current
+                    .as_ref()
+                    .is_some_and(|current| history::path::same_path(current, &cwd))
+                {
                     continue;
                 }
             }
@@ -938,7 +941,10 @@ pub fn discover_agent_keys(
                     .cwd
                     .canonicalize()
                     .unwrap_or_else(|_| header.cwd.clone());
-                if current.as_ref() != Some(&cwd) {
+                if !current
+                    .as_ref()
+                    .is_some_and(|current| history::path::same_path(current, &cwd))
+                {
                     continue;
                 }
             }

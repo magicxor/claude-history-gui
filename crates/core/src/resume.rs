@@ -122,11 +122,12 @@ pub fn resolve_claude_resume_action(
     let cwd_projects_dir = env.claude_projects_dir_for(cwd)?;
     let project_dir = project_path.filter(|p| p.exists() && p.is_dir());
 
-    if project_dir.is_none() || (fork_session && cwd_projects_dir != conv_projects_dir) {
+    let same_projects_dir = |dir: &Path| crate::history::path::same_path(dir, conv_projects_dir);
+    if project_dir.is_none() || (fork_session && !same_projects_dir(&cwd_projects_dir)) {
         return Ok(ClaudeResumeAction::CopyToCurrent { cwd_projects_dir });
     }
 
-    if cwd_projects_dir == conv_projects_dir {
+    if same_projects_dir(&cwd_projects_dir) {
         return Ok(ClaudeResumeAction::Run {
             current_dir: cwd.to_path_buf(),
         });
@@ -134,7 +135,7 @@ pub fn resolve_claude_resume_action(
 
     let project_dir = project_dir.unwrap();
     let project_projects_dir = env.claude_projects_dir_for(project_dir)?;
-    if project_projects_dir == conv_projects_dir {
+    if same_projects_dir(&project_projects_dir) {
         Ok(ClaudeResumeAction::Run {
             current_dir: project_dir.clone(),
         })
@@ -759,7 +760,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 /// Whether two directory paths name the same directory: equal as given, or
 /// equal once canonicalized (both must exist for the latter).
 fn same_dir(left: &Path, right: &Path) -> bool {
-    left == right || same_file(left, right)
+    crate::history::path::same_path(left, right) || same_file(left, right)
 }
 
 /// Whether two existing paths resolve to the same file system object.
@@ -872,6 +873,26 @@ mod tests {
 
     // --- Upstream tests (`sources/claude.rs`, before 9799550
     // `main.rs:1716-1785`), with a sandbox env. ---
+
+    #[cfg(windows)]
+    #[test]
+    fn claude_resume_ignores_case_only_projects_dir_mismatch() {
+        let sandbox = Sandbox::new();
+        let cwd = sandbox.dir("cwd");
+        let selected_path = sandbox
+            .env
+            .claude_projects_dir_for(&cwd)
+            .unwrap()
+            .join(format!("{UUID}.jsonl"));
+        let upper = PathBuf::from(cwd.to_string_lossy().to_uppercase());
+        let action =
+            resolve_claude_resume_action(&sandbox.env, &selected_path, Some(&cwd), &upper, false)
+                .unwrap();
+        assert!(
+            matches!(action, ClaudeResumeAction::Run { .. }),
+            "{action:?}"
+        );
+    }
 
     #[test]
     fn resume_action_uses_cwd_when_it_maps_to_selected_project_dir() {

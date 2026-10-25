@@ -493,15 +493,7 @@ impl OpenTargets {
 
 /// Path equality used for deletions (exact, then case-insensitive on Windows).
 pub fn same_path(a: &Path, b: &Path) -> bool {
-    if a == b {
-        return true;
-    }
-    if cfg!(windows) {
-        let a = a.to_string_lossy().replace('/', "\\").to_lowercase();
-        let b = b.to_string_lossy().replace('/', "\\").to_lowercase();
-        return a == b;
-    }
-    false
+    a == b || claude_history_core::history::path::same_path(a, b)
 }
 
 // ---------------------------------------------------------------------------
