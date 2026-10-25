@@ -593,7 +593,7 @@ impl ListPane {
     pub fn recorded_agent_cwds(&self) -> Vec<PathBuf> {
         let mut cwds: Vec<PathBuf> = Vec::new();
         for conversation in self.browser.conversations() {
-            if conversation.source == claude_history_core::history::Source::Claude
+            if conversation.source == claude_history_core::history::model::SourceKind::Claude
                 || conversation.provenance.hidden_by_default()
             {
                 continue;

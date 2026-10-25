@@ -10,18 +10,21 @@
 //! - [`document`]: a semantic, layout-free [`ConversationDocument`] built by
 //!   the same rules (skipped entry kinds, templates and fixed block order,
 //!   summary-mode grouping, tool output ids, truncation and expansion,
-//!   subagent / agent-progress / Pi metadata handling, timing slots). A GUI
+//!   subagent / agent-progress / note handling, timing slots). A GUI
 //!   renders it natively (markdown, collapsible tool cards).
-//! - [`state`]: [`ViewerModel`] (cached parsed entries, preferences,
+//! - [`state`]: [`ViewerModel`] (the decoded transcript, preferences,
 //!   expanded outputs) and the view-state rules of upstream
 //!   `tui/app/view_state.rs`: in-view search, message navigation, re-render
 //!   anchoring and the Esc order.
 //!
 //! ## Typical flow (document renderer)
 //!
-//! 1. [`ViewerModel::open`] once; keep the [`ConversationDocument`] from
-//!    [`ViewerModel::document`] until preferences or the expanded set
-//!    change (it is rebuilt from the cached entries, not the file).
+//! 1. [`ViewerModel::open`] once, through the environment's
+//!    [`crate::history::service::HistoryService`]; keep the
+//!    [`ConversationDocument`] from [`ViewerModel::document`] until
+//!    preferences or the expanded set change (it is rebuilt from the
+//!    decoded transcript's entries, [`crate::history::view::entries`], not
+//!    the file).
 //! 2. A click on a block with a [`DocBlock::toggle_id`] calls
 //!    [`ViewerModel::toggle_expanded`]; a click inside a navigable message
 //!    calls [`MessageNav::focus`] with its
@@ -36,8 +39,9 @@
 //!    match's message. Esc goes through [`escape`].
 //! 5. Copy / export: [`ViewerModel::message_text`] (focused message),
 //!    [`crate::export::generate_export`] / [`crate::export::export_to_path`]
-//!    with [`ViewerModel::export_options`], and
-//!    [`ViewerModel::plain_display`] for the CLI `--plain` text.
+//!    of a transcript ([`open_conversation`]) with
+//!    [`ViewerModel::export_options`], and [`ViewerModel::plain_display`]
+//!    for the CLI `--plain` text.
 //!
 //! The ledger renderer uses the same model with [`ViewerModel::ledger`] and
 //! the line-based helpers ([`search_lines`], [`capture_anchor`] /
@@ -60,7 +64,8 @@ pub use ledger::{
     GUTTER_WIDTH, LineStyle, MessageRange, NAME_WIDTH, RenderOptions, RenderableEntry,
     RenderedConversation, RenderedLine, TIMESTAMP_WIDTH, TRUNCATED_BODY_LINES,
     TRUNCATED_RESULT_LINES, ToolDisplayMode, ToolOutputId, content_width_for_frame, fitted_name,
-    format_timestamp, parse_conversation_file, render_conversation, render_parsed_conversation,
+    format_timestamp, open_conversation, render_conversation, render_parsed_conversation,
+    renderable_entries,
 };
 pub use state::{
     DocSearchIndex, MessageNav, ScrollAnchor, SearchMatch, ViewEscape, ViewSearch, ViewSearchMode,

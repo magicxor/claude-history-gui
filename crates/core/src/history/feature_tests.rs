@@ -65,7 +65,7 @@ fn l008_the_project_loader_parses_every_file_and_writes_no_cache() {
     set_mtime(&listed, fixed);
     set_mtime(&empty, fixed);
 
-    let first = load_conversations(&project, true, None).unwrap();
+    let first = loader::load_conversations(&project, true, None).unwrap();
     assert_eq!(first.len(), 1);
     assert!(first[0].preview.contains("original question"));
 
@@ -78,7 +78,7 @@ fn l008_the_project_loader_parses_every_file_and_writes_no_cache() {
         ],
     );
     set_mtime(&listed, fixed);
-    let second = load_conversations(&project, true, None).unwrap();
+    let second = loader::load_conversations(&project, true, None).unwrap();
     assert_eq!(second.len(), 1);
     assert!(
         second[0].preview.contains("replaced question"),
@@ -312,7 +312,7 @@ fn x034_thinking_without_signature_drops_the_line_and_subagent_files_are_not_rea
         &[user("SUBAGENTFILE question", "2024-01-01T00:00:00Z")],
     );
 
-    let conversations = load_conversations(&project, true, None).unwrap();
+    let conversations = loader::load_conversations(&project, true, None).unwrap();
     assert_eq!(conversations.len(), 1, "agent-*.jsonl is not listed");
     let conversation = &conversations[0];
     assert!(!conversation.full_text.contains("DROPPEDLINE"));
@@ -343,6 +343,7 @@ fn x035_pi_and_omp_tool_errors_keep_the_error_prefix() {
         conversation.full_text
     );
     let viewer = crate::view::ViewerModel::open(
+        &service::HistoryService::default(),
         &fixture,
         crate::view::ViewPrefs {
             tool_display: crate::view::ToolDisplayMode::Full,

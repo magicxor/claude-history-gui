@@ -11,7 +11,8 @@
 //! corpus's pointers and row numbers.
 
 use crate::env::{WorkspaceScope, normalize_windows_path};
-use crate::history::{Conversation, Source};
+use crate::history::Conversation;
+use crate::history::model::SourceKind;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
@@ -211,20 +212,20 @@ impl KeyIndex {
 pub(super) struct SourceCounts([usize; 4]);
 
 impl SourceCounts {
-    fn slot(source: Source) -> usize {
+    fn slot(source: SourceKind) -> usize {
         match source {
-            Source::Claude => 0,
-            Source::Pi => 1,
-            Source::Omp => 2,
-            Source::Codex => 3,
+            SourceKind::Claude => 0,
+            SourceKind::Pi => 1,
+            SourceKind::Omp => 2,
+            SourceKind::Codex => 3,
         }
     }
 
-    fn add(&mut self, source: Source) {
+    fn add(&mut self, source: SourceKind) {
         self.0[Self::slot(source)] += 1;
     }
 
-    fn remove(&mut self, source: Source) {
+    fn remove(&mut self, source: SourceKind) {
         let count = &mut self.0[Self::slot(source)];
         *count = count.saturating_sub(1);
     }
@@ -287,7 +288,7 @@ impl<'a> ScopeFilter<'a> {
         let Some(workspace) = self.workspace else {
             return true;
         };
-        if conversation.source != Source::Claude {
+        if conversation.source != SourceKind::Claude {
             let current = self
                 .workspace_dir
                 .get_or_insert_with(|| comparable_dir(&workspace.canonical_dir()));
@@ -866,12 +867,12 @@ mod tests {
     fn source_counts_report_a_mix() {
         let mut counts = SourceCounts::default();
         assert!(!counts.mixed());
-        counts.add(Source::Claude);
-        counts.add(Source::Claude);
+        counts.add(SourceKind::Claude);
+        counts.add(SourceKind::Claude);
         assert!(!counts.mixed());
-        counts.add(Source::Pi);
+        counts.add(SourceKind::Pi);
         assert!(counts.mixed());
-        counts.remove(Source::Pi);
+        counts.remove(SourceKind::Pi);
         assert!(!counts.mixed());
     }
 }

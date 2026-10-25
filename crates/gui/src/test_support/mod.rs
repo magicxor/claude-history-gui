@@ -441,6 +441,13 @@ fn ensure_app(cx: &mut TestAppContext, world: &TestWorld, args: &[&str]) {
     cx.executor().allow_parking();
 }
 
+/// The transcript of the session file `path`, decoded as a loose file (core
+/// `history::sources::decode_path`): the input of an expected export.
+pub fn transcript(path: &Path) -> claude_history_core::history::model::Transcript {
+    claude_history_core::history::sources::decode_path(path, None, false)
+        .expect("the session decodes")
+}
+
 /// Initialise the test app on `world` with `args` and the list's store off:
 /// the window opened next loads the history in memory (tests of that path;
 /// `app::init_for_test` turns the store on).

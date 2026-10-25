@@ -152,7 +152,7 @@ impl Browser {
             .position_of_path(path)
             .map(|idx| (idx, self.conversations[idx].source))
             .ok_or(DeleteError::NoTarget)?;
-        let adapter = Registry::from_env(&self.env).for_source(source);
+        let adapter = Registry::from_env(&self.env).for_path(source, path);
         if !adapter.capabilities().delete {
             return Err(DeleteError::Unsupported(source));
         }

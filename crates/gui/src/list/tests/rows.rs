@@ -6,7 +6,7 @@ use std::sync::Arc;
 use chrono::{Duration, Local, TimeZone as _, Utc};
 use claude_history_core::browser::{Browser, BrowserOptions};
 use claude_history_core::display_format::{HighlightQuery, HighlightedText, Recency};
-use claude_history_core::history::load_all_conversations;
+use claude_history_core::store::load_in_memory;
 
 use crate::list::rows::{
     self, RowContext, RowModel, TitleKind, build_row_model, fit_text, format_row_time,
@@ -16,7 +16,7 @@ use crate::test_support::TestWorld;
 use crate::test_support::fixtures_list::SessionSpec;
 
 fn browser_of(world: &TestWorld) -> Browser {
-    let conversations = load_all_conversations(&world.env, true, None).expect("the corpus loads");
+    let conversations = load_in_memory(&world.env, true).expect("the corpus loads");
     Browser::new(
         conversations,
         BrowserOptions::new(Arc::new(world.env.clone())),

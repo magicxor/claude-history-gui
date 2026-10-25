@@ -355,7 +355,7 @@ fn resolved_test_conversation(
 
 fn stubbed_conversation(path: PathBuf, message_count: usize) -> history::Conversation {
     history::Conversation {
-        source: history::Source::Claude,
+        source: history::model::SourceKind::Claude,
         session_id: path
             .file_stem()
             .and_then(|name| name.to_str())
@@ -936,7 +936,7 @@ fn agent_semantic_candidates_require_canonical_transcript_projection() {
         reference: key.conversation_ref(),
     };
     let conversation = history::Conversation {
-        source: history::Source::Claude,
+        source: history::model::SourceKind::Claude,
         session_id: key.session_id.clone(),
         path: key.path.clone(),
         index: 0,

@@ -2,8 +2,7 @@
 //! `projects` root.
 //!
 //! Records are Claude's `LogEntry` wire format, which only this module
-//! decodes into events. Pi and OMP sessions are projected into the same
-//! records, so their adapters share the conversion (`Records`).
+//! decodes into events.
 
 use crate::claude::{AgentContent, ContentBlock, LogEntry, TokenUsage, UserContent};
 use crate::env::{HistoryEnv, WorkspaceScope};
@@ -64,6 +63,15 @@ impl Adapter for ClaudeAdapter {
         events: &mut dyn FnMut(Event),
     ) -> Result<Option<Transcript>> {
         super::decode_file(located, false, events)
+    }
+
+    /// Fork: checked at every read of the session file.
+    fn decode_cancellable(
+        &self,
+        located: &Located,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Transcript>> {
+        super::decode_file_collected(located, false, cancelled)
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -190,7 +198,11 @@ pub(crate) fn decode_reader(
         }
         if !line.trim().is_empty() {
             match serde_json::from_str::<LogEntry>(&line) {
-                Ok(entry) => events(records.push(entry, line_number(line_index))),
+                Ok(entry) => {
+                    if let Some(event) = records.push(entry, line_number(line_index)) {
+                        events(event);
+                    }
+                }
                 Err(error) => diagnostics.push(ParseError {
                     line_number: line_index + 1,
                     line_content: line.clone(),
@@ -308,21 +320,20 @@ impl<R: BufRead> Lines<R> {
 
 /// Converts Claude-format records into events, in order, collecting the
 /// session metadata they define: the first user record's cwd, the first
-/// assistant model unless a `Model` note names one, the first summary
-/// unless a generated title replaces it, the last custom title, and the
-/// latest user or assistant message time.
+/// assistant model, the first summary unless a generated title replaces
+/// it, and the last custom title. A file-history snapshot, which records
+/// file states for undo rather than the conversation, yields no event.
 #[derive(Default)]
 pub(crate) struct Records {
-    pub count: usize,
-    pub latest_activity: Option<DateTime<Utc>>,
-    pub cwd: Option<PathBuf>,
-    pub model: Option<String>,
-    pub summary: Option<String>,
-    pub custom_title: Option<String>,
+    count: usize,
+    cwd: Option<PathBuf>,
+    model: Option<String>,
+    summary: Option<String>,
+    custom_title: Option<String>,
 }
 
 impl Records {
-    pub fn push(&mut self, entry: LogEntry, origin: Origin) -> Event {
+    pub(crate) fn push(&mut self, entry: LogEntry, origin: Origin) -> Option<Event> {
         self.count += 1;
         let (timestamp, kind) = match entry {
             LogEntry::User {
@@ -393,43 +404,19 @@ impl Records {
                 self.custom_title = (!trimmed.is_empty()).then(|| trimmed.to_owned());
                 (None, title(TitleKind::Custom, custom_title))
             }
-            LogEntry::PiMetadata {
-                label,
-                text,
-                timestamp,
-                searchable,
-                usage,
-            } => {
-                if label == "Model" && !text.is_empty() {
-                    self.model = Some(text.clone());
-                }
-                (
-                    timestamp,
-                    EventKind::Note {
-                        label,
-                        text,
-                        searchable,
-                        usage: usage.map(usage_of),
-                    },
-                )
-            }
             LogEntry::Progress { data, .. } => (None, subagent(&data)),
-            LogEntry::FileHistorySnapshot { .. }
-            | LogEntry::System { .. }
+            LogEntry::FileHistorySnapshot { .. } => return None,
+            LogEntry::System { .. }
             | LogEntry::AgentName { .. }
             | LogEntry::PermissionMode { .. }
             | LogEntry::Unknown => (None, EventKind::Other),
         };
-        let timestamp = timestamp.as_deref().and_then(parse_timestamp);
-        if matches!(kind, EventKind::Message(_)) {
-            self.latest_activity = self.latest_activity.max(timestamp);
-        }
-        Event {
+        Some(Event {
             origin,
-            timestamp,
+            timestamp: timestamp.as_deref().and_then(parse_timestamp),
             visibility: Visibility::Dialogue,
             kind,
-        }
+        })
     }
 }
 

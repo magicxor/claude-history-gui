@@ -3,8 +3,9 @@
 //! GUI models itself).
 
 use crate::error::AppError;
+use crate::history::Provenance;
 use crate::history::actions::refusal;
-use crate::history::{Provenance, Source};
+use crate::history::model::SourceKind;
 use crate::search::mode::TuiSearchMode;
 use crate::search::query::ParsedQuery;
 use crate::semantic::types::{SemanticExplanation, SemanticScoreBreakdown};
@@ -180,7 +181,7 @@ pub enum RenameError {
     BecameEmpty,
     /// The adapter of the session's source cannot rename its conversations
     /// (upstream 9799550; the TUI's status message).
-    Unsupported(Source),
+    Unsupported(SourceKind),
     /// Writing or re-parsing the session failed.
     Failed(AppError),
 }
@@ -205,7 +206,7 @@ impl std::error::Error for RenameError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeletedSession {
     pub path: PathBuf,
-    pub source: Source,
+    pub source: SourceKind,
     /// Transcript files removed: every copy of a Claude session across
     /// projects (cross-project forks), else 1.
     pub files_removed: usize,
@@ -220,7 +221,7 @@ pub enum DeleteError {
     SingleFileMode,
     /// The adapter of the session's source cannot delete its conversations
     /// (upstream 9799550; the TUI's status message).
-    Unsupported(Source),
+    Unsupported(SourceKind),
     /// The files could not be removed (upstream only logged this).
     Failed { path: PathBuf, error: AppError },
 }
@@ -295,11 +296,11 @@ mod tests {
         );
         // Upstream 9799550's TUI status messages for refused actions.
         assert_eq!(
-            RenameError::Unsupported(Source::Omp).to_string(),
+            RenameError::Unsupported(SourceKind::Omp).to_string(),
             "Renaming OMP sessions is not supported"
         );
         assert_eq!(
-            DeleteError::Unsupported(Source::Pi).to_string(),
+            DeleteError::Unsupported(SourceKind::Pi).to_string(),
             "Deleting Pi sessions is not supported"
         );
         assert_eq!(

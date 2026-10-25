@@ -121,8 +121,10 @@ fn install_state(cx: &mut App, launch: LaunchContext, env: HistoryEnv) {
     crate::ops::resume::set_terminal_var(cx, launch.terminal_var.clone());
     let (view_defaults, list_mode) =
         workspace::startup::resolve_initial_view(&launch, &config, &settings, &ui);
+    let env = Arc::new(env);
     let mut state = AppState {
-        env: Arc::new(env),
+        history: crate::globals::EnvHistory::new(env.clone()),
+        env,
         config,
         config_errors,
         launch,

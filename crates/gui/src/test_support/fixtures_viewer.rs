@@ -6,7 +6,7 @@
 //!
 //! * JSONL line builders for every block kind the viewer renders (user,
 //!   assistant text, thinking, tool calls and results, subagent entries,
-//!   agent progress, Pi metadata);
+//!   agent progress) and Pi sessions with a searchable note;
 //! * [`write_transcript`] / [`items_for`]: pure item builds (P tests);
 //! * [`open_viewer`] / [`open_main_viewer`]: a viewer in a real test window,
 //!   [`wait_viewer_ready`] waits for its build, [`draw`] renders a frame.
@@ -133,13 +133,27 @@ pub fn agent_progress(agent_id: &str, text: &str) -> String {
     )
 }
 
-/// A searchable Pi metadata record.
-pub fn pi_metadata(label: &str, text: &str) -> String {
-    format!(
-        r#"{{"type":"pi-metadata","label":"{label}","text":{},"timestamp":"{}"}}"#,
-        json(text),
-        stamp(3)
-    )
+/// The lines of a Pi session: the user's `question`, then a searchable
+/// note (a displayed custom message) with `label` and `text`. Notes are Pi,
+/// OMP and Codex records (upstream 9597669 removed Claude's `pi-metadata`
+/// projection).
+pub fn pi_note_session(question: &str, label: &str, text: &str) -> Vec<String> {
+    vec![
+        format!(
+            r#"{{"type":"session","version":3,"id":"fixture","timestamp":"{}","cwd":"/tmp/fixture"}}"#,
+            stamp(0)
+        ),
+        format!(
+            r#"{{"type":"message","id":"u1","parentId":null,"timestamp":"{}","message":{{"role":"user","content":{}}}}}"#,
+            stamp(1),
+            json(question)
+        ),
+        format!(
+            r#"{{"type":"custom_message","id":"n1","parentId":"u1","timestamp":"{}","customType":"{label}","content":{},"display":true}}"#,
+            stamp(3),
+            json(text)
+        ),
+    ]
 }
 
 /// A skill-expansion user message.
@@ -178,7 +192,12 @@ pub fn prefs(tool_display: ToolDisplayMode, thinking: bool, timing: bool) -> Vie
 pub fn model_for(lines: &[String], prefs: ViewPrefs) -> (tempfile::TempDir, ViewerModel) {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = write_transcript(dir.path(), "fixture.jsonl", lines);
-    let model = ViewerModel::open(&path, prefs).expect("the fixture parses");
+    let model = ViewerModel::open(
+        &claude_history_core::history::service::HistoryService::default(),
+        &path,
+        prefs,
+    )
+    .expect("the fixture parses");
     (dir, model)
 }
 

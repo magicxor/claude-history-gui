@@ -432,7 +432,12 @@ pub fn run_render(
         show_tools: settings.show_tools,
         show_thinking: settings.show_thinking,
     };
-    match generate_export(&file, ExportFormat::Ledger, options) {
+    // `--render` decodes the file through the environment's instances, as
+    // upstream's `display::render_to_terminal` does through its service.
+    let history = claude_history_core::history::service::HistoryService::from_env(&env);
+    let rendered = claude_history_core::view::open_conversation(&history, &file)
+        .and_then(|transcript| generate_export(&transcript, ExportFormat::Ledger, options));
+    match rendered {
         Ok(text) => match out.write_stdout(&text) {
             Ok(()) => EXIT_OK,
             Err(error) => {

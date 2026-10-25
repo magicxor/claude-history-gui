@@ -5,6 +5,8 @@
 //!   workspace, view defaults, persisted UI state. Read with [`app_state`],
 //!   change with [`update_app_state`] (bumps `revision`; views observe the
 //!   global and re-read).
+//! * [`EnvHistory`]: the environment's history service, through which the
+//!   viewer, exports, prints and tools open conversations ([`env_history`]).
 //! * [`DebugBuffer`]: the ring of debug-sink lines shown by Tools → Debug log.
 //! * [`MainPanes`], [`ActivePane`]: the main window's panes and the region
 //!   that last had focus per window (menu/palette fallback, §7.8).
@@ -21,7 +23,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Local};
@@ -30,6 +32,7 @@ use claude_history_core::WorkspaceScope;
 use claude_history_core::browser::ListSearchMode;
 use claude_history_core::config::LayeredConfig;
 use claude_history_core::debug::DebugLevel;
+use claude_history_core::history::service::HistoryService;
 use claude_history_core::settings::EffectiveSettings;
 use claude_history_core::view::ViewPrefs;
 use gpui_kit::{
@@ -52,6 +55,8 @@ use crate::viewer::ViewerPane;
 pub struct AppState {
     /// The environment; `workspace_dir` is kept in sync with `workspace`.
     pub env: Arc<HistoryEnv>,
+    /// The history service of `env`, replaced with it.
+    pub history: EnvHistory,
     /// Effective configuration = gui.toml over config.toml (a failing file
     /// contributes defaults).
     pub config: LayeredConfig,
@@ -89,6 +94,8 @@ impl AppState {
         let mut env = (*self.env).clone();
         env.workspace_dir = workspace.as_ref().map(|w| w.dir().to_path_buf());
         self.env = Arc::new(env);
+        // The Pi session root may follow the workspace's settings.
+        self.history = EnvHistory::new(self.env.clone());
         self.workspace = workspace;
     }
 
@@ -242,6 +249,51 @@ impl Global for DebugBufferHandle {}
 /// The debug buffer (panics before `app::init`).
 pub fn debug_buffer(cx: &App) -> Arc<DebugBuffer> {
     cx.global::<DebugBufferHandle>().0.clone()
+}
+
+// ---------------------------------------------------------------------------
+// History service
+// ---------------------------------------------------------------------------
+
+/// The history service of an environment (core `HistoryService::from_env`):
+/// the viewer, exports, prints and tools open conversations through it, so a
+/// conversation decodes through the adapter of the instance whose root holds
+/// it (a Codex rollout with the environment's state database) and the
+/// transcripts opened last are reused (upstream 9597669 keeps one such
+/// service for the whole process; here [`AppState`] holds one per
+/// environment). The service is built on first use, by the background task
+/// that needs it: resolving the Pi and OMP roots reads their settings files.
+#[derive(Clone, Default)]
+pub struct EnvHistory {
+    env: Option<Arc<HistoryEnv>>,
+    service: Arc<OnceLock<HistoryService>>,
+}
+
+impl EnvHistory {
+    pub fn new(env: Arc<HistoryEnv>) -> Self {
+        Self {
+            env: Some(env),
+            service: Arc::default(),
+        }
+    }
+
+    /// The service, built on first use (off the UI thread); without an
+    /// environment, one without instances, which opens every path as a
+    /// loose session file.
+    pub fn service(&self) -> &HistoryService {
+        self.service.get_or_init(|| match &self.env {
+            Some(env) => HistoryService::from_env(env),
+            None => HistoryService::default(),
+        })
+    }
+}
+
+/// The app's [`EnvHistory`]; before `app::init` (a lone pane in a test) one
+/// without an environment.
+pub fn env_history(cx: &App) -> EnvHistory {
+    cx.try_global::<AppState>()
+        .map(|state| state.history.clone())
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------

@@ -420,7 +420,7 @@ mod pure {
     fn v013_v014_label_lane_is_nine_cells_and_fits_names() {
         assert_eq!(items::LABEL_LANE_CELLS, 9);
         let items = items_for(
-            &[user("q"), pi_metadata("Branch summary", "summary text")],
+            &pi_note_session("q", "Branch summary", "summary text"),
             prefs(ToolDisplayMode::Hidden, false, false),
             80,
         );
@@ -434,9 +434,9 @@ mod pure {
     }
 
     #[test]
-    fn v022_pi_metadata_renders_dimmed_with_its_label() {
+    fn v022_notes_render_dimmed_with_their_label() {
         let items = items_for(
-            &[user("q"), pi_metadata("notice", "custom note")],
+            &pi_note_session("q", "notice", "custom note"),
             prefs(ToolDisplayMode::Hidden, false, false),
             80,
         );
@@ -452,7 +452,7 @@ mod pure {
                 .iter()
                 .all(|(_, s)| s.contains(Style::DIMMED))
         );
-        assert_eq!(meta.nav_position, None, "Pi metadata is not navigable");
+        assert_eq!(meta.nav_position, None, "a note is not navigable");
     }
 
     #[test]
@@ -1269,9 +1269,13 @@ mod gui {
         std::fs::create_dir_all(&dir).unwrap();
         let viewer = open_in_main(cx, handle, &ws, &dir, true);
         let expected = failed_to_open(
-            &claude_history_core::view::ViewerModel::open(&dir, Default::default())
-                .unwrap_err()
-                .to_string(),
+            &claude_history_core::view::ViewerModel::open(
+                &claude_history_core::history::service::HistoryService::default(),
+                &dir,
+                Default::default(),
+            )
+            .unwrap_err()
+            .to_string(),
         );
         assert_eq!(read(cx, &viewer, |v| v.failure()), Some(expected.clone()));
         assert_eq!(cx.read(last_toast).as_ref(), expected);

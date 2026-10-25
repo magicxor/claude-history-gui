@@ -74,8 +74,9 @@ use crate::config::GuiSettings;
 use crate::env::{HistoryEnv, WorkspaceScope};
 use crate::error::{AppError, Result};
 use crate::history::actions::{self, Target};
+use crate::history::model::SourceKind;
 use crate::history::sources::Registry;
-use crate::history::{Conversation, Provenance, Source};
+use crate::history::{Conversation, Provenance};
 use crate::program::ResolvedProgram;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -198,23 +199,23 @@ impl ProgramOverrides {
         }
     }
 
-    pub fn for_source(&self, source: Source) -> Option<&Path> {
+    pub fn for_source(&self, source: SourceKind) -> Option<&Path> {
         match source {
-            Source::Claude => self.claude.as_deref(),
-            Source::Pi => self.pi.as_deref(),
-            Source::Omp => self.omp.as_deref(),
-            Source::Codex => self.codex.as_deref(),
+            SourceKind::Claude => self.claude.as_deref(),
+            SourceKind::Pi => self.pi.as_deref(),
+            SourceKind::Omp => self.omp.as_deref(),
+            SourceKind::Codex => self.codex.as_deref(),
         }
     }
 }
 
 /// The program name each source resumes with.
-pub fn program_name(source: Source) -> &'static str {
+pub fn program_name(source: SourceKind) -> &'static str {
     match source {
-        Source::Claude => "claude",
-        Source::Pi => "pi",
-        Source::Omp => "omp",
-        Source::Codex => "codex",
+        SourceKind::Claude => "claude",
+        SourceKind::Pi => "pi",
+        SourceKind::Omp => "omp",
+        SourceKind::Codex => "codex",
     }
 }
 
@@ -236,7 +237,7 @@ pub fn resolve_program(
 /// [`Conversation`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResumeTarget {
-    pub source: Source,
+    pub source: SourceKind,
     pub path: PathBuf,
     pub project_path: Option<PathBuf>,
     /// An orphaned conversation cannot be resumed or forked (upstream
@@ -305,7 +306,7 @@ pub struct CopyReport {
 /// A resume or fork, ready to launch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResumePlan {
-    pub source: Source,
+    pub source: SourceKind,
     pub kind: ResumeKind,
     pub strategy: ResumeStrategy,
     /// The session transcript.
@@ -411,7 +412,7 @@ pub fn plan_resume_target(
             doing,
         )));
     }
-    let adapter = Registry::from_env(env).for_source(source);
+    let adapter = Registry::from_env(env).for_path(source, &target.path);
     adapter.resume(
         env,
         target.target(),
@@ -531,11 +532,11 @@ pub(crate) fn plan_claude(
     args.extend(default_args.iter().map(OsString::from));
 
     Ok(ResumePlan {
-        source: Source::Claude,
+        source: SourceKind::Claude,
         kind,
         strategy,
         session_path: target.path.to_path_buf(),
-        program: program_name(Source::Claude).to_string(),
+        program: program_name(SourceKind::Claude).to_string(),
         program_override: program_override.map(Path::to_path_buf),
         args,
         cwd: Some(cwd),
@@ -551,7 +552,7 @@ pub(crate) fn plan_claude(
 /// project directory; fork inherited upstream's cwd, which is the workspace
 /// here.
 pub(crate) fn plan_native(
-    source: Source,
+    source: SourceKind,
     target: Target<'_>,
     workspace: Option<&WorkspaceScope>,
     kind: ResumeKind,
@@ -559,7 +560,7 @@ pub(crate) fn plan_native(
 ) -> ResumePlan {
     let flag = match (source, kind) {
         (_, ResumeKind::Fork) => "--fork",
-        (Source::Omp, ResumeKind::Resume) => "--resume",
+        (SourceKind::Omp, ResumeKind::Resume) => "--resume",
         (_, ResumeKind::Resume) => "--session",
     };
     let mut warnings = Vec::new();
@@ -609,11 +610,11 @@ pub(crate) fn plan_codex(
     }));
     args.push(OsString::from(thread_id));
     Ok(ResumePlan {
-        source: Source::Codex,
+        source: SourceKind::Codex,
         kind,
         strategy: ResumeStrategy::Native,
         session_path: target.path.to_path_buf(),
-        program: program_name(Source::Codex).to_string(),
+        program: program_name(SourceKind::Codex).to_string(),
         program_override: program_override.map(Path::to_path_buf),
         args,
         cwd,
@@ -829,7 +830,7 @@ mod tests {
 
         fn target(&self, path: &Path, project: Option<&Path>) -> ResumeTarget {
             ResumeTarget {
-                source: Source::Claude,
+                source: SourceKind::Claude,
                 path: path.to_path_buf(),
                 project_path: project.map(Path::to_path_buf),
                 provenance: Provenance::default(),
@@ -959,7 +960,7 @@ mod tests {
             .join("pi sessions")
             .join("session.jsonl");
         let target = ResumeTarget {
-            source: Source::Pi,
+            source: SourceKind::Pi,
             path: path.clone(),
             project_path: Some(cwd.clone()),
             provenance: Provenance::default(),
@@ -997,7 +998,7 @@ mod tests {
             .join("omp sessions")
             .join("session.jsonl");
         let target = ResumeTarget {
-            source: Source::Omp,
+            source: SourceKind::Omp,
             path: path.clone(),
             project_path: Some(cwd.clone()),
             provenance: Provenance::default(),
@@ -1026,7 +1027,7 @@ mod tests {
         let workspace = sandbox.dir("workspace");
         let gone = sandbox.root.path().join("gone");
         let target = ResumeTarget {
-            source: Source::Pi,
+            source: SourceKind::Pi,
             path: sandbox.root.path().join("s.jsonl"),
             project_path: Some(gone.clone()),
             provenance: Provenance::default(),
@@ -1056,7 +1057,7 @@ mod tests {
         let project = sandbox.dir("project");
         let workspace = sandbox.dir("workspace");
         let target = ResumeTarget {
-            source: Source::Codex,
+            source: SourceKind::Codex,
             path: rollout.clone(),
             project_path: Some(project.clone()),
             provenance: Provenance::default(),
@@ -1430,7 +1431,7 @@ mod tests {
         let sandbox = Sandbox::new();
         let workspace = sandbox.dir("workspace");
         let root_only = ResumeTarget {
-            source: Source::Claude,
+            source: SourceKind::Claude,
             path: PathBuf::from("/"),
             project_path: None,
             provenance: Provenance::default(),
@@ -1589,7 +1590,7 @@ mod tests {
     #[test]
     fn display_command_quotes_arguments() {
         let plan = ResumePlan {
-            source: Source::Pi,
+            source: SourceKind::Pi,
             kind: ResumeKind::Resume,
             strategy: ResumeStrategy::Native,
             session_path: PathBuf::from("/tmp/pi sessions/s.jsonl"),
@@ -1609,7 +1610,7 @@ mod tests {
             "pi --session '/tmp/pi sessions/it'\\''s.jsonl'"
         );
         assert_eq!(
-            program_name(Source::Omp),
+            program_name(SourceKind::Omp),
             OsStr::new("omp").to_str().unwrap()
         );
     }

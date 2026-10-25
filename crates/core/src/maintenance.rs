@@ -24,8 +24,9 @@
 use crate::debug::DebugLevel;
 use crate::env::{HistoryEnv, WorkspaceScope};
 use crate::error::{AppError, Result};
+use crate::history::model::SourceKind;
 use crate::history::sources::{Registry, codex};
-use crate::history::{self, Conversation, ParseError, Source};
+use crate::history::{self, Conversation, ParseError};
 use crate::resume::terminal::{LaunchSpec, RunOutput, run_to_completion};
 use crate::search;
 use crate::search::literal::CaseMode;
@@ -435,7 +436,7 @@ pub fn delete_session_by_uuid(env: &HistoryEnv, uuid: &str) -> Result<DeleteByUu
 pub struct DeletePlan {
     /// The source of the conversation the plan was made for (addendum A2:
     /// never the live selection's).
-    pub source: Source,
+    pub source: SourceKind,
     /// The listed conversation the plan was made for: the path of the
     /// upstream debug-log line when the delete fails, whichever item failed.
     pub path: PathBuf,
@@ -506,9 +507,13 @@ impl From<Box<SessionDeleteFailure>> for AppError {
 ///
 /// A source whose adapter cannot delete (`Adapter::capabilities`, upstream
 /// 9799550) is refused with [`AppError::Unsupported`]. Nothing is removed.
-pub fn plan_session_delete(env: &HistoryEnv, path: &Path, source: Source) -> Result<DeletePlan> {
+pub fn plan_session_delete(
+    env: &HistoryEnv,
+    path: &Path,
+    source: SourceKind,
+) -> Result<DeletePlan> {
     if !Registry::from_env(env)
-        .for_source(source)
+        .for_path(source, path)
         .capabilities()
         .delete
     {
@@ -521,7 +526,7 @@ pub fn plan_session_delete(env: &HistoryEnv, path: &Path, source: Source) -> Res
     let not_found = || AppError::SessionNotFound(path.display().to_string());
     let is_jsonl = path.extension().and_then(|extension| extension.to_str()) == Some("jsonl");
     match source {
-        Source::Claude => {
+        SourceKind::Claude => {
             let session_id = path
                 .file_stem()
                 .and_then(|stem| stem.to_str())
@@ -539,11 +544,11 @@ pub fn plan_session_delete(env: &HistoryEnv, path: &Path, source: Source) -> Res
                 session_id,
             })
         }
-        Source::Pi => {
+        SourceKind::Pi => {
             if !is_jsonl || !history::pi::is_pi_file(path) {
                 return Err(not_found());
             }
-            let header = history::pi::parse_file(path)?.map(|projection| projection.header.id);
+            let header = history::pi::read_header(path, None)?.map(|(_, header)| header.id);
             Ok(DeletePlan {
                 source,
                 path: path.to_path_buf(),
@@ -552,11 +557,12 @@ pub fn plan_session_delete(env: &HistoryEnv, path: &Path, source: Source) -> Res
                 dirs: Vec::new(),
             })
         }
-        Source::Omp => {
+        SourceKind::Omp => {
             if !is_jsonl || !history::pi::is_omp_file(path) {
                 return Err(not_found());
             }
-            let header = history::pi::parse_omp_file(path)?.map(|projection| projection.header.id);
+            let header =
+                history::pi::read_header(path, Some(SourceKind::Omp))?.map(|(_, header)| header.id);
             Ok(DeletePlan {
                 source,
                 path: path.to_path_buf(),
@@ -568,7 +574,7 @@ pub fn plan_session_delete(env: &HistoryEnv, path: &Path, source: Source) -> Res
                     .collect(),
             })
         }
-        Source::Codex => {
+        SourceKind::Codex => {
             let thread = codex::discover::rollout_of(path, false)
                 .filter(|_| codex::discover::home_of(path).is_some())
                 .ok_or_else(not_found)?
@@ -648,7 +654,7 @@ pub fn execute_session_delete_with(
             partial: DeleteReport::default(),
         }));
     }
-    if plan.source == Source::Codex {
+    if plan.source == SourceKind::Codex {
         return execute_codex_delete(env, plan, codex_program, run);
     }
     let mut report = DeleteReport::default();
@@ -723,11 +729,11 @@ fn validate_delete_plan(env: &HistoryEnv, plan: &DeletePlan) -> Result<()> {
     let refuse = || Err(AppError::SessionNotFound(plan.session_id.clone()));
     let jsonl =
         |path: &PathBuf| path.extension().and_then(|extension| extension.to_str()) == Some("jsonl");
-    if plan.source != Source::Codex && !plan.files.iter().all(jsonl) {
+    if plan.source != SourceKind::Codex && !plan.files.iter().all(jsonl) {
         return refuse();
     }
     match plan.source {
-        Source::Claude => {
+        SourceKind::Claude => {
             validate_uuid(&plan.session_id)?;
             let id = std::ffi::OsStr::new(&plan.session_id);
             let root = env.claude_projects_root()?;
@@ -750,7 +756,7 @@ fn validate_delete_plan(env: &HistoryEnv, plan: &DeletePlan) -> Result<()> {
                 return refuse();
             }
         }
-        Source::Pi | Source::Omp => {
+        SourceKind::Pi | SourceKind::Omp => {
             let [file] = plan.files.as_slice() else {
                 return refuse();
             };
@@ -759,7 +765,7 @@ fn validate_delete_plan(env: &HistoryEnv, plan: &DeletePlan) -> Result<()> {
             }
             // A file deleted meanwhile is reported missing, not refused.
             let exists = std::fs::symlink_metadata(file).is_ok();
-            let dirs_ok = if plan.source == Source::Pi {
+            let dirs_ok = if plan.source == SourceKind::Pi {
                 if exists && !history::pi::is_pi_file(file) {
                     return refuse();
                 }
@@ -775,7 +781,7 @@ fn validate_delete_plan(env: &HistoryEnv, plan: &DeletePlan) -> Result<()> {
                 return refuse();
             }
         }
-        Source::Codex => {
+        SourceKind::Codex => {
             // `codex delete --force <id>` acts on the home of the listed
             // rollout: the id must be its thread's, and every planned file a
             // rollout of that thread in that home.
@@ -962,7 +968,7 @@ pub fn format_debug_age(age: chrono::Duration) -> String {
 /// `--debug-search --local` decided: Claude by worktree-aware project
 /// directory name, Pi/OMP by canonical working directory.
 pub fn conversation_in_workspace(conversation: &Conversation, workspace: &WorkspaceScope) -> bool {
-    if conversation.source != Source::Claude {
+    if conversation.source != SourceKind::Claude {
         let current = workspace.canonical_dir();
         return conversation
             .project_path
@@ -1605,9 +1611,9 @@ mod tests {
         std::fs::create_dir_all(first.join(uuid).join("subagents")).unwrap();
         let listed = second.join(format!("{uuid}.jsonl"));
 
-        let mut plan = plan_session_delete(&sandbox.env, &listed, Source::Claude).unwrap();
+        let mut plan = plan_session_delete(&sandbox.env, &listed, SourceKind::Claude).unwrap();
         plan.files.sort();
-        assert_eq!(plan.source, Source::Claude);
+        assert_eq!(plan.source, SourceKind::Claude);
         assert_eq!(plan.path, listed);
         assert_eq!(plan.session_id, uuid);
         assert_eq!(
@@ -1634,13 +1640,13 @@ mod tests {
         );
 
         assert!(matches!(
-            plan_session_delete(&sandbox.env, &listed, Source::Claude),
+            plan_session_delete(&sandbox.env, &listed, SourceKind::Claude),
             Err(AppError::SessionNotFound(_))
         ));
         for invalid in ["a b.jsonl", "..jsonl", "x$.jsonl"] {
             assert!(
                 matches!(
-                    plan_session_delete(&sandbox.env, &first.join(invalid), Source::Claude),
+                    plan_session_delete(&sandbox.env, &first.join(invalid), SourceKind::Claude),
                     Err(AppError::SessionNotFound(_))
                 ),
                 "{invalid}"
@@ -1669,7 +1675,7 @@ mod tests {
         let other_project_dir = sandbox.project("-other").join(uuid);
         std::fs::create_dir_all(&other_project_dir).unwrap();
         let plan = |files: Vec<PathBuf>, dirs: Vec<PathBuf>| DeletePlan {
-            source: Source::Claude,
+            source: SourceKind::Claude,
             path: transcript.clone(),
             session_id: uuid.to_string(),
             files,
@@ -1699,7 +1705,7 @@ mod tests {
             plan(vec![transcript.clone()], vec![other_project_dir.clone()]),
             // A Pi plan for a Claude transcript.
             DeletePlan {
-                source: Source::Pi,
+                source: SourceKind::Pi,
                 ..plan(vec![transcript.clone()], Vec::new())
             },
         ] {
@@ -1736,7 +1742,7 @@ mod tests {
             paths
         };
         let listed = rollouts(REVERT).pop().unwrap();
-        let mut plan = plan_session_delete(&sandbox.env, &listed, Source::Codex).unwrap();
+        let mut plan = plan_session_delete(&sandbox.env, &listed, SourceKind::Codex).unwrap();
         plan.files.sort();
         assert_eq!(plan.session_id, REVERT);
         assert_eq!(plan.files, rollouts(REVERT));
@@ -1746,7 +1752,7 @@ mod tests {
             plan_session_delete(
                 &sandbox.env,
                 &sandbox.root.path().join("x.jsonl"),
-                Source::Codex
+                SourceKind::Codex
             ),
             Err(AppError::SessionNotFound(_))
         ));
@@ -1781,7 +1787,7 @@ mod tests {
                 ..plan.clone()
             },
             DeletePlan {
-                source: Source::Codex,
+                source: SourceKind::Codex,
                 path: sandbox.root.path().join("notes.jsonl"),
                 session_id: REVERT.to_string(),
                 files: vec![listed.clone()],
@@ -1856,7 +1862,7 @@ mod tests {
         assert!(other.is_file(), "other threads stay");
 
         // Without a runner, core refuses to run the CLI in tests.
-        let plan = plan_session_delete(&sandbox.env, &other, Source::Codex).unwrap();
+        let plan = plan_session_delete(&sandbox.env, &other, SourceKind::Codex).unwrap();
         assert!(execute_session_delete(&sandbox.env, &plan).is_err());
         assert!(other.is_file());
     }
@@ -1879,14 +1885,14 @@ mod tests {
         let notes = dir.join("notes.jsonl");
         std::fs::write(&notes, "{}\n").unwrap();
 
-        let pi_plan = plan_session_delete(&sandbox.env, &pi, Source::Pi).unwrap();
-        let omp_plan = plan_session_delete(&sandbox.env, &omp, Source::Omp).unwrap();
+        let pi_plan = plan_session_delete(&sandbox.env, &pi, SourceKind::Pi).unwrap();
+        let omp_plan = plan_session_delete(&sandbox.env, &omp, SourceKind::Omp).unwrap();
         assert_eq!(pi_plan.path, pi);
         assert_eq!(omp_plan.path, omp);
         for plan in [
             // An arbitrary directory in an OMP plan without files.
             DeletePlan {
-                source: Source::Omp,
+                source: SourceKind::Omp,
                 path: omp.clone(),
                 session_id: "whatever".to_string(),
                 files: Vec::new(),
@@ -1920,7 +1926,7 @@ mod tests {
             },
             // An OMP session in a Pi plan.
             DeletePlan {
-                source: Source::Pi,
+                source: SourceKind::Pi,
                 dirs: Vec::new(),
                 ..omp_plan.clone()
             },
@@ -1958,18 +1964,18 @@ mod tests {
         let artifacts = dir.join("omp");
         std::fs::create_dir_all(artifacts.join("tool")).unwrap();
 
-        let pi_plan = plan_session_delete(&sandbox.env, &pi, Source::Pi).unwrap();
+        let pi_plan = plan_session_delete(&sandbox.env, &pi, SourceKind::Pi).unwrap();
         assert_eq!(pi_plan.session_id, "custom_v1_id");
         assert_eq!(pi_plan.files, vec![pi.clone()]);
         assert!(pi_plan.dirs.is_empty());
-        let omp_plan = plan_session_delete(&sandbox.env, &omp, Source::Omp).unwrap();
+        let omp_plan = plan_session_delete(&sandbox.env, &omp, SourceKind::Omp).unwrap();
         assert_eq!(omp_plan.session_id, "omp_session_custom_id");
         assert_eq!(omp_plan.files, vec![omp.clone()]);
         assert_eq!(omp_plan.dirs, vec![artifacts.clone()]);
         let not_a_session = dir.join("notes.jsonl");
         std::fs::write(&not_a_session, "{}\n").unwrap();
         assert!(matches!(
-            plan_session_delete(&sandbox.env, &not_a_session, Source::Pi),
+            plan_session_delete(&sandbox.env, &not_a_session, SourceKind::Pi),
             Err(AppError::SessionNotFound(_))
         ));
 
@@ -1991,7 +1997,7 @@ mod tests {
         let uuid = "12345678-1234-4234-9234-123456789abc";
         let listed = sandbox.project("-a").join(format!("{uuid}.jsonl"));
         write(&listed, &[user_jsonl_line("q")]);
-        let mut plan = plan_session_delete(&sandbox.env, &listed, Source::Claude).unwrap();
+        let mut plan = plan_session_delete(&sandbox.env, &listed, SourceKind::Claude).unwrap();
         plan.session_id = "not-a-uuid".to_string();
         let failure = execute_session_delete(&sandbox.env, &plan).unwrap_err();
         assert_eq!(failure.partial, DeleteReport::default());
@@ -2017,7 +2023,7 @@ mod tests {
             &[user_jsonl_line("q")],
         );
         write(&blocked, &["not a directory".to_string()]);
-        let mut plan = plan_session_delete(&sandbox.env, &listed, Source::Claude).unwrap();
+        let mut plan = plan_session_delete(&sandbox.env, &listed, SourceKind::Claude).unwrap();
         plan.files.push(gone.clone());
         plan.dirs = vec![removable.clone(), blocked.clone()];
 
@@ -2044,7 +2050,7 @@ mod tests {
         // remove_file.
         let blocked = sandbox.project("-b").join(format!("{uuid}.jsonl"));
         std::fs::create_dir_all(&blocked).unwrap();
-        let mut plan = plan_session_delete(&sandbox.env, &listed, Source::Claude).unwrap();
+        let mut plan = plan_session_delete(&sandbox.env, &listed, SourceKind::Claude).unwrap();
         plan.files.sort();
         assert_eq!(plan.files, vec![listed.clone(), blocked.clone()]);
 
@@ -2190,7 +2196,7 @@ mod tests {
     fn pi_conversations_match_the_workspace_by_directory() {
         let root = tempfile::tempdir().unwrap();
         let mut pi = conversation("/sessions/x.jsonl", "pi");
-        pi.source = Source::Pi;
+        pi.source = SourceKind::Pi;
         pi.project_path = Some(root.path().to_path_buf());
         assert!(conversation_in_workspace(
             &pi,

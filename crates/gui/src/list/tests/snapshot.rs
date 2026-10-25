@@ -14,10 +14,10 @@
 use std::path::PathBuf;
 
 use chrono::{Duration, Utc};
-use claude_history_core::history::load_all_conversations;
 use claude_history_core::store;
 use claude_history_core::store::card::Fingerprint;
 use claude_history_core::store::generation::{self, Doc, Publish, PublishLock, Update};
+use claude_history_core::store::load_in_memory;
 use claude_history_core::time_filter::TimeFilter;
 use gpui_kit::AppContext as _;
 use gpui_kit::TestAppContext;
@@ -38,8 +38,7 @@ use crate::test_support::{TestWorld, recording, synth};
 /// (`maintenance::load_sorted_conversations` would publish a generation of
 /// its own first).
 fn publish_cards(world: &TestWorld) -> Vec<PathBuf> {
-    let mut conversations =
-        load_all_conversations(&world.env, true, None).expect("load the world's corpus");
+    let mut conversations = load_in_memory(&world.env, true).expect("load the world's corpus");
     conversations.sort_by_key(|c| std::cmp::Reverse(c.timestamp));
     for (ix, conversation) in conversations.iter_mut().enumerate() {
         conversation.custom_title = Some(format!("Card {ix}"));

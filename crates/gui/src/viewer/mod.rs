@@ -526,6 +526,7 @@ impl ViewerPane {
         self.header = info;
         if let Some((path, known)) = count {
             let counted = path.clone();
+            let history = crate::globals::env_history(cx);
             let task = cx.background_executor().spawn(async move {
                 let modified = std::fs::metadata(&counted)
                     .and_then(|meta| meta.modified())
@@ -533,9 +534,12 @@ impl ViewerPane {
                 if known.is_some_and(|known| modified.is_some() && known.modified == modified) {
                     return None;
                 }
-                let errors = claude_history_core::export::display_parse_errors(&counted)
-                    .map(|errors| errors.len())
-                    .unwrap_or(0);
+                let errors =
+                    claude_history_core::view::open_conversation(history.service(), &counted)
+                        .map(|transcript| {
+                            claude_history_core::export::display_parse_errors(&transcript).len()
+                        })
+                        .unwrap_or(0);
                 Some((modified, errors))
             });
             self._parse_count_task = cx.spawn(async move |this, cx| {
@@ -1041,6 +1045,7 @@ impl ViewerPane {
             BuildJob::Open {
                 path: target.path.clone(),
                 prefs: self.prefs,
+                history: crate::globals::env_history(cx),
             },
             cx,
         );

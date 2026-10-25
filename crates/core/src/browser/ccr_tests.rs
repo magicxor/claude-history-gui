@@ -7,7 +7,8 @@
 
 use super::test_helpers::*;
 use super::*;
-use crate::history::{LoaderMessage, Source};
+use crate::history::LoaderMessage;
+use crate::history::model::SourceKind;
 use crate::semantic_worker::{SemanticSearchMessage, SemanticWorkerCommand};
 use chrono::{Local, TimeZone};
 use std::time::{Duration, Instant};
@@ -35,7 +36,7 @@ fn session(root: &Path, project: &str, uuid: &str, text: &str, day: u32) -> Conv
 /// and an excluded project.
 fn mixed_corpus(root: &Path) -> Vec<Conversation> {
     let mut pi = session(root, "pi", UUID_C, "pi session", 9);
-    pi.source = Source::Pi;
+    pi.source = SourceKind::Pi;
     vec![
         session(root, "alpha", UUID_A, "first needle", 1),
         session(root, "beta", UUID_A, "copy needle", 2),
@@ -346,7 +347,7 @@ fn an_initial_load_installs_the_scope_prepared_off_thread() {
     assert_index_consistent(&browser);
     // Sorted newest first, the excluded project left out, indices set.
     assert_eq!(browser.filtered().len(), 6);
-    assert_eq!(browser.row(0).unwrap().source, Source::Pi);
+    assert_eq!(browser.row(0).unwrap().source, SourceKind::Pi);
     assert!(
         browser
             .conversations()

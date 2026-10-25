@@ -6,7 +6,8 @@
 use super::test_helpers::*;
 use super::*;
 use crate::error::AppError;
-use crate::history::{LoaderMessage, Source};
+use crate::history::LoaderMessage;
+use crate::history::model::SourceKind;
 use crate::time_filter::TimeFilter;
 use chrono::{Local, TimeZone};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,7 +19,7 @@ fn test_conversation(path: PathBuf, custom_title: Option<String>) -> Conversatio
         full_text = format!("{} {}", title, full_text);
     }
     Conversation {
-        source: Source::Claude,
+        source: SourceKind::Claude,
         session_id: path
             .file_stem()
             .and_then(|name| name.to_str())
@@ -432,7 +433,7 @@ fn delete_removes_every_copy_of_a_claude_session_and_its_row() {
     let deleted = app.delete_selected().unwrap();
 
     assert_eq!(deleted.path, copy_a);
-    assert_eq!(deleted.source, Source::Claude);
+    assert_eq!(deleted.source, SourceKind::Claude);
     assert_eq!(deleted.files_removed, 2);
     assert!(!copy_a.exists());
     assert!(!copy_b.exists());
@@ -462,7 +463,7 @@ fn delete_uses_the_source_of_the_captured_conversation() {
     write_claude_session(&claude_path, sandbox.path(), "one", "two");
 
     let mut pi = test_conversation(pi_path.clone(), None);
-    pi.source = Source::Pi;
+    pi.source = SourceKind::Pi;
     let mut app = Browser::new(
         vec![test_conversation(claude_path.clone(), None), pi],
         sandbox.options(),
@@ -471,7 +472,7 @@ fn delete_uses_the_source_of_the_captured_conversation() {
 
     let deleted = app.delete_conversation(&pi_path).unwrap();
 
-    assert_eq!(deleted.source, Source::Pi);
+    assert_eq!(deleted.source, SourceKind::Pi);
     assert_eq!(deleted.files_removed, 1);
     assert!(!pi_path.exists());
     assert!(claude_path.exists(), "the Claude copy must survive");
@@ -597,7 +598,12 @@ fn single_file_that_is_only_left_out_of_the_list_is_not_an_error() {
         let app = Browser::new_single_file(path.clone(), sandbox.options());
         assert!(app.conversations().is_empty(), "{}", path.display());
         assert_eq!(app.single_file_error(), None, "{}", path.display());
-        let viewer = crate::view::ViewerModel::open(path, Default::default()).unwrap();
+        let viewer = crate::view::ViewerModel::open(
+            &crate::history::service::HistoryService::default(),
+            path,
+            Default::default(),
+        )
+        .unwrap();
         assert_eq!(viewer.document().messages.len(), messages);
     }
 
@@ -866,7 +872,7 @@ fn selection_navigation_is_clamped() {
     assert!(!app.select(25));
     assert!(app.select(3));
     assert_eq!(app.count_text(), "4/25");
-    assert_eq!(app.selected_source(), Some(Source::Claude));
+    assert_eq!(app.selected_source(), Some(SourceKind::Claude));
 }
 
 #[cfg(windows)]
@@ -876,7 +882,7 @@ fn pi_workspace_match_ignores_verbatim_prefix_and_drive_case() {
     // canonical `\\?\C:\...` workspace.
     let sandbox = Sandbox::new();
     let mut pi = test_conversation(sandbox.path().join("pi.jsonl"), None);
-    pi.source = Source::Pi;
+    pi.source = SourceKind::Pi;
     pi.project_path = Some(PathBuf::from(r"c:\no-such-dir\proj"));
     let mut app = Browser::new(
         vec![pi],
@@ -1257,7 +1263,7 @@ fn row_inputs_wire_mode_metadata_and_sources() {
     };
     let sandbox = Sandbox::new();
     let mut pi = test_conversation(sandbox.path().join("pi.jsonl"), None);
-    pi.source = Source::Pi;
+    pi.source = SourceKind::Pi;
     let mut app = Browser::new(
         vec![test_conversation(sandbox.path().join("a.jsonl"), None), pi],
         sandbox

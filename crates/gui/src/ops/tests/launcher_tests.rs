@@ -124,7 +124,7 @@ fn setup() -> Setup {
     let mut env = HistoryEnv::sandbox(dir.path());
     env.path_var = Some(bin.clone().into_os_string());
     let plan = ResumePlan {
-        source: claude_history_core::history::Source::Claude,
+        source: claude_history_core::history::model::SourceKind::Claude,
         kind: ResumeKind::Resume,
         strategy: ResumeStrategy::InProject,
         session_path: PathBuf::from("session.jsonl"),

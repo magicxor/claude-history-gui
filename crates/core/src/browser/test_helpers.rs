@@ -123,7 +123,7 @@ pub(crate) fn test_semantic_metadata(
 /// A minimal Claude conversation at `path` (session id = file stem).
 pub(crate) fn plain_conversation(path: PathBuf) -> Conversation {
     Conversation {
-        source: crate::history::Source::Claude,
+        source: crate::history::model::SourceKind::Claude,
         session_id: path
             .file_stem()
             .and_then(|name| name.to_str())

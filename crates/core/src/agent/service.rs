@@ -834,9 +834,10 @@ pub fn discover_agent_keys(
             let Ok(Some(projection)) = history::pi::parse_file(&path) else {
                 continue;
             };
-            if projection.source != history::Source::Pi {
+            if projection.source != history::model::SourceKind::Pi {
                 continue;
             }
+            let header = projection.header;
             if project_filter.is_some() {
                 // Upstream additionally re-encoded the canonicalized cwd and
                 // compared it with the filter derived from the same cwd. On
@@ -844,30 +845,28 @@ pub fn discover_agent_keys(
                 // so local Pi/OMP sessions were always dropped (W1). The
                 // workspace scope already is that project, so only the
                 // working-directory equality remains.
-                let cwd = projection
-                    .header
+                let cwd = header
                     .cwd
                     .canonicalize()
-                    .unwrap_or_else(|_| projection.header.cwd.clone());
+                    .unwrap_or_else(|_| header.cwd.clone());
                 if current.as_ref() != Some(&cwd) {
                     continue;
                 }
             }
-            let project_identity = projection
-                .header
+            let project_identity = header
                 .cwd
                 .canonicalize()
-                .unwrap_or(projection.header.cwd)
+                .unwrap_or(header.cwd)
                 .to_string_lossy()
                 .into_owned();
             let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
             keys.push(agent::refs::AgentConversationKey {
-                source: history::Source::Pi,
+                source: history::model::SourceKind::Pi,
                 project_dir_name: project_identity,
                 session_filename: filename.to_owned(),
-                session_id: projection.header.id,
+                session_id: header.id,
                 path,
             });
         }
@@ -879,6 +878,7 @@ pub fn discover_agent_keys(
             let Ok(Some(projection)) = history::pi::parse_omp_file(&path) else {
                 continue;
             };
+            let header = projection.header;
             if project_filter.is_some() {
                 // Upstream additionally re-encoded the canonicalized cwd and
                 // compared it with the filter derived from the same cwd. On
@@ -886,30 +886,28 @@ pub fn discover_agent_keys(
                 // so local Pi/OMP sessions were always dropped (W1). The
                 // workspace scope already is that project, so only the
                 // working-directory equality remains.
-                let cwd = projection
-                    .header
+                let cwd = header
                     .cwd
                     .canonicalize()
-                    .unwrap_or_else(|_| projection.header.cwd.clone());
+                    .unwrap_or_else(|_| header.cwd.clone());
                 if current.as_ref() != Some(&cwd) {
                     continue;
                 }
             }
-            let project_identity = projection
-                .header
+            let project_identity = header
                 .cwd
                 .canonicalize()
-                .unwrap_or(projection.header.cwd)
+                .unwrap_or(header.cwd)
                 .to_string_lossy()
                 .into_owned();
             let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
             keys.push(agent::refs::AgentConversationKey {
-                source: history::Source::Omp,
+                source: history::model::SourceKind::Omp,
                 project_dir_name: project_identity,
                 session_filename: filename.to_owned(),
-                session_id: projection.header.id,
+                session_id: header.id,
                 path,
             });
         }
@@ -927,7 +925,7 @@ pub fn discover_agent_keys(
         listed
             .iter()
             .filter(|conversation| {
-                conversation.source == history::Source::Codex
+                conversation.source == history::model::SourceKind::Codex
                     && !conversation.provenance.hidden_by_default()
             })
             .filter_map(|conversation| {
@@ -1001,7 +999,7 @@ fn warnings_for_skipped_transcripts(
 
 fn conversation_from_agent_transcript(
     transcript: &agent::transcript::AgentTranscript,
-    source: history::Source,
+    source: history::model::SourceKind,
 ) -> history::Conversation {
     let message_text = transcript
         .messages
@@ -2256,7 +2254,8 @@ mode = "hybrid"
         assert!(
             local
                 .iter()
-                .any(|key| key.source == history::Source::Pi && key.session_id == "local_scope_id"),
+                .any(|key| key.source == history::model::SourceKind::Pi
+                    && key.session_id == "local_scope_id"),
             "{local:?}"
         );
 

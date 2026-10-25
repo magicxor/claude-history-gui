@@ -348,8 +348,8 @@ fn omp_sessions_support_agent_search() {
 
 /// Upstream `omp_sessions_support_agent_search_and_direct_render` and
 /// `direct_render_supports_pi_active_branch` (render half): the renderer
-/// consumes `normalized_log_entries`, which must hold the active branch
-/// only. The label/metadata assertions of the rendered text move to the
+/// consumes the decoded transcript (`sources::decode_path` /
+/// `history::view::entries`), whose events must hold the active branch only. The label/metadata assertions of the rendered text move to the
 /// `core::view` tests (Modules stage).
 #[test]
 fn direct_render_inputs_contain_only_the_active_branch() {
@@ -365,12 +365,9 @@ fn direct_render_inputs_contain_only_the_active_branch() {
             "ABANDONED_BRANCH_SENTINEL",
         ),
     ] {
-        let entries = crate::history::normalized_log_entries(&fixture(fixture_name)).unwrap();
-        let text = entries
-            .iter()
-            .map(|(_, entry)| serde_json::to_string(entry).unwrap())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let transcript =
+            crate::history::sources::decode_path(&fixture(fixture_name), None, false).unwrap();
+        let text = format!("{:?}", transcript.events);
         assert!(text.contains(active), "{fixture_name}: {text}");
         assert!(!text.contains(abandoned), "{fixture_name}: {text}");
     }

@@ -6,7 +6,8 @@
 use super::corpus::CorpusEdit;
 use super::test_helpers::*;
 use super::*;
-use crate::history::{LoaderMessage, Source};
+use crate::history::LoaderMessage;
+use crate::history::model::SourceKind;
 use crate::semantic::embed::SemanticEmbedder;
 use crate::semantic_worker::{SemanticSearchMessage, SemanticWorkerCommand};
 use chrono::{Duration as ChronoDuration, Local, TimeZone};
@@ -18,7 +19,7 @@ const UUID_B: &str = "bbbbbbbb-2222-4222-8222-222222222222";
 
 fn conversation(path: PathBuf, text: &str) -> Conversation {
     Conversation {
-        source: Source::Claude,
+        source: SourceKind::Claude,
         session_id: path
             .file_stem()
             .and_then(|name| name.to_str())
@@ -1081,7 +1082,7 @@ fn apply_renamed_is_equivalent_to_rename_conversation() {
     let renamed = crate::history::rename_session(
         &sandbox_b.env,
         &target_b,
-        Source::Claude,
+        SourceKind::Claude,
         "  Renamed  ",
         false,
     )
@@ -1126,7 +1127,8 @@ fn apply_renamed_reports_no_target_when_the_session_left_the_list() {
     let (conversations, target) = rename_fixture(&sandbox);
     let mut app = Browser::new(conversations, sandbox.options());
     let renamed =
-        crate::history::rename_session(&sandbox.env, &target, Source::Claude, "x", true).unwrap();
+        crate::history::rename_session(&sandbox.env, &target, SourceKind::Claude, "x", true)
+            .unwrap();
     app.remove_paths(std::slice::from_ref(&target));
     assert!(matches!(
         app.apply_renamed(&target, renamed),
@@ -1244,7 +1246,8 @@ fn pi_rename_terminates_an_unterminated_last_line() {
     std::fs::write(&path, fixture.trim_end_matches('\n')).unwrap();
 
     let renamed =
-        crate::history::rename_session(&sandbox.env, &path, Source::Pi, "Pi title", true).unwrap();
+        crate::history::rename_session(&sandbox.env, &path, SourceKind::Pi, "Pi title", true)
+            .unwrap();
     assert_eq!(renamed.custom_title.as_deref(), Some("Pi title"));
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(text.ends_with('\n'));
@@ -1557,15 +1560,15 @@ fn l045_pi_and_omp_rows_need_a_working_directory_inside_the_workspace() {
     let workspace = sandbox.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let mut inside = conversation(sandbox.path().join("pi-in.jsonl"), "in");
-    inside.source = Source::Pi;
+    inside.source = SourceKind::Pi;
     inside.project_path = Some(workspace.clone());
     let mut cwd_only = conversation(sandbox.path().join("omp-cwd.jsonl"), "cwd");
-    cwd_only.source = Source::Omp;
+    cwd_only.source = SourceKind::Omp;
     cwd_only.cwd = Some(workspace.join(".").join("..").join("workspace"));
     let mut no_cwd = conversation(sandbox.path().join("pi-none.jsonl"), "none");
-    no_cwd.source = Source::Pi;
+    no_cwd.source = SourceKind::Pi;
     let mut elsewhere = conversation(sandbox.path().join("omp-out.jsonl"), "out");
-    elsewhere.source = Source::Omp;
+    elsewhere.source = SourceKind::Omp;
     elsewhere.project_path = Some(sandbox.path().to_path_buf());
     let mut app = Browser::new(
         vec![inside, cwd_only, no_cwd, elsewhere],

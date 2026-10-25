@@ -2,7 +2,9 @@
 //! by core's loaders with the right sources and paths, the synthetic
 //! transcript parses, and the failure fixtures fail and recover.
 
-use claude_history_core::history::{Source, load_all_conversations, process_conversation_file};
+use claude_history_core::history::model::SourceKind;
+use claude_history_core::history::process_conversation_file;
+use claude_history_core::store::load_in_memory;
 
 use super::{TestWorld, fault, synth};
 
@@ -14,16 +16,16 @@ fn standard_corpus_is_loaded_by_core_with_every_source() {
     for path in &written {
         assert!(path.is_file(), "{}", path.display());
     }
-    let conversations = load_all_conversations(&world.env, true, None).expect("the corpus loads");
-    let by_source = |source: Source| {
+    let conversations = load_in_memory(&world.env, true).expect("the corpus loads");
+    let by_source = |source: SourceKind| {
         conversations
             .iter()
             .filter(|conversation| conversation.source == source)
             .collect::<Vec<_>>()
     };
-    let claude = by_source(Source::Claude);
-    let pi = by_source(Source::Pi);
-    let omp = by_source(Source::Omp);
+    let claude = by_source(SourceKind::Claude);
+    let pi = by_source(SourceKind::Pi);
+    let omp = by_source(SourceKind::Omp);
     // The 6 titled sessions and the one with a malformed line; the empty
     // transcript has no user message and is not listed.
     assert_eq!(claude.len(), 7, "{claude:#?}");
@@ -83,7 +85,7 @@ fn synthetic_transcript_parses() {
         .expect("the transcript parses")
         .expect("the transcript has messages");
     assert!(conversation.parse_errors.is_empty());
-    assert_eq!(conversation.source, Source::Claude);
+    assert_eq!(conversation.source, SourceKind::Claude);
     assert!(
         conversation.message_count >= 40,
         "{}",
@@ -95,7 +97,7 @@ fn synthetic_transcript_parses() {
 fn synthetic_corpus_writes_one_session_per_conversation() {
     let world = TestWorld::new();
     synth::corpus(&world, 12);
-    let conversations = load_all_conversations(&world.env, true, None).unwrap();
+    let conversations = load_in_memory(&world.env, true).unwrap();
     assert_eq!(conversations.len(), 12);
 }
 

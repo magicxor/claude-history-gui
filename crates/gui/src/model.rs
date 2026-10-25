@@ -13,7 +13,8 @@ use claude_history_core::agent::AgentConversationInfo;
 use claude_history_core::display_format::sanitize_preview;
 use claude_history_core::export::ExportFormat;
 use claude_history_core::history::actions::{Capabilities, capabilities_of, refusal};
-use claude_history_core::history::{Conversation, Provenance, Source};
+use claude_history_core::history::model::SourceKind;
+use claude_history_core::history::{Conversation, Provenance};
 use claude_history_core::settings::{GuiLaunchArgs, PickerAction};
 use claude_history_core::time_filter::TimeFilter;
 use gpui_kit::SharedString;
@@ -66,7 +67,7 @@ pub struct ConversationTarget {
     pub path: PathBuf,
     /// `None` = unknown: Resume/Fork/Rename/Delete are disabled
     /// ("Unknown conversation type").
-    pub source: Option<Source>,
+    pub source: Option<SourceKind>,
     /// `Conversation.session_id` (Pi/OMP: header id); the file stem when unknown.
     pub session_id: String,
     /// `path.file_stem()` (lossy): the TUI's "session ID".
@@ -757,7 +758,7 @@ mod tests {
             Some(UNKNOWN_SOURCE)
         );
         let mut codex = unknown.clone();
-        codex.source = Some(Source::Codex);
+        codex.source = Some(SourceKind::Codex);
         for act in [SessionAct::Resume, SessionAct::Fork, SessionAct::Delete] {
             assert!(codex.allows(act), "{act:?}");
             assert_eq!(codex.refusal(act), None);
@@ -772,7 +773,7 @@ mod tests {
             Some("Deleting is unavailable: CX no longer has this conversation's current history")
         );
         let mut claude = unknown;
-        claude.source = Some(Source::Claude);
+        claude.source = Some(SourceKind::Claude);
         assert!(claude.allows(SessionAct::Rename));
     }
 

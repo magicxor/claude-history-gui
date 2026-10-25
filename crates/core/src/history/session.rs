@@ -2,8 +2,9 @@
 //! applies to a [`crate::browser::Browser`]: the UUID jump's disk lookup
 //! (K2) and rename (K3).
 
+use super::model::SourceKind;
 use super::sources::Registry;
-use super::{Conversation, Source, find_jsonl_by_uuid, format_short_name_from_path};
+use super::{Conversation, find_jsonl_by_uuid, format_short_name_from_path};
 use crate::browser::RenameError;
 use crate::env::HistoryEnv;
 use crate::error::Result;
@@ -62,12 +63,12 @@ pub fn load_session_by_uuid(
 pub fn rename_session(
     env: &HistoryEnv,
     path: &Path,
-    source: Source,
+    source: SourceKind,
     title: &str,
     show_last: bool,
 ) -> std::result::Result<Conversation, RenameError> {
     let title = title.trim();
-    let adapter = Registry::from_env(env).for_source(source);
+    let adapter = Registry::from_env(env).for_path(source, path);
     if !adapter.capabilities().rename {
         return Err(RenameError::Unsupported(source));
     }

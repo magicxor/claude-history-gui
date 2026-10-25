@@ -1,6 +1,7 @@
 use crate::agent::diagnostic::{AgentError, AgentErrorKind};
 use crate::error::{AppError, Result};
-use crate::history::{Conversation, Source};
+use crate::history::Conversation;
+use crate::history::model::SourceKind;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -62,7 +63,7 @@ impl AgentConversationRef {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentConversationKey {
-    pub source: Source,
+    pub source: SourceKind,
     pub project_dir_name: String,
     pub session_filename: String,
     pub session_id: String,
@@ -77,7 +78,7 @@ impl AgentConversationKey {
     ) -> Self {
         let session_filename = session_filename.into();
         Self {
-            source: Source::Claude,
+            source: SourceKind::Claude,
             session_id: session_filename
                 .strip_suffix(".jsonl")
                 .unwrap_or(&session_filename)
@@ -89,7 +90,7 @@ impl AgentConversationKey {
     }
 
     pub fn from_conversation(conversation: &Conversation) -> Result<Self> {
-        let project_dir_name = if conversation.source != Source::Claude {
+        let project_dir_name = if conversation.source != SourceKind::Claude {
             let project = conversation
                 .project_path
                 .as_deref()
@@ -135,10 +136,10 @@ impl AgentConversationKey {
 
     pub fn conversation_ref(&self) -> AgentConversationRef {
         match self.source {
-            Source::Claude => {
+            SourceKind::Claude => {
                 AgentConversationRef::from_parts(&self.project_dir_name, &self.session_filename)
             }
-            Source::Pi => {
+            SourceKind::Pi => {
                 let digest = digest_parts([
                     "agent-pi-v1",
                     self.source.label(),
@@ -152,7 +153,7 @@ impl AgentConversationKey {
                     emitted_digest_hex_len: MIN_EMITTED_DIGEST_HEX_LEN,
                 }
             }
-            Source::Omp => {
+            SourceKind::Omp => {
                 let digest = digest_parts([
                     "agent-omp-v1",
                     self.source.label(),
@@ -167,7 +168,7 @@ impl AgentConversationKey {
                 }
             }
             // A thread keeps its id when a revert moves it to a new rollout.
-            Source::Codex => {
+            SourceKind::Codex => {
                 let digest =
                     digest_parts(["agent-codex-v1", self.source.label(), &self.session_id]);
                 AgentConversationRef {
@@ -181,10 +182,10 @@ impl AgentConversationKey {
 
     pub fn project_id(&self) -> String {
         let identity = match self.source {
-            Source::Claude => format!("{PROJECT_NAMESPACE}\0{}", self.project_dir_name),
-            Source::Pi => format!("agent-pi-project-v1\0{}", self.project_dir_name),
-            Source::Omp => format!("agent-omp-project-v1\0{}", self.project_dir_name),
-            Source::Codex => format!("agent-codex-project-v1\0{}", self.project_dir_name),
+            SourceKind::Claude => format!("{PROJECT_NAMESPACE}\0{}", self.project_dir_name),
+            SourceKind::Pi => format!("agent-pi-project-v1\0{}", self.project_dir_name),
+            SourceKind::Omp => format!("agent-omp-project-v1\0{}", self.project_dir_name),
+            SourceKind::Codex => format!("agent-codex-project-v1\0{}", self.project_dir_name),
         };
         format!(
             "pr_{}",
@@ -519,7 +520,8 @@ pub fn conversation_key_for_path(
     )?;
     if let Some(rollout) = rollout
         && let Some(key) = keys.iter().find(|key| {
-            key.source == Source::Codex && key.session_id.eq_ignore_ascii_case(&rollout.thread_id)
+            key.source == SourceKind::Codex
+                && key.session_id.eq_ignore_ascii_case(&rollout.thread_id)
         })
     {
         return Ok(Some(key.clone()));
@@ -693,7 +695,7 @@ mod tests {
         let key = conversation_key_for_path(&env, &config, &rollout.path)
             .unwrap()
             .expect("a Codex rollout has a key");
-        assert_eq!(key.source, Source::Codex);
+        assert_eq!(key.source, SourceKind::Codex);
         assert_eq!(key.session_id, FORK);
     }
 
@@ -717,7 +719,7 @@ mod tests {
         let key = conversation_key_for_path(&env, &config, &first)
             .unwrap()
             .expect("an in-root transcript has a key");
-        assert_eq!(key.source, Source::Claude);
+        assert_eq!(key.source, SourceKind::Claude);
         assert_eq!(key.project_dir_name, "-work-a");
         assert_eq!(key.path, first);
         let fork_key = conversation_key_for_path(&env, &config, &fork)
@@ -769,14 +771,14 @@ mod tests {
         let pi_key = conversation_key_for_path(&env, &config, &pi)
             .unwrap()
             .expect("a Pi session has a key");
-        assert_eq!(pi_key.source, Source::Pi);
+        assert_eq!(pi_key.source, SourceKind::Pi);
         assert_eq!(pi_key.path, pi);
     }
 
     #[test]
     fn pi_refs_include_source_project_and_header_session_identity() {
         let pi = AgentConversationKey {
-            source: Source::Pi,
+            source: SourceKind::Pi,
             project_dir_name: "/tmp/project".to_owned(),
             session_filename: "2024_custom_id_with_underscores.jsonl".to_owned(),
             session_id: "custom_id_with_underscores".to_owned(),
@@ -788,7 +790,7 @@ mod tests {
         };
         let claude = key("/tmp/project", "custom_id_with_underscores.jsonl");
         let omp = AgentConversationKey {
-            source: Source::Omp,
+            source: SourceKind::Omp,
             ..pi.clone()
         };
 
@@ -811,7 +813,7 @@ mod tests {
     #[test]
     fn pi_refs_distinguish_duplicate_session_ids_in_one_project() {
         let first = AgentConversationKey {
-            source: Source::Pi,
+            source: SourceKind::Pi,
             project_dir_name: "/tmp/project".to_owned(),
             session_filename: "first.jsonl".to_owned(),
             session_id: "copied-session".to_owned(),
@@ -972,7 +974,7 @@ mod tests {
         let uuid = "01a082ad-c8d8-7149-8d3e-dd8f74bb7ed4";
         let stem = format!("2026-09-08T20-20-22-361Z_{uuid}");
         let mut pi = key("project-a", &format!("{stem}.jsonl"));
-        pi.source = Source::Pi;
+        pi.source = SourceKind::Pi;
         pi.session_id = uuid.to_owned();
         let keys = vec![pi.clone()];
         for input in [uuid.to_owned(), stem.clone(), format!("{stem}.jsonl")] {
@@ -1005,7 +1007,7 @@ mod tests {
     fn candidate_lines_map_back_to_full_refs_for_every_source() {
         let uuid = "01a082ad-c8d8-7149-8d3e-dd8f74bb7ed4";
         let mut pi = key("/work/a", &format!("2026-01-01T00-00-00-000Z_{uuid}.jsonl"));
-        pi.source = Source::Pi;
+        pi.source = SourceKind::Pi;
         pi.session_id = uuid.to_owned();
         let mut pi_b = pi.clone();
         pi_b.project_dir_name = "/work/b".to_owned();
@@ -1047,7 +1049,7 @@ mod tests {
         );
         // An OMP session maps to its own full ref, also when ambiguous.
         let mut omp = key("/work/a", &format!("2026-01-01T00-00-00-000Z_{uuid}.jsonl"));
-        omp.source = Source::Omp;
+        omp.source = SourceKind::Omp;
         omp.session_id = uuid.to_owned();
         let keys = vec![pi.clone(), omp.clone()];
         let full = full_ref_for_candidate(&keys, "omp", "/work/a", &omp.session_filename).unwrap();

@@ -7,7 +7,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use claude_history_core::history::Source;
+use claude_history_core::history::model::SourceKind;
 use claude_history_core::maintenance::plan_session_delete;
 use gpui_kit::{AppContext as _, TestAppContext};
 
@@ -49,7 +49,7 @@ fn codex_threads_resume_fork_and_delete_but_do_not_rename(cx: &mut TestAppContex
     let home = world.home().join(".codex");
     let f = OpsFixture::open(cx, &world, &[]);
     let target = f.target(cx, &path);
-    assert_eq!(target.source, Some(Source::Codex));
+    assert_eq!(target.source, Some(SourceKind::Codex));
 
     // The viewer shows the thread's dialogue (no error).
     let viewer = f.open_in_viewer(cx, &path);
@@ -99,7 +99,7 @@ fn codex_threads_resume_fork_and_delete_but_do_not_rename(cx: &mut TestAppContex
 
     // Delete: the plan lists the thread's rollouts and says what Codex does.
     let env = cx.read(|cx| crate::globals::app_state(cx).env_with_workspace());
-    let plan = plan_session_delete(&env, &path, Source::Codex).unwrap();
+    let plan = plan_session_delete(&env, &path, SourceKind::Codex).unwrap();
     assert_eq!(plan.files, vec![path.clone()]);
     assert_eq!(plan.session_id, THREAD);
     assert!(

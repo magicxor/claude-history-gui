@@ -1638,7 +1638,7 @@ mod tests {
         let started = std::time::Instant::now();
         let home = real_corpus_home()?;
         let env = crate::env::HistoryEnv::sandbox(&home);
-        let conversations = crate::history::load_all_conversations(&env, false, None).unwrap();
+        let conversations = crate::store::load_in_memory(&env, false).unwrap();
         eprintln!(
             "loaded {} conversations in {:.2?}",
             conversations.len(),
@@ -1704,7 +1704,7 @@ mod tests {
             return;
         };
         let env = crate::env::HistoryEnv::sandbox(&home);
-        let mut conversations = crate::history::load_all_conversations(&env, false, None).unwrap();
+        let mut conversations = crate::store::load_in_memory(&env, false).unwrap();
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
         let now = Local::now();
         let root = tempfile::tempdir().unwrap();

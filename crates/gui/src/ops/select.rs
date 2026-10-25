@@ -22,13 +22,14 @@ use claude_history_core::export::{
     ExportFormat, ExportOptions, display_parse_errors, generate_export, plain_display,
 };
 use claude_history_core::history::Conversation;
+use claude_history_core::history::model::Transcript;
 use claude_history_core::maintenance::log_parse_errors;
 use claude_history_core::settings::{PickerAction, picker_output, session_id_from_path};
 use gpui_kit::{App, Window};
 
 use crate::debug_sink::capture_level;
 use crate::exit;
-use crate::globals::{OpenTargets, app_state};
+use crate::globals::{OpenTargets, app_state, env_history};
 use crate::model::{ConversationTarget, StdoutKind};
 use crate::notify::Toast;
 use crate::ops::copy::{clear_dialog, main_list};
@@ -236,20 +237,26 @@ fn confirm_print(target: ConversationTarget, window: &mut Window, cx: &mut App) 
 }
 
 /// The text Ctrl+O prints: the Ledger export, or the plain CLI format.
-pub fn print_text(path: &Path, plain: bool, options: ExportOptions) -> Result<String, String> {
-    let text = if plain {
-        plain_display(path, options)
+pub fn print_text(
+    transcript: &Transcript,
+    plain: bool,
+    options: ExportOptions,
+) -> Result<String, String> {
+    if plain {
+        Ok(plain_display(transcript, options))
     } else {
-        generate_export(path, ExportFormat::Ledger, options)
-    };
-    text.map_err(|error| error.to_string())
+        generate_export(transcript, ExportFormat::Ledger, options)
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// `--debug` diagnostics before the output, in upstream's order (PD5): the
-/// parse errors logged to debug.log, then the display parse errors.
+/// parse errors logged to debug.log, then the records of `transcript` (the
+/// conversation at `path`) that could not be decoded.
 pub fn print_diagnostics(
     env: &HistoryEnv,
     conversation: Option<&Conversation>,
+    transcript: &Transcript,
     path: &Path,
     level: Option<DebugLevel>,
 ) {
@@ -263,18 +270,16 @@ pub fn print_diagnostics(
             ),
         }
     }
-    if let Ok(errors) = display_parse_errors(path) {
-        for error in errors {
-            debug::error(
-                level,
-                &format!(
-                    "Failed to parse line {}: {}",
-                    error.line_number, error.error
-                ),
-            );
-            if let Some(log) = env.debug_log_file() {
-                let _ = log_display_error(&log, path, error.line_number, &error.error, &error.line);
-            }
+    for error in display_parse_errors(transcript) {
+        debug::error(
+            level,
+            &format!(
+                "Failed to parse line {}: {}",
+                error.line_number, error.error
+            ),
+        );
+        if let Some(log) = env.debug_log_file() {
+            let _ = log_display_error(&log, path, error.line_number, &error.error, &error.line);
         }
     }
 }
@@ -299,22 +304,24 @@ fn print_export(target: ConversationTarget, window: &mut Window, cx: &mut App) {
     let conversation = main_list(cx).and_then(|list| list.read(cx).conversation(&target.path));
     let level = Some(capture_level(cx));
     let path = target.path.clone();
+    let history = env_history(cx);
     let task = cx.background_executor().spawn(async move {
+        let transcript = claude_history_core::view::open_conversation(history.service(), &path)
+            .map_err(|error| error.to_string())?;
         if debug_requested {
             // A list row from the store (a card) carries no parse errors:
-            // the file is parsed again (upstream 358becb).
-            let parsed =
-                claude_history_core::history::process_conversation_file(path.clone(), None, None)
-                    .ok()
-                    .flatten();
+            // they come from the decoded transcript (upstream 358becb parsed
+            // the file again).
+            let parsed = claude_history_core::history::index::index(&transcript).ok();
             print_diagnostics(
                 &env,
                 parsed.as_ref().or(conversation.as_deref()),
+                &transcript,
                 &path,
                 level,
             );
         }
-        print_text(&path, plain, options)
+        print_text(&transcript, plain, options)
     });
     window
         .spawn(&*cx, async move |cx| {

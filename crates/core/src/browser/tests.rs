@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 fn conversation(project: Option<&str>, project_dir: &str, uuid: &str, text: &str) -> Conversation {
     Conversation {
-        source: crate::history::Source::Claude,
+        source: crate::history::model::SourceKind::Claude,
         session_id: uuid.to_owned(),
         path: PathBuf::from(format!("/tmp/claude-projects/{project_dir}/{uuid}.jsonl")),
         index: 0,
@@ -50,7 +50,7 @@ fn mixed_sources_are_identified_and_pi_local_filter_uses_header_cwd() {
     std::fs::create_dir_all(&workspace_dir).unwrap();
     let mut claude = conversation(Some("project"), "-tmp-project", "claude-id", "claude");
     let mut pi = conversation(Some("project"), "ignored", "pi-id", "pi");
-    pi.source = crate::history::Source::Pi;
+    pi.source = crate::history::model::SourceKind::Pi;
     pi.project_path = Some(workspace_dir.clone());
     pi.path = PathBuf::from("/tmp/flat-pi-sessions/session.jsonl");
     claude.project_path = Some(PathBuf::from("/tmp/project"));
@@ -415,7 +415,7 @@ fn uuid_lookup_uses_pi_header_id_instead_of_timestamped_filename() {
     let sandbox = Sandbox::new();
     let uuid = "01a016dd-caa0-7ab1-873e-661d81757152";
     let mut pi = conversation(Some("workmux"), "-tmp-workmux", uuid, "needle");
-    pi.source = crate::history::Source::Pi;
+    pi.source = crate::history::model::SourceKind::Pi;
     pi.path = PathBuf::from(format!(
         "/tmp/pi-sessions/2026-08-18T21-53-49-216Z_{uuid}.jsonl"
     ));

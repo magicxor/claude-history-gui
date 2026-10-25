@@ -84,7 +84,7 @@ pub struct Target<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::Source;
+    use crate::history::model::SourceKind;
     use crate::history::omp_loader::OmpSessionRoot;
     use crate::history::pi_loader::PiSessionRoot;
     use crate::history::sources::Registry;
@@ -93,11 +93,16 @@ mod tests {
     #[test]
     fn every_source_has_an_acting_adapter() {
         let registry = Registry::with_roots(None, None, None);
-        for source in [Source::Claude, Source::Pi, Source::Omp, Source::Codex] {
+        for source in [
+            SourceKind::Claude,
+            SourceKind::Pi,
+            SourceKind::Omp,
+            SourceKind::Codex,
+        ] {
             let adapter = registry.for_source(source);
             assert_eq!(adapter.instance().kind, source);
             let capabilities = adapter.capabilities();
-            assert_eq!(capabilities.rename, source != Source::Codex);
+            assert_eq!(capabilities.rename, source != SourceKind::Codex);
             assert!(capabilities.resume && capabilities.fork && capabilities.delete);
         }
     }
@@ -109,15 +114,20 @@ mod tests {
             orphaned: true,
             ..Provenance::default()
         };
-        for source in [Source::Claude, Source::Pi, Source::Omp, Source::Codex] {
+        for source in [
+            SourceKind::Claude,
+            SourceKind::Pi,
+            SourceKind::Omp,
+            SourceKind::Codex,
+        ] {
             assert_eq!(capabilities_of(source, orphaned), Capabilities::NONE);
         }
         assert_eq!(
-            capabilities_of(Source::Claude, Provenance::default()),
+            capabilities_of(SourceKind::Claude, Provenance::default()),
             Capabilities::ALL
         );
         assert_eq!(
-            capabilities_of(Source::Codex, Provenance::default()),
+            capabilities_of(SourceKind::Codex, Provenance::default()),
             Capabilities {
                 rename: false,
                 ..Capabilities::ALL
@@ -128,7 +138,7 @@ mod tests {
             child: true,
             ..Provenance::default()
         };
-        assert!(capabilities_of(Source::Codex, child).resume);
+        assert!(capabilities_of(SourceKind::Codex, child).resume);
     }
 
     #[test]
@@ -146,9 +156,9 @@ mod tests {
             }),
         );
         for (source, name) in [
-            (Source::Claude, "claude"),
-            (Source::Pi, "pi"),
-            (Source::Omp, "omp"),
+            (SourceKind::Claude, "claude"),
+            (SourceKind::Pi, "pi"),
+            (SourceKind::Omp, "omp"),
         ] {
             let adapter = registry.for_source(source);
             assert_eq!(adapter.instance().kind, source);
@@ -160,11 +170,11 @@ mod tests {
     fn refusals_name_the_source_as_the_list_does() {
         let plain = Provenance::default();
         assert_eq!(
-            refusal(Source::Pi, plain, "Deleting"),
+            refusal(SourceKind::Pi, plain, "Deleting"),
             "Deleting Pi sessions is not supported"
         );
         assert_eq!(
-            refusal(Source::Codex, plain, "Renaming"),
+            refusal(SourceKind::Codex, plain, "Renaming"),
             "Renaming CX sessions is not supported"
         );
         let orphaned = Provenance {
@@ -172,7 +182,7 @@ mod tests {
             ..plain
         };
         assert_eq!(
-            refusal(Source::Codex, orphaned, "Resuming"),
+            refusal(SourceKind::Codex, orphaned, "Resuming"),
             "Resuming is unavailable: CX no longer has this conversation's current history"
         );
     }

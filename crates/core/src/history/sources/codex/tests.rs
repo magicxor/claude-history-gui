@@ -521,25 +521,18 @@ fn the_env_selects_the_home_and_the_state_database() {
 
 #[test]
 fn viewed_threads_show_the_dialogue_and_where_a_fork_begins() {
-    use crate::claude::{ContentBlock, LogEntry, UserContent};
-    fn text_of(entry: &LogEntry) -> String {
-        let blocks = match entry {
-            LogEntry::User {
-                message:
-                    crate::claude::UserMessage {
-                        content: UserContent::Blocks(blocks),
-                        ..
-                    },
-                ..
-            } => blocks.as_slice(),
-            LogEntry::Assistant { message, .. } => message.content.as_slice(),
-            LogEntry::PiMetadata { label, .. } => return format!("[{label}]"),
-            _ => return String::new(),
+    use crate::history::view::{self, Entry, EntryKind};
+    fn text_of(entry: &Entry<'_>) -> String {
+        let message = match entry.kind {
+            EntryKind::Message { message, .. } | EntryKind::Subagent { message, .. } => message,
+            EntryKind::Note { label, .. } => return format!("[{label}]"),
+            EntryKind::Hidden => return String::new(),
         };
-        blocks
+        message
+            .parts
             .iter()
-            .filter_map(|block| match block {
-                ContentBlock::Text { text } => Some(text.clone()),
+            .filter_map(|part| match part {
+                Part::Text(text) => Some(text.clone()),
                 _ => None,
             })
             .collect()
@@ -555,8 +548,9 @@ fn viewed_threads_show_the_dialogue_and_where_a_fork_begins() {
             .path
     };
 
-    let fork = view::log_entries(&path_of(FORK)).unwrap().unwrap();
-    let texts: Vec<String> = fork.iter().map(|(_, entry)| text_of(entry)).collect();
+    let fork = super::view::decode_path(&path_of(FORK)).unwrap().unwrap();
+    let fork = view::entries(&fork);
+    let texts: Vec<String> = fork.iter().map(text_of).collect();
     let walrus = texts.iter().filter(|text| text.contains("walrus")).count();
     assert_eq!(
         walrus, 2,
@@ -573,20 +567,21 @@ fn viewed_threads_show_the_dialogue_and_where_a_fork_begins() {
             .iter()
             .all(|text| !text.contains("ocelot"))
     );
-    assert!(fork.iter().any(|(_, entry)| matches!(
-        entry,
-        LogEntry::Assistant { agent: Some(agent), .. } if agent == "Codex"
+    assert!(fork.iter().any(|entry| matches!(
+        entry.kind,
+        EntryKind::Message { message, speaker: "Codex" } if message.role == Role::Assistant
     )));
 
-    let sub = view::log_entries(&path_of(SUB)).unwrap().unwrap();
-    let texts: Vec<String> = sub.iter().map(|(_, entry)| text_of(entry)).collect();
+    let sub = super::view::decode_path(&path_of(SUB)).unwrap().unwrap();
+    let sub = view::entries(&sub);
+    let texts: Vec<String> = sub.iter().map(text_of).collect();
     assert!(texts.iter().any(|text| text.contains("armadillo")));
     assert!(!texts.iter().any(|text| text == "[Fork]"));
     assert!(!texts.iter().any(|text| text.contains("walrus")));
 
     let claude = dir.path().join("session.jsonl");
     std::fs::write(&claude, "{}\n").unwrap();
-    assert!(view::log_entries(&claude).unwrap().is_none());
+    assert!(super::view::decode_path(&claude).is_none());
 }
 
 /// Fork: a rollout opened by path (the viewer, exports, a single-file
@@ -611,11 +606,8 @@ fn rollouts_opened_by_path_decode_as_their_thread() {
         .unwrap();
     assert_eq!(conversation.source, SourceKind::Codex);
     assert!(conversation.provenance.child);
-    let entries = crate::history::normalized_log_entries(&path).unwrap();
-    assert!(!entries.is_empty());
-    assert!(
-        crate::history::normalized_log_entries_cancellable(&path, &|| true)
-            .unwrap()
-            .is_none()
-    );
+    assert!(!crate::history::view::entries(&transcript).is_empty());
+    let cancelled =
+        crate::history::sources::decode_path_cancellable(&path, None, false, &|| true).unwrap_err();
+    assert!(crate::history::adapter::is_cancelled(&cancelled));
 }

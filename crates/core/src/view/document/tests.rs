@@ -5,24 +5,84 @@
 //! the first timing slot.
 
 use super::*;
+use crate::history::model::{Event, EventKind, Origin, SourceKind, Transcript, Visibility};
+use crate::history::view;
 use crate::theme;
 use crate::view::ledger::{
     LineStyle, NAME_WIDTH, RenderedConversation, RenderedLine, TIMESTAMP_WIDTH,
     render_parsed_conversation,
 };
-use crate::view::{fitted_name, parse_conversation_file};
+use crate::view::{fitted_name, renderable_entries};
 use chrono::{Local, TimeZone};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // -----------------------------------------------------------------
 // Fixtures and helpers
 // -----------------------------------------------------------------
 
-fn entry(entry_index: usize, json: &str) -> RenderableEntry {
-    RenderableEntry::new(entry_index, serde_json::from_str(json).unwrap())
+/// A conversation of one record, shown as the entry at `entry_index`, or
+/// (`entry_index: None`) a whole session file, its entries numbered as the
+/// viewer numbers them. The upstream ledger tests' helper (9597669).
+struct Owned {
+    entry_index: Option<usize>,
+    transcript: Transcript,
 }
 
-fn user_entry(entry_index: usize, text: &str, timestamp: Option<&str>) -> RenderableEntry {
+/// One Claude record. A record naming Pi as its agent reads as a Pi
+/// session, and a `pi-metadata` record (the fork's fixtures; Claude records
+/// have no notes since upstream 9597669) as a Pi session holding that note.
+fn entry(entry_index: usize, json: &str) -> Owned {
+    let record: serde_json::Value = serde_json::from_str(json).unwrap();
+    let mut transcript = crate::history::sources::claude::decode_test_reader(
+        Path::new("test.jsonl"),
+        if record["type"] == "pi-metadata" {
+            String::new()
+        } else {
+            record.to_string()
+        }
+        .as_bytes(),
+    )
+    .unwrap();
+    if record["type"] == "pi-metadata" {
+        transcript.source = SourceKind::Pi;
+        transcript.events.push(Event {
+            origin: Origin::default(),
+            timestamp: record["timestamp"]
+                .as_str()
+                .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+                .map(|timestamp| timestamp.to_utc()),
+            visibility: Visibility::Dialogue,
+            kind: EventKind::Note {
+                label: record["label"].as_str().unwrap().to_owned(),
+                text: record["text"].as_str().unwrap().to_owned(),
+                searchable: record["searchable"].as_bool().unwrap_or(true),
+                usage: None,
+            },
+        });
+    }
+    if json.contains(r#""agent":"Pi""#) {
+        transcript.source = SourceKind::Pi;
+    }
+    Owned {
+        entry_index: Some(entry_index),
+        transcript,
+    }
+}
+
+fn renderable(entries: &[Owned]) -> Vec<RenderableEntry<'_>> {
+    entries
+        .iter()
+        .flat_map(|owned| match owned.entry_index {
+            Some(entry_index) => view::entries(&owned.transcript)
+                .into_iter()
+                .map(|entry| RenderableEntry::new(entry_index, entry))
+                .collect(),
+            None => renderable_entries(&owned.transcript),
+        })
+        .collect()
+}
+
+fn user_entry(entry_index: usize, text: &str, timestamp: Option<&str>) -> Owned {
     let ts_field = match timestamp {
         Some(t) => format!(r#","timestamp":"{}""#, t),
         None => String::new(),
@@ -36,11 +96,7 @@ fn user_entry(entry_index: usize, text: &str, timestamp: Option<&str>) -> Render
     )
 }
 
-fn assistant_text_entry(
-    entry_index: usize,
-    text: &str,
-    timestamp: Option<&str>,
-) -> RenderableEntry {
+fn assistant_text_entry(entry_index: usize, text: &str, timestamp: Option<&str>) -> Owned {
     let ts_field = match timestamp {
         Some(t) => format!(r#","timestamp":"{}""#, t),
         None => String::new(),
@@ -54,7 +110,7 @@ fn assistant_text_entry(
     )
 }
 
-fn tool_summary_entries() -> Vec<RenderableEntry> {
+fn tool_summary_entries() -> Vec<Owned> {
     vec![
         entry(
             0,
@@ -75,7 +131,7 @@ fn tool_summary_entries() -> Vec<RenderableEntry> {
     ]
 }
 
-fn pi_thinking_entries() -> Vec<RenderableEntry> {
+fn pi_thinking_entries() -> Vec<Owned> {
     vec![
         entry(
             0,
@@ -96,7 +152,7 @@ fn pi_thinking_entries() -> Vec<RenderableEntry> {
     ]
 }
 
-fn subagent_entries() -> Vec<RenderableEntry> {
+fn subagent_entries() -> Vec<Owned> {
     vec![
         entry(
             0,
@@ -109,7 +165,7 @@ fn subagent_entries() -> Vec<RenderableEntry> {
     ]
 }
 
-fn reordered_blocks_entry() -> RenderableEntry {
+fn reordered_blocks_entry() -> Owned {
     entry(
         0,
         r#"{"type":"assistant","message":{"role":"assistant","content":[
@@ -120,7 +176,7 @@ fn reordered_blocks_entry() -> RenderableEntry {
     )
 }
 
-fn agent_progress_entries() -> Vec<RenderableEntry> {
+fn agent_progress_entries() -> Vec<Owned> {
     vec![
         entry(
             0,
@@ -147,7 +203,7 @@ fn agent_progress_entries() -> Vec<RenderableEntry> {
 }
 
 /// A conversation exercising every message kind and truncation path.
-fn mixed_entries() -> Vec<RenderableEntry> {
+fn mixed_entries() -> Vec<Owned> {
     vec![
         user_entry(0, "Hello **there**", Some("2026-09-04T12:34:56Z")),
         entry(
@@ -227,8 +283,12 @@ fn mixed_entries() -> Vec<RenderableEntry> {
     ]
 }
 
-fn fixture_entries(path: &str) -> Vec<RenderableEntry> {
-    parse_conversation_file(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path)).unwrap()
+fn fixture_entries(path: &str) -> Vec<Owned> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path);
+    vec![Owned {
+        entry_index: None,
+        transcript: crate::history::sources::decode_path(&path, None, false).unwrap(),
+    }]
 }
 
 fn prefs(tool_display: ToolDisplayMode) -> ViewPrefs {
@@ -239,8 +299,8 @@ fn prefs(tool_display: ToolDisplayMode) -> ViewPrefs {
     }
 }
 
-fn build(entries: &[RenderableEntry], prefs: &ViewPrefs) -> ConversationDocument {
-    build_document(entries, prefs, &BTreeSet::new())
+fn build(entries: &[Owned], prefs: &ViewPrefs) -> ConversationDocument {
+    build_document(&renderable(entries), prefs, &BTreeSet::new())
 }
 
 fn all_blocks(doc: &ConversationDocument) -> Vec<&DocBlock> {
@@ -355,10 +415,11 @@ fn doc_hidden_counts(doc: &ConversationDocument) -> Vec<usize> {
 /// Check that the document and the ledger (at width 80) agree for these
 /// entries, preferences and expanded set. Returns the document.
 fn assert_ledger_parity(
-    entries: &[RenderableEntry],
+    entries: &[Owned],
     prefs: &ViewPrefs,
     expanded: &BTreeSet<ToolOutputId>,
 ) -> ConversationDocument {
+    let entries = &renderable(entries);
     let doc = build_document(entries, prefs, expanded);
     let rendered = render_parsed_conversation(entries, &prefs.render_options(80, expanded));
     let context = format!(
@@ -451,7 +512,7 @@ const MODES: [ToolDisplayMode; 3] = [
 
 /// Parity for every mode / thinking / timing combination, collapsed, with
 /// each toggle id expanded on its own, and with all of them expanded.
-fn assert_parity_everywhere(entries: &[RenderableEntry]) {
+fn assert_parity_everywhere(entries: &[Owned]) {
     for tool_display in MODES {
         for show_thinking in [false, true] {
             for show_timing in [false, true] {
@@ -479,7 +540,7 @@ fn assert_parity_everywhere(entries: &[RenderableEntry]) {
 
 #[test]
 fn parity_with_ledger_for_all_fixtures_and_preferences() {
-    let fixtures: Vec<Vec<RenderableEntry>> = vec![
+    let fixtures: Vec<Vec<Owned>> = vec![
         tool_summary_entries(),
         pi_thinking_entries(),
         subagent_entries(),
@@ -571,10 +632,7 @@ fn collapsed_tool_summary_uses_fixed_timestamp_format() {
         doc.messages[0].blocks[0].timing,
         DocTiming::Stamp("Sep 04 13:59".to_string())
     );
-    assert_eq!(
-        doc.messages[0].raw_timestamp.as_deref(),
-        Some(timestamp.to_rfc3339().as_str())
-    );
+    assert_eq!(doc.messages[0].raw_timestamp, Some(timestamp.to_utc()));
 }
 
 #[test]
@@ -600,7 +658,7 @@ fn tool_summary_uses_source_agent_label() {
     );
 
     let expanded = build_document(
-        &entries,
+        &renderable(&entries),
         &prefs(ToolDisplayMode::Hidden),
         &BTreeSet::from([summary_id.clone()]),
     );
@@ -632,7 +690,7 @@ fn hidden_pi_thinking_allows_clickable_grouped_tool_summary() {
     );
 
     let expanded = build_document(
-        &entries,
+        &renderable(&entries),
         &prefs(ToolDisplayMode::Hidden),
         &BTreeSet::from([summary_id]),
     );
@@ -650,7 +708,7 @@ fn expanded_tool_summary_renders_truncated_details() {
     let entries = tool_summary_entries();
     let summary_id = make_tool_summary_output_id(0, None);
     let doc = build_document(
-        &entries,
+        &renderable(&entries),
         &prefs(ToolDisplayMode::Hidden),
         &BTreeSet::from([summary_id.clone()]),
     );
@@ -700,7 +758,7 @@ fn subagent_summary_label_parity() {
     assert!(message.dimmed && message.is_subagent);
     assert_eq!(message.blocks[0].toggle_id(), Some(&summary_id));
 
-    let expanded = build_document(&entries, &prefs, &BTreeSet::from([summary_id]));
+    let expanded = build_document(&renderable(&entries), &prefs, &BTreeSet::from([summary_id]));
     assert_eq!(expanded.messages[0].label, "↳parent_");
     let text = doc_text(&expanded);
     assert!(text.contains("Grep: \"one\" in ."));
@@ -743,7 +801,7 @@ fn tool_output_ids_use_stable_literal_format() {
 }
 
 #[test]
-fn parse_conversation_file_preserves_entry_indices() {
+fn entries_are_numbered_as_shown() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("conversation.jsonl");
     std::fs::write(
@@ -761,15 +819,21 @@ fn parse_conversation_file_preserves_entry_indices() {
     )
     .unwrap();
 
-    let entries = parse_conversation_file(&path).unwrap();
+    // A file-history snapshot is no entry (upstream 9597669: entries are
+    // numbered among the transcript's entries, not the file's records).
+    let transcript = crate::history::sources::decode_path(&path, None, false).unwrap();
+    let entries = vec![Owned {
+        entry_index: None,
+        transcript,
+    }];
     let doc = build(&entries, &prefs(ToolDisplayMode::Hidden));
 
     let indices: Vec<usize> = doc.messages.iter().map(|m| m.entry_index).collect();
-    assert_eq!(indices, [0, 2]);
+    assert_eq!(indices, [0, 1]);
     // The same index space as the export copy of a single message.
     let options = crate::export::ExportOptions::default();
     assert_eq!(
-        crate::export::extract_message_text(&path, 2, options).unwrap(),
+        crate::export::extract_message_text(&entries[0].transcript, 1, options).unwrap(),
         "second"
     );
 }
@@ -836,7 +900,7 @@ fn tool_call_metadata_tracks_truncated_and_expanded_state() {
     );
 
     let expanded = build_document(
-        &entries,
+        &renderable(&entries),
         &prefs(ToolDisplayMode::Truncated),
         &BTreeSet::from([id]),
     );
@@ -923,7 +987,7 @@ fn single_result_document(content: &str, prefs: &ViewPrefs, expanded: bool) -> D
         return result.clone();
     }
     let ids = BTreeSet::from([result.id.clone()]);
-    let doc = build_document(&entries, prefs, &ids);
+    let doc = build_document(&renderable(&entries), prefs, &ids);
     let DocBlockKind::ToolResult(result) = &doc.messages[1].blocks[0].kind else {
         panic!("expected a result: {doc:#?}");
     };
@@ -1040,10 +1104,8 @@ fn invalid_timestamp_disables_timing_column() {
     let doc = assert_ledger_parity(&entries, &prefs, &BTreeSet::new());
     assert_eq!(doc.messages[0].timestamp, None);
     assert_eq!(doc.messages[0].blocks[0].timing, DocTiming::Disabled);
-    assert_eq!(
-        doc.messages[0].raw_timestamp.as_deref(),
-        Some("not-a-timestamp")
-    );
+    // The transcript keeps no time it could not read.
+    assert_eq!(doc.messages[0].raw_timestamp, None);
 }
 
 #[test]
@@ -1215,8 +1277,10 @@ fn dimmed_skill_message_keeps_its_tool_results_un_muted_like_the_ledger() {
         "{doc:#?}"
     );
 
-    let rendered =
-        render_parsed_conversation(&entries, &prefs.render_options(80, &BTreeSet::new()));
+    let rendered = render_parsed_conversation(
+        &renderable(&entries),
+        &prefs.render_options(80, &BTreeSet::new()),
+    );
     // The message's own text row is muted...
     assert!(name_span(&rendered.lines[0]).1.dimmed);
     // ...but the result row is not: neither its label nor its text.
@@ -1299,7 +1363,7 @@ fn agent_progress_assistant_has_summary_calls_and_no_thinking() {
 }
 
 #[test]
-fn agent_progress_keeps_raw_timestamp_but_never_stamps() {
+fn agent_progress_never_stamps() {
     let entries = [entry(
         0,
         r#"{"type":"progress","timestamp":"2026-09-04T12:34:56Z","data":{"type":"agent_progress","agentId":"agent-1","message":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}}}"#,
@@ -1312,10 +1376,8 @@ fn agent_progress_keeps_raw_timestamp_but_never_stamps() {
     let doc = assert_ledger_parity(&entries, &prefs, &BTreeSet::new());
     let message = &doc.messages[0];
     assert_eq!(message.timestamp, None);
-    assert_eq!(
-        message.raw_timestamp.as_deref(),
-        Some("2026-09-04T12:34:56Z")
-    );
+    // The record's time is not the subagent message's (upstream 9597669).
+    assert_eq!(message.raw_timestamp, None);
     assert_eq!(message.blocks[0].timing, DocTiming::Pad);
 }
 
@@ -1441,7 +1503,7 @@ fn user_text_blocks_are_command_processed_and_joined() {
         assert!(doc.messages.iter().all(|m| m.entry_index != skipped));
     }
     let metadata = doc.messages.iter().find(|m| m.entry_index == 5).unwrap();
-    assert_eq!(metadata.kind, DocMessageKind::PiMetadata);
+    assert_eq!(metadata.kind, DocMessageKind::Note);
     assert_eq!(metadata.label, "notice");
     assert_eq!(metadata.label_role, LabelRole::TextSecondary);
     assert!(metadata.dimmed && !metadata.navigable);
@@ -1526,7 +1588,7 @@ fn truncation_counts_unwrapped_rows_and_ledger_helpers_count_wrapped_rows() {
 
     // The ledger agrees with the helpers at that width.
     let rendered = render_parsed_conversation(
-        &entries,
+        &renderable(&entries),
         &prefs(ToolDisplayMode::Truncated).render_options(40, &BTreeSet::new()),
     );
     assert_eq!(indicator_counts(&rendered), [2, 1]);
@@ -1597,7 +1659,7 @@ fn nav_positions_map_between_document_and_ledger() {
     let metadata = doc
         .messages
         .iter()
-        .position(|m| m.kind == DocMessageKind::PiMetadata)
+        .position(|m| m.kind == DocMessageKind::Note)
         .unwrap();
     assert_eq!(doc.nav_position(metadata), None);
     assert_eq!(doc.message_at_nav_position(navigable.len()), None);
@@ -1609,7 +1671,7 @@ fn nav_positions_map_between_document_and_ledger() {
 // -----------------------------------------------------------------
 
 /// A user entry holding one tool result with this string content.
-fn tool_result_entry(entry_index: usize, tool_use_id: &str, content: &str) -> RenderableEntry {
+fn tool_result_entry(entry_index: usize, tool_use_id: &str, content: &str) -> Owned {
     entry(
         entry_index,
         &serde_json::json!({
@@ -1632,7 +1694,7 @@ fn tool_results(doc: &ConversationDocument) -> Vec<&DocToolResult> {
         .collect()
 }
 
-fn row_entries() -> Vec<RenderableEntry> {
+fn row_entries() -> Vec<Owned> {
     vec![
         user_entry(0, "hi", None),
         // Trailing line break: the ledger shows 4 rows and "(1 more lines...)".
@@ -1682,7 +1744,11 @@ fn tool_result_truncation_counts_rendered_rows() {
 
     // Expanded: everything is shown and the click collapses again.
     let expanded: BTreeSet<ToolOutputId> = BTreeSet::from([trailing.id.clone()]);
-    let doc = build_document(&entries, &prefs(ToolDisplayMode::Truncated), &expanded);
+    let doc = build_document(
+        &renderable(&entries),
+        &prefs(ToolDisplayMode::Truncated),
+        &expanded,
+    );
     let trailing = tool_results(&doc)[0];
     assert_eq!(trailing.hidden_lines(), None);
     assert!(trailing.expandable());

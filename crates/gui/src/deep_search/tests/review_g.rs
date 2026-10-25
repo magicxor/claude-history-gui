@@ -150,7 +150,7 @@ fn candidate_handles_expand_to_full_refs() {
         "a.jsonl",
         std::path::PathBuf::from("x/a.jsonl"),
     );
-    pi.source = claude_history_core::history::Source::Pi;
+    pi.source = claude_history_core::history::model::SourceKind::Pi;
     pi.session_id = "pi-session".to_string();
     let with_keys = expand_handles(detail, std::slice::from_ref(&pi));
     let pi_full = pi.conversation_ref().full_ref();
@@ -179,7 +179,7 @@ fn codex_candidate_handles_expand_through_discovered_keys() {
         "rollout-a.jsonl",
         std::path::PathBuf::from("rollout-a.jsonl"),
     );
-    codex.source = claude_history_core::history::Source::Codex;
+    codex.source = claude_history_core::history::model::SourceKind::Codex;
     codex.session_id = "01a00000-0000-7000-8000-000000000003".to_string();
     let expanded = expand_handles(detail, std::slice::from_ref(&codex));
     let full = codex.conversation_ref().full_ref();

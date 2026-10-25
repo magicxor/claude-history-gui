@@ -28,8 +28,8 @@ pub mod pi_loader;
 mod rename;
 pub mod service;
 mod session;
-mod session_loader;
 pub mod sources;
+pub mod view;
 
 pub(crate) use messages::{MessageOrdinals, Placement};
 pub(crate) use session::apply_preview_mode;
@@ -47,60 +47,12 @@ pub use loader::{
     DeleteEmptyScope, DeleteEmptySummary, EmptyTranscript, EmptyTranscriptDeletion,
     delete_empty_transcript, delete_empty_transcripts, delete_session_by_uuid, delete_transcripts,
     find_all_jsonl_by_uuid, find_empty_transcripts, find_jsonl_by_uuid, list_projects,
-    load_all_conversations, load_all_conversations_streaming, load_conversations,
-    session_artifact_dir,
+    load_all_conversations_streaming, session_artifact_dir,
 };
 pub(crate) use messages::{extract_skill_preview, retained_user_text};
 pub use parser::process_conversation_file;
 pub use path::{convert_path_to_project_dir_name, format_short_name_from_path, is_same_project};
 pub use rename::append_session_rename;
-
-/// The tool that wrote a conversation.
-pub use model::SourceKind as Source;
-
-pub use pi::detect_source;
-
-pub fn normalized_log_entries(
-    path: &std::path::Path,
-) -> Result<Vec<(usize, crate::claude::LogEntry)>> {
-    Ok(normalized_log_entries_cancellable(path, &|| false)?.unwrap_or_default())
-}
-
-/// [`normalized_log_entries`] that polls `cancelled` before parsing and every
-/// 64 lines; `Ok(None)` when it returned true (the GUI viewer abandons a
-/// superseded parse mid-file, V-101). A Codex rollout is decoded as its
-/// thread in one piece (`sources::codex::view`), checked before and after.
-pub fn normalized_log_entries_cancellable(
-    path: &std::path::Path,
-    cancelled: &dyn Fn() -> bool,
-) -> Result<Option<Vec<(usize, crate::claude::LogEntry)>>> {
-    if cancelled() {
-        return Ok(None);
-    }
-    if let Some(entries) = sources::codex::view::log_entries(path)? {
-        return Ok((!cancelled()).then_some(entries));
-    }
-    if let Some(projection) = pi::parse_file(path)? {
-        return Ok((!cancelled()).then_some(projection.entries));
-    }
-    let file = std::fs::File::open(path)?;
-    let reader = std::io::BufReader::new(file);
-    use std::io::BufRead;
-    let mut entries = Vec::new();
-    for (line_index, line) in reader.lines().enumerate() {
-        if line_index % 64 == 0 && cancelled() {
-            return Ok(None);
-        }
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str(&line) {
-            entries.push((line_index + 1, entry));
-        }
-    }
-    Ok(Some(entries))
-}
 
 /// Represents a JSONL parsing error with context for debugging
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -116,7 +68,7 @@ pub struct ParseError {
 
 #[derive(Clone, Debug)]
 pub struct Conversation {
-    pub source: Source,
+    pub source: model::SourceKind,
     pub session_id: String,
     pub path: PathBuf,
     pub index: usize,

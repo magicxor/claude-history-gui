@@ -25,67 +25,77 @@ use super::ViewPrefs;
 use super::document::{ConversationDocument, DocBlockKind, build_document};
 use super::ledger::{
     MessageRange, RenderableEntry, RenderedConversation, RenderedLine, ToolDisplayMode,
-    ToolOutputId, parse_conversation_file, parse_conversation_file_cancellable,
-    render_parsed_conversation,
+    ToolOutputId, open_conversation, render_parsed_conversation, renderable_entries,
 };
 use crate::export::{ExportOptions, MESSAGE_NOT_FOUND};
+use crate::history::model::Transcript;
+use crate::history::service::HistoryService;
+use crate::history::view;
 
 // ---------------------------------------------------------------------
 // ViewerModel
 // ---------------------------------------------------------------------
 
-/// An open conversation: its parsed entries (cached when opened, so the view
-/// keeps rendering and toggling after the file is deleted or changed), the
-/// display preferences and the expanded tool outputs.
+/// An open conversation: its transcript (decoded once when opened, so the
+/// view keeps rendering and toggling after the file is deleted or changed),
+/// the display preferences and the expanded tool outputs.
 #[derive(Clone, Debug)]
 pub struct ViewerModel {
     pub path: PathBuf,
-    pub entries: Arc<Vec<RenderableEntry>>,
+    pub transcript: Arc<Transcript>,
     pub prefs: ViewPrefs,
     pub expanded: BTreeSet<ToolOutputId>,
-    /// `(entry_index, ordinal)` of every entry of `entries` placed as an
-    /// agent message ([`agent_ordinals`]), placed once when the model is
-    /// built (on the thread that parses it) rather than on each reveal.
+    /// `(entry_index, ordinal)` of every entry placed as an agent message
+    /// ([`agent_ordinals`]), placed once when the model is built (on the
+    /// thread that decodes it) rather than on each reveal.
     agent_ordinals: Arc<[(usize, usize)]>,
 }
 
 impl ViewerModel {
-    /// Parse `path` (upstream `enter_view_mode`). Expanded outputs start
-    /// empty. On failure upstream showed `"Failed to open: {e}"`.
-    pub fn open(path: &Path, prefs: ViewPrefs) -> std::io::Result<Self> {
-        let entries = parse_conversation_file(path)?;
-        Ok(Self::from_entries(
-            path.to_path_buf(),
-            Arc::new(entries),
-            prefs,
-        ))
+    /// Open `path` through `history`, the service of the GUI's environment
+    /// (upstream `enter_view_mode`, through its process-wide service).
+    /// Expanded outputs start empty. On failure upstream showed
+    /// `"Failed to open: {e}"`.
+    pub fn open(history: &HistoryService, path: &Path, prefs: ViewPrefs) -> std::io::Result<Self> {
+        let transcript = open_conversation(history, path)?;
+        Ok(Self::from_transcript(path.to_path_buf(), transcript, prefs))
     }
 
-    /// [`Self::open`] that abandons the parse (`Ok(None)`) once `cancelled`
-    /// returns true (polled every 64 lines).
+    /// [`Self::open`] that abandons the decode (`Ok(None)`) once `cancelled`
+    /// returns true (checked while the session file is read, V-101).
     pub fn open_cancellable(
+        history: &HistoryService,
         path: &Path,
         prefs: ViewPrefs,
         cancelled: &dyn Fn() -> bool,
     ) -> std::io::Result<Option<Self>> {
-        Ok(parse_conversation_file_cancellable(path, cancelled)?
-            .map(|entries| Self::from_entries(path.to_path_buf(), Arc::new(entries), prefs)))
+        match history.open_path_cancellable(path, cancelled) {
+            Ok((_, transcript)) => Ok(Some(Self::from_transcript(
+                path.to_path_buf(),
+                transcript,
+                prefs,
+            ))),
+            Err(error) if crate::history::adapter::is_cancelled(&error) => Ok(None),
+            Err(error) => Err(std::io::Error::other(error.to_string())),
+        }
     }
 
-    /// A model over already parsed entries.
-    pub fn from_entries(
-        path: PathBuf,
-        entries: Arc<Vec<RenderableEntry>>,
-        prefs: ViewPrefs,
-    ) -> Self {
-        let agent_ordinals = agent_ordinals(&entries).into();
+    /// A model over an already decoded transcript.
+    pub fn from_transcript(path: PathBuf, transcript: Arc<Transcript>, prefs: ViewPrefs) -> Self {
+        let agent_ordinals = agent_ordinals(&transcript).into();
         Self {
             path,
-            entries,
+            transcript,
             prefs,
             expanded: BTreeSet::new(),
             agent_ordinals,
         }
+    }
+
+    /// The entries shown, numbered as tool outputs and message ranges refer
+    /// to them ([`super::ledger::renderable_entries`]).
+    pub fn entries(&self) -> Vec<RenderableEntry<'_>> {
+        renderable_entries(&self.transcript)
     }
 
     /// `t`: summary → truncated → full → summary. Returns the new mode
@@ -126,14 +136,14 @@ impl ViewerModel {
 
     /// The layout-free document for the current preferences.
     pub fn document(&self) -> ConversationDocument {
-        build_document(&self.entries, &self.prefs, &self.expanded)
+        build_document(&self.entries(), &self.prefs, &self.expanded)
     }
 
     /// The ledger rendering at `content_width_cols` columns (see
     /// [`super::content_width_for_frame`]).
     pub fn ledger(&self, content_width_cols: usize) -> RenderedConversation {
         render_parsed_conversation(
-            &self.entries,
+            &self.entries(),
             &self
                 .prefs
                 .render_options(content_width_cols, &self.expanded),
@@ -152,31 +162,23 @@ impl ViewerModel {
     }
 
     /// The clipboard text of the message at `entry_index` (upstream `y` in
-    /// navigation mode), from the cached entries: the raw markdown source,
-    /// tools and thinking per [`Self::export_options`].
-    ///
-    /// Upstream re-read the file ([`crate::export::extract_message_text`],
-    /// still available); reading the cache copies what is displayed, also
-    /// after the file changed or was deleted. An empty string means
-    /// [`crate::export::NO_TEXT_CONTENT`] (always the case for a summary
-    /// group, whose tools are hidden in summary mode).
+    /// navigation mode, [`crate::export::extract_message_text`]) from the
+    /// open transcript: the raw markdown source, tools and thinking per
+    /// [`Self::export_options`], also after the file changed or was deleted.
+    /// An empty string means [`crate::export::NO_TEXT_CONTENT`] (always the
+    /// case for a summary group, whose tools are hidden in summary mode).
     pub fn message_text(&self, entry_index: usize) -> Result<String, String> {
-        self.entries
-            .binary_search_by_key(&entry_index, |entry| entry.entry_index)
-            .map(|position| {
-                crate::export::message_text(self.entries[position].entry(), self.export_options())
-            })
-            .map_err(|_| MESSAGE_NOT_FOUND.to_string())
+        view::entries(&self.transcript)
+            .get(entry_index)
+            .map(|entry| crate::export::message_text(entry, self.export_options()))
+            .ok_or_else(|| MESSAGE_NOT_FOUND.to_string())
     }
 
-    /// The CLI `--plain` text of the cached entries
+    /// The CLI `--plain` text of the open transcript
     /// ([`crate::export::plain_display`]), with tools and thinking per the
     /// view.
     pub fn plain_display(&self) -> String {
-        crate::export::plain_display_entries(
-            self.entries.iter().map(RenderableEntry::entry),
-            self.export_options(),
-        )
+        crate::export::plain_display(&self.transcript, self.export_options())
     }
 
     /// The entry ([`RenderableEntry::entry_index`]) of agent message `mN`
@@ -185,7 +187,7 @@ impl ViewerModel {
     ///
     /// Ordinals are placed exactly as [`crate::agent::transcript`] places
     /// them (shared rules of `history::messages::MessageOrdinals`), over the
-    /// cached entries. A streamed assistant message whose later records
+    /// transcript's events. A streamed assistant message whose later records
     /// replace it maps to the first entry with that ordinal.
     pub fn entry_for_agent_ordinal(&self, ordinal: usize) -> Option<usize> {
         self.agent_ordinals
@@ -206,26 +208,36 @@ impl ViewerModel {
     }
 }
 
-/// `(entry_index, ordinal)` of every entry of `entries` placed as an agent
-/// message, in entry order.
+/// `(entry_index, ordinal)` of every entry of `transcript` placed as an
+/// agent message, in entry order.
 ///
-/// Placement runs over events (upstream fd27225), so each entry is copied
-/// into the event the Claude adapter decodes it to
-/// (`history::sources::claude::Records`, which Pi and OMP projections go
-/// through too) and placed like the agent transcript reader places it.
-fn agent_ordinals(entries: &[RenderableEntry]) -> Vec<(usize, usize)> {
-    use crate::history::model::Origin;
-    use crate::history::sources::claude::Records;
+/// Ordinals are placed over the transcript's dialogue events, as the agent
+/// transcript reader places them, and each placed event is mapped to the
+/// entry that shows it ([`view::entries_with_events`]).
+fn agent_ordinals(transcript: &Transcript) -> Vec<(usize, usize)> {
+    use crate::history::model::Visibility;
     use crate::history::{MessageOrdinals, Placement};
 
+    let mut entry_of = vec![None; transcript.events.len()];
+    for (entry_index, (event, _)) in view::entries_with_events(transcript)
+        .into_iter()
+        .enumerate()
+    {
+        if let Some(event) = event {
+            entry_of[event] = Some(entry_index);
+        }
+    }
     let mut ordinals = MessageOrdinals::new();
-    let mut records = Records::default();
     let mut placed = Vec::new();
-    for parsed in entries {
-        let event = records.push(parsed.entry().clone(), Origin::default());
-        match ordinals.place(&event) {
+    for (index, event) in transcript.events.iter().enumerate() {
+        if event.visibility != Visibility::Dialogue {
+            continue;
+        }
+        match ordinals.place(event) {
             Placement::Message(ordinal) | Placement::Replaces(ordinal) => {
-                placed.push((parsed.entry_index, ordinal));
+                if let Some(entry_index) = entry_of[index] {
+                    placed.push((entry_index, ordinal));
+                }
             }
             Placement::Control => {}
         }

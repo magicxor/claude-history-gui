@@ -24,12 +24,18 @@ use std::time::Instant;
 use claude_history_core::view::{ConversationDocument, ViewPrefs, ViewerModel};
 
 use super::items::{self, BuildInfo, ViewerItem};
+use crate::globals::EnvHistory;
 
 /// What to build.
 pub enum BuildJob {
-    /// Parse `path` (`ViewerModel::open`) with `prefs`, then build.
-    Open { path: PathBuf, prefs: ViewPrefs },
-    /// Rebuild from the cached entries of `model` (toggles, expansion,
+    /// Decode `path` through `history` (`ViewerModel::open`) with `prefs`,
+    /// then build.
+    Open {
+        path: PathBuf,
+        prefs: ViewPrefs,
+        history: EnvHistory,
+    },
+    /// Rebuild from the decoded transcript of `model` (toggles, expansion,
     /// width): the file is never re-read (V-002).
     Rebuild { model: ViewerModel },
 }
@@ -131,8 +137,12 @@ fn run(
 ) -> Option<BuildResult> {
     let started = Instant::now();
     let (opened, path, model) = match job {
-        BuildJob::Open { path, prefs } => {
-            match ViewerModel::open_cancellable(&path, prefs, stale) {
+        BuildJob::Open {
+            path,
+            prefs,
+            history,
+        } => {
+            match ViewerModel::open_cancellable(history.service(), &path, prefs, stale) {
                 // Superseded mid-parse (V-101): abandon at once.
                 Ok(None) => return None,
                 Ok(Some(model)) => (true, path, model),
@@ -189,6 +199,7 @@ mod tests {
             BuildJob::Open {
                 path: PathBuf::from("does-not-exist.jsonl"),
                 prefs: ViewPrefs::default(),
+                history: EnvHistory::default(),
             },
             80,
         );
@@ -229,6 +240,7 @@ mod tests {
             BuildJob::Open {
                 path,
                 prefs: ViewPrefs::default(),
+                history: EnvHistory::default(),
             },
             80,
             &stale,

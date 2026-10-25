@@ -52,7 +52,7 @@
 //!   (upstream ecc2f2f removed it with its last TUI user).
 //! * **Whole conversations from the store.** [`load_conversations`] takes
 //!   the [`HistoryEnv`] for the root, the sources and the fallback
-//!   ([`crate::history::load_all_conversations`]). Its pass is upstream's
+//!   ([`load_in_memory`], which takes it too). Its pass is upstream's
 //!   uncancellable [`reconcile::reconcile`] on the caller's thread (a GUI
 //!   tool or Deep search worker) and rayon's global pool. The `LOCK` it may
 //!   wait on is usually held by the list's own `store-reconcile` thread
@@ -202,7 +202,38 @@ fn load(
     if cancelled.is_some_and(|cancelled| cancelled()) {
         return Err(generation::cancelled_build().into());
     }
-    crate::history::load_all_conversations(env, show_last, debug_level)
+    load_in_memory(env, show_last)
+}
+
+/// Every conversation the environment's instances hold, parsed in memory
+/// and newest first: the corpus of a run without a store. Fails when no
+/// instance has a history to read.
+pub fn load_in_memory(
+    env: &HistoryEnv,
+    show_last: bool,
+) -> crate::error::Result<Vec<Conversation>> {
+    let sources = crate::history::sources::Registry::from_env(env);
+    if !sources
+        .adapters()
+        .iter()
+        .any(|adapter| adapter.instance().root.exists())
+    {
+        let root = crate::history::get_claude_projects_root(env)?;
+        return Err(crate::error::AppError::ProjectsDirNotFound(
+            root.display().to_string(),
+        ));
+    }
+    let mut conversations = reconcile::parse_everything(&sources);
+    conversations.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
+    for (index, conversation) in conversations.iter_mut().enumerate() {
+        conversation.index = index;
+        conversation.preview = if show_last {
+            conversation.preview_last.clone()
+        } else {
+            conversation.preview_first.clone()
+        };
+    }
+    Ok(conversations)
 }
 
 fn load_from_store(
@@ -608,7 +639,8 @@ impl search::TextSource for SearchIndex {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use crate::history::{Conversation, Source};
+    use crate::history::Conversation;
+    use crate::history::model::SourceKind;
     use chrono::{Local, TimeZone};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -629,7 +661,7 @@ pub(crate) mod test_support {
             .map(str::to_owned);
         let empty: Arc<str> = Arc::from("");
         Conversation {
-            source: Source::Claude,
+            source: SourceKind::Claude,
             session_id,
             path,
             index: 0,
@@ -807,7 +839,7 @@ mod tests {
         let claude = sources
             .adapters()
             .iter()
-            .find(|adapter| adapter.instance().kind == crate::history::Source::Claude)
+            .find(|adapter| adapter.instance().kind == crate::history::model::SourceKind::Claude)
             .unwrap();
         assert_eq!(claude.instance().root, projects);
         let outcome = reconcile::reconcile(&root, &sources).unwrap();
@@ -817,7 +849,7 @@ mod tests {
         );
         assert_eq!((outcome.scanned, outcome.parsed), (3, 3));
 
-        let loaded = crate::history::load_all_conversations(&env, true, None).unwrap();
+        let loaded = load_in_memory(&env, true).unwrap();
         assert_eq!(loaded.len(), 3);
         let snapshot = Snapshot::open(&root, true, TimeFilter::default()).unwrap();
         assert_eq!(snapshot.len(), 3);
@@ -896,7 +928,7 @@ mod tests {
     fn load_conversations_reads_the_store_like_the_loader() {
         let home = tempfile::tempdir().unwrap();
         let env = sessions_with_a_parse_error(home.path());
-        let parsed = crate::history::load_all_conversations(&env, false, None).unwrap();
+        let parsed = load_in_memory(&env, false).unwrap();
         assert_eq!(parsed.len(), 2);
 
         let full = load_conversations(&env, false, None, Contents::Full).unwrap();

@@ -2,6 +2,16 @@ use super::*;
 use crate::view::document::DocBlock;
 use crate::view::{ToolDisplayMode, ViewPrefs};
 
+/// A service without instances: every path opens as a loose session file.
+fn history() -> HistoryService {
+    HistoryService::default()
+}
+
+/// The transcript of `path`, decoded again.
+fn decode(path: &Path) -> Transcript {
+    crate::history::sources::decode_path(path, None, false).unwrap()
+}
+
 fn write(dir: &Path, name: &str, lines: &[&str]) -> PathBuf {
     let path = dir.join(name);
     std::fs::write(&path, lines.join("\n") + "\n").unwrap();
@@ -24,7 +34,9 @@ fn conversation_lines() -> Vec<&'static str> {
         r#"{"type":"user","timestamp":"2024-01-01T00:00:00Z","message":{"role":"user","content":"Find the Bug please"}}"#,
         r#"{"type":"assistant","timestamp":"2024-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"text","text":"Looking for the bug."},{"type":"tool_use","id":"toolu_1","name":"Grep","input":{"pattern":"bug"}}]}}"#,
         r#"{"type":"user","timestamp":"2024-01-01T00:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"src/bug.rs: BUG here\nsrc/other.rs\nl3\nl4\nl5 bug"}]}}"#,
-        r#"{"type":"pi-metadata","label":"notice","text":"a bug note"}"#,
+        // Shows nothing (a Claude record holds no note since upstream
+        // 9597669, which turned `pi-metadata` records into Pi/OMP events).
+        r#"{"type":"system","subtype":"info","content":"a bug note"}"#,
         r#"{"type":"assistant","timestamp":"2024-01-01T00:00:03Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"the bug is subtle","signature":"s"},{"type":"text","text":"Fixed the bug."}]}}"#,
     ]
 }
@@ -70,7 +82,7 @@ fn doc_text(doc: &ConversationDocument) -> String {
 fn view_click_toggles_clickable_output() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_tool_conversation(dir.path());
-    let mut model = ViewerModel::open(&path, truncated()).unwrap();
+    let mut model = ViewerModel::open(&history(), &path, truncated()).unwrap();
 
     let ledger = model.ledger(80);
     assert!(!ledger_text(&ledger).contains("five"));
@@ -89,7 +101,7 @@ fn view_click_toggles_clickable_output() {
     assert!(!ledger_text(&model.ledger(80)).contains("five"));
 }
 
-/// V-101: `open_cancellable` abandons the parse mid-file once `cancelled`
+/// V-101: `open_cancellable` abandons the decode mid-file once `cancelled`
 /// says so, and equals `open` when it never does.
 #[test]
 fn open_cancellable_stops_midway_and_matches_open_otherwise() {
@@ -104,23 +116,25 @@ fn open_cancellable_stops_midway_and_matches_open_otherwise() {
         polls.set(polls.get() + 1);
         polls.get() >= 3
     };
-    let out = ViewerModel::open_cancellable(&path, ViewPrefs::default(), &stop_at_third).unwrap();
+    let out =
+        ViewerModel::open_cancellable(&history(), &path, ViewPrefs::default(), &stop_at_third)
+            .unwrap();
     assert!(out.is_none());
-    assert_eq!(polls.get(), 3, "polled before the file and every 64 lines");
+    assert_eq!(polls.get(), 3, "polled before the file and at each read");
 
-    let full = ViewerModel::open_cancellable(&path, ViewPrefs::default(), &|| false)
+    let full = ViewerModel::open_cancellable(&history(), &path, ViewPrefs::default(), &|| false)
         .unwrap()
         .expect("never cancelled");
-    let plain = ViewerModel::open(&path, ViewPrefs::default()).unwrap();
-    assert_eq!(full.entries.len(), plain.entries.len());
-    assert_eq!(full.entries.len(), 1000);
+    let plain = ViewerModel::open(&history(), &path, ViewPrefs::default()).unwrap();
+    assert_eq!(full.entries().len(), plain.entries().len());
+    assert_eq!(full.entries().len(), 1000);
 }
 
 #[test]
 fn view_click_uses_cached_entries_after_file_removed() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_tool_conversation(dir.path());
-    let mut model = ViewerModel::open(&path, truncated()).unwrap();
+    let mut model = ViewerModel::open(&history(), &path, truncated()).unwrap();
     std::fs::remove_file(&path).unwrap();
 
     let id = first_clickable_id(&model.ledger(80));
@@ -147,8 +161,12 @@ fn view_click_uses_cached_entries_after_file_removed() {
 #[test]
 fn open_reports_io_errors() {
     let dir = tempfile::tempdir().unwrap();
-    let error =
-        ViewerModel::open(&dir.path().join("missing.jsonl"), ViewPrefs::default()).unwrap_err();
+    let error = ViewerModel::open(
+        &history(),
+        &dir.path().join("missing.jsonl"),
+        ViewPrefs::default(),
+    )
+    .unwrap_err();
     assert!(!error.to_string().is_empty());
 }
 
@@ -156,7 +174,7 @@ fn open_reports_io_errors() {
 fn preference_toggles_cycle_and_survive_expansion() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_tool_conversation(dir.path());
-    let mut model = ViewerModel::open(&path, ViewPrefs::default()).unwrap();
+    let mut model = ViewerModel::open(&history(), &path, ViewPrefs::default()).unwrap();
 
     let labels: Vec<&str> = (0..4)
         .map(|_| model.cycle_tool_display().status_label())
@@ -182,12 +200,12 @@ fn preference_toggles_cycle_and_survive_expansion() {
 fn message_text_session_id_and_plain_display_use_the_cache() {
     let dir = tempfile::tempdir().unwrap();
     let path = write(dir.path(), "abc-123.jsonl", &conversation_lines());
-    let mut model = ViewerModel::open(&path, ViewPrefs::default()).unwrap();
+    let mut model = ViewerModel::open(&history(), &path, ViewPrefs::default()).unwrap();
     assert_eq!(model.session_id(), Some("abc-123"));
 
     assert_eq!(model.message_text(0).unwrap(), "Find the Bug please");
     assert_eq!(model.message_text(1).unwrap(), "Looking for the bug.");
-    assert_eq!(model.message_text(3).unwrap(), "[notice] a bug note");
+    assert_eq!(model.message_text(3).unwrap(), "");
     assert_eq!(
         model.message_text(99).unwrap_err(),
         crate::export::MESSAGE_NOT_FOUND
@@ -207,12 +225,16 @@ fn message_text_session_id_and_plain_display_use_the_cache() {
     for entry_index in 0..5 {
         assert_eq!(
             model.message_text(entry_index),
-            crate::export::extract_message_text(&path, entry_index, model.export_options())
+            crate::export::extract_message_text(
+                &decode(&path),
+                entry_index,
+                model.export_options()
+            )
         );
     }
     assert_eq!(
         model.plain_display(),
-        crate::export::plain_display(&path, model.export_options()).unwrap()
+        crate::export::plain_display(&decode(&path), model.export_options())
     );
 }
 
@@ -234,7 +256,7 @@ fn ranges(spec: &[(usize, usize, usize)]) -> Vec<MessageRange> {
 fn ledger_search_matches_lines_case_insensitively_including_labels() {
     let dir = tempfile::tempdir().unwrap();
     let path = write(dir.path(), "c.jsonl", &conversation_lines());
-    let model = ViewerModel::open(&path, ViewPrefs::default()).unwrap();
+    let model = ViewerModel::open(&history(), &path, ViewPrefs::default()).unwrap();
     let rendered = model.ledger(80);
 
     let bug = search_lines(&rendered.lines, "BUG");
@@ -353,7 +375,7 @@ fn resolve_scroll_keeps_the_anchor_row_or_aligns_the_fallback() {
 fn rerender_after_toggle_keeps_the_focused_message() {
     let dir = tempfile::tempdir().unwrap();
     let path = write(dir.path(), "c.jsonl", &conversation_lines());
-    let mut model = ViewerModel::open(&path, ViewPrefs::default()).unwrap();
+    let mut model = ViewerModel::open(&history(), &path, ViewPrefs::default()).unwrap();
     let before = model.ledger(80);
     let mut nav = MessageNav::new(before.messages.len());
     nav.focus(2);
@@ -406,7 +428,7 @@ fn document_anchor_capture_and_resolution() {
 fn document_anchor_survives_tool_mode_changes() {
     let dir = tempfile::tempdir().unwrap();
     let path = write(dir.path(), "c.jsonl", &conversation_lines());
-    let mut model = ViewerModel::open(&path, ViewPrefs::default()).unwrap();
+    let mut model = ViewerModel::open(&history(), &path, ViewPrefs::default()).unwrap();
 
     let doc = model.document();
     let entries = doc.navigable_entry_indices();
@@ -622,7 +644,7 @@ fn escape_unwinds_typing_then_navigation_then_search_then_leaves() {
 fn document_search_reports_block_byte_ranges() {
     let dir = tempfile::tempdir().unwrap();
     let path = write(dir.path(), "c.jsonl", &conversation_lines());
-    let model = ViewerModel::open(&path, truncated()).unwrap();
+    let model = ViewerModel::open(&history(), &path, truncated()).unwrap();
     let doc = model.document();
     let index = DocSearchIndex::new(&doc);
 
@@ -646,7 +668,6 @@ fn document_search_reports_block_byte_ranges() {
             (2, 0, "bug"),
             (2, 0, "BUG"),
             (3, 0, "bug"),
-            (4, 0, "bug"),
         ]
     );
     assert!(index.find("").is_empty());
@@ -664,7 +685,7 @@ fn document_search_reports_block_byte_ranges() {
 fn document_search_covers_expanded_summary_items() {
     let dir = tempfile::tempdir().unwrap();
     let path = write(dir.path(), "c.jsonl", &conversation_lines()[..3]);
-    let mut model = ViewerModel::open(&path, ViewPrefs::default()).unwrap();
+    let mut model = ViewerModel::open(&history(), &path, ViewPrefs::default()).unwrap();
     // Summary mode: "Looking for the bug." + sentence, then nothing else.
     let index = DocSearchIndex::new(&model.document());
     assert!(index.find("src/other").is_empty());
@@ -677,7 +698,7 @@ fn document_search_covers_expanded_summary_items() {
             r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"fn main"}]}}"#,
         ],
     );
-    model = ViewerModel::open(&path, ViewPrefs::default()).unwrap();
+    model = ViewerModel::open(&history(), &path, ViewPrefs::default()).unwrap();
     let id = model.document().messages[0].blocks[0]
         .toggle_id()
         .unwrap()
@@ -771,13 +792,14 @@ fn ordinal_lines() -> Vec<&'static str> {
 fn agent_ordinals_match_the_agent_transcript() {
     let dir = tempfile::tempdir().unwrap();
     let path = write(dir.path(), "ordinals.jsonl", &ordinal_lines());
-    let viewer = ViewerModel::open(&path, truncated()).unwrap();
+    let viewer = ViewerModel::open(&history(), &path, truncated()).unwrap();
     let transcript = crate::agent::transcript::AgentTranscript::load(&path).unwrap();
     assert_eq!(transcript.messages.len(), 5);
 
     for message in &transcript.messages {
-        // Every line is a valid entry, so entry index = JSONL line - 1.
-        let entry = message.jsonl_line - 1;
+        // Every line after the file-history snapshot, which is no entry
+        // (upstream 9597669), is one: entry index = JSONL line - 2.
+        let entry = message.jsonl_line - 2;
         assert_eq!(
             viewer.agent_ordinal_for_entry(entry),
             Some(message.ordinal),
@@ -786,17 +808,17 @@ fn agent_ordinals_match_the_agent_transcript() {
         );
     }
     // The streamed message: the transcript keeps its last record (line 6),
-    // the viewer maps the ordinal to the first one (entry 4); both records
+    // the viewer maps the ordinal to the first one (entry 3); both records
     // carry the ordinal.
     assert_eq!(transcript.messages[1].jsonl_line, 6);
-    assert_eq!(viewer.entry_for_agent_ordinal(2), Some(4));
+    assert_eq!(viewer.entry_for_agent_ordinal(2), Some(3));
+    assert_eq!(viewer.agent_ordinal_for_entry(3), Some(2));
     assert_eq!(viewer.agent_ordinal_for_entry(4), Some(2));
-    assert_eq!(viewer.agent_ordinal_for_entry(5), Some(2));
-    for (ordinal, entry) in [(1, 3), (3, 6), (4, 7), (5, 10)] {
+    for (ordinal, entry) in [(1, 2), (3, 5), (4, 6), (5, 9)] {
         assert_eq!(viewer.entry_for_agent_ordinal(ordinal), Some(entry));
     }
-    // Snapshot, Warmup exchange, /clear and summary are not messages.
-    for entry in [0, 1, 2, 8, 9, 42] {
+    // Warmup exchange, /clear and summary are not messages.
+    for entry in [0, 1, 7, 8, 42] {
         assert_eq!(viewer.agent_ordinal_for_entry(entry), None, "entry {entry}");
     }
     assert_eq!(viewer.entry_for_agent_ordinal(0), None);
@@ -812,21 +834,25 @@ fn agent_ordinals_match_the_agent_transcript_for_pi_and_omp_fixtures() {
         "tests/fixtures/omp/v3.jsonl",
     ] {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture);
-        let viewer = ViewerModel::open(&path, truncated()).unwrap();
+        let viewer = ViewerModel::open(&history(), &path, truncated()).unwrap();
         let transcript = crate::agent::transcript::AgentTranscript::load(&path).unwrap();
         assert!(!transcript.messages.is_empty(), "{fixture}");
+        let shown = crate::history::view::entries_with_events(&viewer.transcript);
         for message in &transcript.messages {
-            // The transcript numbers the lines of the normalized projection.
-            let entry = message.jsonl_line - 1;
+            let entry = viewer
+                .entry_for_agent_ordinal(message.ordinal)
+                .unwrap_or_else(|| panic!("{fixture} m{}", message.ordinal));
             assert_eq!(
                 viewer.agent_ordinal_for_entry(entry),
                 Some(message.ordinal),
                 "{fixture} m{}",
                 message.ordinal
             );
+            // Both number a Pi or OMP message by its line in the session
+            // file (upstream 9597669).
+            let event = shown[entry].0.unwrap();
             assert_eq!(
-                viewer.entry_for_agent_ordinal(message.ordinal),
-                Some(entry),
+                viewer.transcript.events[event].origin.line as usize, message.jsonl_line,
                 "{fixture} m{}",
                 message.ordinal
             );

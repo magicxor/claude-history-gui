@@ -1495,10 +1495,10 @@ mod tests {
             "pi",
             vec!["pi".to_string()],
         );
-        pi.source = crate::history::Source::Pi;
+        pi.source = crate::history::model::SourceKind::Pi;
         pi.project_path = Some(dir.path().to_path_buf());
         let mut omp = test_conversation("sessions/omp.jsonl", "omp", vec!["omp".to_string()]);
-        omp.source = crate::history::Source::Omp;
+        omp.source = crate::history::model::SourceKind::Omp;
         omp.cwd = Some(dir.path().to_path_buf());
         let claude = test_conversation(
             &format!("projects/{project}/claude.jsonl"),

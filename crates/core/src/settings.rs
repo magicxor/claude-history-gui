@@ -109,12 +109,12 @@ impl EffectiveSettings {
     /// The configured arguments for resuming a conversation of `source`
     /// (upstream `ResumeConfig::default_args`): `[resume].default_args` for
     /// Claude, `[resume.codex].default_args` for Codex, none for Pi and OMP.
-    pub fn resume_default_args_for(&self, source: crate::history::Source) -> &[String] {
-        use crate::history::Source;
+    pub fn resume_default_args_for(&self, source: crate::history::model::SourceKind) -> &[String] {
+        use crate::history::model::SourceKind;
         match source {
-            Source::Claude => &self.resume_default_args,
-            Source::Codex => &self.resume_codex_default_args,
-            Source::Pi | Source::Omp => &[],
+            SourceKind::Claude => &self.resume_default_args,
+            SourceKind::Codex => &self.resume_codex_default_args,
+            SourceKind::Pi | SourceKind::Omp => &[],
         }
     }
 
@@ -196,7 +196,11 @@ pub fn effective_settings(
         resume_codex_default_args: config
             .resume
             .as_ref()
-            .map(|resume| resume.default_args(crate::history::Source::Codex).to_vec())
+            .map(|resume| {
+                resume
+                    .default_args(crate::history::model::SourceKind::Codex)
+                    .to_vec()
+            })
             .unwrap_or_default(),
     }
 }
@@ -1208,12 +1212,12 @@ mod tests {
         assert_eq!(settings.resume_default_args, vec!["--model", "opus"]);
         assert_eq!(settings.resume_codex_default_args, vec!["--yolo"]);
         assert_eq!(
-            settings.resume_default_args_for(crate::history::Source::Codex),
+            settings.resume_default_args_for(crate::history::model::SourceKind::Codex),
             ["--yolo"]
         );
         assert!(
             settings
-                .resume_default_args_for(crate::history::Source::Pi)
+                .resume_default_args_for(crate::history::model::SourceKind::Pi)
                 .is_empty()
         );
         assert_eq!(settings.exclude_projects, vec!["secret"]);

@@ -509,7 +509,12 @@ fn render_prints_the_ledger_to_a_redirected_stdout() {
         Some(world.home()),
     );
     assert_eq!(redirected.code(), 0);
-    let expected = generate_export(&file, ExportFormat::Ledger, ExportOptions::default()).unwrap();
+    let expected = generate_export(
+        &crate::test_support::transcript(&file),
+        ExportFormat::Ledger,
+        ExportOptions::default(),
+    )
+    .unwrap();
     assert!(!expected.is_empty());
     assert_eq!(redirected.rec.stdout(), expected);
     assert!(
@@ -531,7 +536,7 @@ fn render_prints_the_ledger_to_a_redirected_stdout() {
         Some(world.home()),
     );
     let expected = generate_export(
-        &file,
+        &crate::test_support::transcript(&file),
         ExportFormat::Ledger,
         ExportOptions {
             show_tools: true,
@@ -1659,7 +1664,8 @@ fn copy_dir(from: &Path, to: &Path) {
 /// source, an empty transcript and a malformed line, and never carries the sandbox marker.
 #[test]
 fn the_qa_home_fixture_loads_in_core() {
-    use claude_history_core::history::{Source, load_all_conversations};
+    use claude_history_core::history::model::SourceKind;
+    use claude_history_core::store::load_in_memory;
 
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -1672,8 +1678,8 @@ fn the_qa_home_fixture_loads_in_core() {
     );
     let world = TestWorld::new();
     copy_dir(&fixture, world.home());
-    let conversations = load_all_conversations(&world.env, true, None).expect("the corpus loads");
-    let titles = |source: Source| {
+    let conversations = load_in_memory(&world.env, true).expect("the corpus loads");
+    let titles = |source: SourceKind| {
         let mut titles: Vec<String> = conversations
             .iter()
             .filter(|conversation| conversation.source == source)
@@ -1683,7 +1689,7 @@ fn the_qa_home_fixture_loads_in_core() {
         titles
     };
     assert_eq!(
-        titles(Source::Claude),
+        titles(SourceKind::Claude),
         vec![
             "Add API pagination",
             "Deploy pipeline",
@@ -1694,8 +1700,8 @@ fn the_qa_home_fixture_loads_in_core() {
             "Worktree cleanup",
         ]
     );
-    assert_eq!(titles(Source::Pi).len(), 1);
-    assert_eq!(titles(Source::Omp).len(), 1);
+    assert_eq!(titles(SourceKind::Pi).len(), 1);
+    assert_eq!(titles(SourceKind::Omp).len(), 1);
 }
 
 /// C-023: after the startup dialog's Retry, the fixed settings take effect

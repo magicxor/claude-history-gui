@@ -812,7 +812,9 @@ use crate::history::apply_preview_mode;
 /// display toggle on (thinking, full tool output). Used for a single file
 /// the list leaves out: only then is it reported as empty.
 fn single_file_renders_nothing(path: &Path) -> std::io::Result<bool> {
-    let entries = crate::view::parse_conversation_file(path)?;
+    let transcript = crate::history::sources::decode_path(path, None, false)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let entries = crate::view::renderable_entries(&transcript);
     let prefs = crate::view::ViewPrefs {
         tool_display: crate::view::ToolDisplayMode::Full,
         show_thinking: true,

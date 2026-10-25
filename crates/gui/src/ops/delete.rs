@@ -11,7 +11,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use claude_history_core::history::Source;
+use claude_history_core::history::model::SourceKind;
 use claude_history_core::maintenance::{
     DeletePlan, delete_by_uuid_message, execute_session_delete_with, plan_session_delete,
 };
@@ -35,12 +35,12 @@ use crate::workspace::startup::register_dialog;
 pub const DIALOG_ID: &str = "delete";
 
 /// `Claude Code`, `Pi`, `OMP` or `Codex`.
-pub fn source_label(source: Source) -> &'static str {
+pub fn source_label(source: SourceKind) -> &'static str {
     match source {
-        Source::Claude => "Claude Code",
-        Source::Pi => "Pi",
-        Source::Omp => "OMP",
-        Source::Codex => "Codex",
+        SourceKind::Claude => "Claude Code",
+        SourceKind::Pi => "Pi",
+        SourceKind::Omp => "OMP",
+        SourceKind::Codex => "Codex",
     }
 }
 
@@ -52,13 +52,13 @@ pub fn dialog_title(target: &ConversationTarget) -> String {
 /// `N copies across projects. This can't be undone.` / `This can't be undone.`;
 /// for a Codex thread, what the Codex CLI does (upstream eea6d37).
 pub fn consequence_text(plan: &DeletePlan) -> String {
-    if plan.source == Source::Codex {
+    if plan.source == SourceKind::Codex {
         format!(
             "Runs codex delete --force {}, which removes the thread and its state. This can't \
              be undone.",
             plan.session_id
         )
-    } else if plan.source == Source::Claude && plan.files.len() > 1 {
+    } else if plan.source == SourceKind::Claude && plan.files.len() > 1 {
         format!(
             "{} copies across projects. This can't be undone.",
             plan.files.len()
@@ -261,7 +261,7 @@ fn execute(
                 match result {
                     Ok(()) => {
                         CorpusBus::broadcast(CorpusNotice::Deleted(gone), cx);
-                        let message = if plan.source == Source::Claude && plan.files.len() > 1 {
+                        let message = if plan.source == SourceKind::Claude && plan.files.len() > 1 {
                             delete_by_uuid_message(&plan.session_id, plan.files.len())
                         } else {
                             format!("Deleted \"{title}\"")

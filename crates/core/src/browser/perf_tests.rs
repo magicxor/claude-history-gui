@@ -13,7 +13,8 @@
 
 use super::test_helpers::*;
 use super::*;
-use crate::history::{LoaderMessage, Source};
+use crate::history::LoaderMessage;
+use crate::history::model::SourceKind;
 use chrono::{Duration as ChronoDuration, Local, TimeZone};
 use std::time::{Duration, Instant};
 
@@ -54,7 +55,7 @@ fn synthetic(root: &Path, index: usize) -> Conversation {
         index % PROJECTS
     );
     Conversation {
-        source: Source::Claude,
+        source: SourceKind::Claude,
         session_id: uuid(index),
         path,
         index: 0,

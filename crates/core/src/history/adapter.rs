@@ -22,6 +22,11 @@
 //!   transcripts removed. A GUI plans a deletion and confirms it first
 //!   (`maintenance::plan_session_delete`, gated by
 //!   [`Adapter::capabilities`]).
+//! * **Cancellable decoding.** [`Adapter::decode_cancellable`] gives a
+//!   decode up once a flag is set, with the error [`is_cancelled`]
+//!   recognizes (the GUI viewer abandons an open the user moved past,
+//!   V-101). The Claude, Pi and OMP adapters check it at every read of the
+//!   session file; others before and after decoding.
 
 use super::actions::{Capabilities, Target};
 use super::model::{ConversationKey, Event, SourceInstance, Transcript};
@@ -184,6 +189,24 @@ pub trait Adapter: Send + Sync {
         }))
     }
 
+    /// [`Self::decode`] that gives up once `cancelled()` returns true, with
+    /// the error [`is_cancelled`] recognizes (fork, see the module docs). By
+    /// default the flag is checked before and after decoding.
+    fn decode_cancellable(
+        &self,
+        located: &Located,
+        cancelled: &dyn Fn() -> bool,
+    ) -> crate::error::Result<Option<Transcript>> {
+        if cancelled() {
+            return Err(cancelled_error());
+        }
+        let transcript = self.decode(located)?;
+        if cancelled() {
+            return Err(cancelled_error());
+        }
+        Ok(transcript)
+    }
+
     fn capabilities(&self) -> Capabilities;
 
     /// Plans resuming `target` in the tool that wrote it, or forking it
@@ -209,6 +232,34 @@ pub trait Adapter: Send + Sync {
 
     /// Sets the title of the conversation whose own artifact is `path`.
     fn rename(&self, path: &Path, title: &str) -> crate::error::Result<()>;
+}
+
+/// Why a cancellable decode stopped (fork, see [`Adapter::decode_cancellable`]).
+#[derive(Debug)]
+struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("decoding was cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+/// The error a cancelled decode ends with (fork).
+pub fn cancelled_error() -> crate::error::AppError {
+    cancelled_io_error().into()
+}
+
+/// [`cancelled_error`] as the I/O error a reader returns (fork).
+pub(crate) fn cancelled_io_error() -> std::io::Error {
+    std::io::Error::other(Cancelled)
+}
+
+/// Whether `error` ends a decode that was cancelled (fork).
+pub fn is_cancelled(error: &crate::error::AppError) -> bool {
+    matches!(error, crate::error::AppError::Io(error)
+        if error.get_ref().is_some_and(|inner| inner.is::<Cancelled>()))
 }
 
 #[cfg(test)]

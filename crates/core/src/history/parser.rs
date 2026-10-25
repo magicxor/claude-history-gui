@@ -17,15 +17,7 @@ pub fn process_conversation_file(
     modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
 ) -> Result<Option<Conversation>> {
-    stream_conversation(&path, modified, false, debug_level)
-}
-
-pub fn process_omp_conversation_file(
-    path: PathBuf,
-    modified: Option<SystemTime>,
-    debug_level: Option<DebugLevel>,
-) -> Result<Option<Conversation>> {
-    stream_conversation(&path, modified, true, debug_level)
+    stream_conversation(&path, modified, debug_level)
 }
 
 /// Decodes `path` straight into an incremental indexer. Upstream collects the
@@ -34,12 +26,11 @@ pub fn process_omp_conversation_file(
 fn stream_conversation(
     path: &std::path::Path,
     modified: Option<SystemTime>,
-    omp: bool,
     debug_level: Option<DebugLevel>,
 ) -> Result<Option<Conversation>> {
     let mut indexer = super::index::Indexer::default();
     let transcript =
-        super::sources::decode_path_into(path, modified, omp, &mut |event| indexer.push(&event))?;
+        super::sources::decode_path_into(path, modified, false, &mut |event| indexer.push(&event))?;
     Ok(index_with(&transcript, debug_level, |t| indexer.finish(t)))
 }
 
@@ -53,7 +44,7 @@ pub fn process_conversation_reader<R: std::io::BufRead>(
 ) -> Result<Option<Conversation>> {
     let key = super::model::ConversationKey {
         instance: super::model::SourceInstance {
-            kind: super::Source::Claude,
+            kind: super::model::SourceKind::Claude,
             root: PathBuf::new(),
         },
         native_id: path.to_string_lossy().into_owned(),
@@ -94,7 +85,7 @@ fn index_with(
     }
     match finish(transcript) {
         Ok(mut conversation) => {
-            if conversation.source == super::Source::Claude {
+            if conversation.source == super::model::SourceKind::Claude {
                 conversation.project_name = None;
                 conversation.project_path = None;
             }
@@ -1576,35 +1567,6 @@ mod tests {
         assert_eq!(
             conversation.semantic_turn_ranges,
             vec![MessageRange::single(1), MessageRange::single(2),]
-        );
-    }
-
-    #[test]
-    fn empty_searchable_metadata_occupies_an_ordinal() {
-        let content = [
-            r#"{"type":"pi-metadata","label":"Hook","text":"","searchable":true}"#.to_string(),
-            user_msg("question", None),
-            assistant_msg("answer"),
-        ]
-        .join("\n");
-
-        let conversation = parse_jsonl(&content).unwrap().unwrap();
-        assert_eq!(conversation.message_count, 3);
-        assert_eq!(
-            conversation.semantic_turn_ranges,
-            vec![MessageRange::single(2), MessageRange::single(3),]
-        );
-
-        let transcript =
-            AgentTranscript::from_reader(PathBuf::from("test.jsonl"), Cursor::new(content))
-                .unwrap();
-        assert_eq!(
-            transcript
-                .messages
-                .iter()
-                .map(|message| message.ordinal)
-                .collect::<Vec<_>>(),
-            vec![1, 2, 3]
         );
     }
 

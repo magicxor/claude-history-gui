@@ -132,12 +132,13 @@ pub fn log_display_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::{Conversation, ParseError, Source};
+    use crate::history::model::SourceKind;
+    use crate::history::{Conversation, ParseError};
     use std::path::PathBuf;
 
     fn conversation_with_errors() -> Conversation {
         Conversation {
-            source: Source::Claude,
+            source: SourceKind::Claude,
             session_id: "session".to_string(),
             path: PathBuf::from("session.jsonl"),
             index: 0,

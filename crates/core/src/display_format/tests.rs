@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 fn test_conversation() -> Conversation {
     Conversation {
-        source: crate::history::Source::Claude,
+        source: crate::history::model::SourceKind::Claude,
         session_id: "session".to_owned(),
         path: PathBuf::from("/tmp/session.jsonl"),
         index: 0,
@@ -1077,7 +1077,7 @@ fn semantic_list_shows_compact_score_metadata_on_wide_rows() {
 #[test]
 fn row_header_shows_source_labels_duration_and_highlights() {
     let mut conversation = test_conversation();
-    conversation.source = crate::history::Source::Omp;
+    conversation.source = crate::history::model::SourceKind::Omp;
     conversation.duration_minutes = Some(75);
     let query = HighlightQuery::parse("sentinel");
     let header = build_row_header(&RowHeaderInput {
@@ -1101,7 +1101,7 @@ fn row_header_shows_source_labels_duration_and_highlights() {
     );
     assert_eq!(header.summary.as_ref().unwrap().highlights.len(), 1);
 
-    conversation.source = crate::history::Source::Pi;
+    conversation.source = crate::history::model::SourceKind::Pi;
     let header = build_row_header(&RowHeaderInput {
         conversation: &conversation,
         query: &query,

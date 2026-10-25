@@ -1,22 +1,22 @@
 //! Layout-free conversation document.
 //!
-//! [`build_document`] turns parsed entries into a [`ConversationDocument`]:
+//! [`build_document`] turns a transcript's entries
+//! ([`crate::history::view::entries`]) into a [`ConversationDocument`]:
 //! messages in render order, each with a label, presentation flags and a list
 //! of semantic blocks (markdown text, thinking, tool summary, tool calls and
 //! results). It follows exactly the rules of the [ledger](super::ledger)
 //! renderer and reuses its helpers, so both agree on:
 //!
-//! - which entries render (summary, file-history snapshot, system, titles,
-//!   agent name, permission mode, hidden Pi metadata and unknown entries
-//!   never do; subagent entries and `agent_progress` entries only with
-//!   `show_thinking`);
+//! - which entries render (hidden records and notes that are not
+//!   searchable never do; subagent entries and `agent_progress` entries only
+//!   with `show_thinking`);
 //! - the user template (text after [`process_command_message`], text
 //!   blocks joined with a blank line, then tool results) and the assistant
 //!   template in fixed order regardless of the JSON block order (text blocks,
 //!   tool summary in summary mode, tool calls in truncated/full mode,
 //!   thinking for top-level assistants);
 //! - summary-mode grouping of consecutive tool-only assistant entries with
-//!   the same parent and agent, absorbing tool-result-only user entries, and
+//!   the same parent and speaker, absorbing tool-result-only user entries, and
 //!   the summary sentence (`"Searched for 2 patterns, read 1 file"`);
 //! - tool output ids ([`ToolOutputId`]), which are stable across re-renders
 //!   and shared with the ledger, so one expanded set drives both;
@@ -49,6 +49,8 @@
 
 use std::collections::BTreeSet;
 
+use chrono::{DateTime, Utc};
+
 use super::ViewPrefs;
 use super::ledger::{
     RenderOptions, RenderableEntry, RowTiming, TRUNCATED_BODY_LINES, TRUNCATED_RESULT_LINES,
@@ -57,8 +59,9 @@ use super::ledger::{
     make_tool_summary_output_id, render_markdown_to_lines, subagent_label, summarize_tool_calls,
     tool_only_assistant_summary, tool_result_display_text, user_entry_is_only_tool_results,
 };
-use crate::claude::{AgentContent, AgentProgressData, ContentBlock, LogEntry, UserContent};
 use crate::commands::process_command_message;
+use crate::history::model::{Message, Part, Role};
+use crate::history::view::EntryKind;
 use crate::theme::{Rgb, Theme};
 use crate::tool_format;
 
@@ -76,9 +79,10 @@ pub enum DocMessageKind {
     User,
     /// An assistant entry (top-level or subagent).
     Assistant,
-    /// A displayable Pi/OMP metadata entry (custom message), rendered with
-    /// the user template. Not navigable.
-    PiMetadata,
+    /// A searchable note of the source (a Pi/OMP custom message, the start
+    /// of a Codex fork's own records), rendered with the user template. Not
+    /// navigable.
+    Note,
     /// The user side of a Claude `agent_progress` record.
     AgentProgressUser,
     /// The assistant side of a Claude `agent_progress` record.
@@ -97,7 +101,7 @@ pub enum LabelRole {
     Accent,
     /// Tool summary group labels.
     AccentDim,
-    /// Pi/OMP metadata labels.
+    /// Note labels.
     TextSecondary,
 }
 
@@ -148,15 +152,16 @@ impl DocTiming {
 /// One rendered message.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DocMessage {
-    /// Index into the normalized entry list ([`RenderableEntry::entry_index`];
-    /// counted before file-history snapshots are dropped). For a summary
-    /// group, the group's first entry. The same index space as
+    /// Index among the transcript's entries
+    /// ([`RenderableEntry::entry_index`]). For a summary group, the group's
+    /// first entry. The same index space as
     /// [`crate::export::extract_message_text`].
     pub entry_index: usize,
     pub kind: DocMessageKind,
-    /// Full label text: `You`, the assistant label (`Claude`, `Pi`, `OMP`
-    /// or the entry's `agent`), `↳{short parent id}` for subagents,
-    /// `↳{agent id, 7 chars}` for agent progress, or the Pi metadata label.
+    /// Full label text: `You`, the assistant label (the source's assistant:
+    /// `Claude`, `Pi`, `OMP`, `Codex`, or a Codex subagent's name),
+    /// `↳{short parent id}` for subagents, `↳{agent id, 7 chars}` for agent
+    /// progress, or the note's label.
     /// The ledger shows it fitted to 9 cells ([`super::fitted_name`]).
     pub label: String,
     pub label_role: LabelRole,
@@ -165,7 +170,7 @@ pub struct DocMessage {
     pub bold: bool,
     /// The ledger mutes the label and the message's own text, i.e. its
     /// [`DocBlockKind::Markdown`] blocks (subagents, agent progress, skill
-    /// expansions, Pi metadata, subagent summary groups).
+    /// expansions, notes, subagent summary groups).
     ///
     /// It is not a style for every block. A [`DocToolCall`] carries its own
     /// [`DocToolCall::dimmed`]; a [`DocBlockKind::ToolSummary`] sentence and
@@ -184,10 +189,10 @@ pub struct DocMessage {
     /// agent progress and for missing or invalid timestamps. Which block
     /// shows it in the ledger is in [`DocBlock::timing`].
     pub timestamp: Option<String>,
-    /// The entry's raw timestamp (RFC 3339 when valid), whatever the
-    /// preferences; for a summary group the first entry's, for agent
-    /// progress the record's own (which the ledger never shows).
-    pub raw_timestamp: Option<String>,
+    /// The entry's time, whatever the preferences; for a summary group the
+    /// first entry's. Agent progress has none (its record's time is not the
+    /// subagent message's), and the ledger never shows one for it.
+    pub raw_timestamp: Option<DateTime<Utc>>,
     /// Whether the message is a navigation / copy unit, i.e. the ledger
     /// records a [`super::MessageRange`] for it. Navigable messages appear in
     /// the same order as the ledger's message ranges.
@@ -208,7 +213,7 @@ pub struct DocBlock {
 pub enum DocBlockKind {
     /// Markdown source: user text after command-tag processing (text blocks
     /// joined by a blank line), one assistant text block, aggregated
-    /// agent-progress text (not command-processed), or Pi metadata text.
+    /// agent-progress text (not command-processed), or a note's text.
     Markdown {
         text: String,
     },
@@ -778,7 +783,7 @@ pub fn markdown_plain_text(markdown: &str) -> String {
 /// rules). `expanded` is the set of expanded tool outputs, shared with the
 /// ledger.
 pub fn build_document(
-    entries: &[RenderableEntry],
+    entries: &[RenderableEntry<'_>],
     prefs: &ViewPrefs,
     expanded: &BTreeSet<ToolOutputId>,
 ) -> ConversationDocument {
@@ -832,7 +837,7 @@ struct Style {
 }
 
 impl Style {
-    fn for_user(parent_id: Option<&str>, content: &UserContent) -> Self {
+    fn for_user(parent_id: Option<&str>, parts: &[Part]) -> Self {
         if let Some(parent) = parent_id {
             return Self {
                 label: subagent_label(parent),
@@ -842,13 +847,10 @@ impl Style {
                 is_subagent: true,
             };
         }
-        let is_skill = match content {
-            UserContent::String(s) => s.trim().starts_with("Base directory for this skill:"),
-            UserContent::Blocks(blocks) => blocks.iter().any(|block| {
-                matches!(block, ContentBlock::Text { text }
-                    if text.trim().starts_with("Base directory for this skill:"))
-            }),
-        };
+        let is_skill = parts.iter().any(|part| {
+            matches!(part, Part::Text(text)
+                if text.trim().starts_with("Base directory for this skill:"))
+        });
         Self {
             label: "You".to_string(),
             role: LabelRole::TextPrimary,
@@ -858,7 +860,7 @@ impl Style {
         }
     }
 
-    fn for_assistant(parent_id: Option<&str>, agent: Option<&str>) -> Self {
+    fn for_assistant(parent_id: Option<&str>, speaker: &str) -> Self {
         match parent_id {
             Some(parent) => Self {
                 label: subagent_label(parent),
@@ -868,7 +870,7 @@ impl Style {
                 is_subagent: true,
             },
             None => Self {
-                label: agent.unwrap_or("Claude").to_string(),
+                label: speaker.to_string(),
                 role: LabelRole::Accent,
                 dimmed: false,
                 bold: true,
@@ -877,7 +879,7 @@ impl Style {
         }
     }
 
-    fn for_pi_metadata(label: &str) -> Self {
+    fn for_note(label: &str) -> Self {
         Self {
             label: label.to_string(),
             role: LabelRole::TextSecondary,
@@ -912,8 +914,8 @@ struct PendingGroup {
     first_parsed_idx: usize,
     last_parsed_idx: usize,
     parent_id: Option<String>,
-    agent: Option<String>,
-    timestamp: Option<String>,
+    speaker: String,
+    timestamp: Option<DateTime<Utc>>,
     summary: ToolActivitySummary,
 }
 
@@ -924,12 +926,10 @@ struct Builder<'a> {
 }
 
 impl Builder<'_> {
-    fn entry_timestamp(&self, raw: Option<&str>) -> Option<String> {
-        if self.prefs.show_timing {
-            raw.and_then(format_timestamp)
-        } else {
-            None
-        }
+    fn entry_timestamp(&self, timestamp: Option<DateTime<Utc>>) -> Option<String> {
+        timestamp
+            .filter(|_| self.prefs.show_timing)
+            .map(format_timestamp)
     }
 
     fn message(
@@ -937,7 +937,7 @@ impl Builder<'_> {
         ctx: Ctx<'_>,
         kind: DocMessageKind,
         timestamp: Option<String>,
-        raw_timestamp: Option<&str>,
+        raw_timestamp: Option<DateTime<Utc>>,
         blocks: Vec<DocBlock>,
     ) -> Option<DocMessage> {
         if blocks.is_empty() {
@@ -952,111 +952,76 @@ impl Builder<'_> {
             dimmed: ctx.style.dimmed,
             is_subagent: ctx.style.is_subagent,
             timestamp,
-            raw_timestamp: raw_timestamp.map(str::to_string),
-            navigable: kind != DocMessageKind::PiMetadata,
+            raw_timestamp,
+            navigable: kind != DocMessageKind::Note,
             blocks,
         })
     }
 
     /// The ledger's `render_entry`.
-    fn entry_message(&self, parsed: &RenderableEntry) -> Option<DocMessage> {
+    fn entry_message(&self, parsed: &RenderableEntry<'_>) -> Option<DocMessage> {
         let entry_index = parsed.entry_index;
-        match parsed.entry() {
-            LogEntry::Summary { .. }
-            | LogEntry::FileHistorySnapshot { .. }
-            | LogEntry::System { .. }
-            | LogEntry::CustomTitle { .. }
-            | LogEntry::AiTitle { .. }
-            | LogEntry::AgentName { .. }
-            | LogEntry::PermissionMode { .. }
-            | LogEntry::PiMetadata {
+        let entry = parsed.entry();
+        match entry.kind {
+            EntryKind::Hidden
+            | EntryKind::Note {
                 searchable: false, ..
-            }
-            | LogEntry::Unknown => None,
-            LogEntry::PiMetadata {
+            } => None,
+            EntryKind::Note {
                 label,
                 text,
-                timestamp,
                 searchable: true,
-                ..
             } => {
-                let content = UserContent::String(text.clone());
+                let content = [Part::Text(text.to_owned())];
                 let ctx = Ctx {
-                    style: Style::for_pi_metadata(label),
+                    style: Style::for_note(label),
                     parent_id: None,
                     entry_index,
                 };
-                let ts = self.entry_timestamp(timestamp.as_deref());
+                let ts = self.entry_timestamp(entry.timestamp);
                 let mut timing = RowTiming::new(self.prefs.show_timing, ts.as_deref());
                 let blocks = self.user_blocks(&ctx, &mut timing, &content);
                 self.message(
                     ctx,
-                    DocMessageKind::PiMetadata,
+                    DocMessageKind::Note,
                     ts.clone(),
-                    timestamp.as_deref(),
+                    entry.timestamp,
                     blocks,
                 )
             }
-            LogEntry::Progress { data, extra } => {
+            EntryKind::Subagent { agent_id, message } => {
                 if !self.prefs.show_thinking {
                     return None;
                 }
-                let agent_progress = crate::claude::parse_agent_progress(data)?;
-                let raw_timestamp = extra.get("timestamp").and_then(|value| value.as_str());
-                self.agent_progress_message(entry_index, &agent_progress, raw_timestamp)
+                self.agent_progress_message(entry_index, agent_id, message, entry.timestamp)
             }
-            LogEntry::User {
-                message,
-                timestamp,
-                parent_tool_use_id,
-                ..
-            } => {
-                if parent_tool_use_id.is_some() && !self.prefs.show_thinking {
+            EntryKind::Message { message, speaker } => {
+                if message.parent_tool_use_id.is_some() && !self.prefs.show_thinking {
                     return None;
                 }
-                let parent_id = parent_tool_use_id.as_deref();
+                let parent_id = message.parent_tool_use_id.as_deref();
+                let (style, kind) = match message.role {
+                    Role::User => (
+                        Style::for_user(parent_id, &message.parts),
+                        DocMessageKind::User,
+                    ),
+                    Role::Assistant => (
+                        Style::for_assistant(parent_id, speaker),
+                        DocMessageKind::Assistant,
+                    ),
+                };
                 let ctx = Ctx {
-                    style: Style::for_user(parent_id, &message.content),
+                    style,
                     parent_id,
                     entry_index,
                 };
-                let ts = self.entry_timestamp(timestamp.as_deref());
+                let ts = self.entry_timestamp(entry.timestamp);
                 let mut timing = RowTiming::new(self.prefs.show_timing, ts.as_deref());
-                let blocks = self.user_blocks(&ctx, &mut timing, &message.content);
-                self.message(
-                    ctx,
-                    DocMessageKind::User,
-                    ts.clone(),
-                    timestamp.as_deref(),
-                    blocks,
-                )
-            }
-            LogEntry::Assistant {
-                message,
-                agent,
-                timestamp,
-                parent_tool_use_id,
-                ..
-            } => {
-                if parent_tool_use_id.is_some() && !self.prefs.show_thinking {
-                    return None;
-                }
-                let parent_id = parent_tool_use_id.as_deref();
-                let ctx = Ctx {
-                    style: Style::for_assistant(parent_id, agent.as_deref()),
-                    parent_id,
-                    entry_index,
+                let blocks = match message.role {
+                    Role::User => self.user_blocks(&ctx, &mut timing, &message.parts),
+                    Role::Assistant => self.assistant_blocks(&ctx, &mut timing, &message.parts),
                 };
-                let ts = self.entry_timestamp(timestamp.as_deref());
-                let mut timing = RowTiming::new(self.prefs.show_timing, ts.as_deref());
-                let blocks = self.assistant_blocks(&ctx, &mut timing, &message.content);
-                self.message(
-                    ctx,
-                    DocMessageKind::Assistant,
-                    ts.clone(),
-                    timestamp.as_deref(),
-                    blocks,
-                )
+                self.message(ctx, kind, ts.clone(), entry.timestamp, blocks)
             }
         }
     }
@@ -1066,31 +1031,19 @@ impl Builder<'_> {
         &self,
         ctx: &Ctx<'_>,
         timing: &mut RowTiming<'_>,
-        content: &UserContent,
+        parts: &[Part],
     ) -> Vec<DocBlock> {
         let mut blocks = Vec::new();
 
         // step_user_text
-        let text = match content {
-            UserContent::String(s) => process_command_message(s),
-            UserContent::Blocks(content_blocks) => {
-                let texts: Vec<String> = content_blocks
-                    .iter()
-                    .filter_map(|block| {
-                        if let ContentBlock::Text { text } = block {
-                            process_command_message(text)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if texts.is_empty() {
-                    None
-                } else {
-                    Some(texts.join("\n\n"))
-                }
-            }
-        };
+        let texts: Vec<String> = parts
+            .iter()
+            .filter_map(|part| match part {
+                Part::Text(text) => process_command_message(text),
+                _ => None,
+            })
+            .collect();
+        let text = (!texts.is_empty()).then(|| texts.join("\n\n"));
         if let Some(text) = text {
             let slot = if ctx.style.dimmed {
                 timing.pad()
@@ -1106,14 +1059,12 @@ impl Builder<'_> {
         }
 
         // step_user_tool_results
-        if self.prefs.tool_display.shows_details()
-            && let UserContent::Blocks(content_blocks) = content
-        {
-            for (block_idx, block) in content_blocks.iter().enumerate() {
-                let ContentBlock::ToolResult {
-                    content,
-                    tool_use_id,
-                } = block
+        if self.prefs.tool_display.shows_details() {
+            for (block_idx, part) in parts.iter().enumerate() {
+                let Part::ToolResult {
+                    output: content,
+                    call_id: tool_use_id,
+                } = part
                 else {
                     continue;
                 };
@@ -1154,13 +1105,13 @@ impl Builder<'_> {
         &self,
         ctx: &Ctx<'_>,
         timing: &mut RowTiming<'_>,
-        content: &[ContentBlock],
+        content: &[Part],
     ) -> Vec<DocBlock> {
         let mut blocks = Vec::new();
 
         // step_assistant_text
-        for block in content {
-            let ContentBlock::Text { text } = block else {
+        for part in content {
+            let Part::Text(text) = part else {
                 continue;
             };
             if text.trim().is_empty() {
@@ -1186,8 +1137,8 @@ impl Builder<'_> {
 
         // step_thinking
         if self.prefs.show_thinking && !ctx.style.is_subagent {
-            for block in content {
-                let ContentBlock::Thinking { thinking, .. } = block else {
+            for part in content {
+                let Part::Thinking(thinking) = part else {
                     continue;
                 };
                 if thinking.is_empty() {
@@ -1212,7 +1163,7 @@ impl Builder<'_> {
         &self,
         blocks: &mut Vec<DocBlock>,
         timing: &mut RowTiming<'_>,
-        content: &[ContentBlock],
+        content: &[Part],
     ) {
         if !self.prefs.tool_display.is_summary() {
             return;
@@ -1237,10 +1188,10 @@ impl Builder<'_> {
         blocks: &mut Vec<DocBlock>,
         ctx: &Ctx<'_>,
         timing: &mut RowTiming<'_>,
-        content: &[ContentBlock],
+        content: &[Part],
     ) {
-        for (block_idx, block) in content.iter().enumerate() {
-            let ContentBlock::ToolUse { id, name, input } = block else {
+        for (block_idx, part) in content.iter().enumerate() {
+            let Part::ToolCall { id, name, input } = part else {
                 continue;
             };
             let output_id = make_tool_output_id(
@@ -1340,21 +1291,19 @@ impl Builder<'_> {
     }
 
     /// The ledger's `render_agent_progress_message`. Agent progress never
-    /// shows a stamp; `raw_timestamp` is the record's own timestamp.
+    /// shows a stamp; `raw_timestamp` is the entry's time.
     fn agent_progress_message(
         &self,
         entry_index: usize,
-        agent_progress: &AgentProgressData,
-        raw_timestamp: Option<&str>,
+        agent_id: &str,
+        message: &Message,
+        raw_timestamp: Option<DateTime<Utc>>,
     ) -> Option<DocMessage> {
-        let agent_id = agent_progress.agent_id.as_str();
         let short_id = crate::claude::short_agent_id(agent_id);
-        let msg = &agent_progress.message;
-        let AgentContent::Blocks(content) = &msg.message.content;
-        let (kind, role) = match msg.message_type.as_str() {
-            "user" => (DocMessageKind::AgentProgressUser, LabelRole::TextPrimary),
-            "assistant" => (DocMessageKind::AgentProgressAssistant, LabelRole::Accent),
-            _ => return None,
+        let content = &message.parts;
+        let (kind, role) = match message.role {
+            Role::User => (DocMessageKind::AgentProgressUser, LabelRole::TextPrimary),
+            Role::Assistant => (DocMessageKind::AgentProgressAssistant, LabelRole::Accent),
         };
         let ctx = Ctx {
             style: Style::for_agent(short_id, role),
@@ -1367,8 +1316,8 @@ impl Builder<'_> {
         // step_aggregated_text (no command-tag processing)
         let texts: Vec<&str> = content
             .iter()
-            .filter_map(|block| match block {
-                ContentBlock::Text { text } => Some(text.as_str()),
+            .filter_map(|part| match part {
+                Part::Text(text) => Some(text.as_str()),
                 _ => None,
             })
             .collect();
@@ -1386,11 +1335,11 @@ impl Builder<'_> {
         if kind == DocMessageKind::AgentProgressUser {
             // step_agent_tool_results: always the subagent presentation.
             if self.prefs.tool_display.shows_details() {
-                for (block_idx, block) in content.iter().enumerate() {
-                    let ContentBlock::ToolResult {
-                        content,
-                        tool_use_id,
-                    } = block
+                for (block_idx, part) in content.iter().enumerate() {
+                    let Part::ToolResult {
+                        output: content,
+                        call_id: tool_use_id,
+                    } = part
                     else {
                         continue;
                     };
@@ -1424,18 +1373,18 @@ impl Builder<'_> {
         &self,
         messages: &mut Vec<DocMessage>,
         pending: &mut Option<PendingGroup>,
-        entries: &[RenderableEntry],
+        entries: &[RenderableEntry<'_>],
         parsed_idx: usize,
     ) -> bool {
         let parsed = &entries[parsed_idx];
         let entry_index = parsed.entry_index;
         let entry = parsed.entry();
 
-        if let Some((parent_id, agent, timestamp, summary)) =
+        if let Some((parent_id, speaker, timestamp, summary)) =
             tool_only_assistant_summary(entry, &self.options)
         {
             match pending {
-                Some(p) if p.parent_id.as_deref() == parent_id && p.agent.as_deref() == agent => {
+                Some(p) if p.parent_id.as_deref() == parent_id && p.speaker == speaker => {
                     p.last_parsed_idx = parsed_idx;
                     p.summary.merge(summary);
                 }
@@ -1447,8 +1396,8 @@ impl Builder<'_> {
                         first_parsed_idx: parsed_idx,
                         last_parsed_idx: parsed_idx,
                         parent_id: parent_id.map(str::to_string),
-                        agent: agent.map(str::to_string),
-                        timestamp: timestamp.map(str::to_string),
+                        speaker: speaker.to_owned(),
+                        timestamp,
                         summary,
                     });
                 }
@@ -1471,16 +1420,15 @@ impl Builder<'_> {
         &self,
         messages: &mut Vec<DocMessage>,
         pending: &mut Option<PendingGroup>,
-        entries: &[RenderableEntry],
+        entries: &[RenderableEntry<'_>],
     ) {
         let Some(group) = pending.take() else {
             return;
         };
 
-        let label =
-            assistant_label(group.parent_id.as_deref(), group.agent.as_deref()).into_owned();
+        let label = assistant_label(group.parent_id.as_deref(), &group.speaker).into_owned();
         let ts = if self.prefs.show_timing {
-            group.timestamp.as_deref().and_then(format_timestamp)
+            group.timestamp.map(format_timestamp)
         } else {
             None
         };
@@ -1532,20 +1480,23 @@ impl Builder<'_> {
     /// the group (same parent) in truncated mode.
     fn summary_group_details(
         &self,
-        entries: &[RenderableEntry],
+        entries: &[RenderableEntry<'_>],
         group: &PendingGroup,
     ) -> Vec<DocBlock> {
         let pad = TimingSlot::from_show_timing(self.prefs.show_timing);
         let mut items = Vec::new();
         for parsed in &entries[group.first_parsed_idx..=group.last_parsed_idx] {
-            match parsed.entry() {
-                LogEntry::Assistant {
-                    message,
-                    parent_tool_use_id,
-                    ..
-                } if parent_tool_use_id.as_deref() == group.parent_id.as_deref() => {
-                    for (block_idx, block) in message.content.iter().enumerate() {
-                        if let ContentBlock::ToolUse { id, name, input } = block {
+            let EntryKind::Message { message, .. } = parsed.entry().kind else {
+                continue;
+            };
+            let parent_tool_use_id = &message.parent_tool_use_id;
+            if parent_tool_use_id.as_deref() != group.parent_id.as_deref() {
+                continue;
+            }
+            match message.role {
+                Role::Assistant => {
+                    for (block_idx, part) in message.parts.iter().enumerate() {
+                        if let Part::ToolCall { id, name, input } = part {
                             let output_id = make_tool_output_id(
                                 parsed.entry_index,
                                 parent_tool_use_id.as_deref(),
@@ -1564,19 +1515,12 @@ impl Builder<'_> {
                         }
                     }
                 }
-                LogEntry::User {
-                    message,
-                    parent_tool_use_id,
-                    ..
-                } if parent_tool_use_id.as_deref() == group.parent_id.as_deref() => {
-                    let UserContent::Blocks(blocks) = &message.content else {
-                        continue;
-                    };
-                    for (block_idx, block) in blocks.iter().enumerate() {
-                        if let ContentBlock::ToolResult {
-                            content,
-                            tool_use_id,
-                        } = block
+                Role::User => {
+                    for (block_idx, part) in message.parts.iter().enumerate() {
+                        if let Part::ToolResult {
+                            output: content,
+                            call_id: tool_use_id,
+                        } = part
                         {
                             let output_id = make_tool_output_id(
                                 parsed.entry_index,
@@ -1594,7 +1538,6 @@ impl Builder<'_> {
                         }
                     }
                 }
-                _ => {}
             }
         }
         items

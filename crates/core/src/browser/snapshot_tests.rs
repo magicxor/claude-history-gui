@@ -184,7 +184,7 @@ fn snapshot_rows_carry_what_open_resume_and_fork_need() {
 
     let card = app.selected_conversation().unwrap();
     assert_eq!(card.path, PathBuf::from("/p/-tmp-alpha/c.jsonl"));
-    assert_eq!(card.source, crate::history::Source::Claude);
+    assert_eq!(card.source, crate::history::model::SourceKind::Claude);
     assert_eq!(card.session_id, "c");
     assert_eq!(card.project_path, Some(PathBuf::from("/tmp/alpha")));
     assert_eq!(card.project_name.as_deref(), Some("alpha"));
@@ -221,10 +221,10 @@ fn snapshot_pi_rows_match_workspace_by_canonical_project_path() {
     let current = sandbox.path().join("work").join("pi-project");
     std::fs::create_dir_all(&current).unwrap();
     let mut here = conversation("/pi/sessions/here.jsonl", HOUR_MS);
-    here.source = crate::history::Source::Pi;
+    here.source = crate::history::model::SourceKind::Pi;
     here.project_path = Some(current.clone());
     let mut elsewhere = conversation("/pi/sessions/elsewhere.jsonl", 2 * HOUR_MS);
-    elsewhere.source = crate::history::Source::Pi;
+    elsewhere.source = crate::history::model::SourceKind::Pi;
     elsewhere.project_path = Some(sandbox.path().join("elsewhere-project"));
     let root = publish(&[here, elsewhere]);
 
@@ -238,7 +238,7 @@ fn snapshot_pi_rows_match_workspace_by_canonical_project_path() {
 fn the_source_label_follows_the_generation() {
     let sandbox = Sandbox::new();
     let mut corpus = corpus();
-    corpus[0].source = crate::history::Source::Pi;
+    corpus[0].source = crate::history::model::SourceKind::Pi;
     let root = publish(&corpus);
     let mut app = loading_app(&sandbox, None, vec![]);
     show(&mut app, &root, TimeFilter::default());

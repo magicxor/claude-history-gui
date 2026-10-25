@@ -15,6 +15,11 @@
 //!   [`HistoryEnv::cli_cache_root`]): a reconcile pass never removes old
 //!   caches from a cache dir inside it (`store::legacy`).
 //!   [`Registry::with_roots`] leaves it unset.
+//! * **Cancellable decoding.** The Claude, Pi and OMP adapters'
+//!   [`Adapter::decode_cancellable`] and [`decode_path_cancellable`] read
+//!   the session file through a reader that fails once the caller's flag is
+//!   set ([`super::adapter::is_cancelled`]); `decode_file` is that decode
+//!   with a flag that never is.
 
 pub mod claude;
 pub mod codex;
@@ -110,6 +115,20 @@ impl Registry {
         &self.adapters
     }
 
+    /// Fork: the instances whose kind `keep` accepts (the in-memory list
+    /// loader reads the Claude projects itself and the others through this).
+    pub fn filtered(&self, keep: impl Fn(SourceKind) -> bool) -> Self {
+        Self {
+            adapters: self
+                .adapters
+                .iter()
+                .filter(|adapter| keep(adapter.instance().kind))
+                .cloned()
+                .collect(),
+            cli_cache: self.cli_cache.clone(),
+        }
+    }
+
     /// The conversation whose own artifact is `path`, in the first instance
     /// whose root holds it.
     pub fn key_of(&self, path: &Path) -> Option<ConversationKey> {
@@ -153,6 +172,19 @@ impl Registry {
     }
 
     /// The adapter of `instance`.
+    /// The adapter acting on `path`, a session file of `source`: the
+    /// instance of that kind whose root holds it, else as `for_source`.
+    pub fn for_path(&self, source: SourceKind, path: &Path) -> Arc<dyn Adapter> {
+        self.adapters
+            .iter()
+            .find(|adapter| {
+                let instance = adapter.instance();
+                instance.kind == source && path.starts_with(&instance.root)
+            })
+            .cloned()
+            .unwrap_or_else(|| self.for_source(source))
+    }
+
     pub fn get(&self, instance: &SourceInstance) -> Option<&Arc<dyn Adapter>> {
         self.adapters
             .iter()
@@ -246,8 +278,48 @@ pub(crate) fn decode_path_into(
     omp: bool,
     events: &mut dyn FnMut(Event),
 ) -> Result<Transcript> {
+    decode_path_into_cancellable(path, modified, omp, events, &|| false)
+}
+
+/// [`decode_path`] that gives up once `cancelled()` returns true, with the
+/// error [`super::adapter::is_cancelled`] recognizes (fork, see the module
+/// docs). A Codex rollout is checked before and after its thread is
+/// decoded.
+pub fn decode_path_cancellable(
+    path: &Path,
+    modified: Option<SystemTime>,
+    omp: bool,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Transcript> {
+    if cancelled() {
+        return Err(super::adapter::cancelled_error());
+    }
+    let mut decoded = Vec::new();
+    let transcript = decode_path_into_cancellable(
+        path,
+        modified,
+        omp,
+        &mut |event| decoded.push(event),
+        cancelled,
+    )?;
+    Ok(Transcript {
+        events: decoded,
+        ..transcript
+    })
+}
+
+fn decode_path_into_cancellable(
+    path: &Path,
+    modified: Option<SystemTime>,
+    omp: bool,
+    events: &mut dyn FnMut(Event),
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Transcript> {
     if let Some(transcript) = codex::view::decode_path_into(path, events) {
-        return transcript;
+        return match transcript {
+            Ok(_) if cancelled() => Err(super::adapter::cancelled_error()),
+            transcript => transcript,
+        };
     }
     let instance = SourceInstance {
         kind: SourceKind::Claude,
@@ -265,7 +337,7 @@ pub(crate) fn decode_path_into(
         stamp: Stamp::default(),
         native: None,
     };
-    Ok(decode_file(&located, omp, events)?
+    Ok(decode_file_cancellable(&located, omp, events, cancelled)?
         .expect("a file that is not a Pi session decodes as a Claude session"))
 }
 
@@ -277,23 +349,75 @@ fn decode_file(
     omp: bool,
     events: &mut dyn FnMut(Event),
 ) -> Result<Option<Transcript>> {
+    decode_file_cancellable(located, omp, events, &|| false)
+}
+
+/// [`decode_file`] reading the file through [`Polled`] (fork).
+fn decode_file_cancellable(
+    located: &Located,
+    omp: bool,
+    events: &mut dyn FnMut(Event),
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Option<Transcript>> {
     let path = &located.path;
     if super::pi::detect_source(path)?.is_some() {
-        let mut reader = Counted::new(BufReader::new(File::open(path)?));
+        let mut reader = Counted::new(BufReader::new(Polled::new(File::open(path)?, cancelled)));
         let expected = omp.then_some(SourceKind::Omp);
-        if let Some(projection) = super::pi::parse_reader(&mut reader, expected)? {
+        if let Some(session) = super::pi::parse_reader(&mut reader, expected)? {
             return Ok(Some(pi::transcript_of(
                 located.key.clone(),
                 path,
-                projection,
+                session,
                 reader.bytes,
                 located.modified,
                 events,
             )));
         }
     }
-    let reader = BufReader::new(File::open(path)?);
+    let reader = BufReader::new(Polled::new(File::open(path)?, cancelled));
     claude::decode_reader(located.key.clone(), path, reader, located.modified, events).map(Some)
+}
+
+/// [`decode_file_cancellable`] collecting the events into the transcript:
+/// the Claude, Pi and OMP adapters' [`Adapter::decode_cancellable`] (fork).
+fn decode_file_collected(
+    located: &Located,
+    omp: bool,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Option<Transcript>> {
+    if cancelled() {
+        return Err(super::adapter::cancelled_error());
+    }
+    let mut decoded = Vec::new();
+    let transcript =
+        decode_file_cancellable(located, omp, &mut |event| decoded.push(event), cancelled)?;
+    Ok(transcript.map(|transcript| Transcript {
+        events: decoded,
+        ..transcript
+    }))
+}
+
+/// A reader that fails with [`super::adapter::cancelled_io_error`] once
+/// `cancelled()` returns true, checked at every read (fork; behind a
+/// `BufReader`, once per buffer fill).
+struct Polled<'a, R> {
+    inner: R,
+    cancelled: &'a dyn Fn() -> bool,
+}
+
+impl<'a, R> Polled<'a, R> {
+    fn new(inner: R, cancelled: &'a dyn Fn() -> bool) -> Self {
+        Self { inner, cancelled }
+    }
+}
+
+impl<R: Read> Read for Polled<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if (self.cancelled)() {
+            return Err(super::adapter::cancelled_io_error());
+        }
+        self.inner.read(buf)
+    }
 }
 
 /// A reader that counts the bytes consumed through it.

@@ -3,7 +3,8 @@
 use super::Browser;
 use super::index::{ScopeFilter, ScopeIndex, ScopeSettings};
 use crate::env::WorkspaceScope;
-use crate::history::{Conversation, Source};
+use crate::history::Conversation;
+use crate::history::model::SourceKind;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -203,7 +204,7 @@ impl Browser {
     }
 
     /// Source of the selected conversation.
-    pub fn selected_source(&self) -> Option<Source> {
+    pub fn selected_source(&self) -> Option<SourceKind> {
         self.selected_conversation_index()
             .map(|index| self.conversations[index].source)
     }
