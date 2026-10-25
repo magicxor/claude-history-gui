@@ -288,7 +288,7 @@ fn x012_searchable_text_is_never_truncated() {
 }
 
 #[test]
-fn x034_thinking_without_signature_drops_the_line_and_subagent_files_are_not_read() {
+fn x034_thinking_without_signature_drops_the_line_and_subagent_files_are_their_own_conversations() {
     let home = tempfile::tempdir().unwrap();
     let env = HistoryEnv::sandbox(home.path());
     let project = env.claude_projects_root().unwrap().join("-work-x");
@@ -317,7 +317,9 @@ fn x034_thinking_without_signature_drops_the_line_and_subagent_files_are_not_rea
             }),
         ],
     );
-    // Neither agent-*.jsonl files nor <uuid>/subagents/*.jsonl are read.
+    // A root agent-*.jsonl file is not read; <uuid>/subagents/agent-*.jsonl
+    // is a conversation of its own, a hidden child of the session (upstream
+    // 3c2ffeb), and never part of the session's text.
     write_lines(
         &project.join("agent-abc.jsonl"),
         &[user("AGENTFILE question", "2024-01-01T00:00:00Z")],
@@ -328,8 +330,24 @@ fn x034_thinking_without_signature_drops_the_line_and_subagent_files_are_not_rea
     );
 
     let conversations = loader::load_conversations(&project, true, None).unwrap();
-    assert_eq!(conversations.len(), 1, "agent-*.jsonl is not listed");
-    let conversation = &conversations[0];
+    assert_eq!(
+        conversations.len(),
+        2,
+        "the root agent-*.jsonl is not listed"
+    );
+    let (sidecars, sessions): (Vec<_>, Vec<_>) = conversations
+        .iter()
+        .partition(|conversation| conversation.provenance.child);
+    let [conversation] = sessions.as_slice() else {
+        panic!("one session: {conversations:?}");
+    };
+    let [subagent] = sidecars.as_slice() else {
+        panic!("one subagent: {conversations:?}");
+    };
+    assert_eq!(subagent.parent.as_deref(), Some(uuid));
+    assert_eq!(subagent.session_id, "x");
+    assert!(subagent.full_text.contains("SUBAGENTFILE"));
+    assert!(is_parent_of(conversation, subagent));
     assert!(!conversation.full_text.contains("DROPPEDLINE"));
     assert!(conversation.full_text.contains("kept answer"));
     assert_eq!(conversation.parse_errors.len(), 1);

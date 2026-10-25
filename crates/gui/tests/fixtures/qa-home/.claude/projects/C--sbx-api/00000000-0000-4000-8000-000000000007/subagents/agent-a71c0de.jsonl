@@ -1,0 +1,2 @@
+{"type":"user","sessionId":"00000000-0000-4000-8000-000000000007","cwd":"C:\\sbx\\api","timestamp":"2026-09-01T10:03:00Z","message":{"role":"user","content":"Find every caller of the cache."}}
+{"type":"assistant","sessionId":"00000000-0000-4000-8000-000000000007","cwd":"C:\\sbx\\api","timestamp":"2026-09-01T10:04:00Z","message":{"role":"assistant","model":"claude-opus-4-5","content":[{"type":"text","text":"Three callers: the loader, the index and the viewer."}],"usage":{"input_tokens":120,"output_tokens":340}}}

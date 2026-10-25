@@ -780,7 +780,54 @@ mod pure {
             parse_error_count: 0,
             parse_errors_known: true,
             file_stem: "3f2a".into(),
+            family: Default::default(),
         }
+    }
+
+    /// V-106 (upstream 3c2ffeb): the family line names the parent, or says
+    /// it is gone, and counts the subagents and forks.
+    #[test]
+    fn v106_family_line_names_the_parent_and_counts_the_children() {
+        use crate::model::{ConversationTarget, FamilyMember};
+        let member = |label: &str, fork: bool| FamilyMember {
+            target: ConversationTarget::from_parsed_file(std::path::Path::new("/x/a.jsonl"), None),
+            label: label.to_string(),
+            fork,
+            message_count: 3,
+            timestamp: header_info().timestamp,
+        };
+        let mut info = header_info();
+        assert_eq!(header::family_line(Some(&info)), None);
+        assert_eq!(header::family_line(None), None);
+
+        info.family.parent_id = Some("12345678-9abc-def0-1234-56789abcdef0".to_string());
+        assert_eq!(
+            header::family_line(Some(&info)).unwrap().text(),
+            "↳ subagent of session 12345678-… (not found)"
+        );
+        info.family.is_fork = true;
+        info.family.parent = Some(member(&"walrus ".repeat(20), false));
+        let line = header::family_line(Some(&info)).unwrap();
+        let parent = line.parent.unwrap();
+        assert_eq!(parent.prefix, "↳ fork of ");
+        assert_eq!(
+            parent.label.unwrap().chars().count(),
+            header::FAMILY_LABEL_CHARS
+        );
+
+        info.family = Default::default();
+        info.family.children = vec![member("a", false), member("b", true), member("c", false)];
+        assert_eq!(
+            header::family_line(Some(&info)).unwrap().text(),
+            "2 subagents, 1 fork"
+        );
+        info.family.children.truncate(2);
+        info.family.children.remove(0);
+        assert_eq!(header::family_line(Some(&info)).unwrap().text(), "1 fork");
+        assert_eq!(
+            crate::viewer::family::row_meta(&info.family.children[0]),
+            "3 · 10-12 14:03"
+        );
     }
 
     #[test]

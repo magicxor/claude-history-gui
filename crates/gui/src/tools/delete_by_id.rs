@@ -236,8 +236,11 @@ impl DeleteByIdDialog {
                 gone.update(cx, |this, _| this.shown_confirm = None).ok();
             })
             .description(format!(
-                "These will be removed from disk ({copies} cop{}). This can't be undone.",
-                if copies == 1 { "y" } else { "ies" }
+                "These will be removed from disk ({copies} cop{}). {}This can't be undone.",
+                if copies == 1 { "y" } else { "ies" },
+                crate::ops::delete::kept_forks_note(&plan)
+                    .map(|note| format!("{note} "))
+                    .unwrap_or_default()
             ))
             .width_rem(40.0)
             .body(move |_, _| {

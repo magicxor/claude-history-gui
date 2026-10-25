@@ -193,6 +193,8 @@ fn table() -> Vec<Row> {
         row!("shift-y", VIEWER, CopyPath),
         row!("shift-i", VIEWER, CopySessionId),
         row!("p", VIEWER, ShowPath),
+        row!("s", VIEWER, ShowSubagentsAndForks),
+        row!("shift-p", VIEWER, OpenParentConversation),
         row!("o", VIEWER, ToggleOutline),
         row!("o", AGENT, ToggleOutline),
         // The same keys in a single-file window.
@@ -230,6 +232,14 @@ fn table() -> Vec<Row> {
         row!("up", "ExportMenu", SelectUp),
         row!("enter", "ExportMenu", Confirm { secondary: false }),
         row!("escape", "ExportMenu", Cancel),
+        row!("j", "FamilyMenu", SelectDown),
+        row!("down", "FamilyMenu", SelectDown),
+        row!("k", "FamilyMenu", SelectUp),
+        row!("up", "FamilyMenu", SelectUp),
+        row!("enter", "FamilyMenu", Confirm { secondary: false }),
+        row!("escape", "FamilyMenu", Cancel),
+        row!("q", "FamilyMenu", Cancel),
+        row!("s", "FamilyMenu", Cancel),
         // Input editing (§8.4).
         row!("ctrl-e", LIST_INPUT, MoveEnd),
         row!("ctrl-k", LIST_INPUT, DeleteToEndOfLine),

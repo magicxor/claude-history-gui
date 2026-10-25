@@ -23,8 +23,18 @@
 //! State machines are core's: `view::MessageNav` (J/K, focus mark),
 //! `view::ViewSearch<SegMatch>` (find bar, n/N), `view::escape` (Esc order),
 //! `capture_anchor_entry` / `find_entry_or_prev` (anchored rebuilds).
+//!
+//! Related conversations (upstream 3c2ffeb, [`family`]): the header's family
+//! line names the conversation's parent and counts its subagents and forks;
+//! `P` (`OpenParentConversation`) opens the parent, `s`
+//! (`ShowSubagentsAndForks`) picks a subagent or fork. Such an open goes
+//! through the workspace ([`ViewerPaneEvent::OpenRelated`], the list's
+//! selection stays) and keeps the conversation it came from on a back
+//! stack: Esc after unwinding and `q` return to it before they leave the
+//! viewer. Any other open forgets the stack.
 
 pub mod code;
+pub mod family;
 pub mod header;
 pub mod items;
 pub mod lru;
@@ -121,6 +131,11 @@ pub enum ViewerPaneEvent {
     LeaveRequested,
     /// The viewer opened or cleared a conversation.
     TargetChanged(Option<ConversationTarget>),
+    /// Open a conversation related to the one shown (its parent, a
+    /// subagent or fork, or the one it was opened from) as a related open
+    /// (`OpenRequest::related`), leaving the list's selection alone
+    /// (upstream 3c2ffeb).
+    OpenRelated(ConversationTarget),
 }
 
 /// What the transcript area shows.
@@ -264,6 +279,9 @@ pub struct ViewerPane {
     /// Focus of the transcript column (`Viewer` context).
     viewer_focus: FocusHandle,
     target: Option<ConversationTarget>,
+    /// The conversations a related open left, most recent last: Esc and `q`
+    /// return to them first (upstream 3c2ffeb `view_stack`).
+    back_stack: Vec<ConversationTarget>,
     header: Option<HeaderInfo>,
     prefs: ViewPrefs,
     agent_panel: Entity<AgentPanel>,
@@ -378,6 +396,7 @@ impl ViewerPane {
             mode,
             viewer_focus,
             target: None,
+            back_stack: Vec::new(),
             header: None,
             prefs,
             agent_panel,
@@ -439,6 +458,9 @@ impl ViewerPane {
             .target
             .as_ref()
             .is_some_and(|target| same_path(&target.path, &req.target.path));
+        if !req.related {
+            self.back_stack.clear();
+        }
         if !same {
             self.target = Some(req.target.clone());
             self.header = None;
@@ -470,6 +492,7 @@ impl ViewerPane {
         self.list.reset(0);
         self.status = LoadStatus::Empty;
         self.file_error = None;
+        self.back_stack.clear();
         if self.target.take().is_some() {
             self.header = None;
             self.agent_panel
@@ -482,6 +505,97 @@ impl ViewerPane {
     /// The open conversation.
     pub fn target(&self) -> Option<&ConversationTarget> {
         self.target.as_ref()
+    }
+
+    /// The conversations Esc and `q` return to, most recent last.
+    pub fn back_stack(&self) -> &[ConversationTarget] {
+        &self.back_stack
+    }
+
+    /// Open `target`, a conversation related to the one shown, keeping the
+    /// one shown to return to (upstream 3c2ffeb `open_related`).
+    pub fn open_related(
+        &mut self,
+        target: ConversationTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Only the main window's workspace opens it (a single-file window
+        // has no family).
+        if self.mode != ViewerMode::Main {
+            return;
+        }
+        if self
+            .target
+            .as_ref()
+            .is_some_and(|current| same_path(&current.path, &target.path))
+        {
+            self.focus(window, cx);
+            return;
+        }
+        if let Some(current) = self.target.clone() {
+            self.back_stack.push(current);
+        }
+        cx.emit(ViewerPaneEvent::OpenRelated(target));
+    }
+
+    /// Return to the conversation the one shown was opened from; `false`
+    /// when there is none (upstream 3c2ffeb `leave_view`).
+    fn go_back(&mut self, cx: &mut Context<Self>) -> bool {
+        match self.back_stack.pop() {
+            Some(previous) => {
+                cx.emit(ViewerPaneEvent::OpenRelated(previous));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The header's family line; none in a single-file window, which has
+    /// no other conversation to open.
+    fn family_line(&self) -> Option<header::FamilyLine> {
+        (self.mode == ViewerMode::Main)
+            .then(|| header::family_line(self.header.as_ref()))
+            .flatten()
+    }
+
+    /// Forget deleted conversations on the back stack.
+    pub fn forget_paths(&mut self, paths: &[std::path::PathBuf]) {
+        self.back_stack
+            .retain(|target| !paths.iter().any(|path| same_path(path, &target.path)));
+    }
+
+    /// `P`: open the parent of the conversation shown, else say why not
+    /// (upstream 3c2ffeb `open_view_parent`).
+    fn open_parent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let family = self.header.as_ref().map(|header| &header.family);
+        match family.and_then(|family| family.parent.clone()) {
+            Some(parent) => self.open_related(parent.target, window, cx),
+            None => {
+                let names_one = family.is_some_and(|family| family.parent_id.is_some());
+                Toast::info(if names_one {
+                    family::PARENT_NOT_FOUND
+                } else {
+                    family::NO_PARENT
+                })
+                .show(window, cx);
+            }
+        }
+    }
+
+    /// `s`: pick one of the subagents and forks of the conversation shown,
+    /// else say there are none (upstream 3c2ffeb `open_children_dialog`).
+    fn show_family(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let children = self
+            .header
+            .as_ref()
+            .map(|header| header.family.children.clone())
+            .unwrap_or_default();
+        if children.is_empty() {
+            Toast::info(family::NO_CHILDREN).show(window, cx);
+        } else {
+            family::open_family_menu(cx.entity().downgrade(), children, window, cx);
+        }
     }
 
     /// The open conversation's view toggles (menu check marks).
@@ -703,6 +817,13 @@ impl ViewerPane {
                 .header_layout()
                 .map(|layout| layout.text())
                 .unwrap_or_default(),
+            // The family line under it (upstream 3c2ffeb).
+            "viewer.family" => self
+                .family_line()
+                .map(|line| line.text())
+                .unwrap_or_default(),
+            // How many conversations Esc returns to before the list.
+            "viewer.back" => self.back_stack.len().to_string(),
             "viewer.path" => self
                 .target
                 .as_ref()
@@ -1683,7 +1804,11 @@ impl ViewerPane {
                 self.focus(window, cx);
             }
             ViewEscape::ExitedNav => {}
-            ViewEscape::Leave => cx.emit(ViewerPaneEvent::LeaveRequested),
+            ViewEscape::Leave => {
+                if !self.go_back(cx) {
+                    cx.emit(ViewerPaneEvent::LeaveRequested);
+                }
+            }
         }
         cx.notify();
     }
@@ -2117,6 +2242,10 @@ impl ViewerPane {
             }
         } else if a.is::<YankOrCopyMessage>() && self.nav.is_active() {
             self.copy_focused_message(window, cx);
+        } else if a.is::<OpenParentConversation>() {
+            self.open_parent(window, cx);
+        } else if a.is::<ShowSubagentsAndForks>() {
+            self.show_family(window, cx);
         } else {
             return false;
         }
@@ -2200,7 +2329,9 @@ impl ViewerPane {
     }
 
     fn on_back(&mut self, _: &ViewerBack, _: &mut Window, cx: &mut Context<Self>) {
-        cx.emit(ViewerPaneEvent::LeaveRequested);
+        if !self.go_back(cx) {
+            cx.emit(ViewerPaneEvent::LeaveRequested);
+        }
     }
 
     // ----- rendering ---------------------------------------------------------------
@@ -2304,6 +2435,7 @@ impl ViewerPane {
                     .text_color(roles.header_summary)
                     .child(SharedString::from(summary))
             });
+        let family_line = self.render_family_line(cx);
         Some(
             v_flex()
                 .id("viewer-header")
@@ -2316,9 +2448,74 @@ impl ViewerPane {
                 .text_sm()
                 .child(row)
                 .children(second_line)
+                .children(family_line)
                 .test_support()
                 .into_any_element(),
         )
+    }
+
+    /// The family line (upstream 3c2ffeb): `↳ fork of <parent>` with the
+    /// parent as a link (Shift+P) and `2 subagents, 1 fork` as a button
+    /// opening the picker (`s`).
+    fn render_family_line(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let line = self.family_line()?;
+        let roles = theme_tokens::roles(cx);
+        let radius = cx.theme().radius;
+        let mut row = h_flex()
+            .id("viewer-family")
+            .qa_id("viewer.family")
+            .flex_wrap()
+            .gap_x_1p5()
+            .items_center()
+            .text_color(roles.text_muted);
+        if let Some(parent) = line.parent {
+            row = row.child(SharedString::from(parent.prefix));
+            if let Some(label) = parent.label {
+                row = row.child(
+                    div()
+                        .id("viewer-family-parent")
+                        .qa_id("viewer.family.parent")
+                        .px_0p5()
+                        .rounded(radius)
+                        .cursor_pointer()
+                        .text_color(roles.accent)
+                        .hover(|style| style.underline())
+                        .child(SharedString::from(label))
+                        .tooltip(|window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new(
+                                "Open the parent conversation (Shift+P)",
+                            )
+                            .build(window, cx)
+                        })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.handle_viewer_action(&OpenParentConversation, window, cx);
+                        }))
+                        .test_support(),
+                );
+            }
+        }
+        if let Some(children) = line.children {
+            row = row.child(
+                div()
+                    .id("viewer-family-children")
+                    .qa_id("viewer.family.children")
+                    .px_1()
+                    .rounded(radius)
+                    .cursor_pointer()
+                    .text_color(roles.text_secondary)
+                    .hover(|style| style.underline())
+                    .child(SharedString::from(children))
+                    .tooltip(|window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new("Subagents and forks (s)")
+                            .build(window, cx)
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.handle_viewer_action(&ShowSubagentsAndForks, window, cx);
+                    }))
+                    .test_support(),
+            );
+        }
+        Some(row.into_any_element())
     }
 
     fn render_status(
@@ -2873,11 +3070,18 @@ impl Render for ViewerPane {
             ]
         );
         let column = if main_mode {
-            crate::on_actions!(
+            let column = crate::on_actions!(
                 column,
                 cx,
                 Self::on_session_action,
                 [Resume, Fork, Rename, Delete, SelectAndExit]
+            );
+            // A single-file window has no other conversation to relate to.
+            crate::on_actions!(
+                column,
+                cx,
+                Self::on_viewer_action,
+                [OpenParentConversation, ShowSubagentsAndForks]
             )
         } else {
             column

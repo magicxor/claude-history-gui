@@ -100,7 +100,7 @@ fn configured_scope(
 }
 
 fn project_is_excluded(path: &Path, excluded: &[String]) -> bool {
-    path.parent()
+    history::sources::claude::project_dir(path)
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
         .is_some_and(|project| {
@@ -782,17 +782,19 @@ impl AgentService {
     }
 }
 
-/// Discover every Claude/Pi/OMP transcript key (public so a GUI can turn the
-/// candidates of an ambiguous-ref error into durable full refs), and the keys
-/// of the listed Codex threads among `listed`, else among the store's cards;
-/// automated and child threads only with `all_kinds`. Codex keys need the
-/// thread's working directory, which only decoding reveals, so they come from
-/// the cards the store keeps. With a `workspace`, only the workspace's Claude
-/// project directories (worktree-aware) and the Pi/OMP sessions whose working
-/// directory or project is the workspace or a folder below it are returned
-/// (upstream 82b355a); Codex keys are not narrowed (as upstream), search
-/// scopes its conversations itself and keys the ones a recorded cwd puts in
-/// the workspace.
+/// Discover every Claude session and Pi/OMP transcript key (public so a GUI
+/// can turn the candidates of an ambiguous-ref error into durable full refs),
+/// and the keys of the listed Codex threads and Claude sidecars (subagents
+/// and `/btw` forks, upstream 3c2ffeb) among `listed`, else among the store's
+/// cards; automated and child conversations only with `all_kinds`. Codex keys
+/// need the thread's working directory and sidecar keys their metadata, which
+/// only decoding reveals, so they come from the cards the store keeps. With a
+/// `workspace`, only the workspace's Claude project directories
+/// (worktree-aware), the sidecars it contains and the Pi/OMP sessions whose
+/// working directory or project is the workspace or a folder below it are
+/// returned (upstream 82b355a); Codex keys are not narrowed (as upstream),
+/// search scopes its conversations itself and keys the ones a recorded cwd
+/// puts in the workspace.
 pub fn discover_agent_keys(
     env: &HistoryEnv,
     workspace: Option<&history::Workspace>,
@@ -964,8 +966,15 @@ pub fn discover_agent_keys(
         listed
             .iter()
             .filter(|conversation| {
-                conversation.source == history::model::SourceKind::Codex
-                    && (all_kinds || !conversation.provenance.hidden_by_default())
+                let from_cards = match conversation.source {
+                    history::model::SourceKind::Codex => true,
+                    history::model::SourceKind::Claude => {
+                        history::sources::claude::sidecar(&conversation.path).is_some()
+                            && workspace.is_none_or(|workspace| workspace.contains(conversation))
+                    }
+                    _ => false,
+                };
+                from_cards && (all_kinds || !conversation.provenance.hidden_by_default())
             })
             .filter_map(|conversation| {
                 agent::refs::AgentConversationKey::from_conversation_in(conversation, &registry)
@@ -1109,6 +1118,7 @@ fn conversation_from_agent_transcript(
         total_tokens: 0,
         duration_minutes: None,
         provenance: Default::default(),
+        parent: None,
     }
 }
 
@@ -1315,6 +1325,7 @@ fn stripped_semantic_conversation(
         total_tokens: 0,
         duration_minutes: None,
         provenance: Default::default(),
+        parent: None,
     }
 }
 

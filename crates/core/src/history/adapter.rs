@@ -29,6 +29,7 @@
 //!   V-101). The Claude, Pi and OMP adapters check it at every read of the
 //!   session file; others before and after decoding.
 
+use super::Provenance;
 use super::actions::{Capabilities, Launch, Launcher, Target};
 use super::model::{ConversationKey, Event, SourceInstance, Transcript};
 use crate::env::{HistoryEnv, WorkspaceScope};
@@ -209,6 +210,12 @@ pub trait Adapter: Send + Sync {
     }
 
     fn capabilities(&self) -> Capabilities;
+
+    /// The actions supported for a conversation of `provenance`.
+    fn capabilities_for(&self, provenance: Provenance) -> Capabilities {
+        let _ = provenance;
+        self.capabilities()
+    }
 
     /// Plans resuming `target` in the tool that wrote it, started as
     /// `launch` says, or forking it into a new conversation.

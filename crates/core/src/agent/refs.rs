@@ -165,9 +165,7 @@ impl AgentConversationKey {
                 .to_string_lossy()
                 .into_owned()
         } else {
-            conversation
-                .path
-                .parent()
+            crate::history::sources::claude::project_dir(&conversation.path)
                 .and_then(|p| p.file_name())
                 .and_then(|n| n.to_str())
                 .ok_or_else(|| {
@@ -606,13 +604,16 @@ pub fn conversation_key_for_path(
     });
     let rollout =
         crate::history::sources::codex::discover::rollout_of(path, false).filter(|_| in_codex_home);
+    // A Claude sidecar (a subagent or `/btw` fork, upstream 3c2ffeb) is
+    // keyed from its card as well.
+    let sidecar = crate::history::sources::claude::sidecar(path).is_some();
     let no_cards: &[Conversation] = &[];
     // Hidden (automated and child) threads resolve too: a lookup by identity
     // (upstream cb990e6: read, outline and within).
     let (keys, _) = crate::agent::service::discover_agent_keys(
         env,
         None,
-        rollout.is_none().then_some(no_cards),
+        (rollout.is_none() && !sidecar).then_some(no_cards),
         true,
     )?;
     if let Some(rollout) = rollout
@@ -885,6 +886,30 @@ mod tests {
             discovered.conversation_ref().full_ref(),
             from_registry.conversation_ref().full_ref()
         );
+    }
+
+    /// Upstream 3c2ffeb: a subagent transcript is keyed from its card, so
+    /// the viewer's agent panel works on it, hidden or not.
+    #[test]
+    fn conversation_key_for_path_keys_claude_sidecars_from_their_cards() {
+        let home = tempfile::tempdir().unwrap();
+        let env = crate::env::HistoryEnv::sandbox(home.path());
+        let config = crate::config::ConfigFile::default();
+        let uuid = "12345678-1234-4234-9234-123456789abc";
+        let project = env.claude_projects_root().unwrap().join("-work-a");
+        let session = project.join(format!("{uuid}.jsonl"));
+        let sidecar = project.join(uuid).join("subagents").join("agent-a1.jsonl");
+        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        let line = crate::agent::test_support::user_jsonl_line("hello");
+        std::fs::write(&session, format!("{line}\n")).unwrap();
+        std::fs::write(&sidecar, format!("{line}\n")).unwrap();
+
+        let key = conversation_key_for_path(&env, &config, &sidecar)
+            .unwrap()
+            .expect("the sidecar's key");
+        assert_eq!(key.path, sidecar);
+        assert_eq!(key.session_id, "a1");
+        assert_eq!(key.project_dir_name, "-work-a");
     }
 
     #[test]

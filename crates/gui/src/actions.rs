@@ -112,6 +112,8 @@ gpui_kit::actions!(
         ToggleOutputs,
         ViewerEscape,
         ViewerBack,
+        OpenParentConversation,
+        ShowSubagentsAndForks,
         // deep search / agent panel
         RunDeepSearch,
         CancelDeepSearch,
@@ -246,6 +248,8 @@ pub const UNIT_ACTION_NAMES: &[&str] = &[
     "history::ToggleOutputs",
     "history::ViewerEscape",
     "history::ViewerBack",
+    "history::OpenParentConversation",
+    "history::ShowSubagentsAndForks",
     "history::RunDeepSearch",
     "history::CancelDeepSearch",
     "history::DeepSearchEscape",

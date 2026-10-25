@@ -74,6 +74,8 @@ pub const CTX_AGENT_ROWS: &str = "AgentRows";
 pub const CTX_CONFIRM: &str = "Confirm";
 pub const CTX_RENAME_INPUT: &str = "RenameDialog > Input";
 pub const CTX_EXPORT_MENU: &str = "ExportMenu";
+/// The viewer's Subagents and forks picker (upstream 3c2ffeb).
+pub const CTX_FAMILY_MENU: &str = "FamilyMenu";
 pub const CTX_INPUT: &str = "Input";
 
 /// The contexts a user-configurable binding is registered in (§8.5).
@@ -245,6 +247,8 @@ pub fn static_bindings() -> Vec<KeyBinding> {
     rows(&mut b, &["shift-y"], CopyPath, &vk);
     rows(&mut b, &["shift-i"], CopySessionId, &vk);
     rows(&mut b, &["p"], ShowPath, &vk);
+    rows(&mut b, &["s"], ShowSubagentsAndForks, &vk);
+    rows(&mut b, &["shift-p"], OpenParentConversation, &vk);
     rows(
         &mut b,
         &["o"],
@@ -293,6 +297,15 @@ pub fn static_bindings() -> Vec<KeyBinding> {
         &[CTX_EXPORT_MENU],
     );
     rows(&mut b, &["escape"], Cancel, &[CTX_EXPORT_MENU]);
+    rows(&mut b, &["j", "down"], SelectDown, &[CTX_FAMILY_MENU]);
+    rows(&mut b, &["k", "up"], SelectUp, &[CTX_FAMILY_MENU]);
+    rows(
+        &mut b,
+        &["enter"],
+        Confirm { secondary: false },
+        &[CTX_FAMILY_MENU],
+    );
+    rows(&mut b, &["escape", "q", "s"], Cancel, &[CTX_FAMILY_MENU]);
 
     b.extend(input_editing_bindings());
     b
@@ -642,7 +655,7 @@ pub struct HelpRow {
     pub context: &'static str,
     pub label: &'static str,
     /// The label in single-file windows when it differs (`Close` for
-    /// `Back to list`).
+    /// `Back`).
     pub single_file_label: Option<&'static str>,
     /// Shown when none of `keys` is bound (typing keys handled by the Input).
     pub fallback_keys: &'static str,
@@ -975,6 +988,26 @@ static HELP_ROWS: &[HelpRow] = &[
     ),
     help!(
         Viewer,
+        [key!(ShowSubagentsAndForks, "s")],
+        V,
+        "Subagents and forks",
+        "s",
+        HelpWhen::Always,
+        HelpWindows::MainOnly,
+        None
+    ),
+    help!(
+        Viewer,
+        [key!(OpenParentConversation, "shift-p")],
+        V,
+        "Open parent conversation",
+        "P",
+        HelpWhen::Always,
+        HelpWindows::MainOnly,
+        None
+    ),
+    help!(
+        Viewer,
         [key!(Resume)],
         V,
         "Resume",
@@ -1007,7 +1040,7 @@ static HELP_ROWS: &[HelpRow] = &[
         Viewer,
         [key!(ViewerBack, "q"), key!(ViewerEscape, "escape")],
         V,
-        "Back to list",
+        "Back",
         "q / Esc",
         HelpWhen::Always,
         HelpWindows::All,

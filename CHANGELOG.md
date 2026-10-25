@@ -4,6 +4,14 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 ## Unreleased
 
+- Claude Code `/btw` side questions are listed and searched as conversations of their own, tagged `fork`, and the
+  question is also searchable in the session it was asked in.
+- Claude Code subagent transcripts are indexed with their session and can be read in full. The viewer header of a
+  session names its subagents and forks: press `s` (or click the count) to open one; the header of a subagent or
+  fork names its session: press Shift+P (or click it) to open that. Esc and `q` go back through the conversations
+  opened this way before returning to the list. Subagents stay hidden from the list unless Ctrl+G or `--all-kinds`
+  is on. Resuming a subagent or fork resumes its session; deleting one removes only its own files; deleting a
+  session keeps its `/btw` forks. The list index is rebuilt once after the update.
 - The Workspace scope also lists conversations that worked in the workspace or a folder below it, not only those
   started there: a session started in `~/code` that moved into `~/code/repo` shows up in `~/code/repo`'s scope.
   Pi, OMP and Codex sessions now also count from a parent folder, so a workspace at `~/code` includes the sessions

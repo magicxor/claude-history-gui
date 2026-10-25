@@ -43,6 +43,11 @@
 //!   directory (the conversation's project directory, or the workspace when
 //!   it maps to the same projects directory).
 //! * `[resume].default_args` are appended for Claude only.
+//! * A sidecar (a subagent or `/btw` fork transcript, upstream 3c2ffeb)
+//!   resumes the session that holds it: that session's transcript is
+//!   planned in place of the sidecar (copy included); a sidecar whose session
+//!   file is gone is refused (`The session holding this transcript no longer
+//!   exists: <path>`). Forking one is refused by its capabilities.
 //!
 //! Upstream copied a session onto itself when the project directory was gone
 //! but the cwd already mapped to the session's directory (which truncates
@@ -411,6 +416,21 @@ pub(crate) fn plan_claude(
     launch: &Launch,
 ) -> Result<ResumePlan> {
     let default_args = &launch.default_args;
+    // A sidecar (a subagent or `/btw` fork) is resumed through the session
+    // that holds it (upstream 3c2ffeb).
+    let parent = crate::history::sources::claude::parent_transcript(target.path);
+    if let Some(parent) = &parent
+        && !parent.is_file()
+    {
+        return Err(AppError::ClaudeExecutionError(format!(
+            "The session holding this transcript no longer exists: {}",
+            parent.display()
+        )));
+    }
+    let target = Target {
+        path: parent.as_deref().unwrap_or(target.path),
+        project: target.project,
+    };
     let conversation_id = target
         .path
         .file_stem()

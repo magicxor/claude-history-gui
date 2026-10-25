@@ -1707,13 +1707,36 @@ fn the_qa_home_fixture_loads_in_core() {
         titles(SourceKind::Claude),
         vec![
             "Add API pagination",
+            "Ask about the LRU size",
+            "Cache eviction review",
             "Deploy pipeline",
+            "Explore: Find cache users",
             "Fix login bug",
             "Malformed line",
             "Rate limit errors",
             "Token refresh retry",
             "Worktree cleanup",
         ]
+    );
+    // The session's subagent and `/btw` fork (upstream 3c2ffeb).
+    let by_title = |title: &str| {
+        conversations
+            .iter()
+            .find(|conversation| conversation.summary.as_deref() == Some(title))
+            .unwrap_or_else(|| panic!("{title}"))
+    };
+    let session = by_title("Cache eviction review");
+    let fork = by_title("Ask about the LRU size");
+    let subagent = by_title("Explore: Find cache users");
+    assert!(fork.provenance.branch && subagent.provenance.child);
+    assert!(claude_history_core::history::is_parent_of(session, fork));
+    assert!(claude_history_core::history::is_parent_of(
+        session, subagent
+    ));
+    assert!(session.full_text.contains("how large is the LRU?"));
+    assert_eq!(
+        &*fork.preview_first,
+        "how large is the LRU? ... It holds 512 entries."
     );
     assert_eq!(titles(SourceKind::Pi).len(), 1);
     assert_eq!(titles(SourceKind::Omp).len(), 1);

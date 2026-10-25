@@ -49,6 +49,7 @@ fn conversation(path: PathBuf, text: &str) -> Conversation {
         total_tokens: 0,
         duration_minutes: None,
         provenance: Default::default(),
+        parent: None,
     }
 }
 

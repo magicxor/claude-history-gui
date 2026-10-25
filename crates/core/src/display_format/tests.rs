@@ -37,6 +37,7 @@ fn test_conversation() -> Conversation {
         total_tokens: 0,
         duration_minutes: None,
         provenance: Default::default(),
+        parent: None,
     }
 }
 
@@ -1478,4 +1479,19 @@ fn lexical_rows_window_around_normalized_matches() {
     assert!(preview.preview.text.starts_with('…'), "{preview:?}");
     assert!(preview.preview.text.contains("needle"), "{preview:?}");
     assert!(UnicodeWidthStr::width(preview.preview.text.as_str()) <= 40);
+}
+
+/// Upstream 3c2ffeb: the viewer names a parent, subagent or fork by its
+/// title, else its summary, else its first message, else its session id.
+#[test]
+fn conversation_labels_fall_back_from_title_to_session_id() {
+    let mut conversation = test_conversation();
+    assert_eq!(conversation_label(&conversation), "title sentinel");
+    conversation.custom_title = None;
+    assert_eq!(conversation_label(&conversation), "summary sentinel");
+    conversation.summary = Some("  ".to_string());
+    conversation.preview_first = "<b>first</b> question ... last answer".into();
+    assert_eq!(conversation_label(&conversation), "first question");
+    conversation.preview_first = "".into();
+    assert_eq!(conversation_label(&conversation), "session");
 }

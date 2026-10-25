@@ -105,6 +105,9 @@
 //! * **All kinds (upstream cb990e6).** [`Browser::set_all_kinds`] also
 //!   applies while loading (to the loaded rows, or the first cards of a
 //!   generation); upstream's Ctrl+G was ignored until the rows were listed.
+//! * **Family (upstream 3c2ffeb).** [`Browser::family_of`] gives the
+//!   parent and the subagents and forks of a conversation as conversations,
+//!   not rows (see `family`).
 //! * **User only (upstream ae7ae39).** [`Browser::set_user_only`] also
 //!   applies while loading (the query runs with it once it can run);
 //!   upstream's Ctrl+V was ignored until the rows were listed. It is a no-op
@@ -145,6 +148,7 @@ use std::sync::mpsc;
 
 mod cards;
 mod corpus;
+mod family;
 mod index;
 mod list_state;
 mod loader;
@@ -154,6 +158,9 @@ mod types;
 
 pub use crate::semantic_worker::{SemanticEmbedderFactory, Waker};
 pub use corpus::{CorpusSnapshot, PreparedCorpus, PreparedSession};
+pub use family::{
+    NO_CHILDREN_STATUS, NO_PARENT_STATUS, PARENT_GONE_STATUS, PARENT_NOT_FOUND_STATUS, ViewFamily,
+};
 pub use loader::{
     DEFAULT_DRAIN_BUDGET, HistoryLoader, LoadEvent, LoaderOptions, LoaderPoll, REFRESHING_STATUS,
     RefreshPolicy,

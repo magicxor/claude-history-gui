@@ -41,6 +41,12 @@ All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-h
   (a forked thread shows the history it continues from, then a `Fork` marker where its own records begin), resume
   and fork through the Codex CLI and delete through `codex delete`; they cannot be renamed, and a thread whose current rollout Codex no longer
   has is read-only.
+* Claude Code's subagent transcripts and `/btw` side questions (kept beside their session, in
+  `<session-id>/subagents/`) are indexed too. A `/btw` fork is listed and searched as a conversation of its own,
+  tagged `fork`, with your question as its first message; the question is also searchable in the session you asked
+  it in. Subagents stay out of the list, Deep search and semantic search like Codex subagents (Ctrl+G or
+  `--all-kinds` lists them, tagged `sub`). Claude Code's internal helper agents (prompt suggestions, compaction) are
+  skipped.
 * Search as you type. **Lexical** search (with highlighted matches and a literal mode for quoted text) or
   **semantic** search (local embedding model, downloaded on first use; falls back to lexical while the cache is
   not ready). Ctrl+T toggles the mode.
@@ -69,6 +75,10 @@ All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-h
   hold only tool calls or results disappear and message navigation skips them), thinking and subagent blocks,
   timestamps, tool outputs.
 * In-conversation search (`/`, `n`/`N`), message navigation, outline, per-message copy, focus-viewer mode.
+* Subagents and forks: the header of a session names its subagents and `/btw` forks (`s` or a click picks one to
+  open), and the header of a subagent or fork names the session it came from (Shift+P or a click opens it), for
+  Codex subagent threads too. Esc and `q` walk back through the conversations opened this way before they
+  return to the list; opening a conversation from the list starts over.
 * Single-file mode: open any `.jsonl` transcript (`FILE`, `--render FILE`, File > Open JSONL file).
 
 **Deep search and the agent protocol**
@@ -82,7 +92,8 @@ All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-h
 * **Resume** and **Fork** in a new terminal window (Windows Terminal or console, Terminal.app or osascript,
   common Linux emulators, or your own template). Resuming into another workspace offers to copy the conversation
   into that project first. Each agent can start through your own command or wrapper (`[resume] command`, below).
-* **Rename** (custom title), **Delete** (every copy of the session, with a confirmation that lists the files),
+* **Rename** (custom title), **Delete** (every copy of the session with its subagent transcripts, keeping its
+  `/btw` forks, which stay listed on their own; with a confirmation that lists the files),
   **Export** (ledger, plain text, Markdown, raw JSONL), **Copy** (conversation in the same formats, message,
   path, session ID), reveal in the file manager.
 * Codex threads: Resume runs `codex resume <thread-id>` and Fork `codex fork <thread-id>` in the thread's
@@ -91,6 +102,9 @@ All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-h
   whose current rollout, as recorded by Codex, no longer exists allows no action. Arguments for every Codex
   resume and fork go in `[resume.codex] default_args` (for example `["--yolo"]`, giving `codex --yolo resume
   <thread-id>`); `[resume] default_args` are Claude's only.
+* Claude subagents and `/btw` forks: Resume resumes the session they belong to (refused once that session is
+  gone), Delete removes only the subagent's or fork's transcript and its `.meta.json`, and Fork and Rename are not
+  supported.
 
 **Tools menu**
 Delete empty transcripts, generate or clear the semantic cache, debug search and semantic debug search, debug
@@ -311,8 +325,10 @@ command palette.
 | Shift+Y / Shift+I | Copy path / session ID |
 | p | Show file path |
 | o | Outline |
-| Esc | Unwind: clear search, leave message navigation, then back to the list |
-| q | Back to the list |
+| s | Subagents and forks of the session (pick one to open; main window) |
+| Shift+P | Open the parent conversation of a subagent or fork (main window) |
+| Esc | Unwind: clear search, leave message navigation, then back to the conversation this one was opened from (`s`, Shift+P), else to the list |
+| q | Back to the conversation this one was opened from, else to the list |
 | Ctrl+R / Ctrl+F / F2 / Ctrl+X / Ctrl+L | Resume / Fork / Rename / Delete / Refresh (rebindable; not in single-file windows) |
 
 **Deep search, agent panel and dialogs**
@@ -327,6 +343,7 @@ command palette.
 | Esc | Agent panel: clear input, cancel, focus transcript |
 | y / n | Confirm / cancel in destructive confirmations (Enter does not confirm) |
 | 1 - 4, j / k, Enter, Esc | Export menu: pick a format |
+| j / k, Enter, Esc, q or s | Subagents and forks: pick one to open |
 | Ctrl+U | Clear the rename field |
 
 The seven rebindable keys come from `[keys]` in `gui.toml` or `config.toml` (`resume`, `fork`, `rename`,

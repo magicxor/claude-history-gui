@@ -641,6 +641,13 @@ impl Workspace {
                 let panel = self.viewer.read(cx).agent_panel().clone();
                 panel.update(cx, |panel, cx| panel.set_viewer_target(target.clone(), cx));
             }
+            ViewerPaneEvent::OpenRelated(target) => {
+                // A parent, subagent or fork, or the conversation it was
+                // opened from (upstream 3c2ffeb): the list keeps its
+                // selection (a subagent is not even listed by default).
+                let req = OpenRequest::new(target.clone(), true).related();
+                self.open_request(req, false, window, cx);
+            }
         }
     }
 
@@ -721,6 +728,8 @@ impl Workspace {
                 self.focus_left_primary(window, cx);
             }
         }
+        self.viewer
+            .update(cx, |viewer, _| viewer.forget_paths(paths));
         let panel = self.viewer.read(cx).agent_panel().clone();
         crate::globals::sub_span(cx, "panel.mark_deleted", |cx| {
             panel.update(cx, |panel, cx| panel.mark_deleted(paths, cx))

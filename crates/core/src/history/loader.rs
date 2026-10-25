@@ -224,7 +224,8 @@ pub fn find_all_jsonl_by_uuid(env: &HistoryEnv, uuid: &str) -> Result<Vec<PathBu
 }
 
 /// Delete a session by UUID across all projects.
-/// Removes both the .jsonl file and the session subdirectory (tool-results/, subagents/).
+/// Removes both the .jsonl file and the session subdirectory (tool-results/,
+/// subagents/), keeping the `/btw` forks among its subagents.
 /// Returns the number of files deleted.
 pub fn delete_session_by_uuid(env: &HistoryEnv, uuid: &str) -> Result<usize> {
     // Validate format to prevent path traversal
@@ -245,7 +246,7 @@ pub fn delete_session_by_uuid(env: &HistoryEnv, uuid: &str) -> Result<usize> {
         if let Some(session_dir) = session_artifact_dir(jsonl_path, uuid)
             && session_dir.is_dir()
         {
-            std::fs::remove_dir_all(&session_dir)?;
+            super::sources::claude::remove_session_dir(&session_dir)?;
         }
     }
 
@@ -298,7 +299,8 @@ pub enum EmptyTranscriptDeletion {
 }
 
 /// Delete one empty transcript and its `<project>/<session id>/` directory
-/// ([`session_artifact_dir`]), after re-reading it: a transcript that gained
+/// ([`session_artifact_dir`]; the `/btw` forks there are kept, upstream
+/// 3c2ffeb), after re-reading it: a transcript that gained
 /// an assistant message since the scan is kept. Upstream scanned and deleted
 /// in one pass; a GUI shows the scan and deletes after a confirmation.
 pub fn delete_empty_transcript(transcript: &EmptyTranscript) -> Result<EmptyTranscriptDeletion> {
@@ -314,7 +316,7 @@ pub fn delete_empty_transcript(transcript: &EmptyTranscript) -> Result<EmptyTran
     if let Some(session_dir) = session_artifact_dir(&transcript.path, &transcript.session_id)
         && session_dir.is_dir()
     {
-        std::fs::remove_dir_all(session_dir)?;
+        super::sources::claude::remove_session_dir(&session_dir)?;
     }
     Ok(EmptyTranscriptDeletion::Deleted)
 }
@@ -528,7 +530,8 @@ pub fn list_projects(root: &Path) -> Result<Vec<Project>> {
     Ok(projects)
 }
 
-/// Find and process all conversation files of a project directory.
+/// Find and process all conversation files of a project directory, with
+/// the sidecars of its sessions (upstream 3c2ffeb).
 ///
 /// Fork: the Claude half of [`load_all_conversations_streaming`]; upstream
 /// 9597669 removed it with its in-memory loader.
@@ -555,6 +558,15 @@ pub(crate) fn load_conversations(
 
             let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
             files.push((path, modified));
+        } else if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            // The session's subagent and `/btw` fork transcripts (upstream
+            // 3c2ffeb), listed like the Claude adapter's discovery does.
+            for sidecar in super::sources::claude::session_sidecars(&path) {
+                let modified = std::fs::metadata(&sidecar)
+                    .ok()
+                    .and_then(|m| m.modified().ok());
+                files.push((sidecar, modified));
+            }
         }
     }
 
@@ -633,6 +645,76 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::io::Write;
+
+    /// T-026: delete by ID and delete-empty remove a session's own files and
+    /// leave its `/btw` forks (3c2ffeb).
+    #[test]
+    fn deleting_a_session_by_id_or_as_empty_keeps_its_forks() {
+        let user = r#"{"type":"user","cwd":"/work","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"hello"}}"#;
+        let put = |path: &Path| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                path,
+                format!(
+                    "{user}
+"
+                ),
+            )
+            .unwrap();
+        };
+        let root = tempfile::tempdir().unwrap();
+        let env = HistoryEnv::sandbox(root.path());
+        let projects = env.claude_projects_root().unwrap();
+        let project = projects.join("-work");
+        let layout = |id: &str| {
+            let session = project.join(format!("{id}.jsonl"));
+            let sidecars = project.join(id).join("subagents");
+            let fork = sidecars.join("agent-afork-1.jsonl");
+            let subagent = sidecars.join("agent-a2.jsonl");
+            put(&session);
+            put(&fork);
+            std::fs::write(
+                fork.with_extension("meta.json"),
+                r#"{"agentType":"fork","isFork":true,"description":"btw"}"#,
+            )
+            .unwrap();
+            put(&subagent);
+            std::fs::write(
+                subagent.with_extension("meta.json"),
+                r#"{"agentType":"Explore"}"#,
+            )
+            .unwrap();
+            std::fs::create_dir_all(project.join(id).join("tool-results")).unwrap();
+            std::fs::write(project.join(id).join("tool-results/out.txt"), "x").unwrap();
+            (session, fork, subagent)
+        };
+        let check = |session: &Path, fork: &Path, subagent: &Path| {
+            assert!(!session.exists());
+            assert!(fork.is_file() && fork.with_extension("meta.json").is_file());
+            assert!(!subagent.exists() && !subagent.with_extension("meta.json").exists());
+            assert!(!session.with_extension("").join("tool-results").exists());
+        };
+
+        let (session, fork, subagent) = layout("s1");
+        assert_eq!(delete_session_by_uuid(&env, "s1").unwrap(), 1);
+        check(&session, &fork, &subagent);
+
+        // A session with no assistant message is empty.
+        let (session, fork, subagent) = layout("s2");
+        let empty = EmptyTranscript {
+            path: session.clone(),
+            session_id: "s2".into(),
+            project_name: "work".into(),
+            user_messages: 1,
+            line_count: 1,
+            preview: None,
+        };
+        assert_eq!(
+            delete_empty_transcript(&empty).unwrap(),
+            EmptyTranscriptDeletion::Deleted
+        );
+        check(&session, &fork, &subagent);
+    }
 
     fn result(output: Option<serde_json::Value>) -> Part {
         Part::ToolResult {

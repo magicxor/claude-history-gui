@@ -403,7 +403,7 @@ fn help_rows_show_key_pairs(cx: &mut TestAppContext) {
             ("Jump by page", "pageup", "pagedown"),
             ("Jump to first/last", "home", "end"),
             ("Next / prev match", "n", "shift-n"),
-            ("Back to list", "q", "escape"),
+            ("Back", "q", "escape"),
             ("Word left/right", "alt-b", "alt-f"),
         ];
         for (label, a, b) in pairs {
@@ -413,9 +413,9 @@ fn help_rows_show_key_pairs(cx: &mut TestAppContext) {
                 "{label}"
             );
         }
-        let back = row("Back to list", "q");
+        let back = row("Back", "q");
         assert_eq!(back.label_for(true), "Close");
-        assert_eq!(back.label_for(false), "Back to list");
+        assert_eq!(back.label_for(false), "Back");
         let toggle = row("Toggle semantic search", "ctrl-t");
         assert!(keymap::help_row_visible(toggle, false, cx));
         assert!(!keymap::help_row_visible(toggle, true, cx));

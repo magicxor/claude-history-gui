@@ -2215,3 +2215,53 @@ fn exclude_paths_hide_cards_by_cwd_in_list_search_and_semantic_scope() {
     app.set_excluded_paths(Vec::new());
     assert_eq!(listed_paths(&app).len(), 7);
 }
+
+/// Upstream 3c2ffeb: the parent and the subagents and forks of a
+/// conversation come from every card of the generation, the hidden
+/// subagents included, before and after the generation opens; one deleted
+/// here is left out.
+#[test]
+fn the_family_of_a_conversation_comes_from_every_card() {
+    let sandbox = Sandbox::new();
+    let session_path = "/p/-tmp-work/s1.jsonl";
+    let subagent_path = "/p/-tmp-work/s1/subagents/agent-a1.jsonl";
+    let fork_path = "/p/-tmp-work/s1/subagents/agent-afork.jsonl";
+    let session = conversation(session_path, HOUR_MS);
+    let mut subagent = conversation(subagent_path, 2 * HOUR_MS);
+    subagent.session_id = "a1".into();
+    subagent.parent = Some("s1".into());
+    subagent.provenance.child = true;
+    let mut fork = conversation(fork_path, 3 * HOUR_MS);
+    fork.session_id = "afork".into();
+    fork.parent = Some("s1".into());
+    fork.provenance.branch = true;
+    let root = publish(&[session, subagent, fork]);
+    let mut app = loading_app(&sandbox, None, vec![]);
+    show(&mut app, &root, TimeFilter::default());
+    let children = |app: &Browser| -> Vec<String> {
+        app.family_of(Path::new(session_path))
+            .children
+            .iter()
+            .map(|child| child.path.display().to_string())
+            .collect()
+    };
+    let parent_of = |app: &Browser, path: &str| {
+        app.family_of(Path::new(path))
+            .parent
+            .map(|parent| parent.path.display().to_string())
+    };
+
+    assert_eq!(listed_paths(&app), vec![fork_path, session_path]);
+    assert_eq!(children(&app), vec![subagent_path, fork_path]);
+    assert_eq!(
+        parent_of(&app, subagent_path).as_deref(),
+        Some(session_path)
+    );
+    assert!(app.open_search_index());
+    assert_eq!(children(&app), vec![subagent_path, fork_path]);
+    assert_eq!(parent_of(&app, fork_path).as_deref(), Some(session_path));
+    assert!(app.family_of(Path::new(session_path)).parent.is_none());
+
+    app.remove_paths(&[PathBuf::from(fork_path)]);
+    assert_eq!(children(&app), vec![subagent_path]);
+}

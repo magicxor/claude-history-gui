@@ -76,7 +76,7 @@ use crate::actions::*;
 use crate::exit;
 use crate::globals::{ActivePane, BusyTimer, UiBusy, app_state, update_app_state};
 use crate::keymap::CTX_LIST;
-use crate::model::{AgentTab, ConversationTarget, HeaderInfo, PaneFocus};
+use crate::model::{AgentTab, ConversationTarget, FamilyMember, HeaderInfo, PaneFocus};
 #[cfg(any(test, feature = "qa"))]
 use crate::notify::ToastKind;
 use crate::notify::{self, Toast};
@@ -629,12 +629,24 @@ impl ListPane {
         cwds
     }
 
-    /// The viewer header for `path` from the live corpus (`None`: not loaded).
+    /// The viewer header for `path` from the live corpus (`None`: not
+    /// loaded), with the conversation's parent, subagents and forks (core
+    /// `Browser::family_of` over every card, hidden ones included; upstream
+    /// 3c2ffeb).
     pub fn header_info(&self, path: &Path) -> Option<HeaderInfo> {
         self.conversation(path).map(|conversation| {
             let mut info = HeaderInfo::from_conversation(&conversation);
             // Cards carry no parse errors: the viewer counts them.
             info.parse_errors_known = !self.browser.shows_snapshot();
+            let family = self.browser.family_of(&conversation.path);
+            info.family.parent = family
+                .parent
+                .map(|parent| FamilyMember::from_conversation(&parent));
+            info.family.children = family
+                .children
+                .iter()
+                .map(|child| FamilyMember::from_conversation(child))
+                .collect();
             info
         })
     }

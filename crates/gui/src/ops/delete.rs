@@ -50,8 +50,37 @@ pub fn dialog_title(target: &ConversationTarget) -> String {
 }
 
 /// `N copies across projects. This can't be undone.` / `This can't be undone.`;
-/// for a Codex thread, what the Codex CLI does (upstream eea6d37).
+/// for a Codex thread, what the Codex CLI does (upstream eea6d37); for a
+/// Claude session with `/btw` forks, that they stay (upstream 3c2ffeb).
 pub fn consequence_text(plan: &DeletePlan) -> String {
+    let text = consequence(plan);
+    match kept_forks_note(plan) {
+        Some(note) => format!("{note} {text}"),
+        None => text,
+    }
+}
+
+/// `Its /btw fork stays, a conversation of its own.` when deleting a Claude
+/// session keeps forks (`DeletePlan::kept`, upstream 3c2ffeb).
+pub fn kept_forks_note(plan: &DeletePlan) -> Option<String> {
+    let forks = plan
+        .kept
+        .iter()
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .count();
+    match forks {
+        0 => None,
+        1 => Some("Its /btw fork stays, a conversation of its own.".to_string()),
+        n => Some(format!(
+            "Its {n} /btw forks stay, conversations of their own."
+        )),
+    }
+}
+
+fn consequence(plan: &DeletePlan) -> String {
     if plan.source == SourceKind::Codex {
         format!(
             "Runs the Codex CLI's delete --force {}, which removes the thread and its state. This can't \
@@ -68,10 +97,12 @@ pub fn consequence_text(plan: &DeletePlan) -> String {
     }
 }
 
-/// The rows of the path list: every transcript, then every folder.
+/// The rows of the path list: every transcript and other file (a sidecar's
+/// metadata file), then every folder.
 pub fn plan_items(plan: &DeletePlan) -> Vec<PathItem> {
     plan.files
         .iter()
+        .chain(&plan.metadata)
         .map(PathItem::file)
         .chain(plan.dirs.iter().map(PathItem::folder))
         .collect()

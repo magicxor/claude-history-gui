@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Local};
 use claude_history_core::agent::AgentConversationInfo;
-use claude_history_core::display_format::sanitize_preview;
+use claude_history_core::display_format::{conversation_label, sanitize_preview};
 use claude_history_core::export::ExportFormat;
 use claude_history_core::history::actions::{Capabilities, capabilities_of, refusal};
 use claude_history_core::history::model::SourceKind;
@@ -234,6 +234,57 @@ pub struct HeaderInfo {
     /// (upstream 358becb).
     pub parse_errors_known: bool,
     pub file_stem: SharedString,
+    /// The conversation's parent, subagents and forks (upstream 3c2ffeb):
+    /// the family line under the header.
+    pub family: HeaderFamily,
+}
+
+/// A conversation related to the one in the viewer: its parent, or one of
+/// its subagents and `/btw` forks (upstream 3c2ffeb).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FamilyMember {
+    pub target: ConversationTarget,
+    /// Core's `display_format::conversation_label`: the title, else the
+    /// summary, else the first message, else the session ID.
+    pub label: String,
+    /// A `/btw` fork (`Provenance::branch`), else a subagent.
+    pub fork: bool,
+    pub message_count: usize,
+    pub timestamp: DateTime<Local>,
+}
+
+impl FamilyMember {
+    pub fn from_conversation(c: &Conversation) -> Self {
+        Self {
+            target: ConversationTarget::from_conversation(c),
+            label: conversation_label(c),
+            fork: c.provenance.branch,
+            message_count: c.message_count,
+            timestamp: c.timestamp,
+        }
+    }
+}
+
+/// The family line of the viewer header (DESIGN §9.10, upstream 3c2ffeb),
+/// from core's `Browser::family_of`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HeaderFamily {
+    /// The session ID of the conversation this one names as its parent
+    /// (`Conversation::parent`), found or not.
+    pub parent_id: Option<String>,
+    /// This conversation is a `/btw` fork (else, with a parent, a subagent).
+    pub is_fork: bool,
+    /// The parent, when the corpus has it.
+    pub parent: Option<FamilyMember>,
+    /// Its subagents and forks, oldest first.
+    pub children: Vec<FamilyMember>,
+}
+
+impl HeaderFamily {
+    /// Whether the family line has anything to show.
+    pub fn is_empty(&self) -> bool {
+        self.parent_id.is_none() && self.children.is_empty()
+    }
 }
 
 impl HeaderInfo {
@@ -253,6 +304,11 @@ impl HeaderInfo {
             parse_error_count: c.parse_errors.len(),
             parse_errors_known: true,
             file_stem: file_stem.into(),
+            family: HeaderFamily {
+                parent_id: c.parent.clone(),
+                is_fork: c.provenance.branch,
+                ..HeaderFamily::default()
+            },
         }
     }
 
@@ -274,6 +330,7 @@ impl HeaderInfo {
             parse_error_count: 0,
             parse_errors_known: true,
             file_stem,
+            family: HeaderFamily::default(),
         }
     }
 
@@ -297,6 +354,10 @@ pub struct OpenRequest {
     /// Read range from the list or Deep search, D-029). The panel then has
     /// the focus whatever `focus` says.
     pub agent_tab: Option<AgentTab>,
+    /// Opened from the viewer's family line or back stack (upstream
+    /// 3c2ffeb): the viewer keeps the conversations it came from; any other
+    /// open forgets them.
+    pub related: bool,
 }
 
 impl OpenRequest {
@@ -307,7 +368,14 @@ impl OpenRequest {
             focus,
             reveal: None,
             agent_tab: None,
+            related: false,
         }
+    }
+
+    /// A related open (see [`OpenRequest::related`]).
+    pub fn related(mut self) -> Self {
+        self.related = true;
+        self
     }
 
     pub fn with_reveal(mut self, reveal: RevealRequest) -> Self {

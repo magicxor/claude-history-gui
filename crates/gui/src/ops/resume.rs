@@ -208,6 +208,17 @@ fn plan_input(target: &ConversationTarget, fork: bool, cx: &App) -> Option<PlanI
 }
 
 fn run_plan(mut input: PlanInput) -> Result<ResumePlan, AppError> {
+    // A sidecar resumes through the session that holds it (upstream
+    // 3c2ffeb): without it nothing can run, so say so in the application's
+    // words, not core's plan error (which reads like a CLI failure).
+    if let Some(parent) =
+        claude_history_core::history::sources::claude::parent_transcript(&input.resume_target.path)
+        && !parent.is_file()
+    {
+        return Err(AppError::Unsupported(
+            claude_history_core::browser::PARENT_GONE_STATUS.to_string(),
+        ));
+    }
     // Upstream 8a99ccc: a missing program fails before any session copy
     // (here: before the copy confirmation), naming it and its config key.
     wait_for_login_path(&mut input.env, input.waiter.as_ref());

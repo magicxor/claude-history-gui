@@ -451,6 +451,13 @@ pub struct DeletePlan {
     /// Directories to remove: the existing `<project>/<uuid>/` session
     /// directories (Claude) or the artifact directory (OMP).
     pub dirs: Vec<PathBuf>,
+    /// Other files to remove with the transcript: the metadata file of a
+    /// Claude sidecar (`agent-<id>.meta.json`, upstream 3c2ffeb).
+    pub metadata: Vec<PathBuf>,
+    /// Files inside `dirs` that stay: the `/btw` forks of a Claude session,
+    /// with their metadata, which are conversations of their own (upstream
+    /// 3c2ffeb). Listed so the confirmation can say so.
+    pub kept: Vec<PathBuf>,
 }
 
 /// What [`execute_session_delete`] did.
@@ -496,8 +503,10 @@ impl From<Box<SessionDeleteFailure>> for AppError {
 ///
 /// * Claude: every `<uuid>.jsonl` with `path`'s stem in all Claude project
 ///   directories ([`find_session_copies`]) plus their existing session
-///   directories. An invalid id or no copy is `SessionNotFound`, like
-///   upstream `--delete`;
+///   directories, except the `/btw` forks there ([`DeletePlan::kept`]). An
+///   invalid id or no copy is `SessionNotFound`, like upstream `--delete`.
+///   A sidecar (a subagent or `/btw` fork transcript, upstream 3c2ffeb) is
+///   deleted alone, with its metadata file;
 /// * Pi: `path`, if it is a `.jsonl` Pi session, else `SessionNotFound`;
 /// * OMP: `path`, if it is a `.jsonl` OMP session, plus its artifact
 ///   directory when it exists;
@@ -528,20 +537,41 @@ pub fn plan_session_delete(
     let is_jsonl = path.extension().and_then(|extension| extension.to_str()) == Some("jsonl");
     match source {
         SourceKind::Claude => {
+            if let Some(sidecar) = history::sources::claude::sidecar(path) {
+                if !path.is_file() {
+                    return Err(not_found());
+                }
+                let meta = history::sources::claude::meta_path(path);
+                return Ok(DeletePlan {
+                    source,
+                    path: path.to_path_buf(),
+                    session_id: sidecar.agent_id.to_string(),
+                    files: vec![path.to_path_buf()],
+                    dirs: Vec::new(),
+                    metadata: meta.is_file().then_some(meta).into_iter().collect(),
+                    kept: Vec::new(),
+                });
+            }
             let session_id = path
                 .file_stem()
                 .and_then(|stem| stem.to_str())
                 .unwrap_or_default()
                 .to_string();
             let copies = find_session_copies(env, &session_id)?;
+            let dirs: Vec<PathBuf> = copies
+                .iter()
+                .filter_map(|copy| copy.session_dir.clone())
+                .collect();
             Ok(DeletePlan {
                 source,
                 path: path.to_path_buf(),
                 files: copies.iter().map(|copy| copy.jsonl.clone()).collect(),
-                dirs: copies
-                    .into_iter()
-                    .filter_map(|copy| copy.session_dir)
+                kept: dirs
+                    .iter()
+                    .flat_map(|dir| history::sources::claude::kept_in_session_dir(dir))
                     .collect(),
+                dirs,
+                metadata: Vec::new(),
                 session_id,
             })
         }
@@ -556,6 +586,8 @@ pub fn plan_session_delete(
                 session_id: plan_session_id(header, path),
                 files: vec![path.to_path_buf()],
                 dirs: Vec::new(),
+                metadata: Vec::new(),
+                kept: Vec::new(),
             })
         }
         SourceKind::Omp => {
@@ -573,6 +605,8 @@ pub fn plan_session_delete(
                     .filter(|dir| dir.is_dir())
                     .into_iter()
                     .collect(),
+                metadata: Vec::new(),
+                kept: Vec::new(),
             })
         }
         SourceKind::Codex => {
@@ -590,6 +624,8 @@ pub fn plan_session_delete(
                 session_id: thread,
                 files,
                 dirs: Vec::new(),
+                metadata: Vec::new(),
+                kept: Vec::new(),
             })
         }
     }
@@ -616,7 +652,9 @@ fn plan_session_id(header_id: Option<String>, path: &Path) -> String {
 /// removed:
 ///
 /// * Claude: only `<projects root>/<project>/<session_id>.jsonl` files and
-///   `<session_id>` directories beside one of them;
+///   `<session_id>` directories beside one of them, whose `/btw` forks stay;
+///   for a sidecar, exactly the listed sidecar and at most its metadata
+///   file;
 /// * Pi: exactly the listed file, a `.jsonl` Pi session (when it still
 ///   exists), and no directory;
 /// * OMP: exactly the listed file, a `.jsonl` OMP session (when it still
@@ -679,8 +717,27 @@ pub fn execute_session_delete_with(
             }
         }
     }
+    for file in &plan.metadata {
+        match std::fs::remove_file(file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Box::new(SessionDeleteFailure {
+                    error: log_delete_failure(env, &plan.path, error.into()),
+                    partial: report,
+                }));
+            }
+        }
+    }
     for dir in &plan.dirs {
-        match std::fs::remove_dir_all(dir) {
+        // A Claude session directory keeps its `/btw` forks (upstream
+        // 3c2ffeb), whichever forks it holds by now.
+        let removed = if plan.source == SourceKind::Claude {
+            history::sources::claude::remove_session_dir(dir)
+        } else {
+            std::fs::remove_dir_all(dir)
+        };
+        match removed {
             Ok(()) => report.removed_dirs.push(dir.clone()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 report.missing.push(dir.clone());
@@ -739,7 +796,31 @@ fn validate_delete_plan(env: &HistoryEnv, plan: &DeletePlan) -> Result<()> {
     if plan.source != SourceKind::Codex && !plan.files.iter().all(jsonl) {
         return refuse();
     }
+    let sidecar = (plan.source == SourceKind::Claude)
+        .then(|| history::sources::claude::sidecar(&plan.path))
+        .flatten();
+    if sidecar.is_none() && !plan.metadata.is_empty() {
+        return refuse();
+    }
     match plan.source {
+        SourceKind::Claude if sidecar.is_some() => {
+            // `<projects root>/<project>/<session>/subagents/agent-<id>.jsonl`
+            // alone, with at most its metadata file.
+            let sidecar = sidecar.expect("checked above");
+            let root = env.claude_projects_root()?;
+            let in_root = sidecar.project_dir.file_name().is_some()
+                && sidecar.project_dir.parent() == Some(root.as_path());
+            let meta = history::sources::claude::meta_path(&plan.path);
+            if !in_root
+                || plan.session_id != sidecar.agent_id
+                || plan.files != [plan.path.clone()]
+                || !plan.dirs.is_empty()
+                || plan.metadata.len() > 1
+                || plan.metadata.iter().any(|file| *file != meta)
+            {
+                return refuse();
+            }
+        }
         SourceKind::Claude => {
             validate_uuid(&plan.session_id)?;
             let id = std::ffi::OsStr::new(&plan.session_id);
@@ -1644,6 +1725,91 @@ mod tests {
         }
     }
 
+    /// Upstream 3c2ffeb: deleting a Claude session removes its subagent
+    /// transcripts but keeps its `/btw` forks, which the plan lists as kept;
+    /// a sidecar is deleted alone, with its metadata file, and never its
+    /// session. A tampered sidecar plan is refused.
+    #[test]
+    fn claude_sidecars_are_deleted_alone_and_a_session_delete_keeps_its_forks() {
+        let sandbox = Sandbox::new();
+        let uuid = "12345678-1234-4234-9234-123456789abc";
+        let project = sandbox.project("-a");
+        let session = project.join(format!("{uuid}.jsonl"));
+        let sidecars = project.join(uuid).join("subagents");
+        std::fs::create_dir_all(&sidecars).unwrap();
+        let fork = sidecars.join("agent-afork-1.jsonl");
+        let fork_meta = sidecars.join("agent-afork-1.meta.json");
+        let subagent = sidecars.join("agent-a2.jsonl");
+        let subagent_meta = sidecars.join("agent-a2.meta.json");
+        write(&session, &[user_jsonl_line("q")]);
+        write(&fork, &[user_jsonl_line("btw question")]);
+        std::fs::write(&fork_meta, r#"{"agentType":"fork","isFork":true}"#).unwrap();
+        write(&subagent, &[user_jsonl_line("explore")]);
+        std::fs::write(&subagent_meta, r#"{"agentType":"Explore","toolUseId":"t"}"#).unwrap();
+
+        let plan = plan_session_delete(&sandbox.env, &subagent, SourceKind::Claude).unwrap();
+        assert_eq!(plan.session_id, "a2");
+        assert_eq!(plan.files, vec![subagent.clone()]);
+        assert_eq!(plan.metadata, vec![subagent_meta.clone()]);
+        assert!(plan.dirs.is_empty() && plan.kept.is_empty());
+        let other = sidecars.join("agent-a3.jsonl");
+        write(&other, &[user_jsonl_line("other")]);
+        let tampered = [
+            DeletePlan {
+                files: vec![other.clone()],
+                ..plan.clone()
+            },
+            DeletePlan {
+                files: vec![subagent.clone(), session.clone()],
+                ..plan.clone()
+            },
+            DeletePlan {
+                metadata: vec![fork_meta.clone()],
+                ..plan.clone()
+            },
+            DeletePlan {
+                dirs: vec![sidecars.clone()],
+                ..plan.clone()
+            },
+            DeletePlan {
+                session_id: "a3".to_string(),
+                ..plan.clone()
+            },
+        ];
+        for tampered in tampered {
+            assert!(
+                matches!(
+                    execute_session_delete(&sandbox.env, &tampered),
+                    Err(failure) if matches!(failure.error, AppError::SessionNotFound(_))
+                ),
+                "{tampered:?}"
+            );
+        }
+        let report = execute_session_delete(&sandbox.env, &plan).unwrap();
+        assert_eq!(report.removed_files, vec![subagent.clone()]);
+        assert!(!subagent.exists() && !subagent_meta.exists());
+        assert!(session.exists() && fork.exists() && other.exists());
+
+        let plan = plan_session_delete(&sandbox.env, &session, SourceKind::Claude).unwrap();
+        assert_eq!(plan.files, vec![session.clone()]);
+        assert_eq!(plan.dirs, vec![project.join(uuid)]);
+        assert_eq!(plan.kept, vec![fork.clone(), fork_meta.clone()]);
+        assert!(plan.metadata.is_empty());
+        execute_session_delete(&sandbox.env, &plan).unwrap();
+        assert!(!session.exists() && !other.exists());
+        let mut left: Vec<PathBuf> = std::fs::read_dir(&sidecars)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec![fork.clone(), fork_meta.clone()]);
+
+        // The fork outlives its session and is deleted on its own.
+        let plan = plan_session_delete(&sandbox.env, &fork, SourceKind::Claude).unwrap();
+        execute_session_delete(&sandbox.env, &plan).unwrap();
+        assert!(std::fs::read_dir(&sidecars).unwrap().next().is_none());
+    }
+
     #[test]
     fn a_tampered_claude_plan_is_refused_before_anything_is_removed() {
         let sandbox = Sandbox::new();
@@ -1670,6 +1836,8 @@ mod tests {
             session_id: uuid.to_string(),
             files,
             dirs,
+            metadata: Vec::new(),
+            kept: Vec::new(),
         };
         for plan in [
             plan(vec![transcript.clone(), bystander.clone()], Vec::new()),
@@ -1782,6 +1950,8 @@ mod tests {
                 session_id: REVERT.to_string(),
                 files: vec![listed.clone()],
                 dirs: Vec::new(),
+                metadata: Vec::new(),
+                kept: Vec::new(),
             },
         ] {
             let failure = execute_session_delete_with(
@@ -1927,6 +2097,8 @@ mod tests {
                 session_id: "whatever".to_string(),
                 files: Vec::new(),
                 dirs: vec![unrelated.clone()],
+                metadata: Vec::new(),
+                kept: Vec::new(),
             },
             DeletePlan {
                 dirs: vec![unrelated.clone()],

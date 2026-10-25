@@ -211,6 +211,8 @@ macro_rules! on_fallback_actions {
                 $crate::actions::StartSearch,
                 $crate::actions::NextMatch,
                 $crate::actions::PrevMatch,
+                $crate::actions::OpenParentConversation,
+                $crate::actions::ShowSubagentsAndForks,
                 // session (incl. the viewer's ToggleOutline / Yank / CopyFocusedMessage)
                 $crate::actions::OpenConversation,
                 $crate::actions::Resume,
@@ -269,6 +271,8 @@ pub fn is_viewer_action(action: &dyn Action) -> bool {
         || a.is::<ToggleOutline>()
         || a.is::<YankOrCopyMessage>()
         || a.is::<CopyFocusedMessage>()
+        || a.is::<OpenParentConversation>()
+        || a.is::<ShowSubagentsAndForks>()
 }
 
 /// Session (target-resolving) actions.

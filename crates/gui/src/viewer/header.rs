@@ -177,3 +177,89 @@ pub fn layout(info: Option<&HeaderInfo>, file_stem: &str, width: usize) -> Heade
         parse_errors: info.parse_error_count,
     }
 }
+
+/// Characters of a parent's label on the family line (upstream 3c2ffeb
+/// cuts it at 60 columns).
+pub const FAMILY_LABEL_CHARS: usize = 60;
+
+/// The family line under the header (upstream 3c2ffeb `family_line`): the
+/// conversation this one came from and the count of its subagents and
+/// forks. `None` when it has neither.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FamilyLine {
+    /// `↳ fork of ` / `↳ subagent of `, then the parent's label (a link), or
+    /// the whole text when the parent is not found.
+    pub parent: Option<FamilyParent>,
+    /// `2 subagents, 1 fork` (a button opening the picker).
+    pub children: Option<String>,
+}
+
+/// The parent half of the [`FamilyLine`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FamilyParent {
+    pub prefix: String,
+    /// The parent's label (`None`: not found, `prefix` says so).
+    pub label: Option<String>,
+}
+
+impl FamilyLine {
+    /// The line as plain text (probes, tests).
+    pub fn text(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(parent) = &self.parent {
+            parts.push(format!(
+                "{}{}",
+                parent.prefix,
+                parent.label.as_deref().unwrap_or_default()
+            ));
+        }
+        if let Some(children) = &self.children {
+            parts.push(children.clone());
+        }
+        parts.join(" · ")
+    }
+}
+
+/// `1 subagent, 2 forks` (subagents first, a zero count left out).
+pub fn children_count_text(children: &[crate::model::FamilyMember]) -> String {
+    let forks = children.iter().filter(|child| child.fork).count();
+    let subagents = children.len() - forks;
+    [
+        (subagents, "subagent", "subagents"),
+        (forks, "fork", "forks"),
+    ]
+    .into_iter()
+    .filter(|(count, _, _)| *count > 0)
+    .map(|(count, one, many)| format!("{count} {}", if count == 1 { one } else { many }))
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
+/// Lay out the family line of `info`.
+pub fn family_line(info: Option<&HeaderInfo>) -> Option<FamilyLine> {
+    let family = &info?.family;
+    if family.is_empty() {
+        return None;
+    }
+    let parent = family.parent_id.as_ref().map(|parent_id| {
+        let kind = if family.is_fork { "fork" } else { "subagent" };
+        match &family.parent {
+            Some(parent) => FamilyParent {
+                prefix: format!("↳ {kind} of "),
+                label: Some(crate::model::truncate_chars(
+                    &parent.label,
+                    FAMILY_LABEL_CHARS,
+                )),
+            },
+            None => FamilyParent {
+                prefix: format!(
+                    "↳ {kind} of session {} (not found)",
+                    crate::model::short_session_id(parent_id)
+                ),
+                label: None,
+            },
+        }
+    });
+    let children = (!family.children.is_empty()).then(|| children_count_text(&family.children));
+    Some(FamilyLine { parent, children })
+}

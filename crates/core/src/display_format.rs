@@ -292,6 +292,27 @@ pub fn semantic_row_metadata(metadata: &SemanticResultMetadata) -> String {
     format!("{:.2}", metadata.score_breakdown.hybrid)
 }
 
+/// What the viewer calls `conversation` (upstream 3c2ffeb, `tui/ui.rs`): its
+/// title, else its summary, else its first previewed message, else its
+/// session id. Names a session's parent, subagents and forks.
+pub fn conversation_label(conversation: &Conversation) -> String {
+    let first_message = || {
+        let preview = &conversation.preview_first;
+        sanitize_preview(preview.split(" ... ").next().unwrap_or(preview))
+    };
+    let label = conversation
+        .custom_title
+        .as_deref()
+        .or(conversation.summary.as_deref())
+        .filter(|label| !label.trim().is_empty())
+        .map_or_else(first_message, sanitize_preview);
+    if label.is_empty() {
+        conversation.session_id.clone()
+    } else {
+        label
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Truncation
 // ---------------------------------------------------------------------------

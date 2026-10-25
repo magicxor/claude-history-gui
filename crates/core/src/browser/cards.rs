@@ -963,6 +963,30 @@ impl Browser {
         self.cards.evidence_checked.clear();
     }
 
+    /// The conversation of card `doc`, unless it was deleted here: its row,
+    /// else (only the first cards are rows yet) the card read from the
+    /// generation with the title renamed here (`family`, upstream 3c2ffeb).
+    pub(super) fn card_conversation(&self, doc: u32) -> Option<Arc<Conversation>> {
+        let snapshot = self.snapshot.as_ref()?;
+        if self.cards.removed.contains(&snapshot.key_hash(doc)) {
+            return None;
+        }
+        let row = match self.cards.open {
+            Some(docs) => (doc as usize) < docs,
+            None => false,
+        }
+        .then_some(doc as usize)
+        .or_else(|| self.doc_rows.get(doc as usize).copied().flatten());
+        if let Some(row) = row {
+            return self.conversations.get(row).cloned();
+        }
+        let mut card = snapshot.card(doc);
+        if let Some(title) = self.cards.renamed.get(&card.path) {
+            card.custom_title = title.clone();
+        }
+        Some(Arc::new(card))
+    }
+
     /// The conversation of the row stored at `path` (upstream
     /// `conversation_at`, for acting on it after the TUI exits).
     pub fn conversation_at(&self, path: &Path) -> Option<Conversation> {
