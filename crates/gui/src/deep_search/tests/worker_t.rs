@@ -165,6 +165,40 @@ fn cancel_drops_the_queued_job() {
     assert!(response.is_success());
 }
 
+/// dcd3978: a user-only search runs lexically in core, so the semantic gate
+/// does not refuse it and core's answer carries the semantic-unavailable
+/// warning.
+#[test]
+fn the_semantic_gate_does_not_refuse_user_only_searches() {
+    let world = TestWorld::new();
+    agent_corpus(&world);
+    let worker = worker(&Arc::default());
+    let client = worker.client();
+    worker.pause_semantic(true);
+    for mode in [SearchMode::Semantic, SearchMode::Hybrid] {
+        client.submit(job(
+            &world,
+            AgentJobKind::Search,
+            AgentRequest::Search(AgentSearchArgs {
+                search_mode: AgentSearchModeArgs::explicit(mode),
+                user_only: true,
+                ..AgentSearchArgs::new("retry")
+            }),
+        ));
+        let (_, _, response) = wait_done(&client);
+        assert!(
+            !response.text().contains(SEMANTIC_PAUSED_TEXT),
+            "{}",
+            response.text()
+        );
+        assert!(
+            response.text().contains("semantic-unavailable"),
+            "{}",
+            response.text()
+        );
+    }
+}
+
 /// §7.6: while paused, semantic and hybrid jobs fail fast (the shared
 /// worker refuses them); lexical, read and outline jobs run.
 #[test]

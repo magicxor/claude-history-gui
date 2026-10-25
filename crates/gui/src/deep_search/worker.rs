@@ -360,6 +360,8 @@ fn worker_loop(inner: Arc<Inner>, factory: SemanticEmbedderFactory) {
 /// Whether `request` runs a semantic or hybrid search under `config`.
 fn is_semantic(request: &AgentRequest, config: &ConfigFile) -> bool {
     let (query, cli_mode) = match request {
+        // Core runs a user-only search lexically, without the embedder.
+        AgentRequest::Search(args) if args.forces_lexical() => return false,
         AgentRequest::Search(args) => (args.query.as_str(), args.mode_override()),
         AgentRequest::Within(args) => (args.query.as_str(), args.mode_override()),
         AgentRequest::Read(_) | AgentRequest::Outline(_) => return false,

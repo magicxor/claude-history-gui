@@ -49,7 +49,9 @@ All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-h
   messages; assistant replies, tool calls and output, injected context such as system reminders and hook output,
   history a Codex thread inherits from the thread it forked, prompts written for a subagent, and the title,
   summary and project name don't count, and snippets come from your messages too. Semantic search ignores it (the
-  footer says `you only: not in semantic`). The query and selection stay when you toggle it.
+  footer says `you only: not in semantic`). The query and selection stay when you toggle it. In Deep search,
+  **Only my messages** (`agent search --user-only`) does the same; its semantic and hybrid modes search lexically
+  instead.
 * Scope **All** or **Workspace** (project folder), a workspace picker with recent folders, a time filter
   (`--since`/`--before` grammar such as `2d`, `1d6h`, `6mo`, `2026-07-20`), excluded projects and working
   directories.
@@ -195,14 +197,15 @@ first when stdout is a terminal.
 
 | Command | Arguments | Options |
 |---|---|---|
-| `agent search` | `<QUERY>` | `--top`, `--budget`, `--no-budget`, `--flat`, `--hits-per-conv`, `--all-hits`, `--local`, `--all`, `--all-kinds`, `--mode <lexical\|semantic\|exact\|hybrid>` (or `--lexical`, `--semantic`, `--exact`, `--hybrid`), `--since`, `--after`, `--before` |
+| `agent search` | `<QUERY>` | `--top`, `--budget`, `--no-budget`, `--flat`, `--hits-per-conv`, `--all-hits`, `--local`, `--all`, `--all-kinds`, `--user-only`, `--mode <lexical\|semantic\|exact\|hybrid>` (or `--lexical`, `--semantic`, `--exact`, `--hybrid`), `--since`, `--after`, `--before` |
 | `agent within` | `<CONVERSATION> <QUERY>` | `--top`, `--budget`, `--no-budget`, mode options |
 | `agent read` | `<REFS>...` (`ch_` handle, UUID or filename, optionally `:mN..mM`) | `--anchor`, `--focus`, `--lines`, `--match`, `--context`, `--budget`, `--no-budget`, `--tools`, `--tool-results`, `--thinking`, `--subagents` |
 | `agent outline` | `<CONVERSATION>` | `--budget`, `--no-budget`, `--tools`, `--tool-results`, `--thinking`, `--subagents` |
 
 `agent search` leaves automated (Codex exec) and subagent conversations out unless `--all-kinds` is given, and
 conversations under a `[tui] exclude_paths` prefix out always; `agent read`, `outline` and `within` resolve their refs
-either way.
+either way. `agent search --user-only` takes hits from your own messages only (semantic and hybrid modes search
+lexically instead and say so in a warning).
 `claude-history-gui agent <command> --help` lists the exact options. The companion Claude Code skill of the
 original project calls `claude-history agent ...`. **This repository installs nothing** and never writes to
 `.claude/skills`. To let that skill use the GUI binary, make `claude-history` resolve to it yourself:

@@ -49,7 +49,7 @@ pub use loader::{
     find_all_jsonl_by_uuid, find_empty_transcripts, find_jsonl_by_uuid, list_projects,
     load_all_conversations_streaming, session_artifact_dir,
 };
-pub(crate) use messages::{extract_skill_preview, retained_user_text};
+pub(crate) use messages::{authored_text, extract_skill_preview, retained_user_text};
 pub use parser::process_conversation_file;
 pub use path::{convert_path_to_project_dir_name, format_short_name_from_path, is_same_project};
 pub use rename::append_session_rename;

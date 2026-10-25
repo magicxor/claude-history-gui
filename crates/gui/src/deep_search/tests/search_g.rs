@@ -812,3 +812,39 @@ fn include_exec_and_subagent_runs_searches_the_hidden_threads(cx: &mut TestAppCo
     let want = expected(&world, args);
     assert_eq!(text.text(), want.text());
 }
+
+/// D-039 (upstream dcd3978): "Only my messages" takes hits from what the
+/// person typed (`agent search --user-only`); a word only the assistant
+/// wrote is not found.
+#[gpui_kit::test]
+fn only_my_messages_searches_what_the_person_typed(cx: &mut TestAppContext) {
+    let world = TestWorld::new();
+    agent_corpus(&world);
+    let f = DeepFixture::open(cx, &world, &[]);
+    f.with(cx, |pane, _, cx| pane.set_mode(ModeChoice::Lexical, cx));
+    f.search(cx, "dereferences");
+    assert!(
+        f.response(cx).text().contains("\nhit "),
+        "{}",
+        f.response(cx).text()
+    );
+    assert_eq!(f.probe(cx, "deep.user_only"), "false");
+
+    f.with(cx, |pane, _, cx| pane.set_user_only(true, cx));
+    assert_eq!(f.probe(cx, "deep.user_only"), "true");
+    f.search(cx, "dereferences");
+    assert!(
+        !f.response(cx).text().contains("\nhit "),
+        "{}",
+        f.response(cx).text()
+    );
+    f.search(cx, "crashes");
+    let text = f.response(cx);
+    assert!(text.text().contains("\nhit "), "{}", text.text());
+    let mut args = AgentSearchArgs::new("crashes");
+    args.search_mode = claude_history_core::agent::args::AgentSearchModeArgs::explicit(
+        claude_history_core::search::mode::SearchMode::Lexical,
+    );
+    args.user_only = true;
+    assert_eq!(text.text(), expected(&world, args).text());
+}

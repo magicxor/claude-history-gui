@@ -648,6 +648,7 @@ fn global_search_finds_progress_only_subagent_evidence() {
         retrieval_hits_per_conversation: None,
         all_hits: false,
         budget: None,
+        user_only: false,
     };
     let output =
         agent::search::run_global_lexical_search(&request, &conversations, &keys, &ranked, |key| {

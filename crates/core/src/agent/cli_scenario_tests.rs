@@ -69,6 +69,7 @@ fn parse(args: &[&str]) -> AgentRequest {
                     ("lexical", None) => search.search_mode.lexical = true,
                     ("exact", None) => search.search_mode.exact = true,
                     ("all-kinds", None) => search.all_kinds = true,
+                    ("user-only", None) => search.user_only = true,
                     ("mode", Some(mode)) => {
                         search.search_mode.mode = Some(mode.parse::<SearchMode>().unwrap())
                     }
@@ -914,6 +915,75 @@ fn lexical_and_exact_search_omit_semantic_breakdowns() {
             assert!(!output.stdout.contains(atom), "{}", output.stdout);
         }
     }
+}
+
+/// Upstream dcd3978: `agent search --user-only` takes hits from what the
+/// person typed, and semantic or hybrid modes search lexically instead.
+#[test]
+fn user_only_search_finds_the_prompt_and_falls_back_from_semantic() {
+    let (home, config, _) = dirs();
+    let project = project(config.path());
+    let user = serde_json::json!({
+        "type": "user",
+        "timestamp": "2026-07-20T00:00:00Z",
+        "cwd": "/tmp/agent-phase3-tests",
+        "message": {"role": "user", "content": "walrusprompt question"}
+    });
+    let assistant = serde_json::json!({
+        "type": "assistant",
+        "timestamp": "2026-07-20T00:00:01Z",
+        "message": {"role": "assistant", "content": [{"type": "text", "text": "sealreply answer"}]}
+    });
+    std::fs::write(
+        project.join("12345678-1234-4234-9234-123456789abc.jsonl"),
+        format!("{user}\n{assistant}\n"),
+    )
+    .expect("write transcript");
+
+    let found = run(
+        home.path(),
+        config.path(),
+        &["agent", "search", "--user-only", "walrusprompt"],
+    );
+    assert!(found.success, "{}", found.stderr);
+    assert!(found.stdout.contains("hit project="), "{}", found.stdout);
+    let missed = run(
+        home.path(),
+        config.path(),
+        &["agent", "search", "--user-only", "sealreply"],
+    );
+    assert!(missed.success, "{}", missed.stderr);
+    assert!(!missed.stdout.contains("hit project="), "{}", missed.stdout);
+    let both = run(
+        home.path(),
+        config.path(),
+        &["agent", "search", "sealreply"],
+    );
+    assert!(both.stdout.contains("hit project="), "{}", both.stdout);
+
+    let semantic = run(
+        home.path(),
+        config.path(),
+        &[
+            "agent",
+            "search",
+            "--user-only",
+            "--mode",
+            "semantic",
+            "walrusprompt",
+        ],
+    );
+    assert!(semantic.success, "{}", semantic.stderr);
+    assert!(
+        semantic.stdout.contains("hit project="),
+        "{}",
+        semantic.stdout
+    );
+    let text = format!("{}{}", semantic.stdout, semantic.stderr);
+    assert!(
+        text.contains("kind=semantic-unavailable") && text.contains("your%20own%20messages"),
+        "{text}"
+    );
 }
 
 // --- additions: hermeticity of the scenarios themselves ----------------------

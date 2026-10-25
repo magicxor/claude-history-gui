@@ -27,6 +27,8 @@ Release notes are taken from the `## v<version>` section of this file by the rel
   tagged `auto` or `sub`, keeping the query and the selection. Deep Search's "Include exec and subagent runs" (`agent
   search --all-kinds`) searches them too, and their refs open in the agent panel either way. Semantic search never
   finds them.
+- Deep Search has an "Only my messages" option (`agent search --user-only`): hits come only from what you typed, not
+  from replies or tool output. Semantic and hybrid modes search by keywords instead and show a warning.
 - Conversation refs and message anchors in Deep Search and the agent panel change once: a Codex thread keeps its ref
   across reverts and archiving, and a Pi or OMP ref no longer depends on its working directory still existing. Old
   refs and anchors still resolve; an anchor whose message was edited or dropped is reported as `stale-anchor`.

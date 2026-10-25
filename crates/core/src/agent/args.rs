@@ -129,11 +129,20 @@ pub struct AgentSearchArgs {
     pub all: bool,
     /// Also search automated (Codex exec) and subagent conversations
     pub all_kinds: bool,
+    /// Search only your own messages; semantic and hybrid modes search lexically instead
+    pub user_only: bool,
     pub search_mode: AgentSearchModeArgs,
     pub time: TimeRangeArgs,
 }
 
 impl AgentSearchArgs {
+    /// Whether the search runs lexically whatever mode is asked for: embeddings
+    /// cover both sides of a conversation, so only lexical search can keep to
+    /// the person's own messages (`--user-only`).
+    pub fn forces_lexical(&self) -> bool {
+        self.user_only
+    }
+
     /// A search with every option at its default.
     pub fn new(query: impl Into<String>) -> Self {
         Self {

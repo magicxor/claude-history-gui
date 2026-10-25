@@ -162,6 +162,10 @@ const SEARCH_OPTIONS: &[OptionSpec] = &[
         "all-kinds",
         "Also search automated (Codex exec) and subagent conversations",
     ),
+    flag(
+        "user-only",
+        "Search only your own messages; semantic and hybrid modes search lexically instead",
+    ),
     MODE_OPTIONS[0],
     MODE_OPTIONS[1],
     MODE_OPTIONS[2],
@@ -558,6 +562,7 @@ fn search_args(matches: &Matches) -> Result<AgentSearchArgs, LaunchArgsError> {
         local: matches.flag("local"),
         all: matches.flag("all"),
         all_kinds: matches.flag("all-kinds"),
+        user_only: matches.flag("user-only"),
         search_mode: search_mode(matches)?,
         time: TimeRangeArgs {
             since: time_point(matches, "since")?,
@@ -753,6 +758,22 @@ mod tests {
         let text = help(&["search", "--help"]);
         assert!(text.contains("--all-kinds"));
         assert!(text.contains("Also search automated (Codex exec) and subagent conversations"));
+    }
+
+    #[test]
+    fn agent_search_user_only_flag() {
+        // Upstream dcd3978.
+        let AgentRequest::Search(search) = request(&["search", "cache"]) else {
+            panic!("search expected");
+        };
+        assert!(!search.user_only);
+        let AgentRequest::Search(search) = request(&["search", "cache", "--user-only"]) else {
+            panic!("search expected");
+        };
+        assert!(search.user_only);
+        let text = help(&["search", "--help"]);
+        assert!(text.contains("--user-only"));
+        assert!(text.contains("Search only your own messages"));
     }
 
     #[test]

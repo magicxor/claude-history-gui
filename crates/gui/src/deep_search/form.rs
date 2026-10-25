@@ -30,6 +30,8 @@ pub mod help {
     pub const LOCAL: &str = "Search only the current workspace";
     pub const ALL: &str = "Search all workspaces";
     pub const ALL_KINDS: &str = "Also search automated (Codex exec) and subagent conversations";
+    pub const USER_ONLY: &str =
+        "Search only your own messages; semantic and hybrid modes search lexically instead";
     pub const MODE: &str =
         "Search mode for this invocation [possible values: lexical, semantic, exact, hybrid]";
     pub const HYBRID: &str =
@@ -62,6 +64,7 @@ pub mod help {
         ("local", LOCAL),
         ("all", ALL),
         ("all-kinds", ALL_KINDS),
+        ("user-only", USER_ONLY),
         ("mode", MODE),
         ("hybrid", HYBRID),
         ("since", SINCE),
@@ -290,6 +293,9 @@ pub struct SearchForm {
     /// Also search automated (Codex exec) and subagent conversations
     /// (`--all-kinds`, upstream cb990e6).
     pub all_kinds: bool,
+    /// Search only the person's own messages (`--user-only`, upstream
+    /// dcd3978); semantic and hybrid modes search lexically instead.
+    pub user_only: bool,
     pub time: TimeTexts,
     pub top: String,
     pub flat: bool,
@@ -314,6 +320,7 @@ impl SearchForm {
             local: self.scope == ScopeChoice::Workspace,
             all: self.scope == ScopeChoice::All,
             all_kinds: self.all_kinds,
+            user_only: self.user_only,
             search_mode: self.mode.modes(),
             time: self.time.to_args()?,
         };
@@ -565,11 +572,13 @@ mod tests {
             (None, None, None)
         );
         assert!(!args.flat && !args.all_hits && !args.no_budget && !args.all_kinds);
+        assert!(!args.user_only);
 
         let form = SearchForm {
             mode: ModeChoice::Hybrid,
             scope: ScopeChoice::Workspace,
             all_kinds: true,
+            user_only: true,
             time: TimeTexts {
                 since: "2d".into(),
                 before: String::new(),
@@ -582,7 +591,7 @@ mod tests {
             no_budget: false,
         };
         let args = form.to_args("q").unwrap();
-        assert!(args.local && !args.all && args.all_kinds);
+        assert!(args.local && !args.all && args.all_kinds && args.user_only);
         assert_eq!(args.mode_override(), Some(SearchMode::Hybrid));
         assert_eq!(args.top, Some(3));
         assert_eq!(args.hits_per_conv, Some(1));
@@ -710,6 +719,10 @@ mod tests {
             (
                 "all-kinds",
                 "Also search automated (Codex exec) and subagent conversations",
+            ),
+            (
+                "user-only",
+                "Search only your own messages; semantic and hybrid modes search lexically instead",
             ),
             (
                 "hybrid",
