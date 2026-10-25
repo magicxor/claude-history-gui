@@ -48,8 +48,9 @@ All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-h
   `--all-kinds` lists them, tagged `sub`). Claude Code's internal helper agents (prompt suggestions, compaction) are
   skipped.
 * Search as you type. **Lexical** search (with highlighted matches and a literal mode for quoted text) or
-  **semantic** search (local embedding model, downloaded on first use; falls back to lexical while the cache is
-  not ready). Ctrl+T toggles the mode.
+  **semantic** search (local embedding model, downloaded on first use; it answers from the conversations embedded
+  so far while it embeds new ones in the background, and falls back to lexical while nothing embedded matches).
+  Ctrl+T toggles the mode.
 * **You only** (Alt+U, View > Search only your own messages, `[keys] user_only`): lexical search matches only what
   you typed. A conversation is found only when every word and quoted phrase of the query occurs in your own
   messages; assistant replies, tool calls and output, injected context such as system reminders and hook output,

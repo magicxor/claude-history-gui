@@ -156,7 +156,7 @@ mod mutations;
 mod search_state;
 mod types;
 
-pub use crate::semantic_worker::{SemanticEmbedderFactory, Waker};
+pub use crate::semantic_worker::{SemanticEmbedderFactory, SemanticIndexing, Waker};
 pub use corpus::{CorpusSnapshot, PreparedCorpus, PreparedSession};
 pub use family::{
     NO_CHILDREN_STATUS, NO_PARENT_STATUS, PARENT_GONE_STATUS, PARENT_NOT_FOUND_STATUS, ViewFamily,
@@ -435,10 +435,16 @@ impl HelperThreads {
 
 impl Drop for Browser {
     /// Gives up a semantic corpus still being read (it stops before its
-    /// next card) and waits for the helper threads.
+    /// next card) and waits for the helper threads. The semantic worker is
+    /// not waited for: its channel closes and its running step is cancelled
+    /// (background indexing stops at its next batch).
     fn drop(&mut self) {
         self.retire_semantic_corpus();
         self.helpers.join_all();
+        self.semantic_search.worker_tx = None;
+        if let Some(cancellation) = &self.semantic_search.cancellation {
+            cancellation.cancel();
+        }
     }
 }
 

@@ -113,14 +113,17 @@ pub enum ListPaneEvent {
 /// semantic worker reports `InitializingModel`: the shared embedder loads its
 /// model lazily at the first embedding call, which would hide the model load
 /// behind `Embedding 0/n` (the TUI created the embedder eagerly). The warm-up
-/// call embeds nothing; its result is ignored (a load failure shows again at
-/// the first real call).
+/// call embeds nothing. A load failure fails the factory, so the search or
+/// prewarm that needed the model reports it: the first real embedding runs
+/// in the worker's background indexing (upstream c6d0421), where nothing
+/// would report it to a prewarm. The worker calls the factory again for the
+/// next search.
 fn warmed_factory(
     inner: claude_history_core::browser::SemanticEmbedderFactory,
 ) -> claude_history_core::browser::SemanticEmbedderFactory {
     Arc::new(move || {
         let mut embedder = inner()?;
-        let _ = embedder.embed_passages(&[]);
+        embedder.embed_passages(&[])?;
         Ok(embedder)
     })
 }
@@ -209,6 +212,9 @@ pub struct ListPane {
     now: DateTime<Local>,
     /// The path whose `SelectionChanged` was emitted last.
     emitted_selection: Option<PathBuf>,
+    /// The selected row index when `emitted_selection` was last checked: a kept
+    /// path that moved (refreshed results) is scrolled back into view.
+    emitted_position: Option<usize>,
     /// `[tui] exclude_projects` (for the empty-scope state, L-079).
     exclude_projects: Vec<String>,
     time_filter: TimeFilter,
@@ -484,6 +490,7 @@ impl ListPane {
             literal: false,
             now,
             emitted_selection: None,
+            emitted_position: None,
             exclude_projects: excluded,
             time_filter: launch_filter,
             time_label: crate::widgets::time_range::launch_filter_label(&launch_filter, now),
@@ -1116,9 +1123,16 @@ impl ListPane {
     /// one emitted.
     fn emit_selection(&mut self, user: bool, cx: &mut Context<Self>) {
         let path = self.browser.selected_path();
+        let position = self.browser.selected();
         if path == self.emitted_selection {
+            if position != self.emitted_position {
+                // The same row moved (refreshed results): keep it in view.
+                self.emitted_position = position;
+                self.scroll_to_selection();
+            }
             return;
         }
+        self.emitted_position = position;
         self.emitted_selection = path;
         // Every selection change keeps the row visible (§10.5): a new result
         // set resets the selection to row 0 without going through navigate().
@@ -1796,7 +1810,7 @@ impl ListPane {
     #[cfg(any(test, feature = "qa"))]
     pub fn debug_state(&self) -> String {
         format!(
-            "view={:?} mode={:?} query={:?} rows={} total={} in_flight={} progress={:?} activity={:?} error={:?} status={:?} loader_running={} refreshing={}",
+            "view={:?} mode={:?} query={:?} rows={} total={} in_flight={} progress={:?} indexing={:?} activity={:?} error={:?} status={:?} loader_running={} refreshing={}",
             self.view,
             self.mode(),
             self.browser.query(),
@@ -1804,6 +1818,7 @@ impl ListPane {
             self.browser.conversations().len(),
             self.browser.has_search_work_in_flight(),
             self.browser.semantic_progress(),
+            self.browser.semantic_indexing(),
             self.browser.semantic_activity_status_text(),
             self.browser.semantic_error(),
             self.browser.search_status_text(),

@@ -1508,6 +1508,177 @@ fn semantic_progress_messages_update_activity_status_text() {
     );
 }
 
+/// Upstream c6d0421: background indexing has its own activity text, shown
+/// while no search has one, and ends with `Indexing(None)`.
+#[test]
+fn background_indexing_shows_its_activity_until_it_ends() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(&sandbox, vec![visible()]);
+    let (_request_tx, _request_rx, response_tx) = connect_semantic_search_channels(&mut app);
+    app.semantic_search.prewarm_generation = None;
+    app.semantic_search.prewarm_status = None;
+
+    response_tx
+        .send(SemanticSearchMessage::Indexing(Some(SemanticIndexing {
+            completed: 3,
+            total: 10,
+        })))
+        .unwrap();
+    assert!(app.poll());
+    assert_eq!(
+        app.semantic_indexing(),
+        Some(SemanticIndexing {
+            completed: 3,
+            total: 10
+        })
+    );
+    assert_eq!(
+        app.semantic_activity_status_text().as_deref(),
+        Some("sem indexing 30%  3/10 chunks")
+    );
+    assert_eq!(app.semantic_activity_counts(), Some((3, 10)));
+    assert!(!app.has_search_work_in_flight(), "indexing is not a search");
+    assert_eq!(app.semantic_status_text(), None);
+
+    // A search status of its own comes first.
+    app.semantic_search.pending_status = Some(SemanticProgress::InitializingModel);
+    assert_eq!(
+        app.semantic_activity_status_text().as_deref(),
+        Some("sem preparing embeddings")
+    );
+    assert_eq!(app.semantic_activity_counts(), None);
+    app.semantic_search.pending_status = None;
+
+    // Only in semantic mode.
+    app.list_search_mode = ListSearchMode::Lexical;
+    assert_eq!(app.semantic_activity_status_text(), None);
+    app.list_search_mode = ListSearchMode::Semantic;
+
+    response_tx
+        .send(SemanticSearchMessage::Indexing(None))
+        .unwrap();
+    assert!(app.poll());
+    assert_eq!(app.semantic_indexing(), None);
+    assert_eq!(app.semantic_activity_status_text(), None);
+}
+
+/// Upstream c6d0421: a search that nothing embedded so far matches shows
+/// the indexing progress as its embedding progress.
+#[test]
+fn a_search_waiting_for_indexing_follows_its_progress() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(&sandbox, vec![visible()]);
+    let (_request_tx, _request_rx, response_tx) = connect_semantic_search_channels(&mut app);
+    app.semantic_search.prewarm_generation = None;
+    app.semantic_search.prewarm_status = None;
+    app.search_generation = 7;
+    app.semantic_search.pending_generation = Some(7);
+    response_tx
+        .send(SemanticSearchMessage::Indexing(Some(SemanticIndexing {
+            completed: 0,
+            total: 10,
+        })))
+        .unwrap();
+    send_semantic_progress_response(
+        &response_tx,
+        7,
+        SemanticProgress::Embedding {
+            completed: 0,
+            total: 10,
+        },
+    );
+    response_tx
+        .send(SemanticSearchMessage::Indexing(Some(SemanticIndexing {
+            completed: 4,
+            total: 10,
+        })))
+        .unwrap();
+
+    assert!(app.poll());
+    assert_eq!(
+        app.semantic_activity_status_text().as_deref(),
+        Some("sem embedding 40%  4/10 chunks")
+    );
+    assert_eq!(app.semantic_activity_counts(), Some((4, 10)));
+    assert!(app.has_search_work_in_flight());
+}
+
+/// Upstream c6d0421: results refreshed once indexing finishes replace the
+/// ones shown, keeping a row the user moved to.
+#[test]
+fn refreshed_semantic_results_keep_the_row_the_user_moved_to() {
+    let sandbox = Sandbox::new();
+    let conversations = (1..=3)
+        .map(|n| {
+            conversation(
+                Some("Visible"),
+                "-tmp-visible",
+                &format!("{n}{n}{n}{n}{n}{n}{n}{n}-2222-4222-8222-222222222222"),
+                "needle",
+            )
+        })
+        .collect();
+    let mut app = app_with_semantic_mode(&sandbox, conversations);
+    let (_request_tx, _request_rx, response_tx) = connect_semantic_search_channels(&mut app);
+    app.semantic_search.prewarm_generation = None;
+    app.semantic_search.prewarm_status = None;
+    app.search_generation = 7;
+    app.semantic_search.pending_generation = Some(7);
+    send_semantic_complete_response(
+        &response_tx,
+        7,
+        vec![0, 1, 2],
+        HashMap::new(),
+        SemanticProgress::Complete,
+    );
+    assert!(app.poll());
+    assert_eq!(app.selected(), Some(0));
+    assert!(app.select(2));
+    let chosen = app.selected_path();
+
+    send_semantic_complete_response(
+        &response_tx,
+        7,
+        vec![2, 0, 1],
+        HashMap::new(),
+        SemanticProgress::Complete,
+    );
+    assert!(app.poll());
+    assert_eq!(app.filtered(), &[2, 0, 1]);
+    assert_eq!(app.selected_path(), chosen);
+    assert_eq!(app.selected(), Some(0));
+
+    // On the first row, the refreshed results select their first row.
+    send_semantic_complete_response(
+        &response_tx,
+        7,
+        vec![1, 2, 0],
+        HashMap::new(),
+        SemanticProgress::Complete,
+    );
+    assert!(app.poll());
+    assert_eq!(app.selected(), Some(0));
+    assert_eq!(
+        app.selected_path().as_deref(),
+        Some(app.conversations()[1].path.as_path())
+    );
+}
+
+/// Fork (K6): a suspended worker is joined, so its indexing progress goes
+/// with it.
+#[test]
+fn suspending_the_worker_forgets_its_indexing() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(&sandbox, vec![visible()]);
+    app.semantic_search.indexing = Some(SemanticIndexing {
+        completed: 1,
+        total: 2,
+    });
+    app.suspend_semantic();
+    assert_eq!(app.semantic_indexing(), None);
+    assert_eq!(app.semantic_activity_status_text(), None);
+}
+
 #[test]
 fn clearing_query_preserves_in_flight_prewarm_preparing_status() {
     let sandbox = Sandbox::new();

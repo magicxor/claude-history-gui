@@ -14,7 +14,32 @@
 //!   can never download the model by accident.
 //! * After posting every message the worker calls the optional
 //!   [`SemanticWorkerConfig::waker`], so a GUI can wake its poller instead of
-//!   polling on a timer.
+//!   polling on a timer (upstream c6d0421's TUI polled every 250 ms while
+//!   indexing).
+//!
+//! Searches are ranked over the passages embedded so far and the rest of the
+//! corpus is embedded in the background, in slices between commands, as
+//! upstream c6d0421 ("rank semantic queries without waiting for new
+//! embeddings"), with these differences:
+//!
+//! * The embedder is created by the factory as before, and again after a
+//!   failed creation (upstream c6d0421 keeps the first failure for the life
+//!   of the worker).
+//! * Cache writes, every 30 s while indexing and when it ends, go through
+//!   the same cache writer as every other write (the configured file, under
+//!   the K6 `embeddings.lock`).
+//! * The cancellation token of a slice is taken before the worker looks for
+//!   a command, so closing the channel followed by a cancel
+//!   ([`crate::browser::Browser::suspend_semantic`], `Browser::drop`) always
+//!   stops a running slice at its next batch.
+//! * A prewarm answered before anything is embedded reports
+//!   [`SemanticProgress::CacheReady`] rather than `EmptyCorpus`: the corpus
+//!   has text, which indexing is embedding (upstream showed `sem no text`
+//!   until the next query).
+//! * When embedding fails while indexing, a search still waiting for it is
+//!   answered with the error (upstream left it waiting, showing `sem
+//!   embedding` for good). An embedder whose model loads at its first call
+//!   (the GUI's shared model) fails there.
 //!
 //! Everything else is unchanged: the command protocol, corpus/scope version
 //! gating, coalescing of queued commands, the quoted-only exact fallback
@@ -23,7 +48,7 @@
 
 use crate::browser::{SemanticProgress, SemanticResultMetadata};
 use crate::env::HistoryEnv;
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::history::Conversation;
 use crate::search::literal::{build_literal_corpus, exact_fallback};
 use crate::search::query::ParsedQuery;
@@ -34,8 +59,8 @@ use crate::semantic::index::{
     SemanticIndexState,
 };
 use crate::semantic::types::{
-    EmbeddingCache, SemanticCancellationToken, SemanticChunkIdentity, SemanticExplanation,
-    SemanticQuality, SemanticRationaleKind, SemanticScoreBreakdown,
+    DEFAULT_EMBEDDING_BATCH_SIZE, EmbeddingCache, SemanticCancellationToken, SemanticChunkIdentity,
+    SemanticExplanation, SemanticQuality, SemanticRationaleKind, SemanticScoreBreakdown,
 };
 use crate::store::SearchIndex;
 use std::collections::HashMap;
@@ -158,6 +183,16 @@ pub enum SemanticSearchMessage {
         progress: SemanticProgress,
     },
     Complete(SemanticSearchResponse),
+    /// Progress of embedding the passages the corpus has no embedding for,
+    /// which runs behind searches; `None` once there are none left.
+    Indexing(Option<SemanticIndexing>),
+}
+
+/// Passages embedded since indexing started, of those it has found to embed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SemanticIndexing {
+    pub completed: usize,
+    pub total: usize,
 }
 
 pub struct SemanticSearchResponse {
@@ -199,7 +234,7 @@ pub fn spawn_semantic_worker(
 
 /// A spawned semantic worker, with its thread so that the owner can join
 /// it (the worker exits once `tx` is dropped and its current request
-/// returns; cancel it first to make that quick).
+/// returns; drop `tx` first, then cancel, to make that quick).
 pub(crate) struct SemanticWorkerHandle {
     pub(crate) tx: mpsc::Sender<SemanticWorkerCommand>,
     pub(crate) rx: mpsc::Receiver<SemanticSearchMessage>,
@@ -233,6 +268,68 @@ pub(crate) fn spawn_semantic_worker_thread(config: SemanticWorkerConfig) -> Sema
     }
 }
 
+/// Embedding of the passages a search found without embeddings, done in
+/// slices between commands so that searches never wait for it.
+struct Indexing {
+    /// The search whose results are refreshed once indexing finishes.
+    request: SemanticSearchRequest,
+    /// Fork: whether `request` has been answered. One still waiting for
+    /// indexing is answered with the error when embedding fails (upstream
+    /// left it waiting; its 960281f adds this field for its own use).
+    answered: bool,
+    completed: usize,
+    /// Passages to embed per slice, sized so a slice takes about
+    /// `SLICE_TARGET`.
+    budget: usize,
+    last_save: std::time::Instant,
+}
+
+impl Indexing {
+    /// How long a slice should take: short enough that a command waits
+    /// little for the running slice, long enough that planning each slice
+    /// costs little next to embedding.
+    const SLICE_TARGET: std::time::Duration = std::time::Duration::from_secs(2);
+    /// Interval between writes of the embedding cache while indexing; the
+    /// cache is also written when indexing finishes.
+    const SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+    fn new(request: SemanticSearchRequest) -> Self {
+        Self {
+            request,
+            answered: true,
+            completed: 0,
+            budget: DEFAULT_EMBEDDING_BATCH_SIZE,
+            last_save: std::time::Instant::now(),
+        }
+    }
+
+    fn progress(&self, missing: usize) -> SemanticIndexing {
+        SemanticIndexing {
+            completed: self.completed,
+            total: self.completed + missing,
+        }
+    }
+
+    fn resize(&mut self, embedded: usize, elapsed: std::time::Duration) {
+        if embedded == 0 || elapsed.is_zero() {
+            return;
+        }
+        let per_second = embedded as f64 / elapsed.as_secs_f64();
+        let budget = (per_second * Self::SLICE_TARGET.as_secs_f64()) as usize;
+        self.budget = budget.clamp(DEFAULT_EMBEDDING_BATCH_SIZE / 2, 4096);
+    }
+
+    /// Writes `cache` through `save_cache` (fork: the configured cache
+    /// writer; upstream `write_embedding_cache`) unless it was written less
+    /// than `SAVE_INTERVAL` ago.
+    fn save(&mut self, cache: &EmbeddingCache, save_cache: &mut dyn FnMut(&EmbeddingCache)) {
+        if self.last_save.elapsed() >= Self::SAVE_INTERVAL {
+            save_cache(cache);
+            self.last_save = std::time::Instant::now();
+        }
+    }
+}
+
 fn run_semantic_worker(
     cmd_rx: mpsc::Receiver<SemanticWorkerCommand>,
     res_tx: mpsc::Sender<SemanticSearchMessage>,
@@ -247,8 +344,43 @@ fn run_semantic_worker(
     let mut state = SemanticIndexState::load(config.cache_path.as_deref());
     let mut save_cache = embedding_cache_writer(config.cache_path.clone());
     let mut embedder: Option<Box<dyn SemanticEmbedder>> = None;
+    let mut indexing: Option<Indexing> = None;
 
-    while let Ok(command) = cmd_rx.recv() {
+    loop {
+        // Fork: the token of the next slice is taken before the channel is
+        // looked at. Closing the channel and then cancelling (K6 suspend)
+        // either closes it before the look or cancels the slice.
+        let slice_cancellation = cancellation_source.child();
+        let command = if indexing.is_some() {
+            match cmd_rx.try_recv() {
+                Ok(command) => Some(command),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        } else {
+            match cmd_rx.recv() {
+                Ok(command) => Some(command),
+                Err(_) => break,
+            }
+        };
+        let Some(command) = command else {
+            if let Some(current) = indexing.as_mut() {
+                let done = index_slice(
+                    &worker,
+                    &mut state,
+                    &mut embedder,
+                    current,
+                    &slice_cancellation,
+                    &outbox,
+                    &mut save_cache,
+                );
+                if done {
+                    indexing = None;
+                }
+            }
+            continue;
+        };
+
         let mut request = worker.apply_command(command, &cancellation_source);
         while let Ok(pending) = cmd_rx.try_recv() {
             if let Some(search) = worker.apply_command(pending, &cancellation_source) {
@@ -322,6 +454,7 @@ fn run_semantic_worker(
                         generation: request.generation,
                         progress: SemanticProgress::InitializingModel,
                     });
+                    // Fork: created again after a failure (upstream kept it).
                     embedder = match config.create_embedder() {
                         Ok(embedder) => Some(embedder),
                         Err(error) => {
@@ -334,34 +467,168 @@ fn run_semantic_worker(
                         }
                     };
                 }
-                let embedder = embedder.as_deref_mut().expect("embedder initialized above");
-                rank_or_prewarm_semantic_request(
+                let model = embedder.as_deref_mut().expect("embedder initialized above");
+                rank_embedded(
                     request.generation,
                     &index_request,
                     &request.query,
                     &mut state,
-                    embedder,
+                    model,
                     &cancellation,
-                    &outbox,
-                    &mut save_cache,
                 )
+                .map(|(mut response, missing)| {
+                    if missing == 0 {
+                        return Some(response);
+                    }
+                    let current = indexing.get_or_insert_with(|| Indexing::new(request.clone()));
+                    let unanswered = response.filtered.is_empty() && !request.prewarm;
+                    if !request.prewarm || current.request.prewarm {
+                        current.request = request.clone();
+                        current.answered = !unanswered;
+                    }
+                    let progress = current.progress(missing);
+                    outbox.post(SemanticSearchMessage::Indexing(Some(progress)));
+                    if unanswered {
+                        // Nothing embedded so far matches; the search is
+                        // answered again once indexing finishes.
+                        outbox.post(SemanticSearchMessage::Progress {
+                            generation: request.generation,
+                            progress: SemanticProgress::Embedding {
+                                completed: progress.completed,
+                                total: progress.total,
+                            },
+                        });
+                        return None;
+                    }
+                    if response.progress == SemanticProgress::EmptyCorpus {
+                        // Fork: nothing is embedded yet, but the corpus has
+                        // text (upstream answered `sem no text`).
+                        response.progress = SemanticProgress::CacheReady;
+                    }
+                    Some(response)
+                })
                 .unwrap_or_else(|error| {
-                    failed_semantic_response(request.generation, request.prewarm, error.to_string())
+                    Some(failed_semantic_response(
+                        request.generation,
+                        request.prewarm,
+                        error.to_string(),
+                    ))
                 })
             }
-            Ok(false) => match state.clear_empty(&index_request, &cancellation) {
+            Ok(false) => Some(match state.clear_empty(&index_request, &cancellation) {
                 Ok(()) => empty_semantic_response(request.generation, request.prewarm),
                 Err(error) => {
                     failed_semantic_response(request.generation, request.prewarm, error.to_string())
                 }
-            },
-            Err(error) => {
-                failed_semantic_response(request.generation, request.prewarm, error.to_string())
-            }
+            }),
+            Err(error) => Some(failed_semantic_response(
+                request.generation,
+                request.prewarm,
+                error.to_string(),
+            )),
         };
 
-        outbox.post(SemanticSearchMessage::Complete(response));
+        if let Some(response) = response {
+            outbox.post(SemanticSearchMessage::Complete(response));
+        }
     }
+}
+
+/// Embeds one slice of the passages still without embeddings. Returns
+/// whether indexing is over: every passage is embedded, and the search it
+/// serves has been answered again with all of them, or embedding failed.
+fn index_slice(
+    worker: &SemanticWorkerState,
+    state: &mut SemanticIndexState,
+    embedder: &mut Option<Box<dyn SemanticEmbedder>>,
+    indexing: &mut Indexing,
+    cancellation: &SemanticCancellationToken,
+    outbox: &Outbox,
+    save_cache: &mut dyn FnMut(&EmbeddingCache),
+) -> bool {
+    let Some(model) = embedder.as_deref_mut() else {
+        outbox.post(SemanticSearchMessage::Indexing(None));
+        return true;
+    };
+    let full_corpus = worker.full_corpus_candidates();
+    let index_request = SemanticIndexRequest {
+        query: "",
+        literal_filters: &[],
+        full_corpus: &full_corpus,
+        scope: &full_corpus,
+        corpus_version: worker.corpus_version,
+        prewarm: true,
+        include_chunk_hits: false,
+    };
+    let started = std::time::Instant::now();
+    let budget = indexing.budget;
+    let slice = state.index_slice(&index_request, model, cancellation, budget, |cache| {
+        indexing.save(cache, save_cache)
+    });
+    let response = match slice {
+        Ok(response) => response,
+        // A command is waiting; the next slice continues after it.
+        Err(AppError::SemanticSearchCancelled) => return false,
+        Err(error) => {
+            save_cache(&state.cache);
+            // Fork: a search still waiting for indexing gets the error
+            // (upstream left it waiting). A model that loads at its first
+            // embedding, like the GUI's shared one, can fail here.
+            let request = &indexing.request;
+            if !indexing.answered
+                && worker
+                    .version_state_for(request)
+                    .is_some_and(|version| matches!(version, VersionState::Current))
+            {
+                outbox.post(SemanticSearchMessage::Complete(failed_semantic_response(
+                    request.generation,
+                    request.prewarm,
+                    error.to_string(),
+                )));
+            }
+            outbox.post(SemanticSearchMessage::Indexing(None));
+            return true;
+        }
+    };
+    indexing.completed += response.embedded_chunk_count;
+    indexing.resize(response.embedded_chunk_count, started.elapsed());
+    if response.missing_chunk_count > 0 {
+        outbox.post(SemanticSearchMessage::Indexing(Some(
+            indexing.progress(response.missing_chunk_count),
+        )));
+        return false;
+    }
+
+    save_cache(&state.cache);
+    let request = &indexing.request;
+    if !request.prewarm
+        && worker
+            .version_state_for(request)
+            .is_some_and(|version| matches!(version, VersionState::Current))
+    {
+        let scope = worker.semantic_candidates();
+        let index_request = SemanticIndexRequest {
+            query: request.query.semantic_text(),
+            literal_filters: request.query.literals(),
+            full_corpus: &full_corpus,
+            scope: &scope,
+            corpus_version: request.corpus_version,
+            prewarm: false,
+            include_chunk_hits: false,
+        };
+        if let Ok((response, _)) = rank_embedded(
+            request.generation,
+            &index_request,
+            &request.query,
+            state,
+            model,
+            cancellation,
+        ) {
+            outbox.post(SemanticSearchMessage::Complete(response));
+        }
+    }
+    outbox.post(SemanticSearchMessage::Indexing(None));
+    true
 }
 
 #[derive(Default)]
@@ -489,34 +756,28 @@ impl SemanticWorkerState {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn rank_or_prewarm_semantic_request(
+/// Answers `request` from the passages embedded so far, embedding none.
+/// Also returns how many passages of the corpus have no embedding yet.
+fn rank_embedded(
     generation: u64,
     request: &SemanticIndexRequest<'_>,
     parsed: &ParsedQuery,
     state: &mut SemanticIndexState,
     embedder: &mut dyn SemanticEmbedder,
     cancellation: &SemanticCancellationToken,
-    outbox: &Outbox,
-    save_cache: &mut impl FnMut(&EmbeddingCache),
-) -> Result<SemanticSearchResponse> {
-    let response = state.refresh_or_prewarm(
+) -> Result<(SemanticSearchResponse, usize)> {
+    let response = state.refresh_or_prewarm_with_budget(
         request,
         embedder,
         cancellation,
-        |progress| {
-            outbox.post(SemanticSearchMessage::Progress {
-                generation,
-                progress: semantic_progress(progress),
-            });
-        },
-        save_cache,
+        Some(0),
+        |_| {},
+        |_| {},
     )?;
-    Ok(semantic_search_response(
-        generation,
-        response,
-        request.full_corpus,
-        parsed,
+    let missing = response.missing_chunk_count;
+    Ok((
+        semantic_search_response(generation, response, request.full_corpus, parsed),
+        missing,
     ))
 }
 
@@ -883,6 +1144,9 @@ mod tests {
             SemanticSearchMessage::Progress { progress, .. } => {
                 panic!("unexpected progress before empty response: {progress:?}");
             }
+            SemanticSearchMessage::Indexing(indexing) => {
+                panic!("unexpected indexing before empty response: {indexing:?}");
+            }
         }
     }
 
@@ -892,8 +1156,122 @@ mod tests {
                 .recv_timeout(WORKER_RESPONSE_TIMEOUT)
                 .expect("worker response")
             {
-                SemanticSearchMessage::Progress { .. } => continue,
+                SemanticSearchMessage::Progress { .. } | SemanticSearchMessage::Indexing(_) => {
+                    continue;
+                }
                 SemanticSearchMessage::Complete(response) => return response,
+            }
+        }
+    }
+
+    /// Embeds passages and queries by whether they mention alpha or beta,
+    /// and holds passage embedding while `hold` is set.
+    struct FakeEmbedder {
+        hold: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl FakeEmbedder {
+        fn vector(text: &str) -> Vec<f32> {
+            vec![
+                f32::from(u8::from(text.contains("alpha"))),
+                f32::from(u8::from(text.contains("beta"))),
+                0.1,
+            ]
+        }
+    }
+
+    impl SemanticEmbedder for FakeEmbedder {
+        fn embed_passages(&mut self, passages: &[String]) -> Result<Vec<Vec<f32>>> {
+            while self.hold.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(passages
+                .iter()
+                .map(|passage| Self::vector(passage))
+                .collect())
+        }
+
+        fn embed_query(&mut self, query: &str) -> Result<Option<Vec<f32>>> {
+            Ok(Some(Self::vector(query)))
+        }
+    }
+
+    /// A worker with [`FakeEmbedder`], its cache in a sandbox under `root`,
+    /// and the switch that holds its passage embedding (upstream:
+    /// `spawn_semantic_worker_with`).
+    fn spawn_fake_worker(
+        root: &Path,
+    ) -> (
+        mpsc::Sender<SemanticWorkerCommand>,
+        mpsc::Receiver<SemanticSearchMessage>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let hold = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let embedder_hold = hold.clone();
+        let factory: SemanticEmbedderFactory = Arc::new(move || {
+            Ok(Box::new(FakeEmbedder {
+                hold: embedder_hold.clone(),
+            }) as Box<dyn SemanticEmbedder>)
+        });
+        let config = sandbox_config(root).with_embedder_factory(factory);
+        let (tx, rx, _cancellation) = spawn_semantic_worker(config);
+        (tx, rx, hold)
+    }
+
+    fn send_corpus(
+        tx: &mpsc::Sender<SemanticWorkerCommand>,
+        version: u64,
+        conversations: Vec<Conversation>,
+    ) {
+        let indices = (0..conversations.len()).collect();
+        tx.send(SemanticWorkerCommand::UpdateCorpus {
+            corpus_version: version,
+            conversations: corpus(conversations),
+            texts: None,
+        })
+        .expect("send corpus");
+        tx.send(SemanticWorkerCommand::UpdateScope {
+            corpus_version: version,
+            scope_version: version,
+            indices: Arc::new(indices),
+        })
+        .expect("send scope");
+    }
+
+    fn send_search(
+        tx: &mpsc::Sender<SemanticWorkerCommand>,
+        generation: u64,
+        version: u64,
+        query: &str,
+        prewarm: bool,
+    ) {
+        tx.send(SemanticWorkerCommand::Search {
+            generation,
+            query: ParsedQuery::parse(query),
+            corpus_version: version,
+            scope_version: version,
+            prewarm,
+        })
+        .expect("send semantic request");
+    }
+
+    fn recv(rx: &mpsc::Receiver<SemanticSearchMessage>) -> SemanticSearchMessage {
+        rx.recv_timeout(WORKER_RESPONSE_TIMEOUT)
+            .expect("worker message")
+    }
+
+    /// Receives until indexing finishes, returning the searches answered on
+    /// the way.
+    fn recv_until_indexed(
+        rx: &mpsc::Receiver<SemanticSearchMessage>,
+    ) -> Vec<SemanticSearchResponse> {
+        let mut responses = Vec::new();
+        loop {
+            match recv(rx) {
+                SemanticSearchMessage::Complete(response) => responses.push(response),
+                SemanticSearchMessage::Indexing(None) => return responses,
+                SemanticSearchMessage::Indexing(Some(_))
+                | SemanticSearchMessage::Progress { .. } => {}
             }
         }
     }
@@ -911,6 +1289,7 @@ mod tests {
                 chunk_hits: Vec::new(),
                 indexed_chunk_count: 1,
                 missing_chunk_count: 0,
+                embedded_chunk_count: 0,
                 query_embedding_returned: true,
                 progress: SemanticIndexProgress::Complete,
                 prewarm: false,
@@ -952,23 +1331,242 @@ mod tests {
     }
 
     #[test]
-    fn empty_prewarm_search_builds_cache_without_idle_short_circuit() {
+    fn prewarm_answers_at_once_and_indexes_in_the_background() {
         let root = tempfile::tempdir().unwrap();
-        let config = sandbox_config(root.path());
-        let cache_path = config.cache_path.clone().unwrap();
-        let (tx, rx, _cancellation) = spawn_semantic_worker(config);
+        let cache_path = sandbox_config(root.path()).cache_path.unwrap();
+        let (tx, rx, _hold) = spawn_fake_worker(root.path());
         send_worker_setup(&tx, vec!["visible dialogue"], "\"\"", true);
 
-        let response = recv_complete(&rx);
+        let SemanticSearchMessage::Progress { progress, .. } = recv(&rx) else {
+            panic!("expected model initialization first");
+        };
+        assert_eq!(progress, SemanticProgress::InitializingModel);
+        let SemanticSearchMessage::Indexing(Some(indexing)) = recv(&rx) else {
+            panic!("expected indexing to start");
+        };
+        assert_eq!(indexing.completed, 0);
+        assert!(indexing.total > 0);
+        let SemanticSearchMessage::Complete(response) = recv(&rx) else {
+            panic!("expected the prewarm to be answered");
+        };
         assert!(response.prewarm);
         assert!(response.filtered.is_empty());
-        assert!(response.metadata.is_empty());
         assert_eq!(response.error, None);
         assert_ne!(response.progress, SemanticProgress::Idle);
-        // The embedding cache is written inside the sandbox only.
+        // Fork: nothing embedded yet is not `sem no text`.
+        assert_eq!(response.progress, SemanticProgress::CacheReady);
+        assert!(recv_until_indexed(&rx).is_empty());
+        // The embedding cache is written when indexing ends, inside the
+        // sandbox only.
         assert!(cache_path.starts_with(root.path()));
         assert!(cache_path.exists(), "{cache_path:?}");
         drop(tx);
+    }
+
+    #[test]
+    fn search_waiting_for_indexing_is_answered_when_it_finishes() {
+        let root = tempfile::tempdir().unwrap();
+        let (tx, rx, _hold) = spawn_fake_worker(root.path());
+        send_corpus(
+            &tx,
+            1,
+            vec![conversation(
+                "/projects/a/session-a.jsonl",
+                vec!["alpha notes"],
+            )],
+        );
+        send_search(&tx, 1, 1, "alpha", false);
+
+        let responses = recv_until_indexed(&rx);
+        assert_eq!(responses.len(), 1, "answered once, after indexing");
+        assert_eq!(responses[0].generation, 1);
+        assert_eq!(responses[0].filtered, vec![0]);
+    }
+
+    /// Fork: when indexing cannot embed, a search waiting for it gets the
+    /// error instead of waiting for good; one already answered keeps its
+    /// results.
+    #[test]
+    fn search_waiting_for_indexing_gets_the_embedding_error() {
+        /// Embeds passages until `fail` is set.
+        struct Failing {
+            fail: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl SemanticEmbedder for Failing {
+            fn embed_passages(&mut self, passages: &[String]) -> Result<Vec<Vec<f32>>> {
+                if self.fail.load(Ordering::SeqCst) {
+                    return Err(AppError::ConfigError("no model".to_string()));
+                }
+                Ok(passages
+                    .iter()
+                    .map(|passage| FakeEmbedder::vector(passage))
+                    .collect())
+            }
+
+            fn embed_query(&mut self, query: &str) -> Result<Option<Vec<f32>>> {
+                Ok(Some(FakeEmbedder::vector(query)))
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let embedder_fail = fail.clone();
+        let factory: SemanticEmbedderFactory = Arc::new(move || {
+            Ok(Box::new(Failing {
+                fail: embedder_fail.clone(),
+            }) as Box<dyn SemanticEmbedder>)
+        });
+        let config = sandbox_config(root.path()).with_embedder_factory(factory);
+        let (tx, rx, _cancellation) = spawn_semantic_worker(config);
+        let alpha = || conversation("/projects/a/session-a.jsonl", vec!["alpha notes"]);
+        send_corpus(&tx, 1, vec![alpha()]);
+        send_search(&tx, 1, 1, "alpha", false);
+
+        let responses = recv_until_indexed(&rx);
+        assert_eq!(responses.len(), 1, "answered once, with the error");
+        assert_eq!(responses[0].generation, 1);
+        assert!(responses[0].filtered.is_empty());
+        assert_eq!(responses[0].progress, SemanticProgress::Failed);
+        assert_eq!(
+            responses[0].error.as_deref(),
+            Some("Configuration error: no model")
+        );
+
+        // Embedded once embedding works; then a new conversation fails to
+        // embed behind a search that the embedded one answers.
+        fail.store(false, Ordering::SeqCst);
+        send_search(&tx, 2, 1, "", true);
+        recv_until_indexed(&rx);
+        fail.store(true, Ordering::SeqCst);
+        send_corpus(
+            &tx,
+            2,
+            vec![
+                alpha(),
+                conversation("/projects/b/session-b.jsonl", vec!["beta notes"]),
+            ],
+        );
+        send_search(&tx, 3, 2, "alpha", false);
+        let responses = recv_until_indexed(&rx);
+        assert_eq!(responses.len(), 1, "answered once, before indexing");
+        assert_eq!(responses[0].generation, 3);
+        assert_eq!(responses[0].filtered, vec![0]);
+        assert_eq!(responses[0].error, None);
+    }
+
+    #[test]
+    fn search_ranks_embedded_conversations_while_indexing_new_ones() {
+        let root = tempfile::tempdir().unwrap();
+        let (tx, rx, hold) = spawn_fake_worker(root.path());
+        let alpha = || conversation("/projects/a/session-a.jsonl", vec!["alpha notes"]);
+        send_corpus(&tx, 1, vec![alpha()]);
+        send_search(&tx, 1, 1, "", true);
+        recv_until_indexed(&rx);
+
+        hold.store(true, std::sync::atomic::Ordering::SeqCst);
+        send_corpus(
+            &tx,
+            2,
+            vec![
+                alpha(),
+                conversation("/projects/b/session-b.jsonl", vec!["beta notes"]),
+            ],
+        );
+        send_search(&tx, 2, 2, "alpha", false);
+        let first = loop {
+            match recv(&rx) {
+                SemanticSearchMessage::Complete(response) => break response,
+                SemanticSearchMessage::Indexing(None) => panic!("indexing ran while held"),
+                _ => {}
+            }
+        };
+        assert_eq!(first.generation, 2);
+        assert_eq!(first.filtered, vec![0]);
+
+        hold.store(false, std::sync::atomic::Ordering::SeqCst);
+        let refreshed = recv_until_indexed(&rx);
+        assert_eq!(refreshed.len(), 1, "refreshed once indexing finishes");
+        assert_eq!(refreshed[0].generation, 2);
+        assert_eq!(refreshed[0].filtered[0], 0);
+    }
+
+    /// Fork (K6): closing the channel and cancelling, as
+    /// `Browser::suspend_semantic` does, stops a slice that is running at
+    /// its next batch, so the worker ends without finishing its indexing.
+    #[test]
+    fn closing_the_channel_stops_a_running_slice() {
+        const BATCH: usize = DEFAULT_EMBEDDING_BATCH_SIZE;
+        /// The first call takes a millisecond (the first slice measures
+        /// it and grows the next one past a batch); the second waits while
+        /// `hold` is set.
+        struct Counting {
+            hold: Arc<std::sync::atomic::AtomicBool>,
+            passages: Arc<AtomicUsize>,
+        }
+        impl SemanticEmbedder for Counting {
+            fn embed_passages(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+                let before = self.passages.fetch_add(texts.len(), Ordering::SeqCst);
+                if before == 0 {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                while before > 0 && self.hold.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Ok(texts
+                    .iter()
+                    .map(|text| FakeEmbedder::vector(text))
+                    .collect())
+            }
+
+            fn embed_query(&mut self, query: &str) -> Result<Option<Vec<f32>>> {
+                Ok(Some(FakeEmbedder::vector(query)))
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let hold = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let passages = Arc::new(AtomicUsize::new(0));
+        let (embedder_hold, embedder_passages) = (hold.clone(), passages.clone());
+        let factory: SemanticEmbedderFactory = Arc::new(move || {
+            Ok(Box::new(Counting {
+                hold: embedder_hold.clone(),
+                passages: embedder_passages.clone(),
+            }) as Box<dyn SemanticEmbedder>)
+        });
+        let worker = spawn_semantic_worker_thread(
+            sandbox_config(root.path()).with_embedder_factory(factory),
+        );
+        // Four batches: the first slice embeds one, the second the rest.
+        let conversations = (0..BATCH * 4)
+            .map(|index| {
+                let text = format!("beta {index}");
+                conversation(&format!("/projects/b/session-{index}.jsonl"), vec![&text])
+            })
+            .collect();
+        send_corpus(&worker.tx, 1, conversations);
+        send_search(&worker.tx, 1, 1, "", true);
+        // The second slice's first batch is being embedded.
+        let deadline = std::time::Instant::now() + WORKER_RESPONSE_TIMEOUT;
+        while passages.load(Ordering::SeqCst) <= BATCH {
+            assert!(std::time::Instant::now() < deadline, "no second slice");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let embedding = passages.load(Ordering::SeqCst);
+        drop(worker.tx);
+        worker.cancellation.cancel();
+        hold.store(false, Ordering::SeqCst);
+        worker.thread.join().unwrap();
+        assert_eq!(
+            passages.load(Ordering::SeqCst),
+            embedding,
+            "the slice stopped after its running batch"
+        );
+        assert!(embedding < BATCH * 4);
+        let messages: Vec<_> = worker.rx.try_iter().collect();
+        assert!(
+            !messages
+                .iter()
+                .any(|message| matches!(message, SemanticSearchMessage::Indexing(None))),
+            "indexing did not finish"
+        );
     }
 
     #[test]
@@ -996,6 +1594,9 @@ mod tests {
             }
             SemanticSearchMessage::Progress { progress, .. } => {
                 panic!("unexpected progress before literal response: {progress:?}");
+            }
+            SemanticSearchMessage::Indexing(indexing) => {
+                panic!("unexpected indexing before literal response: {indexing:?}");
             }
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -1114,6 +1715,9 @@ mod tests {
             }
             SemanticSearchMessage::Progress { progress, .. } => {
                 panic!("unexpected progress before literal response: {progress:?}");
+            }
+            SemanticSearchMessage::Indexing(indexing) => {
+                panic!("unexpected indexing before literal response: {indexing:?}");
             }
         }
     }
@@ -1275,7 +1879,10 @@ mod tests {
         })
         .unwrap();
 
+        // Nothing is embedded yet: the search waits for indexing, which
+        // embeds both passages, and is answered when it finishes.
         let mut progress = Vec::new();
+        let mut indexing = Vec::new();
         let response = loop {
             match rx.recv_timeout(WORKER_RESPONSE_TIMEOUT).unwrap() {
                 SemanticSearchMessage::Progress {
@@ -1285,13 +1892,36 @@ mod tests {
                     assert_eq!(generation, 3);
                     progress.push(step);
                 }
+                SemanticSearchMessage::Indexing(step) => indexing.push(step),
                 SemanticSearchMessage::Complete(response) => break response,
             }
         };
-        assert_eq!(progress.first(), Some(&SemanticProgress::InitializingModel));
-        assert!(
-            progress.contains(&SemanticProgress::Ranking),
-            "{progress:?}"
+        assert_eq!(
+            progress,
+            vec![
+                SemanticProgress::InitializingModel,
+                SemanticProgress::Embedding {
+                    completed: 0,
+                    total: 2
+                }
+            ]
+        );
+        assert_eq!(
+            indexing.first(),
+            Some(&Some(SemanticIndexing {
+                completed: 0,
+                total: 2
+            }))
+        );
+        assert_eq!(
+            rx.recv_timeout(WORKER_RESPONSE_TIMEOUT)
+                .ok()
+                .and_then(|message| match message {
+                    SemanticSearchMessage::Indexing(indexing) => Some(indexing),
+                    _ => None,
+                }),
+            Some(None),
+            "indexing ends after the answer"
         );
         assert_eq!(response.error, None);
         assert_eq!(response.generation, 3);
@@ -1449,7 +2079,9 @@ mod tests {
         .unwrap();
         let response = loop {
             match rx.recv_timeout(Duration::from_secs(600)).unwrap() {
-                SemanticSearchMessage::Progress { .. } => continue,
+                SemanticSearchMessage::Progress { .. } | SemanticSearchMessage::Indexing(_) => {
+                    continue;
+                }
                 SemanticSearchMessage::Complete(response) => break response,
             }
         };

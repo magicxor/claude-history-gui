@@ -56,6 +56,14 @@
 //!   query, the view is kept for the corpus version it was built from
 //!   ([`SearchCommand::corpus_version`]) rather than until upstream's
 //!   `UpdateData`; it holds copies, never the browser's snapshots.
+//! * **Background semantic indexing.** As upstream c6d0421, the semantic
+//!   worker answers from the passages embedded so far and embeds the rest
+//!   in the background ([`Browser::semantic_indexing`], `sem indexing`).
+//!   The worker wakes the poller with each report (upstream's TUI polled
+//!   every 250 ms while indexing). [`Browser::suspend_semantic`] closes the
+//!   worker's channel before it cancels, and forgets the indexing progress
+//!   with the worker (as does a replaced worker); a dropped browser cancels
+//!   its worker's running slice (upstream detached it).
 
 use super::corpus::{CorpusSnapshot, SearchSnapshot};
 use super::{
@@ -67,7 +75,7 @@ use crate::search;
 use crate::search::query::ParsedQuery;
 use crate::semantic::types::SemanticCancellationToken;
 use crate::semantic_worker::{
-    SemanticSearchMessage, SemanticWorkerCommand, SemanticWorkerConfig, Waker,
+    SemanticIndexing, SemanticSearchMessage, SemanticWorkerCommand, SemanticWorkerConfig, Waker,
     spawn_semantic_worker_thread,
 };
 use crate::store;
@@ -84,6 +92,9 @@ pub(super) struct SemanticSearchState {
     pub(super) pending_status: Option<SemanticProgress>,
     pub(super) prewarm_generation: Option<u64>,
     pub(super) prewarm_status: Option<SemanticProgress>,
+    /// Progress of embedding the conversations the worker has no
+    /// embeddings for, while it does.
+    pub(super) indexing: Option<SemanticIndexing>,
     pub(super) last_status: SemanticProgress,
     pub(super) error: Option<String>,
     pub(super) results: HashMap<usize, SemanticResultMetadata>,
@@ -94,6 +105,14 @@ pub(super) struct SemanticSearchState {
     pub(super) worker_thread: Option<std::thread::JoinHandle<()>>,
     /// Suspended by [`Browser::suspend_semantic`]: no worker is started
     pub(super) suspended: bool,
+}
+
+/// What [`Browser::semantic_activity_status_text`] shows.
+enum SemanticActivity {
+    Loading,
+    Preparing,
+    Embedding { completed: usize, total: usize },
+    Indexing { completed: usize, total: usize },
 }
 
 /// Conversations with semantic data that semantic search ranks in
@@ -955,13 +974,17 @@ impl Browser {
         self.semantic_search.worker_thread = Some(worker.thread);
         self.semantic_sent_corpus_version = 0;
         self.semantic_sent_scope_signature = None;
+        // The replaced worker's indexing reports no longer arrive.
+        self.semantic_search.indexing = None;
     }
 
     /// Stop the semantic worker for an exclusive semantic-cache operation
     /// (generate or clear the cache, K6): cancel its search, close its
     /// channel and **join** its thread, which drops its embedder and its
     /// copy of the embedding cache. Blocks until the worker's current step
-    /// returns (embedding checks the cancellation between batches).
+    /// returns (embedding checks the cancellation between batches). Its
+    /// background indexing stops with it; what it embedded since its last
+    /// cache write (at most 30 s of work) is embedded again later.
     ///
     /// While suspended no worker is started: a semantic query still gets
     /// the lexical fallback rows, [`Browser::semantic_progress`] is
@@ -972,16 +995,20 @@ impl Browser {
             return;
         }
         self.semantic_search.suspended = true;
+        // The channel is closed before the cancel: an indexing slice the
+        // worker starts in between is cancelled (it takes its token before
+        // it looks at the channel).
+        self.semantic_search.worker_tx = None;
+        self.semantic_search.worker_rx = None;
         if let Some(cancellation) = self.semantic_search.cancellation.take() {
             cancellation.cancel();
         }
-        self.semantic_search.worker_tx = None;
-        self.semantic_search.worker_rx = None;
         if let Some(thread) = self.semantic_search.worker_thread.take() {
             let _ = thread.join();
         }
         self.semantic_sent_corpus_version = 0;
         self.semantic_sent_scope_signature = None;
+        self.semantic_search.indexing = None;
         // No semantic answer will come; a lexical fallback that is still
         // running is applied when it arrives.
         if !self.search_in_flight {
@@ -1371,6 +1398,20 @@ impl Browser {
                             }
                         }
                     }
+                    SemanticSearchMessage::Indexing(indexing) => {
+                        // A search waiting for indexing shows its progress.
+                        if let (Some(SemanticProgress::Embedding { .. }), Some(indexing)) =
+                            (&self.semantic_search.pending_status, indexing)
+                        {
+                            self.semantic_search.pending_status =
+                                Some(SemanticProgress::Embedding {
+                                    completed: indexing.completed,
+                                    total: indexing.total,
+                                });
+                        }
+                        self.semantic_search.indexing = indexing;
+                        applied = true;
+                    }
                     SemanticSearchMessage::Complete(response) => {
                         if self.list_search_mode == ListSearchMode::Semantic {
                             // CCR-3: the worker answers requests in order and
@@ -1409,6 +1450,14 @@ impl Browser {
                                 }
                                 applied = true;
                             } else if response.generation == active_generation {
+                                // Results refreshed after indexing replace ones
+                                // already shown; keep a row the user moved to.
+                                if self.semantic_search.pending_generation.is_none()
+                                    && self.selection_anchor.is_none()
+                                    && self.selected.is_some_and(|selected| selected > 0)
+                                {
+                                    self.selection_anchor = self.selected_path();
+                                }
                                 self.search_in_flight = false;
                                 self.semantic_search.pending_generation = None;
                                 self.semantic_search.pending_status = None;
@@ -1427,6 +1476,13 @@ impl Browser {
             self.semantic_search.worker_rx = Some(rx);
         }
         applied
+    }
+
+    /// Progress of the semantic worker's background indexing, while it runs
+    /// (upstream c6d0421). It continues after the search or prewarm that
+    /// started it was answered, and is not search work in flight.
+    pub fn semantic_indexing(&self) -> Option<SemanticIndexing> {
+        self.semantic_search.indexing
     }
 
     /// Whether a lexical search, a semantic search or a prewarm is running,
@@ -1496,10 +1552,47 @@ impl Browser {
         }
     }
 
-    /// Activity text while the conversations load, the model loads or the
-    /// corpus is embedded: `"sem loading conversations"`, `"sem preparing
-    /// embeddings"` or `"sem embedding <p>%  <d>/<t> chunks"`.
+    /// Activity text while the conversations load, the model loads, a
+    /// search waits for embeddings or the worker embeds the corpus in the
+    /// background: `"sem loading conversations"`, `"sem preparing
+    /// embeddings"`, `"sem embedding <p>%  <d>/<t> chunks"` or `"sem indexing
+    /// <p>%  <d>/<t> chunks"` (upstream c6d0421).
     pub fn semantic_activity_status_text(&self) -> Option<String> {
+        let percent = |completed: usize, total: usize| {
+            completed
+                .saturating_mul(100)
+                .checked_div(total)
+                .unwrap_or(100)
+        };
+        Some(match self.semantic_activity()? {
+            SemanticActivity::Loading => "sem loading conversations".to_string(),
+            SemanticActivity::Preparing => "sem preparing embeddings".to_string(),
+            SemanticActivity::Embedding { completed, total } => format!(
+                "sem embedding {}%  {completed}/{total} chunks",
+                percent(completed, total)
+            ),
+            SemanticActivity::Indexing { completed, total } => format!(
+                "sem indexing {}%  {completed}/{total} chunks",
+                percent(completed, total)
+            ),
+        })
+    }
+
+    /// The `(done, total)` chunk counts that
+    /// [`Browser::semantic_activity_status_text`] shows, when it shows any
+    /// (`sem embedding` or `sem indexing`), for a progress bar.
+    pub fn semantic_activity_counts(&self) -> Option<(usize, usize)> {
+        match self.semantic_activity()? {
+            SemanticActivity::Embedding { completed, total }
+            | SemanticActivity::Indexing { completed, total } => Some((completed, total)),
+            SemanticActivity::Loading | SemanticActivity::Preparing => None,
+        }
+    }
+
+    /// What the semantic activity shows: the prewarm's or the pending
+    /// search's status, else the semantic corpus load, else the background
+    /// indexing (upstream c6d0421; done counts capped at the total).
+    fn semantic_activity(&self) -> Option<SemanticActivity> {
         if self.list_search_mode != ListSearchMode::Semantic || self.semantic_search.error.is_some()
         {
             return None;
@@ -1512,21 +1605,21 @@ impl Browser {
             .prewarm_status
             .as_ref()
             .or(self.semantic_search.pending_status.as_ref())
-            .or(self.semantic_corpus_pending().then_some(&loading))?;
+            .or(self.semantic_corpus_pending().then_some(&loading));
+        let Some(status) = status else {
+            let SemanticIndexing { completed, total } = self.semantic_search.indexing?;
+            return Some(SemanticActivity::Indexing {
+                completed: completed.min(total),
+                total,
+            });
+        };
         match status {
-            SemanticProgress::LoadingSessions => Some("sem loading conversations".to_string()),
-            SemanticProgress::InitializingModel => Some("sem preparing embeddings".to_string()),
-            SemanticProgress::Embedding { completed, total } => {
-                let percent = if *total == 0 {
-                    100
-                } else {
-                    completed.min(total).saturating_mul(100) / total
-                };
-                Some(format!(
-                    "sem embedding {percent}%  {}/{total} chunks",
-                    completed.min(total)
-                ))
-            }
+            SemanticProgress::LoadingSessions => Some(SemanticActivity::Loading),
+            SemanticProgress::InitializingModel => Some(SemanticActivity::Preparing),
+            SemanticProgress::Embedding { completed, total } => Some(SemanticActivity::Embedding {
+                completed: *completed.min(total),
+                total: *total,
+            }),
             _ => None,
         }
     }

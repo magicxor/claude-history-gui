@@ -1,5 +1,5 @@
 //! G tests of the semantic flows with a fake embedder (L-020, L-033, L-039,
-//! L-070, L-071, S-023, S-025…S-029, S-036, X-016). The fake never loads a
+//! L-070, L-071, S-023, S-025…S-029, S-036, S-040, X-016). The fake never loads a
 //! model; gates make the slow phases observable.
 
 use std::sync::Arc;
@@ -99,9 +99,28 @@ fn the_footer_shows_the_model_preparation(cx: &mut TestAppContext) {
     );
 }
 
-/// L-039, S-026, S-036, X-016, S-025, L-020: embedding progress shows as a
-/// percentage; typing keeps the rows and the progress; rows have no scores
-/// while pending and scores after completion; Lexical rows never have scores.
+/// Parse `<prefix><p>%  <d>/<t> chunks` into `(p, d, t)`.
+fn activity_counts(text: &str, prefix: &str) -> (u32, usize, usize) {
+    let (percent, rest) = text
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.split_once("%  "))
+        .unwrap_or_else(|| panic!("format of {text:?}"));
+    let (done, total) = rest
+        .strip_suffix(" chunks")
+        .and_then(|rest| rest.split_once('/'))
+        .unwrap_or_else(|| panic!("format of {text:?}"));
+    (
+        percent.parse().unwrap(),
+        done.parse().unwrap(),
+        total.parse().unwrap(),
+    )
+}
+
+/// L-039, S-026, S-036, X-016, S-025, L-020, S-040: the prewarm is answered
+/// at once and the passages are indexed in the background, shown as a
+/// percentage with a progress bar; typing keeps the rows and the progress;
+/// rows have no scores while pending and scores after completion; Lexical
+/// rows never have scores.
 #[gpui_kit::test]
 fn embedding_progress_and_scores(cx: &mut TestAppContext) {
     let world = semantic_world(60);
@@ -112,28 +131,27 @@ fn embedding_progress_and_scores(cx: &mut TestAppContext) {
     let _open = OpenOnDrop(vec![gate.clone()]);
     let f = ListFixture::open_loaded(cx, &world, &[]);
     to_semantic(&f, cx);
-    f.wait_until(cx, "embedding progress", |list, _| {
+    // S-040: the prewarm is answered while the passages are embedded.
+    f.wait_until(cx, "indexing progress", |list, _| {
         list.browser()
             .semantic_activity_status_text()
-            .is_some_and(|text| text.starts_with("sem embedding "))
+            .is_some_and(|text| text.starts_with("sem indexing "))
+            && !list.browser().has_search_work_in_flight()
     });
     let model = footer(&f, cx);
     let text = model.semantic_activity.clone().unwrap();
-    // `sem embedding <p>%  <d>/<t> chunks`
-    let (percent, rest) = text
-        .strip_prefix("sem embedding ")
-        .and_then(|rest| rest.split_once("%  "))
-        .unwrap_or_else(|| panic!("format of {text:?}"));
-    assert!(percent.parse::<u32>().is_ok(), "{text}");
-    let (done, total) = rest
-        .strip_suffix(" chunks")
-        .unwrap()
-        .split_once('/')
-        .unwrap();
-    assert!(done.parse::<usize>().unwrap() <= total.parse::<usize>().unwrap());
+    // `sem indexing <p>%  <d>/<t> chunks`
+    let (percent, done, total) = activity_counts(&text, "sem indexing ");
+    assert!(done <= total, "{text}");
+    assert_eq!(percent as usize, done * 100 / total, "{text}");
+    let bar = model.semantic_percent.expect("a progress bar");
+    assert!(
+        (bar - done as f32 * 100.0 / total as f32).abs() < 0.01,
+        "{bar}"
+    );
     assert!(model.chips.is_empty());
 
-    // Typing during the embedding keeps the rows and the progress.
+    // Typing during the indexing keeps the rows and the progress.
     f.type_text(cx, "synthetic");
     // X-016: the lexical result of the typed query arrives while the passages
     // are still being embedded (a result of that query, not the empty browse).
@@ -148,7 +166,7 @@ fn embedding_progress_and_scores(cx: &mut TestAppContext) {
     assert!(
         kept.semantic_activity
             .as_deref()
-            .is_some_and(|text| text.starts_with("sem embedding ")),
+            .is_some_and(|text| text.starts_with("sem indexing ")),
         "{kept:?}"
     );
     // S-025: pending rows have no scores.
@@ -178,6 +196,63 @@ fn embedding_progress_and_scores(cx: &mut TestAppContext) {
     f.wait_idle(cx);
     let lexical = f.read(cx, |list, _| list.row_models(0..3, 480.0));
     assert!(lexical.iter().all(|row| row.score.is_none()));
+}
+
+/// S-040, S-025: a search that nothing embedded so far matches keeps its
+/// lexical rows and shows the indexing progress as `sem embedding`; it is
+/// answered with scores once indexing finishes.
+#[gpui_kit::test]
+fn a_search_waits_for_indexing_with_its_lexical_rows(cx: &mut TestAppContext) {
+    let world = semantic_world(60);
+    ListFixture::init_app(cx, &world, &[]);
+    let control = install_fake_embedder(cx);
+    let init = Gate::closed();
+    let batch = Gate::closed();
+    *control.init_gate.lock().unwrap() = Some(init.clone());
+    *control.batch_gate.lock().unwrap() = Some(batch.clone());
+    let _open = OpenOnDrop(vec![init.clone(), batch.clone()]);
+    let f = ListFixture::open_loaded(cx, &world, &[]);
+    to_semantic(&f, cx);
+    f.wait_until(cx, "the preparing activity", |list, _| {
+        list.browser().semantic_activity_status_text().as_deref()
+            == Some("sem preparing embeddings")
+    });
+    // The query reaches the worker before anything is embedded.
+    f.type_text(cx, "synthetic");
+    f.wait_until(cx, "the lexical fallback", |list, cx| {
+        list.query(cx).as_ref() == "synthetic" && !list.browser().filtered().is_empty()
+    });
+    init.open();
+    f.wait_until(cx, "the search waiting for indexing", |list, _| {
+        list.browser()
+            .semantic_activity_status_text()
+            .is_some_and(|text| text.starts_with("sem embedding "))
+    });
+    let model = footer(&f, cx);
+    let text = model.semantic_activity.clone().unwrap();
+    let (_, done, total) = activity_counts(&text, "sem embedding ");
+    assert!(done < total, "{text}");
+    assert!(model.semantic_percent.is_some());
+    assert!(f.read(cx, |list, _| list.browser().has_search_work_in_flight()));
+    let pending = f.read(cx, |list, _| list.row_models(0..3, 480.0));
+    assert!(!pending.is_empty());
+    assert!(pending.iter().all(|row| row.score.is_none()), "{pending:?}");
+
+    batch.open();
+    f.wait_until(cx, "the semantic result", |list, _| {
+        !list.browser().has_search_work_in_flight()
+            && list.browser().semantic_indexing().is_none()
+            && list
+                .browser()
+                .semantic_result_metadata_for_selection()
+                .is_some()
+    });
+    assert_eq!(
+        f.read(cx, |list, _| list.browser().semantic_activity_status_text()),
+        None
+    );
+    let done = f.read(cx, |list, _| list.row_models(0..3, 480.0));
+    assert!(done.iter().all(|row| row.score.is_some()), "{done:?}");
 }
 
 /// L-033, S-027: a failing model shows `sem failed` with the error in a

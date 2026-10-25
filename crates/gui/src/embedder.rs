@@ -132,6 +132,11 @@ impl SemanticEmbedder for SharedModelEmbedder {
         &mut self,
         passages: &[String],
     ) -> claude_history_core::Result<Vec<Vec<f32>>> {
+        if passages.is_empty() {
+            // Only loads the model (the list's warm-up), whatever the model
+            // makes of an empty batch.
+            return self.shared.with_model(|_| Ok(Vec::new()));
+        }
         self.shared
             .with_model(|model| model.embed_passages(passages))
     }
@@ -397,6 +402,35 @@ mod tests {
         let error = thin(&shared).embed_passages(&[]).unwrap_err().to_string();
         assert!(error.contains(NOT_AVAILABLE_IN_TESTS), "{error}");
         assert_eq!(shared.load_count(), 0);
+    }
+
+    /// The list's warm-up (an empty batch) loads the model without asking
+    /// it to embed nothing.
+    #[test]
+    fn an_empty_batch_only_loads_the_model() {
+        struct NoEmptyBatches;
+        impl SemanticEmbedder for NoEmptyBatches {
+            fn embed_passages(
+                &mut self,
+                passages: &[String],
+            ) -> claude_history_core::Result<Vec<Vec<f32>>> {
+                assert!(!passages.is_empty(), "the model got an empty batch");
+                Ok(passages.iter().map(|_| vec![1.0]).collect())
+            }
+
+            fn embed_query(
+                &mut self,
+                _query: &str,
+            ) -> claude_history_core::Result<Option<Vec<f32>>> {
+                Ok(Some(vec![1.0]))
+            }
+        }
+        let shared = Arc::new(SharedEmbedder::new(Arc::new(|| {
+            Ok(Box::new(NoEmptyBatches) as Box<dyn SemanticEmbedder + Send>)
+        })));
+        assert!(thin(&shared).embed_passages(&[]).unwrap().is_empty());
+        assert!(shared.is_loaded());
+        assert_eq!(shared.load_count(), 1);
     }
 
     #[test]

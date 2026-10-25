@@ -4,6 +4,10 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 ## Unreleased
 
+- Semantic search answers right away from the conversations it has already embedded, and embeds new ones in the
+  background ("sem indexing 40%  1200/3000 chunks" with a progress bar in the list footer) instead of making every
+  search wait until all of them are embedded. When indexing finishes, the results are refreshed, keeping the row you
+  selected; a search that nothing embedded so far matches shows the keyword matches until then.
 - Claude Code `/btw` side questions are listed and searched as conversations of their own, tagged `fork`, and the
   question is also searchable in the session it was asked in.
 - Claude Code subagent transcripts are indexed with their session and can be read in full. The viewer header of a

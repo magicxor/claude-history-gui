@@ -354,10 +354,14 @@ impl ListFixture {
         self.wait_idle(cx);
     }
 
-    /// Wait until no search worker has pending work.
+    /// Wait until no search worker has pending work and the semantic worker
+    /// has finished its background indexing (which goes on after the search
+    /// or prewarm that started it was answered).
     pub fn wait_idle(&self, cx: &mut TestAppContext) {
         self.wait_until(cx, "the search workers to go idle", |list, _| {
-            !list.browser().has_search_work_in_flight() && !list.loader().is_running()
+            !list.browser().has_search_work_in_flight()
+                && list.browser().semantic_indexing().is_none()
+                && !list.loader().is_running()
         });
     }
 

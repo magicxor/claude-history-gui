@@ -891,3 +891,28 @@ fn a_row_click_takes_the_focus_back(cx: &mut TestAppContext) {
     })
     .unwrap();
 }
+
+/// §10.5: a kept selection whose row moved (refreshed semantic results keep the
+/// path, not the index) is scrolled back into view without a new event.
+#[gpui_kit::test]
+fn a_selected_row_that_moved_is_scrolled_into_view(cx: &mut TestAppContext) {
+    let world = corpus(200);
+    let f = ListFixture::open_loaded(cx, &world, &[]);
+    cx.update_window(f.handle, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    let before = f.read(cx, |list, _| list.scroll_offset());
+    f.list.update(cx, |list, cx| {
+        list.browser.select(150);
+        // The row was at another index when the path was last emitted.
+        list.emitted_selection = list.browser.selected_path();
+        list.emitted_position = Some(0);
+        list.emit_selection(false, cx);
+    });
+    cx.update_window(f.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let after = f.read(cx, |list, _| list.scroll_offset());
+    assert_ne!(before, after, "the viewport followed the moved row");
+}

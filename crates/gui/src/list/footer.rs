@@ -10,6 +10,10 @@
 //! semantic activity instead), with `  ·  results may be incomplete` while a
 //! query is typed.
 //!
+//! The semantic worker's background indexing (upstream c6d0421) is the
+//! semantic activity `sem indexing 40%  12/30 chunks` with a progress bar,
+//! while no search has an activity of its own.
+//!
 //! The hint chips are only shown while the list has focus and no activity is
 //! displayed. While the initial load runs (AD6) the rename and delete chips
 //! are dimmed, and open, resume and fork until the rows are listed newest
@@ -171,9 +175,10 @@ pub struct FooterModel {
     pub count: String,
     /// `Refreshing conversations…`
     pub refreshing: bool,
-    /// `sem preparing embeddings` / `sem embedding 40%  12/30 chunks`
+    /// `sem preparing embeddings` / `sem embedding 40%  12/30 chunks` /
+    /// `sem indexing 40%  12/30 chunks`
     pub semantic_activity: Option<String>,
-    /// The embedding progress in percent, when known.
+    /// The embedding or indexing progress in percent, when known.
     pub semantic_percent: Option<f32>,
     /// `Indexing conversations… 2,345 / 7,185` / `Finishing index… 7,185
     /// conversations` while a reconcile pass is shown as indexing
@@ -236,16 +241,17 @@ impl ListPane {
     /// are trimmed to it).
     pub fn footer_model_for_width(&self, pane_rem: f32, window: &Window, cx: &App) -> FooterModel {
         let activity = self.browser.semantic_activity_status_text();
-        let percent = match self.browser.semantic_progress() {
-            SemanticProgress::Embedding { completed, total } if activity.is_some() => {
-                Some(if *total == 0 {
+        // The counts the activity text shows (`sem embedding`, `sem indexing`).
+        let percent = self
+            .browser
+            .semantic_activity_counts()
+            .map(|(completed, total)| {
+                if total == 0 {
                     100.0
                 } else {
-                    (*completed).min(*total) as f32 * 100.0 / *total as f32
-                })
-            }
-            _ => None,
-        };
+                    completed.min(total) as f32 * 100.0 / total as f32
+                }
+            });
         let indexing = self
             .browser
             .indexing_status_text()
