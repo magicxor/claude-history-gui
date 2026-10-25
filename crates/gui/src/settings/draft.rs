@@ -77,7 +77,7 @@ impl Field {
     }
 
     /// Every field, page by page, in display order.
-    pub const ALL: [Field; 34] = [
+    pub const ALL: [Field; 35] = [
         Field::Theme,
         Field::Terminal,
         Field::ClaudePath,
@@ -99,6 +99,7 @@ impl Field {
         Field::Key(KeyAction::Delete),
         Field::Key(KeyAction::Refresh),
         Field::Key(KeyAction::AllKinds),
+        Field::Key(KeyAction::UserOnly),
         Field::ResumeArgs,
         Field::CodexResumeArgs,
         Field::AgentScope,
@@ -196,6 +197,7 @@ impl Field {
             Field::Key(KeyAction::Delete) => "[keys] delete",
             Field::Key(KeyAction::Refresh) => "[keys] refresh",
             Field::Key(KeyAction::AllKinds) => "[keys] all_kinds",
+            Field::Key(KeyAction::UserOnly) => "[keys] user_only",
             Field::ResumeArgs => "[resume] default_args",
             Field::CodexResumeArgs => "[resume.codex] default_args",
             Field::AgentScope => "[agent] scope",
@@ -324,6 +326,7 @@ pub fn get(field: Field, gui: &GuiConfigFile) -> Value {
         Field::Key(KeyAction::Delete) => opt(keys.delete, Value::Key),
         Field::Key(KeyAction::Refresh) => opt(keys.refresh, Value::Key),
         Field::Key(KeyAction::AllKinds) => opt(keys.all_kinds, Value::Key),
+        Field::Key(KeyAction::UserOnly) => opt(keys.user_only, Value::Key),
         Field::ResumeArgs => opt(
             gui.resume.as_ref().and_then(|r| r.default_args.clone()),
             Value::List,
@@ -441,6 +444,7 @@ pub fn set(field: Field, gui: &mut GuiConfigFile, value: Value) {
         Field::Key(KeyAction::Delete) => keys(gui).delete = key(&value),
         Field::Key(KeyAction::Refresh) => keys(gui).refresh = key(&value),
         Field::Key(KeyAction::AllKinds) => keys(gui).all_kinds = key(&value),
+        Field::Key(KeyAction::UserOnly) => keys(gui).user_only = key(&value),
         Field::ResumeArgs => {
             gui.resume
                 .get_or_insert_with(ResumeConfig::default)
@@ -509,6 +513,7 @@ pub fn cli_value(field: Field, cli: &ConfigFile) -> Value {
         Field::Key(KeyAction::Delete) => opt(keys.delete, Value::Key),
         Field::Key(KeyAction::Refresh) => opt(keys.refresh, Value::Key),
         Field::Key(KeyAction::AllKinds) => opt(keys.all_kinds, Value::Key),
+        Field::Key(KeyAction::UserOnly) => opt(keys.user_only, Value::Key),
         Field::ResumeArgs => opt(
             cli.resume.as_ref().and_then(|r| r.default_args.clone()),
             Value::List,
@@ -551,6 +556,7 @@ pub fn default_value(field: Field) -> Value {
         Field::Key(KeyAction::Delete) => Value::Key(keys.delete),
         Field::Key(KeyAction::Refresh) => Value::Key(keys.refresh),
         Field::Key(KeyAction::AllKinds) => Value::Key(keys.all_kinds),
+        Field::Key(KeyAction::UserOnly) => Value::Key(keys.user_only),
         Field::AgentScope => Value::Scope(AgentScopeConfig::Global),
         Field::AgentOutputChars => Value::Number(6000),
         Field::AgentTop => Value::Number(10),
@@ -778,6 +784,7 @@ pub fn effective_keys(cli: &ConfigFile, draft: &GuiConfigFile) -> KeyBindings {
         delete: gui_keys.delete.or(cli_keys.delete),
         refresh: gui_keys.refresh.or(cli_keys.refresh),
         all_kinds: gui_keys.all_kinds.or(cli_keys.all_kinds),
+        user_only: gui_keys.user_only.or(cli_keys.user_only),
     }))
 }
 

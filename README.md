@@ -44,6 +44,12 @@ All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-h
 * Search as you type. **Lexical** search (with highlighted matches and a literal mode for quoted text) or
   **semantic** search (local embedding model, downloaded on first use; falls back to lexical while the cache is
   not ready). Ctrl+T toggles the mode.
+* **You only** (Alt+U, View > Search only your own messages, `[keys] user_only`): lexical search matches only what
+  you typed. A conversation is found only when every word and quoted phrase of the query occurs in your own
+  messages; assistant replies, tool calls and output, injected context such as system reminders and hook output,
+  history a Codex thread inherits from the thread it forked, prompts written for a subagent, and the title,
+  summary and project name don't count, and snippets come from your messages too. Semantic search ignores it (the
+  footer says `you only: not in semantic`). The query and selection stay when you toggle it.
 * Scope **All** or **Workspace** (project folder), a workspace picker with recent folders, a time filter
   (`--since`/`--before` grammar such as `2d`, `1d6h`, `6mo`, `2026-07-20`), excluded projects and working
   directories.
@@ -271,6 +277,7 @@ command palette.
 | Shift+F10, Menu | Row context menu |
 | Ctrl+R / Ctrl+F / F2 / Ctrl+X / Ctrl+L | Resume / Fork / Rename / Delete / Refresh (rebindable) |
 | Ctrl+G | Show / hide automated and subagent conversations (rebindable) |
+| Alt+U | Search only your own messages, or everything again (rebindable; lexical search) |
 | Ctrl+E, Ctrl+B, Ctrl+F, Alt+B, Alt+F, Ctrl+K, Ctrl+U, Ctrl+W | Emacs-style editing in the search field (Ctrl+F moves right unless Fork is on Ctrl+F) |
 
 **Viewer**
@@ -311,9 +318,9 @@ command palette.
 | 1 - 4, j / k, Enter, Esc | Export menu: pick a format |
 | Ctrl+U | Clear the rename field |
 
-The six rebindable keys come from `[keys]` in `gui.toml` or `config.toml` (`resume`, `fork`, `rename`,
-`delete`, `refresh`, `all_kinds`; syntax such as `ctrl+r`, `f2`). Ctrl+C, Ctrl+V, Ctrl+A, Ctrl+Z, Ctrl+Y and Ctrl+W are rejected as reserved for
-clipboard and editing.
+The seven rebindable keys come from `[keys]` in `gui.toml` or `config.toml` (`resume`, `fork`, `rename`,
+`delete`, `refresh`, `all_kinds`, `user_only`; syntax such as `ctrl+r`, `f2`). Ctrl+C, Ctrl+V, Ctrl+A, Ctrl+Z, Ctrl+Y and Ctrl+W are rejected as reserved for
+clipboard and editing, so the CLI's default `user_only = "ctrl+v"` is not used here: the GUI's default is Alt+U.
 Ctrl+W deletes a word in text fields and never closes a window.
 
 ## Configuration and data

@@ -906,6 +906,7 @@ impl Browser {
             .0
             .clone();
         let generation = self.search_generation;
+        let user_only = self.searches_user_only();
         let waker = self.waker.clone();
         // Joined when the browser is dropped (it reads the mapped text).
         let spawned = std::thread::Builder::new()
@@ -915,9 +916,10 @@ impl Browser {
                 let found = wanted
                     .into_iter()
                     .filter_map(|(row, doc, preview)| {
-                        let text = index.text(doc);
-                        crate::search::build_lexical_evidence(&text, &preview, &parsed)
-                            .map(|evidence| (row, evidence))
+                        super::search_state::index_evidence(
+                            &index, doc, &preview, &parsed, user_only,
+                        )
+                        .map(|evidence| (row, evidence))
                     })
                     .collect();
                 if tx.send((generation, found)).is_ok()

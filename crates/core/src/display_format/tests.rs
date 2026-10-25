@@ -20,6 +20,7 @@ fn test_conversation() -> Conversation {
         preview_first: "lexical preview sentinel".into(),
         preview_last: "lexical preview sentinel".into(),
         full_text: "tool output sentinel summary sentinel cwd sentinel".into(),
+        own_text: "".into(),
         agent_search_text: "".into(),
         semantic_route_text: "".into(),
         semantic_turns: vec!["semantic visible text".to_string()].into(),

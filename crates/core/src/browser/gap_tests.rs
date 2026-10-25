@@ -34,6 +34,7 @@ fn conversation(path: PathBuf, text: &str) -> Conversation {
         semantic_turns: vec![text.to_string()].into(),
         semantic_turn_ranges: vec![crate::agent::refs::MessageRange::single(1)],
         full_text: text.to_string().into(),
+        own_text: "".into(),
         agent_search_text: String::new().into(),
         semantic_route_text: String::new().into(),
         project_name: Some("project".to_string()),
@@ -755,6 +756,8 @@ fn the_search_worker_coalesces_to_the_latest_query() {
         conversations: app.corpus_snapshot(),
         searchable: app.searchable.clone(),
         index: None,
+        user_only: false,
+        corpus_version: 1,
     };
     for (generation, query) in [(1, "n"), (2, "ne"), (3, "need")] {
         tx.send(command(generation, query)).unwrap();

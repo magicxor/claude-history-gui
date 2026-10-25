@@ -50,7 +50,7 @@ pub const DIALOG_WIDTH_REM: f32 = 56.0;
 pub const CONTENT_HEIGHT_REM: f32 = 34.0;
 
 /// Fields edited with a single-line input.
-pub const TEXT_FIELDS: [Field; 16] = [
+pub const TEXT_FIELDS: [Field; 17] = [
     Field::Terminal,
     Field::ClaudePath,
     Field::PiPath,
@@ -63,6 +63,7 @@ pub const TEXT_FIELDS: [Field; 16] = [
     Field::Key(KeyAction::Delete),
     Field::Key(KeyAction::Refresh),
     Field::Key(KeyAction::AllKinds),
+    Field::Key(KeyAction::UserOnly),
     Field::AgentOutputChars,
     Field::AgentTop,
     Field::AgentWithinTop,

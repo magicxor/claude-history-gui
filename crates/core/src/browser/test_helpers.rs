@@ -136,6 +136,7 @@ pub(crate) fn plain_conversation(path: PathBuf) -> Conversation {
         preview_first: String::new().into(),
         preview_last: String::new().into(),
         full_text: String::new().into(),
+        own_text: "".into(),
         agent_search_text: String::new().into(),
         semantic_route_text: String::new().into(),
         semantic_turns: Vec::new().into(),

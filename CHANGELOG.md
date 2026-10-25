@@ -4,6 +4,11 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 ## Unreleased
 
+- Search only your own messages: the list's new **You only** toggle (Alt+U, View > Search only your own messages,
+  rebindable as `[keys] user_only`) makes lexical search match only what you typed, leaving out assistant replies,
+  tool output, injected context, subagent prompts and titles; snippets come from your messages too. The query and
+  the selection stay when you switch, and the footer shows `you only` while it is on. Semantic search ignores it.
+  The conversation index is rebuilt once to include what you typed.
 - New setting `[tui] exclude_paths` (Settings → Search → Excluded working directories): conversations whose recorded
   working directory starts with a listed prefix, such as throwaway runs under `/tmp/` or your Temp folder, are hidden
   from the list, its searches and Deep Search, for Claude, Pi, OMP and Codex alike. Prefixes match literally and

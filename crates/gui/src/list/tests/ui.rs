@@ -14,8 +14,10 @@ use gpui_kit::{Entity, TestAppContext, px};
 use crate::keymap;
 use crate::list::ListPaneEvent;
 use crate::list::context_menu::MenuEntry;
-use crate::list::footer::{ChipKind, FooterModel};
-use crate::list::toolbar::{NO_WORKSPACE_TOOLTIP, WORKSPACE_TOOLTIP};
+use crate::list::footer::{ChipKind, FooterModel, chip_width_rem};
+use crate::list::toolbar::{
+    NO_WORKSPACE_TOOLTIP, USER_ONLY_SEMANTIC_TOOLTIP, USER_ONLY_TOOLTIP, WORKSPACE_TOOLTIP,
+};
 use crate::list::workspace_picker::IS_DIR_CALLS;
 use crate::model::RowMenuItem;
 use crate::test_support::fixtures_list::{ListFixture, SessionSpec, listed_corpus};
@@ -502,6 +504,153 @@ fn the_all_kinds_flag_and_key_binding(cx: &mut TestAppContext) {
     f.press(cx, "alt-k");
     f.wait_idle(cx);
     assert_eq!(codex_rows(&f, cx), [("002".to_string(), None)]);
+}
+
+/// Two conversations that mention `walrus`: `asked` in what the user typed,
+/// `answered` only in the assistant's reply (twice, so it ranks first).
+fn walrus_world() -> (TestWorld, std::path::PathBuf, std::path::PathBuf) {
+    let world = TestWorld::new();
+    let start = Utc::now() - Duration::hours(3);
+    let asked = SessionSpec::new("alpha", 1)
+        .messages(&[
+            ("user", "how does the walrus work"),
+            ("assistant", "it assigns a value"),
+        ])
+        .start(start)
+        .write(&world);
+    let answered = SessionSpec::new("beta", 2)
+        .messages(&[
+            ("user", "explain this operator"),
+            ("assistant", "the walrus assigns, the walrus returns"),
+        ])
+        .start(start + Duration::hours(1))
+        .write(&world);
+    (world, asked, answered)
+}
+
+/// S-039 (upstream ae7ae39): Alt+U searches only the user's own messages,
+/// keeping the query and the selected conversation; Alt+U again searches
+/// everything. The toolbar's `You only` toggle, the View menu item and the
+/// footer's `you only` chip follow; in semantic mode, which ignores it, the
+/// chip and the tooltip say so.
+#[gpui_kit::test]
+fn alt_u_searches_only_your_own_messages(cx: &mut TestAppContext) {
+    let (world, asked, answered) = walrus_world();
+    ListFixture::init_app(cx, &world, &[]);
+    let _control = crate::test_support::fixtures_list::install_fake_embedder(cx);
+    let f = ListFixture::open_loaded(cx, &world, &[]);
+    let probe = |cx: &TestAppContext| f.read(cx, |list, cx| list.qa_probe("list.user_only", cx));
+    let wide_footer = |cx: &mut TestAppContext| {
+        cx.update_window(f.handle, |_, window, cx| {
+            window.render_frame(cx);
+            f.list.read(cx).footer_model_for_width(120.0, window, cx)
+        })
+        .unwrap()
+    };
+    assert_eq!(probe(cx).as_deref(), Some("false"));
+    assert_eq!(chip(&wide_footer(cx), ChipKind::UserOnly), None);
+
+    f.type_text(cx, "walrus");
+    f.wait_idle(cx);
+    assert_eq!(f.paths(cx), [answered.clone(), asked.clone()]);
+
+    f.press(cx, "alt-u");
+    f.wait_idle(cx);
+    assert_eq!(probe(cx).as_deref(), Some("true"));
+    assert_eq!(f.paths(cx), std::slice::from_ref(&asked));
+    assert_eq!(f.read(cx, |list, cx| list.query(cx).to_string()), "walrus");
+    assert!(cx.read(|cx| crate::menus::current_checks(cx).user_only));
+    let toolbar = f.read(cx, |list, _| list.toolbar_model());
+    assert!(toolbar.user_only);
+    assert_eq!(toolbar.user_only_tooltip, USER_ONLY_TOOLTIP);
+    let chip_text = chip(&wide_footer(cx), ChipKind::UserOnly);
+    assert_eq!(chip_text, Some(format!("{} you only", kbd("alt-u"))));
+    assert_eq!(f.selected_path(cx), Some(asked.clone()));
+
+    // Everything again: the query stays and so does the selection.
+    f.press(cx, "alt-u");
+    f.wait_idle(cx);
+    assert_eq!(probe(cx).as_deref(), Some("false"));
+    assert_eq!(f.paths(cx), [answered.clone(), asked.clone()]);
+    assert_eq!(
+        f.selected_path(cx),
+        Some(asked.clone()),
+        "the selection is kept"
+    );
+    assert!(!cx.read(|cx| crate::menus::current_checks(cx).user_only));
+    assert_eq!(chip(&wide_footer(cx), ChipKind::UserOnly), None);
+
+    // Semantic search ignores the toggle; the chip and the tooltip say so.
+    f.press(cx, "alt-u");
+    f.press(cx, "ctrl-t");
+    f.wait_idle(cx);
+    let toolbar = f.read(cx, |list, _| list.toolbar_model());
+    assert!(toolbar.user_only);
+    assert_eq!(toolbar.user_only_tooltip, USER_ONLY_SEMANTIC_TOOLTIP);
+    assert_eq!(
+        chip(&wide_footer(cx), ChipKind::UserOnly),
+        Some(format!("{} you only: not in semantic", kbd("alt-u")))
+    );
+    // 18rem with all kinds on too: the pinned chips and help stay and fit.
+    f.press(cx, "ctrl-g");
+    f.wait_idle(cx);
+    let narrow = cx
+        .update_window(f.handle, |_, window, cx| {
+            window.render_frame(cx);
+            f.list.read(cx).footer_model_for_width(18.0, window, cx)
+        })
+        .unwrap();
+    for kind in [ChipKind::AllKinds, ChipKind::UserOnly, ChipKind::Help] {
+        assert!(chip(&narrow, kind).is_some(), "{kind:?}: {narrow:?}");
+    }
+    let width: f32 = narrow
+        .chips
+        .iter()
+        .map(|chip| {
+            let key = if chip.keyless {
+                0
+            } else {
+                chip.key.chars().count()
+            };
+            chip_width_rem(key, chip.label.chars().count())
+        })
+        .sum::<f32>()
+        + (narrow.chips.len() - 1) as f32 * 0.75;
+    let count = narrow.count.chars().count() as f32 * 0.35 + 1.0;
+    assert!(width + count + 1.5 <= 18.0, "{width} {narrow:?}");
+    f.press(cx, "ctrl-g");
+    f.wait_idle(cx);
+    f.press(cx, "ctrl-t");
+    f.wait_idle(cx);
+    assert_eq!(f.paths(cx), [asked], "lexical again: only yours");
+}
+
+/// C-070: upstream's default `[keys] user_only = "ctrl+v"` is paste in the
+/// GUI: it is rejected and Alt+U stays.
+#[gpui_kit::test]
+fn the_user_only_key_binding(cx: &mut TestAppContext) {
+    let (world, asked, _) = walrus_world();
+    world.write_config(Some("[keys]\nuser_only = \"ctrl+v\"\n"), None);
+    let f = ListFixture::open_loaded(cx, &world, &[]);
+    f.type_text(cx, "walrus");
+    f.press(cx, "alt-u");
+    f.wait_idle(cx);
+    assert_eq!(f.paths(cx), [asked]);
+    f.press(cx, "alt-u");
+    f.wait_idle(cx);
+    assert_eq!(f.paths(cx).len(), 2);
+}
+
+/// C-070: `gui.toml` `[keys] user_only` rebinds the toggle.
+#[gpui_kit::test]
+fn gui_toml_rebinds_the_user_only_key(cx: &mut TestAppContext) {
+    let (world, asked, _) = walrus_world();
+    world.write_config(None, Some("[keys]\nuser_only = \"alt+y\"\n"));
+    let f = ListFixture::open_loaded(cx, &world, &[]);
+    f.type_text(cx, "walrus");
+    f.press(cx, "alt-y");
+    f.wait_idle(cx);
+    assert_eq!(f.paths(cx), [asked]);
 }
 
 #[gpui_kit::test]

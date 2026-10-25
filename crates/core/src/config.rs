@@ -16,6 +16,8 @@
 //!
 //! Key bindings use a neutral [`KeyChord`] (refactor R4) instead of
 //! crossterm key codes, with upstream's parsing rules, labels and errors.
+//! One default differs: `[keys] user_only` is Alt+U, not upstream's Ctrl+V,
+//! which pastes into the GUI's search field.
 
 use crate::env::{CLI_CONFIG_FILE_NAME, HistoryEnv, WorkspaceScope};
 use crate::error::{AppError, Result};
@@ -204,6 +206,8 @@ pub struct KeysConfig {
     pub refresh: Option<KeyBinding>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub all_kinds: Option<KeyBinding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_only: Option<KeyBinding>,
 }
 
 // ---------------------------------------------------------------------------
@@ -430,6 +434,8 @@ pub struct KeyBindings {
     pub refresh: KeyBinding,
     /// Lists or hides automated and child conversations
     pub all_kinds: KeyBinding,
+    /// Searches only the user's own messages, or everything
+    pub user_only: KeyBinding,
 }
 
 impl Default for KeyBindings {
@@ -441,6 +447,9 @@ impl Default for KeyBindings {
             delete: KeyChord::ctrl('x'),
             refresh: KeyChord::ctrl('l'),
             all_kinds: KeyChord::ctrl('g'),
+            // Fork: upstream binds Ctrl+V, which is paste in the GUI's search
+            // field (a reserved key, DESIGN §8.5).
+            user_only: KeyChord::alt('u'),
         }
     }
 }
@@ -457,14 +466,16 @@ impl KeyBindings {
                 delete: cfg.delete.unwrap_or(defaults.delete),
                 refresh: cfg.refresh.unwrap_or(defaults.refresh),
                 all_kinds: cfg.all_kinds.unwrap_or(defaults.all_kinds),
+                user_only: cfg.user_only.unwrap_or(defaults.user_only),
             },
         }
     }
 
     /// Whether any action is bound to `Ctrl+T`. Upstream disables the
-    /// lexical/semantic toggle (Ctrl+T) in that case. `all_kinds` counts too
-    /// (fork: upstream's `semantic_toggle_available` does not list it, but
-    /// its key is checked before Ctrl+T, so the toggle never runs either).
+    /// lexical/semantic toggle (Ctrl+T) in that case. `all_kinds` and
+    /// `user_only` count too (fork: upstream's `semantic_toggle_available`
+    /// does not list them, but their keys are checked before Ctrl+T, so the
+    /// toggle never runs either).
     pub fn conflicts_with_ctrl_t(&self) -> bool {
         let ctrl_t = (Key::Char('t'), KeyMods::CTRL);
         [
@@ -474,6 +485,7 @@ impl KeyBindings {
             self.fork,
             self.refresh,
             self.all_kinds,
+            self.user_only,
         ]
         .iter()
         .any(|binding| binding.matches(ctrl_t.0, ctrl_t.1))
@@ -703,6 +715,7 @@ impl ConfigFile {
                     delete: overlay(base.delete, &top.delete),
                     refresh: overlay(base.refresh, &top.refresh),
                     all_kinds: overlay(base.all_kinds, &top.all_kinds),
+                    user_only: overlay(base.user_only, &top.user_only),
                 })
             }
         };
@@ -1377,6 +1390,19 @@ subagents = true
         assert!(keys.all_kinds.matches(Key::Char('k'), KeyMods::ALT));
         assert_eq!(keys.refresh, KeyChord::ctrl('l'));
         let config: ConfigFile = toml::from_str("[keys]\nall_kinds = \"ctrl+t\"\n").unwrap();
+        assert!(KeyBindings::from_config(config.keys).conflicts_with_ctrl_t());
+    }
+
+    #[test]
+    fn applies_user_only_key_config() {
+        // Upstream ae7ae39: `[keys] user_only` (upstream default Ctrl+V; the
+        // fork's is Alt+U, since Ctrl+V pastes into the search field).
+        assert_eq!(KeyBindings::default().user_only, KeyChord::alt('u'));
+        let config: ConfigFile = toml::from_str("[keys]\nuser_only = \"ctrl+v\"\n").unwrap();
+        let keys = KeyBindings::from_config(config.keys);
+        assert!(keys.user_only.matches(Key::Char('v'), KeyMods::CTRL));
+        assert_eq!(keys.all_kinds, KeyChord::ctrl('g'));
+        let config: ConfigFile = toml::from_str("[keys]\nuser_only = \"ctrl+t\"\n").unwrap();
         assert!(KeyBindings::from_config(config.keys).conflicts_with_ctrl_t());
     }
 

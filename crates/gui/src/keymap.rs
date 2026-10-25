@@ -4,10 +4,10 @@
 //! 1. the static table (§8.3) in table order, incl. the `ConversationList > Input`
 //!    and `Workspace > Input` duplicates that beat the focused Input;
 //! 2. the input-editing bindings (§8.4);
-//! 3. the user-configurable bindings (§8.5) in the order rename, all kinds,
-//!    refresh, fork, resume, delete — later wins at equal depth, which
-//!    reproduces the TUI check order delete > resume > fork > refresh > all
-//!    kinds > rename (C-028).
+//! 3. the user-configurable bindings (§8.5) in the order rename, user only,
+//!    all kinds, refresh, fork, resume, delete — later wins at equal depth,
+//!    which reproduces the TUI check order delete > resume > fork > refresh >
+//!    all kinds > user only > rename (C-028).
 //!    They are validated first, at startup too: a rejected binding (reserved
 //!    clipboard/editing keys, §8.5) keeps the default and is reported in the
 //!    debug log, like every warning.
@@ -375,19 +375,20 @@ fn user_binding_rows(chord: &KeyChord, action: Box<dyn Action>) -> Result<Vec<Ke
         .collect()
 }
 
-/// The user-configurable bindings (§8.5) in registration order rename, all
-/// kinds, refresh, fork, resume, delete. Does not validate (see
+/// The user-configurable bindings (§8.5) in registration order rename, user
+/// only, all kinds, refresh, fork, resume, delete. Does not validate (see
 /// [`sanitize_keys`]).
 pub fn user_bindings(keys: &KeyBindings) -> Result<Vec<KeyBinding>, String> {
-    let ordered: [(&KeyChord, Box<dyn Action>); 6] = [
+    let ordered: [(&KeyChord, Box<dyn Action>); 7] = [
         (&keys.rename, Box::new(Rename)),
+        (&keys.user_only, Box::new(ToggleUserOnly)),
         (&keys.all_kinds, Box::new(ToggleAllKinds)),
         (&keys.refresh, Box::new(Refresh)),
         (&keys.fork, Box::new(Fork)),
         (&keys.resume, Box::new(Resume)),
         (&keys.delete, Box::new(Delete)),
     ];
-    let mut out = Vec::with_capacity(18);
+    let mut out = Vec::with_capacity(21);
     for (chord, action) in ordered {
         out.extend(user_binding_rows(chord, action)?);
     }
@@ -426,6 +427,7 @@ pub fn sanitize_keys(keys: &KeyBindings) -> (KeyBindings, KeyValidation) {
             KeyAction::Delete => effective.delete = default,
             KeyAction::Refresh => effective.refresh = default,
             KeyAction::AllKinds => effective.all_kinds = default,
+            KeyAction::UserOnly => effective.user_only = default,
         }
     }
     (effective, validation)
@@ -480,7 +482,7 @@ fn report_validation(configured: &KeyBindings, validation: &KeyValidation, cx: &
     }
 }
 
-/// Rebind the six configurable actions live (Settings → Keys). Validates
+/// Rebind the seven configurable actions live (Settings → Keys). Validates
 /// first: a rejected binding (reserved key, unparseable key) is an error
 /// and changes nothing. The keymap update runs deferred.
 pub fn install_user_bindings(cx: &mut App, keys: &KeyBindings) -> Result<(), String> {
@@ -828,6 +830,16 @@ static HELP_ROWS: &[HelpRow] = &[
         [key!(ToggleAllKinds)],
         L,
         crate::menus::ALL_KINDS_LABEL,
+        "",
+        HelpWhen::Always,
+        HelpWindows::MainOnly,
+        None
+    ),
+    help!(
+        List,
+        [key!(ToggleUserOnly)],
+        L,
+        crate::menus::USER_ONLY_LABEL,
         "",
         HelpWhen::Always,
         HelpWindows::MainOnly,
@@ -1572,6 +1584,7 @@ pub fn chord_of(keys: &KeyBindings, action: KeyAction) -> KeyChord {
         KeyAction::Delete => keys.delete,
         KeyAction::Refresh => keys.refresh,
         KeyAction::AllKinds => keys.all_kinds,
+        KeyAction::UserOnly => keys.user_only,
     }
 }
 
@@ -1583,11 +1596,12 @@ mod tests {
     #[test]
     fn user_bindings_cover_every_context_in_registration_order() {
         let bindings = user_bindings(&KeyBindings::default()).unwrap();
-        assert_eq!(bindings.len(), 18);
+        assert_eq!(bindings.len(), 21);
         assert!(bindings[0].action().as_any().is::<Rename>());
-        assert!(bindings[3].action().as_any().is::<ToggleAllKinds>());
-        assert!(bindings[6].action().as_any().is::<Refresh>());
-        assert!(bindings[17].action().as_any().is::<Delete>());
+        assert!(bindings[3].action().as_any().is::<ToggleUserOnly>());
+        assert!(bindings[6].action().as_any().is::<ToggleAllKinds>());
+        assert!(bindings[9].action().as_any().is::<Refresh>());
+        assert!(bindings[20].action().as_any().is::<Delete>());
     }
 
     #[test]
@@ -1615,6 +1629,7 @@ mod tests {
             delete: Some(parse_key_binding("f2").unwrap()),
             refresh: None,
             all_kinds: None,
+            user_only: None,
         };
         let validation = validate_keys(&keys);
         assert_eq!(
@@ -1652,6 +1667,26 @@ mod tests {
             ..KeyBindings::default()
         };
         assert_eq!(sanitize_keys(&keys).0, keys);
+    }
+
+    /// Upstream's Ctrl+V `user_only` pastes in the GUI: it is rejected and
+    /// the default (Alt+U) stays.
+    #[test]
+    fn the_upstream_user_only_key_is_reserved() {
+        let keys = KeyBindings {
+            user_only: parse_key_binding("ctrl+v").unwrap(),
+            ..KeyBindings::default()
+        };
+        let (effective, validation) = sanitize_keys(&keys);
+        assert_eq!(effective.user_only, KeyChord::alt('u'));
+        assert_eq!(
+            validation.errors,
+            vec![(
+                KeyAction::UserOnly,
+                "ctrl+v is reserved for clipboard and editing".to_string()
+            )]
+        );
+        assert!(validate_bindings(&KeyBindings::default()).errors.is_empty());
     }
 
     #[test]

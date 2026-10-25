@@ -1148,6 +1148,8 @@ fn the_index_answers_with_the_top_page_then_every_result() {
             index: index.clone(),
             docs: Arc::new(vec![true; 120]),
         }),
+        user_only: false,
+        corpus_version: 1,
     })
     .unwrap();
     let page = rx.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -1180,6 +1182,7 @@ fn the_complete_ranking_keeps_a_row_selected_on_the_first_page() {
         complete,
         generation,
         mode: ListSearchMode::Lexical,
+        user_only: false,
         evidence: HashMap::new(),
     };
 
@@ -1903,6 +1906,72 @@ fn a_cancel_wakes_a_wait_for_the_lock() {
     assert!(cancelled);
     assert!(waited < Duration::from_secs(60), "{waited:?}");
     assert!(cancel.sleep(Duration::from_secs(60)), "set stays set");
+}
+
+#[test]
+fn user_only_searches_what_the_person_typed_and_keeps_the_query() {
+    let sandbox = Sandbox::new();
+    let mut corpus = corpus();
+    corpus[0].full_text = "the walrus assigns, the walrus returns".into();
+    corpus[1].full_text = "how does the walrus work".into();
+    corpus[1].own_text = "how does the walrus work".into();
+    corpus[2].own_text = "nothing relevant".into();
+    let root = publish(&corpus);
+    let mut app = loading_app(&sandbox, None, vec![]);
+    show(&mut app, &root, TimeFilter::default());
+    assert!(app.open_search_index());
+    type_query(&mut app, "walrus");
+    wait_for_search(&mut app);
+    let both = ["/p/-tmp-alpha/a.jsonl", "/p/-tmp-beta/b.jsonl"];
+    assert_eq!(listed_paths(&app), both);
+    // Upstream pressed Down; the GUI's toggle is `toggle_user_only`.
+    app.select_next();
+
+    app.toggle_user_only();
+    wait_for_search(&mut app);
+    assert!(app.user_only());
+    assert_eq!(app.query(), "walrus");
+    assert_eq!(listed_paths(&app), ["/p/-tmp-beta/b.jsonl"]);
+    let evidence = app.lexical_evidence(app.filtered()[0]).unwrap();
+    assert_eq!(evidence.text, "how does the walrus work");
+
+    app.toggle_user_only();
+    wait_for_search(&mut app);
+    assert!(!app.user_only());
+    assert_eq!(listed_paths(&app), both);
+    assert_eq!(app.selected(), Some(1));
+}
+
+/// Fork: rows the worker left without evidence get it from the own text in
+/// user-only mode ([`Browser::fill_visible_evidence`]).
+#[test]
+fn visible_rows_get_evidence_from_own_text_in_user_only_mode() {
+    let sandbox = Sandbox::new();
+    let mut corpus = corpus();
+    corpus[1].full_text = "assistant said walrus first, then the person asked".into();
+    corpus[1].own_text = "a question about the walrus".into();
+    let root = publish(&corpus);
+    let mut app = loading_app(&sandbox, None, vec![]);
+    show(&mut app, &root, TimeFilter::default());
+    assert!(app.open_search_index());
+    app.toggle_user_only();
+    type_query(&mut app, "walrus");
+    wait_for_search(&mut app);
+    assert_eq!(listed_paths(&app), ["/p/-tmp-beta/b.jsonl"]);
+    let row = app.filtered()[0];
+    app.lexical_evidence.clear();
+    app.fill_visible_evidence(0..1);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while app.lexical_evidence(row).is_none() {
+        assert!(Instant::now() < deadline, "no evidence arrived");
+        if !app.poll() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    assert_eq!(
+        app.lexical_evidence(row).unwrap().text,
+        "a question about the walrus"
+    );
 }
 
 #[test]

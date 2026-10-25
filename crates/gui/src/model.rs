@@ -455,7 +455,7 @@ impl SettingsPage {
     }
 }
 
-/// The six user-configurable key actions (`[keys]`, §8.5).
+/// The seven user-configurable key actions (`[keys]`, §8.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum KeyAction {
     Resume,
@@ -466,28 +466,33 @@ pub enum KeyAction {
     /// List or hide automated and subagent conversations (upstream
     /// cb990e6, `ToggleAllKinds`).
     AllKinds,
+    /// Search only the user's own messages, or everything (upstream
+    /// ae7ae39, `ToggleUserOnly`).
+    UserOnly,
 }
 
 impl KeyAction {
     /// Display order (Settings → Keys).
-    pub const ALL: [KeyAction; 6] = [
+    pub const ALL: [KeyAction; 7] = [
         KeyAction::Resume,
         KeyAction::Fork,
         KeyAction::Rename,
         KeyAction::Delete,
         KeyAction::Refresh,
         KeyAction::AllKinds,
+        KeyAction::UserOnly,
     ];
 
     /// The TUI's check order, highest priority first: delete, resume, fork,
-    /// refresh, all kinds, rename (C-028). With equal keys the earlier one
-    /// wins.
-    pub const PRIORITY: [KeyAction; 6] = [
+    /// refresh, all kinds, user only, rename (C-028). With equal keys the
+    /// earlier one wins.
+    pub const PRIORITY: [KeyAction; 7] = [
         KeyAction::Delete,
         KeyAction::Resume,
         KeyAction::Fork,
         KeyAction::Refresh,
         KeyAction::AllKinds,
+        KeyAction::UserOnly,
         KeyAction::Rename,
     ];
 
@@ -499,6 +504,7 @@ impl KeyAction {
             KeyAction::Delete => "Delete",
             KeyAction::Refresh => "Refresh",
             KeyAction::AllKinds => crate::menus::ALL_KINDS_LABEL,
+            KeyAction::UserOnly => crate::menus::USER_ONLY_LABEL,
         }
     }
 
@@ -511,6 +517,7 @@ impl KeyAction {
             KeyAction::Delete => "delete",
             KeyAction::Refresh => "refresh",
             KeyAction::AllKinds => "all_kinds",
+            KeyAction::UserOnly => "user_only",
         }
     }
 
@@ -812,9 +819,10 @@ mod tests {
     #[test]
     fn key_action_priority_follows_the_tui_check_order() {
         assert_eq!(KeyAction::Delete.priority(), 0);
-        assert_eq!(KeyAction::Rename.priority(), 5);
+        assert_eq!(KeyAction::Rename.priority(), 6);
         assert!(KeyAction::Resume.priority() < KeyAction::Fork.priority());
         assert!(KeyAction::Refresh.priority() < KeyAction::AllKinds.priority());
-        assert!(KeyAction::AllKinds.priority() < KeyAction::Rename.priority());
+        assert!(KeyAction::AllKinds.priority() < KeyAction::UserOnly.priority());
+        assert!(KeyAction::UserOnly.priority() < KeyAction::Rename.priority());
     }
 }

@@ -198,6 +198,7 @@ fn the_tree_marks_each_state() {
         semantic_mode: true,
         workspace_scope: true,
         all_kinds: true,
+        user_only: true,
         picker: false,
         header_session_id: false,
     });
@@ -211,6 +212,7 @@ fn the_tree_marks_each_state() {
         ("View › Search mode", "Semantic"),
         ("View › Scope", "Workspace"),
         ("View", menus::ALL_KINDS_LABEL),
+        ("View", menus::USER_ONLY_LABEL),
     ] {
         assert!(checked(&leaves, path, name), "{path} / {name}");
     }

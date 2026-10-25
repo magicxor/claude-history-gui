@@ -103,6 +103,10 @@
 //! * **All kinds (upstream cb990e6).** [`Browser::set_all_kinds`] also
 //!   applies while loading (to the loaded rows, or the first cards of a
 //!   generation); upstream's Ctrl+G was ignored until the rows were listed.
+//! * **User only (upstream ae7ae39).** [`Browser::set_user_only`] also
+//!   applies while loading (the query runs with it once it can run);
+//!   upstream's Ctrl+V was ignored until the rows were listed. It is a no-op
+//!   in single-file mode, which has no list.
 //! * **Generation mode.** The cards' workspace test is [`WorkspaceScope`]'s
 //!   (D2, W1), not the process cwd. Every card is materialized and the index
 //!   opened off the UI thread, and a swap keeps a query's rows until it
@@ -364,6 +368,8 @@ pub struct Browser {
     workspace_filter: bool,
     /// Whether automated and child conversations are listed
     all_kinds: bool,
+    /// Whether lexical search matches only the text the person typed
+    user_only: bool,
     /// The workspace for the scope filter (upstream: the process cwd)
     workspace: Option<WorkspaceScope>,
     /// Exact project names hidden from list-mode display
@@ -504,6 +510,7 @@ impl Browser {
             single_file_error: parts.single_file_error,
             workspace_filter,
             all_kinds,
+            user_only: false,
             workspace,
             excluded_projects,
             excluded_paths,

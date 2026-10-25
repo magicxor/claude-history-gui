@@ -673,6 +673,18 @@ impl ListPane {
         self.browser.all_kinds()
     }
 
+    /// Whether search is limited to the user's own messages (upstream
+    /// ae7ae39, `ToggleUserOnly`), whatever the mode.
+    pub fn user_only(&self) -> bool {
+        self.browser.user_only()
+    }
+
+    /// Whether the current query matches only the user's own messages: the
+    /// toggle is on and the mode is lexical (semantic search ignores it).
+    pub fn searches_user_only(&self) -> bool {
+        self.browser.searches_user_only()
+    }
+
     pub fn has_workspace(&self) -> bool {
         self.browser.has_project_context()
     }
@@ -856,6 +868,9 @@ impl ListPane {
         } else if any.is::<ToggleAllKinds>() {
             let next = !self.all_kinds();
             self.set_all_kinds(next, cx);
+        } else if any.is::<ToggleUserOnly>() {
+            let next = !self.user_only();
+            self.set_user_only(next, cx);
         } else if any.is::<ShowSemanticDetails>() {
             self.show_semantic_details(window, cx);
         } else if any.is::<Refresh>() {
@@ -904,6 +919,17 @@ impl ListPane {
         // The selected conversation stays selected but moves when rows come
         // in above it (or go): keep it in view.
         self.scroll_to_selection();
+        self.after_filter_change(cx);
+    }
+
+    /// Search only the user's own messages, or everything again, keeping
+    /// the query and the selected conversation (core
+    /// `Browser::set_user_only`; not remembered, as upstream).
+    pub fn set_user_only(&mut self, user_only: bool, cx: &mut Context<Self>) {
+        if self.user_only() == user_only {
+            return;
+        }
+        self.browser.set_user_only(user_only);
         self.after_filter_change(cx);
     }
 
@@ -1364,6 +1390,7 @@ impl ListPane {
             }
             .to_string(),
             "list.all_kinds" => self.all_kinds().to_string(),
+            "list.user_only" => self.user_only().to_string(),
             "list.time" => self
                 .time_label
                 .as_ref()
@@ -1516,6 +1543,9 @@ impl Render for ListPane {
                 this.handle_forwarded(a, w, cx);
             }))
             .on_action(cx.listener(|this, a: &ToggleAllKinds, w, cx| {
+                this.handle_forwarded(a, w, cx);
+            }))
+            .on_action(cx.listener(|this, a: &ToggleUserOnly, w, cx| {
                 this.handle_forwarded(a, w, cx);
             }))
             .on_action(cx.listener(|this, _: &ShowSemanticDetails, w, cx| {

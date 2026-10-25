@@ -15,7 +15,10 @@
 //! are dimmed, and open, resume and fork until the rows are listed newest
 //! first (snapshot cards, upstream 3708bb6). Refresh is never advertised
 //! (L-041). While automated and subagent conversations are listed, an
-//! active `all kinds` chip says so (upstream cb990e6's `^G·all kinds`).
+//! active `all kinds` chip says so (upstream cb990e6's `^G·all kinds`), and
+//! while search is limited to the user's own messages an active `you only`
+//! chip (upstream ae7ae39's `^V·you only`; `you only: not in semantic` in
+//! semantic mode, which ignores it).
 
 use claude_history_core::browser::{ListSearchMode, SemanticProgress};
 use gpui_kit::component::kbd::Kbd;
@@ -32,12 +35,18 @@ use gpui_kit::{
 
 use crate::actions::{
     ClearQuery, Delete, Fork, OpenConversation, Rename, Resume, ShowShortcuts, ToggleAllKinds,
-    ToggleScope, ToggleSearchMode,
+    ToggleScope, ToggleSearchMode, ToggleUserOnly,
 };
 use crate::keymap::{CTX_LIST, CTX_WORKSPACE, binding_labels};
 use crate::theme_tokens::roles;
 
 use super::ListPane;
+
+/// The `you only` chip's label while search is limited to the user's own
+/// messages (upstream ae7ae39's status-bar marker).
+pub const USER_ONLY_CHIP: &str = "you only";
+/// The chip's label in semantic mode, which ignores the toggle.
+pub const USER_ONLY_SEMANTIC_CHIP: &str = "you only: not in semantic";
 
 /// The context stack the list's hints are looked up in (outermost first).
 const HINT_STACK: &str = "Workspace ConversationList";
@@ -124,6 +133,8 @@ pub enum ChipKind {
     Scope,
     /// Shown only while automated and subagent conversations are listed.
     AllKinds,
+    /// Shown only while search is limited to the user's own messages.
+    UserOnly,
     Mode,
     Help,
 }
@@ -139,11 +150,16 @@ pub struct FooterChip {
     pub dimmed: bool,
     /// The chip shows the non-default value (`Prj`, `sem`): accent and bold (§8.7).
     pub active: bool,
+    /// The key part is left out (a narrow footer keeping the pinned chips).
+    pub keyless: bool,
 }
 
 impl FooterChip {
     /// `Ctrl+R resume`
     pub fn text(&self) -> String {
+        if self.keyless {
+            return self.label.to_string();
+        }
         format!("{} {}", self.key, self.label)
     }
 }
@@ -250,19 +266,25 @@ impl ListPane {
         };
         if !model.has_activity() && self.contains_focus(window, cx) {
             let specs = self.chip_specs(cx);
-            let kept = fit_chips(&specs, &model.count, pane_rem);
+            let fit = fit_chips(&specs, &model.count, pane_rem);
             model.chips = specs
                 .into_iter()
-                .zip(kept)
+                .zip(fit.keep)
                 .filter(|(_, keep)| *keep)
                 .map(|(spec, _)| FooterChip {
                     kind: spec.kind,
                     key: spec.key,
-                    label: spec.label,
-                    dimmed: spec.dimmed,
+                    keyless: fit.keyless && pinned_kind(spec.kind),
+                    // The ignored toggle shows dimmed instead of the long label.
+                    dimmed: spec.dimmed || (fit.short_semantic && spec.kind == ChipKind::UserOnly),
+                    label: if fit.short_semantic && spec.kind == ChipKind::UserOnly {
+                        USER_ONLY_CHIP.into()
+                    } else {
+                        spec.label
+                    },
                     active: match spec.kind {
                         ChipKind::Scope => self.scope_is_workspace(),
-                        ChipKind::AllKinds => true,
+                        ChipKind::AllKinds | ChipKind::UserOnly => true,
                         ChipKind::Mode => self.mode() == ListSearchMode::Semantic,
                         _ => false,
                     },
@@ -372,6 +394,22 @@ impl ListPane {
                 false,
             ));
         }
+        if self.user_only() {
+            // Semantic search ignores the toggle; the chip says so.
+            let label = if self.searches_user_only() {
+                USER_ONLY_CHIP
+            } else {
+                USER_ONLY_SEMANTIC_CHIP
+            };
+            specs.extend(spec(
+                ChipKind::UserOnly,
+                Box::new(ToggleUserOnly),
+                CTX_LIST,
+                HINT_STACK,
+                label,
+                false,
+            ));
+        }
         let mode = match self.mode() {
             ListSearchMode::Lexical => "lex",
             ListSearchMode::Semantic => "sem",
@@ -396,35 +434,87 @@ impl ListPane {
     }
 }
 
+/// The chips that stay whatever the width: `Ctrl+G all kinds` and
+/// `Alt+U you only` are the footer's only signs of their toggles' state.
+fn pinned_kind(kind: ChipKind) -> bool {
+    matches!(kind, ChipKind::AllKinds | ChipKind::UserOnly)
+}
+
+/// Which chips a footer shows and how the pinned ones are drawn.
+struct Fit {
+    keep: Vec<bool>,
+    /// The pinned chips drop their key part.
+    keyless: bool,
+    /// The semantic `you only: not in semantic` chip shrinks to a dimmed
+    /// `you only`.
+    short_semantic: bool,
+}
+
 /// Which chips fit a pane `pane_rem` wide: the lowest priority goes first,
-/// `F1 help` stays.
-fn fit_chips(specs: &[ChipSpec], count: &str, pane_rem: f32) -> Vec<bool> {
+/// `F1 help` stays. While a pinned chip is shown, `Enter open` may go too,
+/// and when the pinned chips and help still do not fit, the pinned chips
+/// lose their key and the long semantic label.
+fn fit_chips(specs: &[ChipSpec], count: &str, pane_rem: f32) -> Fit {
     let count_rem = count.chars().count() as f32 * CHAR_REM + 1.0;
     let available = pane_rem - FOOTER_PADDING_REM - count_rem;
-    let width_of =
-        |spec: &ChipSpec| chip_width_rem(spec.key.chars().count(), spec.label.chars().count());
-    // `Ctrl+G all kinds` is the only sign of the toggle's state: it is never dropped.
-    let pinned = specs
-        .iter()
-        .position(|spec| spec.kind == ChipKind::AllKinds);
-    let Some(pinned) = pinned else {
-        let widths: Vec<f32> = specs.iter().map(width_of).collect();
-        return trim_chips(&widths, available);
+    let any_pinned = specs.iter().any(|spec| pinned_kind(spec.kind));
+    let build = |keyless: bool, short_semantic: bool| {
+        let width_of = |spec: &ChipSpec| {
+            let key = if keyless && pinned_kind(spec.kind) {
+                0
+            } else {
+                spec.key.chars().count()
+            };
+            let label = if short_semantic && spec.kind == ChipKind::UserOnly {
+                USER_ONLY_CHIP.chars().count()
+            } else {
+                spec.label.chars().count()
+            };
+            chip_width_rem(key, label)
+        };
+        let pinned_rem: f32 = specs
+            .iter()
+            .filter(|spec| pinned_kind(spec.kind))
+            .map(|spec| width_of(spec) + CHIP_GAP_REM)
+            .sum();
+        let widths: Vec<f32> = specs
+            .iter()
+            .filter(|spec| !pinned_kind(spec.kind))
+            .map(width_of)
+            .collect();
+        let (kept, fits) = trim_chips_pinned(&widths, available - pinned_rem, !any_pinned);
+        let mut kept = kept.into_iter();
+        let keep: Vec<bool> = specs
+            .iter()
+            .map(|spec| pinned_kind(spec.kind) || kept.next().unwrap_or(true))
+            .collect();
+        (
+            Fit {
+                keep,
+                keyless,
+                short_semantic,
+            },
+            fits,
+        )
     };
-    let widths: Vec<f32> = specs
-        .iter()
-        .enumerate()
-        .filter(|(ix, _)| *ix != pinned)
-        .map(|(_, spec)| width_of(spec))
-        .collect();
-    let mut kept = trim_chips(&widths, available - width_of(&specs[pinned]) - CHIP_GAP_REM);
-    kept.insert(pinned, true);
-    kept
+    for keyless in [false, true] {
+        let (fit, fits) = build(keyless, false);
+        if fits || !any_pinned {
+            return fit;
+        }
+    }
+    build(true, true).0
 }
 
 /// The estimated width of a chip (rem).
 pub fn chip_width_rem(key_chars: usize, label_chars: usize) -> f32 {
-    (key_chars + label_chars) as f32 * CHAR_REM + CHIP_CHROME_REM
+    // Without a key there is no kbd box: only the label's own gap remains.
+    let chrome = if key_chars == 0 {
+        CHIP_CHROME_REM / 3.0
+    } else {
+        CHIP_CHROME_REM
+    };
+    (key_chars + label_chars) as f32 * CHAR_REM + chrome
 }
 
 /// Which of the chips (priority order, the last one is `F1 help`) fit
@@ -432,6 +522,12 @@ pub fn chip_width_rem(key_chars: usize, label_chars: usize) -> f32 {
 /// first chip and the last (`help`) always stay when at all possible, so the
 /// result keeps at least `help`.
 pub fn trim_chips(widths: &[f32], available_rem: f32) -> Vec<bool> {
+    trim_chips_pinned(widths, available_rem, true).0
+}
+
+/// [`trim_chips`] with the first chip droppable (`keep_first` false), and
+/// whether what is kept fits `available_rem`.
+fn trim_chips_pinned(widths: &[f32], available_rem: f32, keep_first: bool) -> (Vec<bool>, bool) {
     let mut keep = vec![true; widths.len()];
     let total = |keep: &[bool]| -> f32 {
         let chosen: Vec<f32> = widths
@@ -443,12 +539,14 @@ pub fn trim_chips(widths: &[f32], available_rem: f32) -> Vec<bool> {
         chosen.iter().sum::<f32>() + chosen.len().saturating_sub(1) as f32 * CHIP_GAP_REM
     };
     // Drop from the second-to-last backwards (the last chip is help).
+    let floor = if keep_first { 1 } else { 0 };
     let mut ix = widths.len().saturating_sub(1);
-    while total(&keep) > available_rem && ix > 1 {
+    while total(&keep) > available_rem && ix > floor {
         ix -= 1;
         keep[ix] = false;
     }
-    keep
+    let fits = total(&keep) <= available_rem;
+    (keep, fits)
 }
 
 /// The footer element.
@@ -472,7 +570,7 @@ pub fn render_footer(list: &ListPane, window: &Window, cx: &App) -> impl IntoEle
                 h_flex()
                     .gap_1()
                     .when(chip.dimmed, |this| this.opacity(0.5))
-                    .child(kbd)
+                    .when(!chip.keyless, |this| this.child(kbd))
                     .child(if chip.active {
                         div()
                             .text_color(accent)
@@ -566,5 +664,15 @@ mod unit_tests {
         assert_eq!(tight.iter().filter(|keep| **keep).count(), 2);
         // Nothing fits: help is still kept.
         assert_eq!(trim_chips(&widths, 0.5).last(), Some(&true));
+    }
+
+    #[test]
+    fn dropping_the_first_chip_keeps_help_and_reports_the_fit() {
+        let widths = [3.0, 3.0, 3.0, 3.0];
+        let (keep, fits) = trim_chips_pinned(&widths, 4.0, false);
+        assert_eq!(keep, vec![false, false, false, true]);
+        assert!(fits);
+        let (keep, _) = trim_chips_pinned(&widths, 4.0, true);
+        assert!(keep[0] && keep[3]);
     }
 }

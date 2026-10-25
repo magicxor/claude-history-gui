@@ -391,6 +391,7 @@ fn chords_with_all_kinds(
         rename: parse_key_binding(rename).unwrap(),
         refresh: parse_key_binding(refresh).unwrap(),
         all_kinds: parse_key_binding(all_kinds).unwrap(),
+        user_only: KeyBindings::default().user_only,
         fork: parse_key_binding(fork).unwrap(),
         resume: parse_key_binding(resume).unwrap(),
         delete: parse_key_binding(delete).unwrap(),
@@ -494,6 +495,35 @@ fn duplicate_bindings_resolve_by_the_tui_check_order(cx: &mut TestAppContext) {
             assert!(
                 got.as_ref()
                     .is_some_and(|got| got.partial_eq(&ToggleAllKinds)),
+                "ctrl-k in [{declaration}]: {}",
+                name_of(&got)
+            );
+        }
+    });
+    // All kinds, user only and rename on one key → ToggleAllKinds; user only
+    // and rename → ToggleUserOnly (upstream checks user_only after
+    // all_kinds, before rename).
+    let user_only_on_k = |all_kinds: &str| KeyBindings {
+        user_only: parse_key_binding("ctrl+k").unwrap(),
+        ..chords_with_all_kinds("ctrl+k", "f6", all_kinds, "f7", "f8", "f9")
+    };
+    rebind(cx, user_only_on_k("ctrl+k"));
+    cx.update(|cx| {
+        let got = winner(cx, "ctrl-k", LIST);
+        assert!(
+            got.as_ref()
+                .is_some_and(|got| got.partial_eq(&ToggleAllKinds)),
+            "{}",
+            name_of(&got)
+        );
+    });
+    rebind(cx, user_only_on_k("f4"));
+    cx.update(|cx| {
+        for declaration in [LIST, LIST_INPUT, VIEWER] {
+            let got = winner(cx, "ctrl-k", declaration);
+            assert!(
+                got.as_ref()
+                    .is_some_and(|got| got.partial_eq(&ToggleUserOnly)),
                 "ctrl-k in [{declaration}]: {}",
                 name_of(&got)
             );

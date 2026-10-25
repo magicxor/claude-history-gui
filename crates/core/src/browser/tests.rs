@@ -21,6 +21,7 @@ fn conversation(project: Option<&str>, project_dir: &str, uuid: &str, text: &str
         preview_first: text.to_string().into(),
         preview_last: text.to_string().into(),
         full_text: text.to_string().into(),
+        own_text: "".into(),
         agent_search_text: "".into(),
         semantic_route_text: "".into(),
         semantic_turns: vec![text.to_string()].into(),
@@ -406,6 +407,92 @@ fn all_kinds_toggles_hidden_conversations_keeping_query_and_selection() {
 }
 
 #[test]
+fn user_only_searches_own_text_in_memory_keeping_query_and_selection() {
+    // Upstream ae7ae39 (Ctrl+V), in memory: only the text the person typed
+    // matches, without title, summary or project name; the query and the
+    // selected session stay, and a changed corpus gets a new view.
+    let sandbox = Sandbox::new();
+    let alpha = conversation(
+        Some("Alpha"),
+        "-tmp-alpha",
+        "11111111-1111-4111-8111-111111111111",
+        "the walrus assigns, the walrus returns",
+    );
+    let mut beta = conversation(
+        Some("Beta"),
+        "-tmp-beta",
+        "22222222-2222-4222-8222-222222222222",
+        "how does the walrus work",
+    );
+    beta.own_text = "how does the walrus work".into();
+    let mut gamma = conversation(
+        Some("Gamma"),
+        "-tmp-gamma",
+        "33333333-3333-4333-8333-333333333333",
+        "unrelated",
+    );
+    gamma.own_text = "nothing relevant".into();
+    // Found by its project name alone.
+    let mut project = conversation(
+        Some("Walrus"),
+        "-tmp-walrus",
+        "44444444-4444-4444-8444-444444444444",
+        "plain words",
+    );
+    project.own_text = "plain words".into();
+    let gamma_path = gamma.path.clone();
+    let mut app = app(&sandbox, vec![alpha, beta, gamma.clone(), project], vec![]);
+    app.set_query("walrus");
+    wait_for_search(&mut app);
+    let mut found = filtered_projects(&app);
+    found.sort();
+    assert_eq!(found, vec![Some("Alpha"), Some("Beta"), Some("Walrus")]);
+    let beta_row = app
+        .filtered()
+        .iter()
+        .position(|&index| app.conversations()[index].project_name.as_deref() == Some("Beta"))
+        .unwrap();
+    app.select(beta_row);
+    let beta_path = app.selected_path();
+
+    app.toggle_user_only();
+    wait_for_search(&mut app);
+    assert!(app.user_only() && app.searches_user_only());
+    assert_eq!(app.query(), "walrus");
+    assert_eq!(filtered_projects(&app), vec![Some("Beta")]);
+    assert_eq!(app.selected_path(), beta_path);
+    let evidence = app.lexical_evidence(app.filtered()[0]).unwrap();
+    assert_eq!(evidence.text, "how does the walrus work");
+
+    // A renamed session with new own text: the view follows the corpus.
+    gamma.own_text = "a walrus question".into();
+    app.apply_renamed(&gamma_path, gamma).unwrap();
+    wait_for_search(&mut app);
+    let mut found = filtered_projects(&app);
+    found.sort();
+    assert_eq!(found, vec![Some("Beta"), Some("Gamma")]);
+    let beta_row = app
+        .filtered()
+        .iter()
+        .position(|&index| app.conversations()[index].project_name.as_deref() == Some("Beta"))
+        .unwrap();
+    app.select(beta_row);
+
+    app.toggle_user_only();
+    wait_for_search(&mut app);
+    assert!(!app.user_only());
+    let mut found = filtered_projects(&app);
+    found.sort();
+    assert_eq!(found, vec![Some("Alpha"), Some("Beta"), Some("Walrus")]);
+    assert_eq!(app.selected_path(), beta_path);
+
+    // Semantic search ignores the toggle.
+    app.set_user_only(true);
+    app.list_search_mode = ListSearchMode::Semantic;
+    assert!(app.user_only() && !app.searches_user_only());
+}
+
+#[test]
 fn exclude_projects_filters_search_results() {
     let sandbox = Sandbox::new();
     let mut app = app(
@@ -526,6 +613,7 @@ fn stale_response_with_current_generation_but_old_mode_is_ignored() {
         complete: true,
         generation: 7,
         mode: ListSearchMode::Lexical,
+        user_only: false,
         evidence: HashMap::new(),
     })
     .unwrap();
@@ -773,6 +861,7 @@ fn semantic_search_dispatches_lexical_fallback() {
         generation,
         mode,
         conversations,
+        user_only,
         ..
     } = search_rx
         .try_recv()
@@ -781,6 +870,7 @@ fn semantic_search_dispatches_lexical_fallback() {
     assert_eq!(generation, app.search_generation);
     assert_eq!(mode, ListSearchMode::Semantic);
     assert!(Arc::ptr_eq(&conversations, &app.corpus_snapshot()));
+    assert!(!user_only);
 }
 
 #[test]
@@ -936,6 +1026,8 @@ fn semantic_search_worker_returns_lexical_fallback() {
         conversations: app.corpus_snapshot(),
         searchable: app.searchable.clone(),
         index: None,
+        user_only: false,
+        corpus_version: 1,
     })
     .unwrap();
 
@@ -979,6 +1071,7 @@ fn semantic_search_applies_lexical_fallback_while_pending() {
         complete: true,
         generation: 7,
         mode: ListSearchMode::Semantic,
+        user_only: false,
         evidence: HashMap::new(),
     })
     .unwrap();
@@ -1006,6 +1099,7 @@ fn empty_lexical_fallback_keeps_results_visible_while_semantic_search_is_pending
         complete: true,
         generation: 7,
         mode: ListSearchMode::Semantic,
+        user_only: false,
         evidence: HashMap::new(),
     })
     .unwrap();
@@ -1032,6 +1126,7 @@ fn semantic_search_ignores_lexical_fallback_after_completion() {
         complete: true,
         generation: 7,
         mode: ListSearchMode::Semantic,
+        user_only: false,
         evidence: HashMap::new(),
     })
     .unwrap();
@@ -1603,6 +1698,7 @@ fn uuid_dispatch_invalidates_stale_search_response() {
         complete: true,
         generation: 1,
         mode: ListSearchMode::Lexical,
+        user_only: false,
         evidence: HashMap::new(),
     })
     .unwrap();
@@ -1631,6 +1727,7 @@ fn finish_loading_invalidates_stale_loading_search_response() {
         complete: true,
         generation: 1,
         mode: ListSearchMode::Lexical,
+        user_only: false,
         evidence: HashMap::new(),
     })
     .unwrap();

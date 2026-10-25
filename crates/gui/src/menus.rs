@@ -31,6 +31,9 @@ pub const APP_MENU_NAME: &str = "Claude History";
 /// View → the toggle of automated and subagent conversations (upstream
 /// cb990e6; also the shortcuts dialog's label).
 pub const ALL_KINDS_LABEL: &str = "Show automated and subagent conversations";
+/// View → the toggle of searching only the user's own messages (upstream
+/// ae7ae39; also the shortcuts dialog's and Settings → Keys' label).
+pub const USER_ONLY_LABEL: &str = "Search only your own messages";
 
 const MAC: bool = cfg!(target_os = "macos");
 
@@ -48,6 +51,8 @@ pub struct MenuChecks {
     /// The list shows automated and subagent conversations (upstream
     /// cb990e6).
     pub all_kinds: bool,
+    /// List search matches only the user's own messages (upstream ae7ae39).
+    pub user_only: bool,
     pub picker: bool,
     /// The active conversation's header session ID differs from its file
     /// stem (Pi/OMP): Session → Copy header session ID is listed (A-042;
@@ -83,6 +88,7 @@ pub fn current_checks(cx: &App) -> MenuChecks {
         checks.semantic_mode = list.mode() == ListSearchMode::Semantic;
         checks.workspace_scope = list.scope_is_workspace();
         checks.all_kinds = list.all_kinds();
+        checks.user_only = list.user_only();
     }
     checks
 }
@@ -328,6 +334,7 @@ pub fn build_tree_with(checks: &MenuChecks, app_menu_items: bool) -> Vec<Menu> {
             item("Workspace", SetScopeWorkspace).checked(checks.workspace_scope),
         ])),
         item(ALL_KINDS_LABEL, ToggleAllKinds).checked(checks.all_kinds),
+        item(USER_ONLY_LABEL, ToggleUserOnly).checked(checks.user_only),
         MenuItem::separator(),
         MenuItem::submenu(Menu::new("Theme").items([
             item("System", SetThemeSystem).checked(checks.theme == ThemePreference::System),
@@ -677,6 +684,31 @@ mod tests {
         assert!(!checked(&MenuChecks::default()));
         assert!(checked(&MenuChecks {
             all_kinds: true,
+            ..MenuChecks::default()
+        }));
+    }
+
+    /// S-039: View lists the user-only toggle, checked while it is on.
+    #[test]
+    fn the_view_menu_checks_the_user_only_toggle() {
+        let checked = |checks: &MenuChecks| {
+            build_tree(checks)
+                .iter()
+                .find(|menu| menu.name.as_ref() == "View")
+                .unwrap()
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    MenuItem::Action { name, checked, .. } if name.as_ref() == USER_ONLY_LABEL => {
+                        Some(*checked)
+                    }
+                    _ => None,
+                })
+                .expect("listed")
+        };
+        assert!(!checked(&MenuChecks::default()));
+        assert!(checked(&MenuChecks {
+            user_only: true,
             ..MenuChecks::default()
         }));
     }

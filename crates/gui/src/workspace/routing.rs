@@ -197,6 +197,7 @@ macro_rules! on_fallback_actions {
                 $crate::actions::ToggleScope,
                 $crate::actions::ToggleSearchMode,
                 $crate::actions::ToggleAllKinds,
+                $crate::actions::ToggleUserOnly,
                 $crate::actions::ShowSemanticDetails,
                 $crate::actions::Refresh,
                 // viewer
@@ -246,6 +247,7 @@ pub fn is_list_action(action: &dyn Action) -> bool {
         || a.is::<ToggleScope>()
         || a.is::<ToggleSearchMode>()
         || a.is::<ToggleAllKinds>()
+        || a.is::<ToggleUserOnly>()
         || a.is::<ShowSemanticDetails>()
         || a.is::<Refresh>()
 }

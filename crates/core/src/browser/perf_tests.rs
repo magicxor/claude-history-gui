@@ -67,6 +67,7 @@ fn synthetic(root: &Path, index: usize) -> Conversation {
         semantic_turns: vec![text.clone()].into(),
         semantic_turn_ranges: vec![crate::agent::refs::MessageRange::single(1)],
         full_text: text.into(),
+        own_text: "".into(),
         agent_search_text: String::new().into(),
         semantic_route_text: String::new().into(),
         project_name: Some(format!("project-{:02}", index % PROJECTS)),
