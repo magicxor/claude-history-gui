@@ -4,6 +4,10 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 ## Unreleased
 
+- Deep search lists conversations in the same order as the list search and no longer drops conversations that match
+  only through their title, summary or project, or whose words are spread over several messages; such a
+  conversation shows one hit at its first message. Queries with Chinese characters (also kanji) match anywhere in a message,
+  and projects in Excluded projects stay out of Deep search.
 - Find in conversation (`/`) matches words the way the list search does: `istanbul` finds `İstanbul`, `strasse`
   finds `Straße`, `needle token` finds `needle_token` (highlighted as one match), any word of the query can match,
   quoted text matches exactly, and a word no longer matches inside a longer one (`ired` does not find `fired`).

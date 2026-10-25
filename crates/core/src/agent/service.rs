@@ -423,7 +423,13 @@ impl AgentService {
     fn run_search(&self, args: &AgentSearchArgs) -> Result<Served> {
         let search_config = self.config.search.clone().unwrap_or_default();
         let agent_config = self.agent_config();
-        let exclude_paths = self.config.tui.clone().unwrap_or_default().exclude_paths;
+        let tui_config = self.config.tui.clone().unwrap_or_default();
+        let exclude_paths = tui_config.exclude_paths;
+        // Projects the list hides stay out of agent search too.
+        let tui_excluded_projects = tui_config
+            .exclude_projects
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
         // Resolved before loading so an inverted range fails without paying for
         // a full corpus parse.
         let time = args.time.resolve()?;
@@ -439,7 +445,11 @@ impl AgentService {
             crate::store::Contents::Full,
             &|| cancellation.is_cancelled(),
             &|conversation| {
-                if history::path::cwd_is_excluded(conversation.cwd.as_deref(), &exclude_paths) {
+                if history::path::cwd_is_excluded(conversation.cwd.as_deref(), &exclude_paths)
+                    || conversation.project_name.as_deref().is_some_and(|name| {
+                        history::path::project_is_excluded(name, &tui_excluded_projects)
+                    })
+                {
                     excluded_paths
                         .lock()
                         .unwrap()
@@ -2599,6 +2609,79 @@ mode = "hybrid"
             .map(|conversation| conversation.uuid.clone())
             .collect::<Vec<_>>();
         assert_eq!(paths, vec![sessions[0].1.to_string()]);
+
+        for (_, uuid) in &sessions[1..] {
+            let read = execute(
+                &env,
+                &config,
+                AgentRequest::Read(AgentReadArgs::new([uuid.to_string()])),
+            );
+            assert!(read.is_success(), "{}", read.stderr);
+            assert!(read.stdout.contains("shared needle"), "{}", read.stdout);
+            let outline = execute(
+                &env,
+                &config,
+                AgentRequest::Outline(AgentOutlineArgs::new(uuid.to_string())),
+            );
+            assert!(outline.is_success(), "{}", outline.stderr);
+        }
+    }
+
+    #[test]
+    fn d017_tui_exclude_projects_narrows_agent_search_but_not_read_or_outline() {
+        // `[tui] exclude_projects` holds project names (`hidden` also covers
+        // `hidden/<worktree>`); read and outline still reach them.
+        let home = tempfile::tempdir().unwrap();
+        let projects = home.path().join(".claude").join("projects");
+        let sessions = [
+            ("-tmp-keep", "11111111-1111-4111-8111-111111111111"),
+            ("-tmp-hidden", "22222222-2222-4222-8222-222222222222"),
+            (
+                "-tmp-hidden--worktrees-feature",
+                "33333333-3333-4333-8333-333333333333",
+            ),
+        ];
+        for (project, uuid) in sessions {
+            let dir = projects.join(project);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(format!("{uuid}.jsonl")),
+                [
+                    user_jsonl_line("shared needle question"),
+                    crate::agent::test_support::assistant_jsonl_line("shared needle answer"),
+                ]
+                .join(
+                    "
+",
+                ),
+            )
+            .unwrap();
+        }
+        let env = HistoryEnv::sandbox(home.path());
+        let config = ConfigFile {
+            tui: Some(crate::config::TuiConfig {
+                exclude_projects: vec!["hidden".to_string()],
+                ..crate::config::TuiConfig::default()
+            }),
+            ..ConfigFile::default()
+        };
+
+        let response = execute(
+            &env,
+            &config,
+            AgentRequest::Search(AgentSearchArgs::new("shared needle")),
+        );
+        assert!(response.is_success(), "{}", response.stderr);
+        assert!(response.warnings.is_empty(), "{:?}", response.warnings);
+        let Some(AgentResult::Search(result)) = &response.result else {
+            panic!("search result expected");
+        };
+        let uuids = result
+            .conversations
+            .iter()
+            .map(|conversation| conversation.uuid.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(uuids, vec![sessions[0].1.to_string()]);
 
         for (_, uuid) in &sessions[1..] {
             let read = execute(

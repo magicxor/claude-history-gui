@@ -589,7 +589,7 @@ impl SettingsDialog {
                 Field::ExcludeProjects,
                 exclude,
                 Some(self.note(
-                    "One project name per line; `repo` also hides `repo/<worktree>`.",
+                    "One project name per line; `repo` also hides `repo/<worktree>`; also hidden from Deep search.",
                     cx,
                 )),
                 cx,

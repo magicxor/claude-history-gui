@@ -203,7 +203,8 @@ first when stdout is a terminal.
 | `agent outline` | `<CONVERSATION>` | `--budget`, `--no-budget`, `--tools`, `--tool-results`, `--thinking`, `--subagents` |
 
 `agent search` leaves automated (Codex exec) and subagent conversations out unless `--all-kinds` is given, and
-conversations under a `[tui] exclude_paths` prefix out always; `agent read`, `outline` and `within` resolve their refs
+conversations under a `[tui] exclude_paths` prefix or in a `[tui] exclude_projects` project (by name; `repo` also
+covers `repo/<worktree>`) out always; `agent read`, `outline` and `within` resolve their refs
 either way. `agent search --user-only` takes hits from your own messages only (semantic and hybrid modes search
 lexically instead and say so in a warning).
 `claude-history-gui agent <command> --help` lists the exact options. The companion Claude Code skill of the
@@ -345,7 +346,7 @@ is not remembered. An invalid file shows a dialog naming it (Quit / Continue wit
 `omp_path`, `codex_path`, `default_workspace`, `restore_session`. `[resume] default_args` (Claude) and
 `[resume.codex] default_args` (Codex) hold extra arguments for Resume and Fork.
 
-`[tui] exclude_projects` hides exact project names from the list (`repo` also hides `repo/<worktree>`).
+`[tui] exclude_projects` hides exact project names from the list, its searches and Deep search (`agent search`) (`repo` also hides `repo/<worktree>`).
 `[tui] exclude_paths` hides the conversations whose recorded working directory starts with a listed prefix, from the
 list, its searches and Deep search (`agent search`), for every source. Matching is literal and case-sensitive: `/tmp/`
 matches `/tmp/eval-123` but not `/tmp` or `/tmp-other`; nothing is resolved or expanded (`~`, variables, globs), empty

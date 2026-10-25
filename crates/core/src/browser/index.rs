@@ -13,6 +13,7 @@
 use crate::env::{WorkspaceScope, normalize_windows_path};
 use crate::history::Conversation;
 use crate::history::model::SourceKind;
+use crate::history::path::project_is_excluded;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
@@ -400,13 +401,6 @@ fn comparable_canonical(path: &Path) -> PathBuf {
 /// for paths without a drive or verbatim prefix.
 fn comparable_dir(path: &Path) -> PathBuf {
     normalize_windows_path(path)
-}
-
-fn project_is_excluded(project_name: &str, excluded_projects: &HashSet<String>) -> bool {
-    excluded_projects.contains(project_name)
-        || project_name
-            .split_once('/')
-            .is_some_and(|(parent, _)| excluded_projects.contains(parent))
 }
 
 /// The rows in scope for one corpus and one [`ScopeSettings`]: ascending
