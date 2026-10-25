@@ -640,6 +640,21 @@ fn find_normalized_ranges_prefix_match() {
 }
 
 #[test]
+fn find_normalized_ranges_follow_keyword_search() {
+    let found = |text: &'static str, query: &str| {
+        find_normalized_match_ranges(text, &normalize_for_search(query))
+            .into_iter()
+            .map(|(start, end)| &text[start..end])
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(found("the İstanbul trip", "istanbul"), ["İstanbul"]);
+    assert_eq!(found("ΛΟΓΟΣ and λογος", "λογος"), ["ΛΟΓΟΣ", "λογος"]);
+    assert_eq!(found("中间这是测试会话内容", "测试会话"), ["测试会话"]);
+    assert_eq!(found("asp.net", ".net"), Vec::<&str>::new());
+    assert_eq!(found("bump v1.1.1", "1.1"), ["1.1"]);
+}
+
+#[test]
 fn find_normalized_ranges_underscore() {
     let text = "set red_team flag";
     let ranges = find_normalized_match_ranges(text, "red team");

@@ -24,6 +24,7 @@ use crate::search::literal::{Literal, match_literal_ranges};
 use crate::search::normalize_for_search;
 use crate::search::query::ParsedQuery;
 use crate::semantic::types::SemanticRationaleKind;
+use crate::text_match::{NormalizedText, is_word_separator};
 use chrono::{DateTime, Local};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -814,131 +815,32 @@ pub struct TermHit {
     pub term_idx: usize,
 }
 
-/// Text normalized for matching (lowercase, `_` as space) with a mapping
-/// back to byte ranges of the original text, for repeated searches.
-#[derive(Clone, Debug)]
-pub struct NormalizedText {
-    norm_chars: Vec<char>,
-    char_map: Vec<(usize, usize)>,
-}
-
-impl NormalizedText {
-    pub fn new(text: &str) -> Self {
-        let mut norm_chars: Vec<char> = Vec::new();
-        let mut char_map: Vec<(usize, usize)> = Vec::new();
-
-        let mut iter = text.char_indices().peekable();
-        while let Some((byte_start, ch)) = iter.next() {
-            let byte_end = iter.peek().map_or(text.len(), |(i, _)| *i);
-            if ch == '_' {
-                norm_chars.push(' ');
-                char_map.push((byte_start, byte_end));
-            } else {
-                for lc in ch.to_lowercase() {
-                    norm_chars.push(lc);
-                    char_map.push((byte_start, byte_end));
-                }
-            }
-        }
-
-        Self {
-            norm_chars,
-            char_map,
-        }
-    }
-
-    /// All non-overlapping matches of one normalized term, requiring a word
-    /// start when the term starts with an alphanumeric character (`red`
-    /// matches `redaction` but not `fired`). Byte ranges in the original.
-    pub fn find_term_ranges(&self, term: &str) -> Vec<(usize, usize)> {
-        let query_chars: Vec<char> = term.chars().collect();
-        if query_chars.is_empty() {
-            return Vec::new();
-        }
-
-        let query_starts_alnum = query_chars.first().is_some_and(|c| c.is_alphanumeric());
-        let mut matches = Vec::new();
-
-        let mut i = 0;
-        while i + query_chars.len() <= self.norm_chars.len() {
-            if self.norm_chars[i..i + query_chars.len()] == query_chars[..] {
-                let prev_is_alnum = i > 0 && self.norm_chars[i - 1].is_alphanumeric();
-                let valid_start = !query_starts_alnum || !prev_is_alnum;
-
-                if valid_start {
-                    let start_byte = self.char_map[i].0;
-                    let end_byte = self.char_map[i + query_chars.len() - 1].1;
-                    matches.push((start_byte, end_byte));
-                    i += query_chars.len();
-                } else {
-                    i += 1;
-                }
-            } else {
-                i += 1;
-            }
-        }
-
-        matches
-    }
-
-    /// Matches of every whitespace-separated term, sorted and merged;
-    /// ranges separated only by ` _ - /` are merged into one (so
-    /// `run with loader` highlights `run_with_loader` as one span).
-    pub fn find_all_ranges(&self, query_normalized: &str) -> Vec<(usize, usize)> {
-        let terms: Vec<&str> = query_normalized.split_whitespace().collect();
-        if terms.is_empty() {
-            return Vec::new();
-        }
-
-        let mut all_matches = Vec::new();
-        for term in &terms {
-            all_matches.extend(self.find_term_ranges(term));
-        }
-
-        // Sort and merge overlapping or separator-adjacent ranges.
-        // This ensures "run_with_loader" highlights as one span including the underscores
-        // when searching "run with loader" (underscores normalized to spaces).
-        all_matches.sort_unstable_by_key(|m| m.0);
-        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(all_matches.len());
-        for m in all_matches {
-            if let Some(last) = merged.last_mut() {
-                if m.0 <= last.1 {
-                    // Overlapping — merge
-                    last.1 = last.1.max(m.1);
-                    continue;
-                }
-                // Check if the gap between ranges is only separators (_, -, /)
-                let gap = &self.norm_chars[..];
-                let gap_start = self.byte_to_char_index(last.1);
-                let gap_end = self.byte_to_char_index(m.0);
-                if gap_start < gap_end
-                    && gap[gap_start..gap_end]
-                        .iter()
-                        .all(|c| *c == ' ' || *c == '_' || *c == '-' || *c == '/')
-                {
-                    last.1 = m.1;
-                    continue;
-                }
-            }
-            merged.push(m);
-        }
-
-        merged
-    }
-
-    /// Convert a byte offset in the original text to a char index in norm_chars
-    fn byte_to_char_index(&self, byte_offset: usize) -> usize {
-        self.char_map
-            .iter()
-            .position(|(start, _)| *start >= byte_offset)
-            .unwrap_or(self.char_map.len())
-    }
-}
-
-/// All matches of `query_normalized` in `text` (see
-/// [`NormalizedText::find_all_ranges`]), as byte ranges of `text`.
+/// All matches of `query_normalized` in `text` (words matched as keyword
+/// search matches them, see [`NormalizedText::query_ranges`]), as byte
+/// ranges of `text`; ranges separated only by word separators are merged
+/// (see [`merge_separated_ranges`]).
 pub fn find_normalized_match_ranges(text: &str, query_normalized: &str) -> Vec<(usize, usize)> {
-    NormalizedText::new(text).find_all_ranges(query_normalized)
+    merge_separated_ranges(
+        text,
+        NormalizedText::new(text).query_ranges(query_normalized),
+    )
+}
+
+/// Sorted `ranges` with those that overlap or are separated only by word
+/// separators merged, so `run_with_loader` highlights as one span for
+/// `run with loader`.
+fn merge_separated_ranges(text: &str, ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut()
+            && (start <= last.1 || text[last.1..start].chars().all(is_word_separator))
+        {
+            last.1 = last.1.max(end);
+            continue;
+        }
+        merged.push((start, end));
+    }
+    merged
 }
 
 // ---------------------------------------------------------------------------
@@ -1077,7 +979,7 @@ impl HighlightQuery {
 /// A term searched for in context snippets.
 #[derive(Clone, Debug)]
 pub enum ContextMatchSpec {
-    /// A normalized term (word-start, case-insensitive matching).
+    /// A normalized term, matched as keyword search counts it (folded; at word starts, or anywhere when it has CJK text; see [`NormalizedText::query_ranges`]).
     Normalized(String),
     /// A literal (matched at word starts, smart case).
     Literal(Literal),
@@ -1097,12 +999,13 @@ impl ContextMatchSpec {
     pub fn find_ranges(
         &self,
         text: &str,
-        normalized: Option<&NormalizedText>,
+        normalized: Option<&NormalizedText<'_>>,
     ) -> Vec<(usize, usize)> {
         match self {
-            Self::Normalized(term) => normalized
-                .map(|normalized| normalized.find_all_ranges(term))
-                .unwrap_or_else(|| find_normalized_match_ranges(text, term)),
+            Self::Normalized(term) => match normalized {
+                Some(normalized) => merge_separated_ranges(text, normalized.query_ranges(term)),
+                None => find_normalized_match_ranges(text, term),
+            },
             Self::Literal(literal) => literal.match_ranges(text),
         }
     }
@@ -1131,7 +1034,7 @@ pub fn dedupe_context_specs(specs: &[ContextMatchSpec]) -> Vec<ContextMatchSpec>
 pub fn find_all_spec_hits(
     text: &str,
     specs: &[ContextMatchSpec],
-    normalized: Option<&NormalizedText>,
+    normalized: Option<&NormalizedText<'_>>,
 ) -> Vec<TermHit> {
     let mut all_hits = Vec::new();
     for (term_idx, spec) in specs.iter().enumerate() {
