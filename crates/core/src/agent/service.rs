@@ -160,6 +160,7 @@ impl fmt::Display for AgentNotice {
 /// explicitly), a per-invocation transcript cache, and collected notices.
 #[derive(Default)]
 pub struct AgentService {
+    history: crate::history::service::HistoryService,
     env: HistoryEnv,
     config: ConfigFile,
     embedder_factory: Option<EmbedderFactory>,
@@ -241,6 +242,9 @@ fn error_envelope(error: AppError) -> (String, Option<AgentError>) {
 impl AgentService {
     pub fn new(env: HistoryEnv, config: ConfigFile) -> Self {
         Self {
+            history: crate::history::service::HistoryService::new(
+                crate::history::sources::Registry::from_env(&env),
+            ),
             env,
             config,
             ..Self::default()
@@ -387,20 +391,29 @@ impl AgentService {
         #[cfg(test)]
         self.transcript_parse_count
             .set(self.transcript_parse_count.get() + 1);
-        let loaded = agent::transcript::AgentTranscript::load(path).map_err(|error| match error {
-            AppError::Agent(error) => error,
-            AppError::Io(error) => AgentError::io(
-                Some(&path.to_string_lossy()),
-                format!("failed to read transcript: {error}"),
-            ),
-            AppError::Json(error) => AgentError::malformed_transcript(
-                Some(&path.to_string_lossy()),
-                format!("failed to parse transcript JSONL: {error}"),
-            ),
-            error => {
-                AgentError::malformed_transcript(Some(&path.to_string_lossy()), error.to_string())
-            }
-        });
+        // Fork: an I/O failure of the open stays an `io` error (the GUI's
+        // warnings banner counts it apart from malformed transcripts).
+        let loaded = self
+            .history
+            .open_path(path)
+            .and_then(|(_, transcript)| {
+                agent::transcript::AgentTranscript::from_transcript(&transcript)
+            })
+            .map_err(|error| match error {
+                AppError::Agent(error) => error,
+                AppError::Io(error) => AgentError::io(
+                    Some(&path.to_string_lossy()),
+                    format!("failed to read transcript: {error}"),
+                ),
+                AppError::Json(error) => AgentError::malformed_transcript(
+                    Some(&path.to_string_lossy()),
+                    format!("failed to parse transcript JSONL: {error}"),
+                ),
+                error => AgentError::malformed_transcript(
+                    Some(&path.to_string_lossy()),
+                    error.to_string(),
+                ),
+            });
         self.transcripts
             .borrow_mut()
             .insert(path.to_path_buf(), loaded.clone());
