@@ -698,6 +698,11 @@ impl Browser {
     /// whether anything arrived.
     fn receive_semantic_corpus(&mut self) -> bool {
         let mut arrived = false;
+        // Whether a query may wait for what arrived: not for a read of the
+        // generation shown that failed while the cards read before serve it
+        // (their query ran when they were mapped to it, and would run again
+        // for nothing).
+        let mut awaited = false;
         if let Some((_, job)) = &self.semantic_corpus.loading
             && let Some(answer) = job.answer()
         {
@@ -715,9 +720,14 @@ impl Browser {
                     self.readiness.semantic = true;
                     self.semantic_corpus_version += 1;
                     self.semantic_sent_scope_signature = None;
+                    awaited = true;
                 }
                 // Cards read before keep serving (mapped to this one).
-                None => self.semantic_corpus.failed = Some(id),
+                None => {
+                    awaited = self.generation_id().as_ref() != Some(&id)
+                        || self.semantic_docs_shown().is_none();
+                    self.semantic_corpus.failed = Some(id);
+                }
             }
         }
         if let Some(job) = &self.semantic_corpus.mapping
@@ -742,9 +752,10 @@ impl Browser {
                 }
                 self.semantic_sent_scope_signature = None;
                 arrived = true;
+                awaited = true;
             }
         }
-        if !arrived || self.list_search_mode != ListSearchMode::Semantic {
+        if !awaited || self.list_search_mode != ListSearchMode::Semantic {
             return arrived;
         }
         // Read or mapped for another generation than the one shown now

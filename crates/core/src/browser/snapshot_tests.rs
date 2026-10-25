@@ -954,16 +954,23 @@ fn remove_semantic_segments(id: &str) {
     assert!(removed > 0, "the generation has semantic segments");
 }
 
-/// Fork: cards read before keep serving a generation whose semantic data
-/// cannot be read, mapped to its docs on a `semantic-corpus` thread (the
-/// open of the generation came before the cards).
-#[test]
-fn older_cards_serve_a_generation_whose_semantic_data_cannot_be_read() {
-    let sandbox = Sandbox::new();
+/// Fork: a browser that read the cards of g000001 (a has semantic turns),
+/// then opened g000002, which drops b, adds d and has no semantic segments
+/// (the open came before the cards: no docs are mapped to it yet); not in
+/// semantic mode. Returns it with the cards read, the snapshot of g000002
+/// and the store root.
+fn older_cards_and_unreadable_semantic_data(
+    sandbox: &Sandbox,
+) -> (
+    Browser,
+    Arc<crate::store::SemanticCards>,
+    crate::store::Snapshot,
+    tempfile::TempDir,
+) {
     let mut published = corpus();
     published[0].semantic_turns = vec!["alpha turn".to_string()].into();
     let root = publish(&published);
-    let mut app = loading_app(&sandbox, None, vec![]);
+    let mut app = loading_app(sandbox, None, vec![]);
     show(&mut app, &root, TimeFilter::default());
     assert!(app.open_search_index());
     assert!(!app.ensure_semantic_corpus());
@@ -978,32 +985,110 @@ fn older_cards_serve_a_generation_whose_semantic_data_cannot_be_read() {
     ];
     let snapshot = republish(&root, &newer);
     remove_semantic_segments(&snapshot.generation_id());
-    let open = cards::GenerationOpen::build(snapshot, Some(app.corpus_snapshot()), None);
+    let open = cards::GenerationOpen::build(snapshot.clone(), Some(app.corpus_snapshot()), None);
     app.install_generation(open);
+    (app, first, snapshot, root)
+}
+
+/// The scopes sent to the semantic worker since the last call, and how
+/// many queries.
+fn sent_scopes_and_queries(
+    rx: &mpsc::Receiver<crate::semantic_worker::SemanticWorkerCommand>,
+) -> (Vec<Vec<usize>>, usize) {
+    let mut scopes = Vec::new();
+    let mut queries = 0;
+    for command in rx.try_iter() {
+        match command {
+            crate::semantic_worker::SemanticWorkerCommand::UpdateScope { indices, .. } => {
+                scopes.push(indices.to_vec());
+            }
+            crate::semantic_worker::SemanticWorkerCommand::Search { .. } => queries += 1,
+            crate::semantic_worker::SemanticWorkerCommand::UpdateCorpus { .. } => {}
+        }
+    }
+    (scopes, queries)
+}
+
+/// Fork: cards read before keep serving a generation whose semantic data
+/// cannot be read, mapped to its docs on a `semantic-corpus` thread. The
+/// read of that data fails on another one, before or after the mapping
+/// sends the scope: the test waits for both, and the query runs once
+/// either way.
+#[test]
+fn older_cards_serve_a_generation_whose_semantic_data_cannot_be_read() {
+    let sandbox = Sandbox::new();
+    let (mut app, first, _, _root) = older_cards_and_unreadable_semantic_data(&sandbox);
     let (_request_tx, request_rx, _response_tx) = connect_semantic_search_channels(&mut app);
     app.set_list_search_mode(ListSearchMode::Semantic);
     type_query(&mut app, "needle");
 
+    let (mut scopes, mut queries) = (Vec::new(), 0);
     let deadline = Instant::now() + Duration::from_secs(10);
-    let scope = 'sent: loop {
-        assert!(Instant::now() < deadline, "no scope was sent");
+    while scopes.is_empty() || app.semantic_corpus.loading.is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "no scope was sent, or the read never answered"
+        );
         app.poll();
-        while let Ok(command) = request_rx.try_recv() {
-            if let crate::semantic_worker::SemanticWorkerCommand::UpdateScope { indices, .. } =
-                command
-            {
-                break 'sent indices;
-            }
-        }
+        let (sent, ran) = sent_scopes_and_queries(&request_rx);
+        scopes.extend(sent);
+        queries += ran;
         std::thread::sleep(Duration::from_millis(5));
-    };
+    }
     // c and a of the cards read before; b has no card any more.
-    assert_eq!(*scope, vec![0, 2]);
+    assert_eq!(scopes, vec![vec![0, 2]]);
+    assert_eq!(queries, 1, "the query ran once");
     assert!(Arc::ptr_eq(
         app.semantic_corpus.loaded.as_ref().unwrap(),
         &first
     ));
     assert_eq!(app.semantic_corpus.failed, app.generation_id());
+    assert_eq!(app.semantic_error(), None);
+}
+
+/// Fork: a read that fails once the cards read before serve the generation
+/// shown changes nothing for the query they serve: it is not run again
+/// (it was, when the mapping answered before the read), and the failure is
+/// kept.
+#[test]
+fn a_read_failing_after_older_cards_serve_does_not_run_the_query_again() {
+    let sandbox = Sandbox::new();
+    let (mut app, first, snapshot, _root) = older_cards_and_unreadable_semantic_data(&sandbox);
+    let (_request_tx, request_rx, _response_tx) = connect_semantic_search_channels(&mut app);
+    let (release, gate) = mpsc::channel();
+    app.semantic_corpus.loading = Some(gated_semantic_read(snapshot, gate));
+    app.set_list_search_mode(ListSearchMode::Semantic);
+    type_query(&mut app, "needle");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let sent = loop {
+        assert!(Instant::now() < deadline, "no scope was sent");
+        app.poll();
+        let sent = sent_scopes_and_queries(&request_rx);
+        if !sent.0.is_empty() {
+            break sent;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(sent, (vec![vec![0, 2]], 1), "the older cards serve");
+    assert_eq!(app.semantic_corpus.failed, None, "the read is held");
+
+    release.send(()).unwrap();
+    while app.semantic_corpus.loading.is_some() {
+        assert!(Instant::now() < deadline, "the read never answered");
+        app.poll();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(app.semantic_corpus.failed, app.generation_id());
+    assert_eq!(
+        sent_scopes_and_queries(&request_rx),
+        (Vec::new(), 0),
+        "the query is not run again"
+    );
+    assert!(Arc::ptr_eq(
+        app.semantic_corpus.loaded.as_ref().unwrap(),
+        &first
+    ));
     assert_eq!(app.semantic_error(), None);
 }
 

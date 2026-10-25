@@ -2345,9 +2345,10 @@ recorded each frame (for the keyboard context menu position).
      allocation, so the resident semantic index matches them by pointer and re-chunks only changed cards), and the
      older cards serve meanwhile once mapped to the new docs by path (on `generation-open` for the swap, else on a
      `semantic-corpus` thread; a semantic query waits for that mapping). A read of a generation no longer shown is
-     given up. A generation whose semantic data cannot be read keeps the cards read before (mapped to it); with
-     none, semantic search fails with `semantic corpus unavailable`. It is not read again until semantic mode is
-     entered again (Retry does that) or a newer generation is shown. Quoted-only
+     given up. A generation whose semantic data cannot be read keeps the cards read before (mapped to it; a read
+     failing once they serve it does not run their query again); with none, semantic search fails with `semantic
+     corpus unavailable`. It is not read again until semantic mode is entered again (Retry does that) or a newer
+     generation is shown. Quoted-only
      semantic queries find their matches in the generation's lexical index, newest first, and read the text of the
      first 200 for their evidence (later rows show their preview); the cards are sent to the semantic worker again
      once their generation's index is open.
