@@ -152,8 +152,8 @@ pub use loader::{
     RefreshPolicy,
 };
 pub use types::{
-    DeleteError, DeletedSession, EscapeOutcome, ListSearchMode, RENAMED_STATUS, Readiness,
-    ReconcileState, RenameError, SemanticProgress, SemanticResultMetadata, UuidLookup,
+    DeleteError, DeletedSession, EscapeOutcome, IndexNotice, ListSearchMode, RENAMED_STATUS,
+    Readiness, ReconcileState, RenameError, SemanticProgress, SemanticResultMetadata, UuidLookup,
     query_has_literals,
 };
 
@@ -323,6 +323,11 @@ pub struct Browser {
     query: String,
     /// Which parts of the list are usable
     readiness: Readiness,
+    /// Progress of the reconcile pass shown as indexing (upstream 04c714b)
+    indexing: Option<crate::store::progress::Indexing>,
+    /// What the last pass shown as indexing, or a failed one, left for the
+    /// status line, until the GUI takes it (upstream: the status message)
+    index_notice: Option<IndexNotice>,
     /// Generation whose cards are the rows, in generation mode
     snapshot: Option<crate::store::Snapshot>,
     /// Generation index lexical queries run against, when there is one
@@ -471,6 +476,8 @@ impl Browser {
             selection_anchor: None,
             query: String::new(),
             readiness: parts.readiness,
+            indexing: None,
+            index_notice: None,
             snapshot: None,
             search_index: None,
             index_scope: None,

@@ -1740,6 +1740,153 @@ fn a_locked_store_is_reconciled_once_the_lock_is_free() {
     );
 }
 
+/// Upstream 04c714b: while a pass may run, the progress another instance's
+/// pass reports in `PROGRESS` (upstream: another process) reaches the
+/// browser through the `store-watch` thread; once no pass runs, the shown
+/// indexing leaves a completion notice.
+#[test]
+fn the_progress_of_a_pass_indexing_the_store_shows_until_no_pass_runs() {
+    use crate::store::progress::{Indexing, MIN_FILES, Reporter};
+    let sandbox = Sandbox::new();
+    write_sessions(&sandbox);
+    let root = crate::store::default_root(&sandbox.env).unwrap();
+    // Another instance holds the store and indexes it: the loader's pass
+    // waits for the lock meanwhile.
+    let held = PublishLock::try_acquire(&root).unwrap().unwrap();
+    let total = MIN_FILES + 10;
+    let reporter = Reporter::start(&root, total).unwrap();
+    reporter
+        .counter()
+        .fetch_add(3, std::sync::atomic::Ordering::Relaxed);
+    let mut loader = snapshot_loader(&sandbox);
+    let mut app = loading_app(&sandbox, None, vec![]);
+    assert_eq!(app.index_progress(), None);
+    assert!(loader.start_initial_load());
+    poll_until(&mut loader, &mut app, "the progress", |app| {
+        app.index_progress() == Some(Indexing { done: 3, total })
+    });
+    assert_eq!(
+        app.indexing_status_text().as_deref(),
+        Some("Indexing sessions\u{2026} 3 / 60")
+    );
+    assert_eq!(app.take_index_notice(), None);
+
+    // That pass ends (its file is removed), then the loader's own runs.
+    drop(reporter);
+    drop(held);
+    let event = poll_until_event(&mut loader, &mut app);
+    assert!(matches!(event, LoadEvent::Loaded { .. }), "{event:?}");
+    loader.finish_snapshot_write();
+    poll_until(&mut loader, &mut app, "the pass to end", |app| {
+        app.readiness().reconcile == ReconcileState::Done
+    });
+    assert_eq!(app.indexing_status_text(), None);
+    let notice = app.take_index_notice();
+    assert_eq!(notice, Some(IndexNotice::Indexed { total }));
+    assert!(!root.join("PROGRESS").exists());
+}
+
+/// Upstream 04c714b: a failed pass that no load event reports (here the
+/// initial load's pass over a store whose generation is shown) leaves a
+/// failure notice and its message in `PROGRESS`; a refresh's failed pass is
+/// reported by `RefreshFailed` instead, without a notice.
+#[test]
+fn a_failed_pass_leaves_a_failure_notice_unless_an_event_reports_it() {
+    let sandbox = Sandbox::new();
+    write_sessions(&sandbox);
+    let root = crate::store::default_root(&sandbox.env).unwrap();
+    let sources = crate::history::sources::Registry::from_env(&sandbox.env);
+    crate::store::reconcile::reconcile(&root, &sources).unwrap();
+    // The next pass cannot open the store's lock file: it fails.
+    std::fs::remove_file(root.join("LOCK")).unwrap();
+    std::fs::create_dir(root.join("LOCK")).unwrap();
+
+    let mut loader = snapshot_loader(&sandbox);
+    let mut app = loading_app(&sandbox, None, vec![]);
+    app.show_snapshot(loader.open_snapshot().unwrap());
+    assert!(loader.start_initial_load());
+    let event = poll_until_event(&mut loader, &mut app);
+    assert!(
+        matches!(
+            event,
+            LoadEvent::Loaded {
+                conversations: 3,
+                ..
+            }
+        ),
+        "{event:?}"
+    );
+    let mut notice = app.take_index_notice();
+    if notice.is_none() {
+        loader.finish_snapshot_write();
+        poll_until(&mut loader, &mut app, "the failed pass", |app| {
+            app.readiness().reconcile == ReconcileState::Done
+        });
+        notice = app.take_index_notice();
+    }
+    let Some(IndexNotice::Failed(message)) = &notice else {
+        panic!("a failure notice: {notice:?}");
+    };
+    assert!(
+        !message.is_empty() && !message.contains('\n'),
+        "{message:?}"
+    );
+    assert_eq!(
+        notice.as_ref().unwrap().status_message(),
+        format!("Indexing failed: {message}")
+    );
+    assert_eq!(
+        crate::store::progress::read(&root),
+        Some(crate::store::progress::Status::Failed(message.clone())),
+        "upstream's record for the instance that started the pass"
+    );
+
+    assert!(loader.start_refresh());
+    let event = poll_until_event(&mut loader, &mut app);
+    assert!(matches!(event, LoadEvent::RefreshFailed(_)), "{event:?}");
+    assert_eq!(app.take_index_notice(), None, "the event reports it");
+}
+
+/// Upstream 04c714b: when the first pass fails and no card is listed, the
+/// initial load fails with `indexing sessions failed: …` (upstream exited
+/// with it) instead of reporting no history.
+#[test]
+fn a_first_pass_that_fails_with_no_card_fails_the_initial_load() {
+    let sandbox = Sandbox::new();
+    write_sessions(&sandbox);
+    let root = crate::store::default_root(&sandbox.env).unwrap();
+    std::fs::create_dir_all(root.join("LOCK")).unwrap();
+    let mut loader = snapshot_loader(&sandbox);
+    let mut app = loading_app(&sandbox, None, vec![]);
+    assert!(loader.open_snapshot().is_none());
+    assert!(loader.start_initial_load());
+    let event = poll_until_event(&mut loader, &mut app);
+    let LoadEvent::LoadFailed(error) = &event else {
+        panic!("{event:?}");
+    };
+    assert!(
+        error
+            .to_string()
+            .starts_with("I/O error: indexing sessions failed: "),
+        "{error}"
+    );
+    assert!(app.readiness().list, "an empty, ready list");
+    assert_eq!(app.take_index_notice(), None, "the event reports it");
+
+    // A retry that fails again shows the same text.
+    assert!(loader.start_refresh());
+    let event = poll_until_event(&mut loader, &mut app);
+    let LoadEvent::RefreshFailed(error) = &event else {
+        panic!("{event:?}");
+    };
+    assert!(
+        error
+            .to_string()
+            .starts_with("I/O error: indexing sessions failed: "),
+        "{error}"
+    );
+}
+
 #[test]
 fn a_cancel_wakes_a_wait_for_the_lock() {
     let cancel = Arc::new(loader::Cancel::default());

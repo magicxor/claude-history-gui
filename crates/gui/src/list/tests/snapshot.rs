@@ -1,12 +1,14 @@
 //! G tests of the list in store mode (L-099…L-101, L-062, L-068, L-040,
-//! A-001, L-004, L-048, S-015; upstream 3708bb6, ac7f591, e905169, 358becb):
+//! A-001, L-004, L-048, S-015, L-105, L-106; upstream 3708bb6, ac7f591,
+//! e905169, 358becb, 04c714b):
 //! the first rows are the newest cards of the store's generation; Resume,
 //! Fork and Ctrl+O work on them, Rename and Delete wait until the generation
 //! is shown in full; a query typed before that runs on the generation's
 //! index; the initial load is a reconcile pass whose newer generation is
 //! swapped in keeping the selection; a time filter re-scopes the cards and a
 //! UUID finds a card outside it; a delete hides the row until a generation
-//! drops it.
+//! drops it; a pass indexing the store shows its progress in the footer and
+//! a toast when it ends, and a failed pass an error toast or the load error.
 //!
 //! The store is on in tests (`app::init_for_test`); tests that end while a
 //! pass may still publish join it (`ListPane::finish_snapshot_write`).
@@ -21,10 +23,13 @@ use claude_history_core::store::load_in_memory;
 use claude_history_core::time_filter::TimeFilter;
 use gpui_kit::AppContext as _;
 use gpui_kit::TestAppContext;
+use gpui_kit::test::TestWindowExt as _;
 
 use crate::actions::OpenRowContextMenu;
 use crate::list::ListPaneEvent;
 use crate::list::footer::ChipKind;
+use crate::list::states::{StateAction, StateKind};
+use crate::notify::ToastKind;
 use crate::test_support::fixtures_list::{ListFixture, SessionSpec, listed_corpus};
 use crate::test_support::fixtures_ops::{project_dir, write_gui_config};
 use crate::test_support::fixtures_viewer::{draw, wait_viewer_ready};
@@ -575,4 +580,175 @@ fn a_delete_hides_the_row_until_a_generation_drops_it(cx: &mut TestAppContext) {
     });
     assert_eq!(f.paths(cx).len(), cards - 1);
     f.list.update(cx, |list, _| list.finish_snapshot_write());
+}
+
+/// The footer model as the main window draws it.
+fn footer(f: &ListFixture, cx: &mut TestAppContext) -> crate::list::footer::FooterModel {
+    cx.update_window(f.handle, |_, window, cx| {
+        window.render_frame(cx);
+        f.list.read(cx).footer_model(window, cx)
+    })
+    .unwrap()
+}
+
+/// L-105 (upstream 04c714b): while a pass indexing the store reports its
+/// progress (here another instance's pass, holding the store), the footer
+/// shows `Indexing conversations… <done> / <total>` with a progress bar in
+/// place of the hints, `  ·  results may be incomplete` while a query is
+/// typed, then `Finishing index… <total> conversations` with a spinner; once
+/// no pass runs, a success toast says how many were indexed.
+#[gpui_kit::test]
+fn a_pass_indexing_the_store_shows_its_progress_then_a_toast(cx: &mut TestAppContext) {
+    use std::sync::atomic::Ordering;
+    use store::progress::Reporter;
+    let world = TestWorld::new();
+    listed_corpus(&world);
+    let root = store::default_root(&world.env).expect("a store root in the sandbox");
+    let held = hold_store(&world);
+    let reporter = Reporter::start(&root, 7185).expect("a large pass reports");
+    reporter.counter().fetch_add(2345, Ordering::Relaxed);
+    let f = ListFixture::open(cx, &world, &[]);
+    f.with_window(cx, |list, window, cx| list.focus_search(window, cx));
+    f.wait_until(cx, "the indexing progress", |list, _| {
+        list.browser()
+            .index_progress()
+            .is_some_and(|progress| progress.done == 2345)
+    });
+    let model = footer(&f, cx);
+    assert_eq!(
+        model.indexing.as_deref(),
+        Some("Indexing conversations… 2,345 / 7,185")
+    );
+    let percent = model.indexing_percent.expect("a progress bar");
+    assert!(
+        (percent - 2345.0 * 100.0 / 7185.0).abs() < 0.01,
+        "{percent}"
+    );
+    assert!(model.has_activity());
+    assert!(model.chips.is_empty(), "the progress replaces the hints");
+    assert_eq!(
+        f.read(cx, |list, cx| list.qa_probe("list.indexing", cx)),
+        Some("Indexing conversations… 2,345 / 7,185".to_string())
+    );
+
+    f.type_text(cx, "alpha");
+    cx.run_until_parked();
+    assert_eq!(
+        footer(&f, cx).indexing.as_deref(),
+        Some("Indexing conversations… 2,345 / 7,185  ·  results may be incomplete")
+    );
+    f.with_window(cx, |list, window, cx| list.clear_query(window, cx));
+
+    reporter.counter().fetch_add(7185 - 2345, Ordering::Relaxed);
+    f.wait_until(cx, "the index to be finishing", |list, _| {
+        list.browser()
+            .index_progress()
+            .is_some_and(|progress| progress.done == 7185)
+    });
+    let model = footer(&f, cx);
+    assert_eq!(
+        model.indexing.as_deref(),
+        Some("Finishing index… 7,185 conversations")
+    );
+    assert_eq!(model.indexing_percent, None, "a spinner");
+    assert!(
+        !f.read(cx, |list, _| list
+            .toasts()
+            .iter()
+            .any(|t| t.text.starts_with("Indexed"))),
+        "no toast while a pass runs"
+    );
+
+    // That pass ends, then this window's own pass runs and publishes.
+    drop(reporter);
+    drop(held);
+    f.list.update(cx, |list, _| list.finish_snapshot_write());
+    f.wait_until(cx, "the completion toast", |list, _| {
+        list.toasts()
+            .iter()
+            .any(|t| t.text == "Indexed 7,185 conversations")
+    });
+    let toast = f
+        .read(cx, |list, _| {
+            list.toasts()
+                .iter()
+                .find(|t| t.text.starts_with("Indexed"))
+                .cloned()
+        })
+        .unwrap();
+    assert_eq!(toast.kind, ToastKind::Success);
+    assert_eq!(footer(&f, cx).indexing, None);
+    f.wait_loaded(cx);
+    f.list.update(cx, |list, _| list.finish_snapshot_write());
+}
+
+/// L-106 (upstream 04c714b): a failed pass that no load event reports (the
+/// initial pass of a window over a store whose generation is listed) shows
+/// `Indexing failed: <message>` with a Show debug log action; the rows stay.
+#[gpui_kit::test]
+fn a_failed_pass_shows_an_error_toast(cx: &mut TestAppContext) {
+    let world = TestWorld::new();
+    listed_corpus(&world);
+    let first = ListFixture::open_loaded(cx, &world, &[]);
+    first
+        .list
+        .update(cx, |list, _| list.finish_snapshot_write());
+    first.wait_idle(cx);
+    // The next pass cannot open the store's lock file: it fails.
+    let root = store::default_root(&world.env).unwrap();
+    std::fs::remove_file(root.join("LOCK")).unwrap();
+    std::fs::create_dir(root.join("LOCK")).unwrap();
+
+    let f = ListFixture::open_loaded(cx, &world, &[]);
+    f.wait_until(cx, "the failure toast", |list, _| {
+        list.toasts()
+            .iter()
+            .any(|t| t.text.starts_with("Indexing failed: "))
+    });
+    let toast = f.read(cx, |list, _| list.toasts().last().cloned()).unwrap();
+    assert!(
+        toast.text.starts_with("Indexing failed: "),
+        "{}",
+        toast.text
+    );
+    assert_eq!(toast.kind, ToastKind::Error);
+    assert_eq!(toast.buttons, vec!["Show debug log".to_string()]);
+    assert_eq!(f.paths(cx).len(), 8, "the generation stays listed");
+    assert!(f.read(cx, |list, cx| list.empty_state(cx)).is_none());
+}
+
+/// L-006, L-106 (upstream 04c714b): when the first pass fails and no
+/// conversation is listed, the list shows the load error
+/// (`indexing sessions failed: …`) with Retry instead of "no history", and
+/// no toast.
+#[gpui_kit::test]
+fn a_failed_first_pass_with_nothing_listed_is_a_load_error(cx: &mut TestAppContext) {
+    let world = TestWorld::new();
+    listed_corpus(&world);
+    let root = store::default_root(&world.env).unwrap();
+    std::fs::create_dir_all(root.join("LOCK")).unwrap();
+    let f = ListFixture::open_loaded(cx, &world, &[]);
+    let state = f
+        .read(cx, |list, cx| list.empty_state(cx))
+        .expect("an error state");
+    assert_eq!(state.kind, StateKind::Error);
+    assert_eq!(state.title, "Couldn't load history");
+    assert!(
+        state
+            .description
+            .as_deref()
+            .is_some_and(|text| text.starts_with("I/O error: indexing sessions failed: ")),
+        "{state:?}"
+    );
+    assert_eq!(
+        state.actions,
+        vec![StateAction::Retry, StateAction::ShowDebugLog]
+    );
+    assert!(
+        !f.read(cx, |list, _| list
+            .toasts()
+            .iter()
+            .any(|t| t.text.starts_with("Indexing failed"))),
+        "the error view reports it"
+    );
 }

@@ -1779,3 +1779,100 @@ fn search_bar_status_texts() {
     assert_eq!(failed.search_status_text(), "sem 1/1 sem failed");
     assert_eq!(failed.semantic_error(), Some("model missing"));
 }
+
+// --- indexing progress (upstream 04c714b; the status message is an
+// `IndexNotice` the GUI takes) ---
+
+#[test]
+fn indexing_shows_progress_then_a_completion_message() {
+    use crate::store::progress::Indexing;
+    let sandbox = Sandbox::new();
+    let mut app = app(
+        &sandbox,
+        vec![conversation(None, "-tmp", "a", "alpha")],
+        vec![],
+    );
+    app.set_index_progress(
+        Some(Indexing {
+            done: 2345,
+            total: 7185,
+        }),
+        true,
+    );
+    assert_eq!(
+        app.indexing_status_text().as_deref(),
+        Some("Indexing sessions\u{2026} 2,345 / 7,185")
+    );
+    assert_eq!(
+        app.index_progress(),
+        Some(Indexing {
+            done: 2345,
+            total: 7185
+        })
+    );
+    app.query = "alpha".to_string();
+    assert_eq!(
+        app.indexing_status_text().as_deref(),
+        Some("Indexing sessions\u{2026} 2,345 / 7,185  \u{b7}  results may be incomplete")
+    );
+    app.query.clear();
+
+    // The progress file is gone but the pass has not exited yet.
+    app.set_index_progress(None, true);
+    assert!(app.indexing_status_text().is_some());
+    assert!(app.index_notice.is_none());
+
+    app.set_index_progress(None, false);
+    assert_eq!(app.indexing_status_text(), None);
+    let notice = app.take_index_notice().unwrap();
+    assert_eq!(notice, IndexNotice::Indexed { total: 7185 });
+    assert_eq!(notice.status_message(), "Indexed 7,185 sessions");
+    assert_eq!(app.take_index_notice(), None, "taken once");
+}
+
+#[test]
+fn a_pass_never_shown_leaves_no_completion_message() {
+    let sandbox = Sandbox::new();
+    let mut app = app(
+        &sandbox,
+        vec![conversation(None, "-tmp", "a", "alpha")],
+        vec![],
+    );
+    app.set_index_progress(None, true);
+    app.set_index_progress(None, false);
+    assert_eq!(app.indexing_status_text(), None);
+    assert!(app.take_index_notice().is_none());
+}
+
+#[test]
+fn a_failed_pass_shows_its_error_instead_of_completing() {
+    use crate::store::progress::Indexing;
+    let sandbox = Sandbox::new();
+    let mut app = app(
+        &sandbox,
+        vec![conversation(None, "-tmp", "a", "alpha")],
+        vec![],
+    );
+    app.set_index_progress(Some(Indexing { done: 5, total: 5 }), true);
+    assert_eq!(
+        app.indexing_status_text().as_deref(),
+        Some("Finishing index\u{2026} 5 sessions")
+    );
+    app.index_failed("No space left on device (os error 28)");
+    app.set_index_progress(None, false);
+    assert_eq!(app.indexing_status_text(), None);
+    let notice = app.take_index_notice().unwrap();
+    assert_eq!(
+        notice.status_message(),
+        "Indexing failed: No space left on device (os error 28)"
+    );
+}
+
+#[test]
+fn group_digits_separates_thousands() {
+    use crate::display_format::group_digits;
+    assert_eq!(group_digits(0), "0");
+    assert_eq!(group_digits(999), "999");
+    assert_eq!(group_digits(1000), "1,000");
+    assert_eq!(group_digits(1234567), "1,234,567");
+}

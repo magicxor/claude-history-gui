@@ -3,6 +3,13 @@
 //! then key hints from the live keymap, priority-trimmed, `F1 help` always
 //! kept. WP1.
 //!
+//! The store's indexing progress (upstream 04c714b) is an activity too:
+//! `Indexing conversations… 2,345 / 7,185` with a progress bar, then
+//! `Finishing index… 7,185 conversations` with a spinner, in place of the
+//! refresh indicator and after the semantic activity (upstream showed the
+//! semantic activity instead), with `  ·  results may be incomplete` while a
+//! query is typed.
+//!
 //! The hint chips are only shown while the list has focus and no activity is
 //! displayed. While the initial load runs (AD6) the rename and delete chips
 //! are dimmed, and open, resume and fork until the rows are listed newest
@@ -152,6 +159,12 @@ pub struct FooterModel {
     pub semantic_activity: Option<String>,
     /// The embedding progress in percent, when known.
     pub semantic_percent: Option<f32>,
+    /// `Indexing conversations… 2,345 / 7,185` / `Finishing index… 7,185
+    /// conversations` while a reconcile pass is shown as indexing
+    /// (`Browser::indexing_status_text`).
+    pub indexing: Option<String>,
+    /// The indexing progress in percent, while files are parsed.
+    pub indexing_percent: Option<f32>,
     /// Hint chips (empty while an activity shows or the list lacks focus).
     pub chips: Vec<FooterChip>,
 }
@@ -159,7 +172,7 @@ pub struct FooterModel {
 impl FooterModel {
     /// Whether an activity replaces the hints.
     pub fn has_activity(&self) -> bool {
-        self.refreshing || self.semantic_activity.is_some()
+        self.refreshing || self.semantic_activity.is_some() || self.indexing.is_some()
     }
 }
 
@@ -217,11 +230,22 @@ impl ListPane {
             }
             _ => None,
         };
+        let indexing = self
+            .browser
+            .indexing_status_text()
+            .map(|text| crate::notify::gui_text(&text));
+        let indexing_percent = self
+            .browser
+            .index_progress()
+            .filter(|progress| indexing.is_some() && progress.done < progress.total)
+            .map(|progress| progress.done as f32 * 100.0 / progress.total as f32);
         let mut model = FooterModel {
             count: crate::notify::gui_text(&self.browser.search_status_text()),
             refreshing: self.is_refreshing(),
             semantic_activity: activity,
             semantic_percent: percent,
+            indexing,
+            indexing_percent,
             chips: Vec::new(),
         };
         if !model.has_activity() && self.contains_focus(window, cx) {
@@ -463,7 +487,8 @@ pub fn render_footer(list: &ListPane, window: &Window, cx: &App) -> impl IntoEle
     let activity = h_flex()
         .gap_2()
         .items_center()
-        .when(model.refreshing, |this| {
+        // The indexing progress says more than the refresh indicator.
+        .when(model.refreshing && model.indexing.is_none(), |this| {
             this.child(
                 h_flex()
                     .id("footer-refreshing")
@@ -489,6 +514,25 @@ pub fn render_footer(list: &ListPane, window: &Window, cx: &App) -> impl IntoEle
                         )
                     })
                     .when(model.semantic_percent.is_none(), |this| {
+                        this.child(Spinner::new().xsmall().color(muted))
+                    })
+                    .child(div().text_color(muted).child(text)),
+            )
+        })
+        .when_some(model.indexing.clone(), |this, text| {
+            this.child(
+                h_flex()
+                    .id("footer-indexing")
+                    .gap_1()
+                    .items_center()
+                    .when_some(model.indexing_percent, |this, percent| {
+                        this.child(
+                            div()
+                                .w_12()
+                                .child(Progress::new("indexing-progress").value(percent)),
+                        )
+                    })
+                    .when(model.indexing_percent.is_none(), |this| {
                         this.child(Spinner::new().xsmall().color(muted))
                     })
                     .child(div().text_color(muted).child(text)),

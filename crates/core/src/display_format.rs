@@ -113,6 +113,20 @@ pub fn format_duration_minutes(minutes: u64) -> String {
     }
 }
 
+/// `n` with its thousands separated by commas, e.g. "7,185" (upstream
+/// `tui/app.rs` `group_digits`, 04c714b: the indexing status texts).
+pub fn group_digits(n: usize) -> String {
+    let digits = n.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
 /// Viewer-header timestamp: `"%Y-%m-%d %H:%M"` (local time).
 pub fn format_header_timestamp(timestamp: DateTime<Local>) -> String {
     timestamp.format("%Y-%m-%d %H:%M").to_string()

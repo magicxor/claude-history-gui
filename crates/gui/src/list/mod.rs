@@ -1333,6 +1333,13 @@ impl ListPane {
             // published is still being opened; `false` once the newest
             // generation is shown in full (always `false` in memory).
             "list.reconciling" => self.is_reconciling().to_string(),
+            // Store mode: the footer's indexing text while a pass is shown as
+            // indexing (upstream 04c714b), empty otherwise.
+            "list.indexing" => self
+                .browser
+                .indexing_status_text()
+                .map(|text| crate::notify::gui_text(&text))
+                .unwrap_or_default(),
             "list.query" => self.query(cx).to_string(),
             "list.query_calls" => self.query_calls.to_string(),
             "list.mode" => self.mode().label().to_string(),

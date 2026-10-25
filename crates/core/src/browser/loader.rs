@@ -24,6 +24,18 @@
 //! [`LoadEvent::Refreshed`] from the generation sizes. Every thread sends its
 //! result before it calls the waker, so the poll it schedules finds it.
 //!
+//! A pass that parses at least [`crate::store::progress::MIN_FILES`] files
+//! reports its progress in the store's `PROGRESS` file (upstream 04c714b);
+//! the `store-watch` thread reads it with `CURRENT` (from this process or
+//! another holding the lock) and wakes the poll when it changes, and the
+//! poll hands it to the browser ([`Browser::set_index_progress`]) while a
+//! pass runs or is due. A pass shown that way leaves an
+//! [`super::IndexNotice::Indexed`] when it ends. A failed pass is reported
+//! by [`LoadEvent::RefreshFailed`] during a refresh, by
+//! [`LoadEvent::LoadFailed`] (`indexing sessions failed: …`) when the
+//! initial load's pass fails and no card is listed, and otherwise by an
+//! [`super::IndexNotice::Failed`] ([`Browser::index_failed`]).
+//!
 //! # In memory
 //!
 //! Without a store, [`HistoryLoader::poll`] never runs O(corpus) work on the
@@ -52,8 +64,9 @@
 //!   thread-priority port (upstream 8322afe/9ee0a03) covers
 //!   `store-reconcile` and its pool as well as the semantic worker.
 //! * **Waker-driven `CURRENT` checks.** Upstream's event loop read `CURRENT`
-//!   every 200 ms while a pass could publish; here the pass's `store-watch`
-//!   thread does, so an idle GUI never polls.
+//!   (and `PROGRESS`, 04c714b) every 200 ms while a pass could publish; here
+//!   the pass's `store-watch` thread does, so an idle GUI never polls. A
+//!   failed pass's message comes from its error, not from `PROGRESS`.
 //! * **Off the UI thread.** Upstream opened each generation, its index and
 //!   the cards of the browse list on the TUI thread; here a
 //!   `generation-open` thread does (see `cards`).
@@ -61,8 +74,10 @@
 //!   when the first generation is shown in full, [`LoadEvent::NoHistory`]
 //!   when the first pass leaves no card in the time filter (upstream exited
 //!   with no history found), [`LoadEvent::LoadFailed`] when it failed with
-//!   no generation, [`LoadEvent::Refreshed`] / [`LoadEvent::RefreshFailed`]
-//!   when a refresh's pass and the swap it led to are done. A swap outside a
+//!   no card listed (upstream exited with `indexing sessions failed: …`),
+//!   [`LoadEvent::Refreshed`] / [`LoadEvent::RefreshFailed`] when a
+//!   refresh's pass and the swap it led to are done (upstream showed
+//!   `Indexing failed: …` for a refresh's failed pass). A swap outside a
 //!   refresh only sets [`LoaderPoll::swapped`].
 //! * **Runtime settings.** The time filter ([`HistoryLoader::set_time_filter`])
 //!   re-scopes the cards shown and a new preview mode reopens the
@@ -79,6 +94,7 @@ use crate::error::AppError;
 use crate::history::sources::Registry;
 use crate::history::{Conversation, LoaderMessage};
 use crate::store::generation::{MergePolicy, Publish};
+use crate::store::progress::{self, Indexing};
 use crate::store::reconcile::{self, Outcome};
 use crate::store::{Generation, Snapshot};
 use crate::time_filter::TimeFilter;
@@ -462,6 +478,10 @@ struct StoreRun {
     /// The newest generation `CURRENT` named, as seen by a pass's watcher,
     /// at a pass's end or when the store was opened.
     latest: Arc<Mutex<Option<String>>>,
+    /// What `PROGRESS` said at the running pass's watcher's last check: the
+    /// progress of the pass indexing the store, by this process or another
+    /// (upstream 04c714b). `None` between passes.
+    progress: Arc<Mutex<Option<Indexing>>>,
     /// The generation an open was last started for (not started again
     /// until `CURRENT` or the preview mode changes).
     attempted: Option<(String, bool)>,
@@ -491,6 +511,7 @@ impl StoreRun {
         Self {
             root,
             latest: Arc::new(Mutex::new(latest)),
+            progress: Arc::default(),
             attempted: None,
             shown_len: 0,
             pass: None,
@@ -522,8 +543,8 @@ impl StoreRun {
         }
     }
 
-    /// Takes in what a finished pass left.
-    fn collect(&mut self, done: Option<PassResult>) {
+    /// Takes in what a finished pass left. Returns whether it failed.
+    fn collect(&mut self, done: Option<PassResult>) -> bool {
         match done {
             Some(PassResult {
                 root,
@@ -539,12 +560,28 @@ impl StoreRun {
                     Ok(publish) => {
                         self.written = Some(publish);
                         self.failed = None;
+                        false
                     }
-                    Err(error) => self.failed = Some(error),
+                    Err(error) => {
+                        self.failed = Some(error);
+                        true
+                    }
                 }
             }
-            None => self.failed = Some(std::io::Error::other("the reconcile pass stopped")),
+            None => {
+                self.failed = Some(std::io::Error::other("the reconcile pass stopped"));
+                true
+            }
         }
+    }
+
+    /// The progress of the pass indexing the store while one may run
+    /// (upstream `Store::progress`).
+    fn indexing(&self, pending: bool) -> Option<Indexing> {
+        if !pending {
+            return None;
+        }
+        *self.progress.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// No pass runs or is due and no generation is being opened.
@@ -716,6 +753,7 @@ impl HistoryLoader {
             let store = self.store.as_mut()?;
             if let Some(pass) = store.pass.take() {
                 let done = pass.join();
+                // A failure is reported by the next poll.
                 store.collect(done);
             }
             if std::mem::take(&mut store.again) {
@@ -743,6 +781,7 @@ impl HistoryLoader {
             cancel: self.cancel.clone(),
             log_path: self.env.debug_log_file(),
             latest: store.latest.clone(),
+            progress: store.progress.clone(),
             waker: self.options.waker.clone(),
         };
         #[cfg(test)]
@@ -1028,7 +1067,12 @@ impl HistoryLoader {
             return result;
         };
         if let Some(done) = take_finished(&mut store.pass) {
-            store.collect(done);
+            if store.collect(done) {
+                // Upstream `index_failed`: the indicator ends without a
+                // completion notice; the failure goes to a load event or a
+                // notice below.
+                browser.end_index_progress();
+            }
             if std::mem::take(&mut store.again) {
                 self.start_pass();
             }
@@ -1073,9 +1117,26 @@ impl HistoryLoader {
                     });
             }
         }
-        browser.set_reconciling(store.pass.is_some() || store.again);
+        // Upstream `Store::show_progress`.
+        let pending = store.pass.is_some() || store.again;
+        browser.set_reconciling(pending);
+        if !pending && store.failed.is_some() {
+            // A failed pass (however it was collected) ends the indicator
+            // without a completion notice.
+            browser.end_index_progress();
+        }
+        browser.set_index_progress(store.indexing(pending), pending);
         result.preparing = store.opening.is_some();
         result.event = self.store_event(browser);
+        // A failed pass that no load event reports (upstream `index_failed`;
+        // its TUI showed every failure in the status line).
+        if let Some(store) = &mut self.store
+            && !store.initial
+            && store.refreshing.is_none()
+            && let Some(error) = store.failed.take()
+        {
+            browser.index_failed(&failure_message(&error));
+        }
         result
     }
 
@@ -1094,13 +1155,15 @@ impl HistoryLoader {
                     return None;
                 }
                 store.initial = false;
-                return Some(if empty {
-                    no_history(time_filter_active)
-                } else {
+                return Some(if !empty {
                     LoadEvent::Loaded {
                         conversations: browser.generation_len().unwrap_or(0),
                         project_errors: 0,
                     }
+                } else if let Some(error) = store.failed.take() {
+                    indexing_failed(&error)
+                } else {
+                    no_history(time_filter_active)
                 });
             }
             if !settled {
@@ -1110,13 +1173,18 @@ impl HistoryLoader {
             store.initial = false;
             browser.finish_loading();
             return Some(match store.failed.take() {
-                Some(error) => LoadEvent::LoadFailed(AppError::Io(error)),
+                Some(error) => indexing_failed(&error),
                 None => no_history(time_filter_active),
             });
         }
         if store.refreshing.is_some() && settled {
             let old = store.refreshing.take().unwrap_or_default();
             return Some(match store.failed.take() {
+                Some(error) if browser.generation_is_empty() => {
+                    // Nothing listed (a retry of the first launch's error):
+                    // the same text as the initial load's failure.
+                    LoadEvent::RefreshFailed(AppError::Io(indexing_failed_error(&error)))
+                }
                 Some(error) => LoadEvent::RefreshFailed(AppError::Io(error)),
                 None => LoadEvent::Refreshed {
                     old,
@@ -1127,6 +1195,31 @@ impl HistoryLoader {
         }
         None
     }
+}
+
+/// The first line of a failed pass's error (upstream: the message its
+/// `--reconcile` child left in `PROGRESS`).
+fn failure_message(error: &std::io::Error) -> String {
+    error
+        .to_string()
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// The initial load's first pass failed and no card is listed (upstream:
+/// the TUI exited with this error instead of "no history").
+fn indexing_failed(error: &std::io::Error) -> LoadEvent {
+    LoadEvent::LoadFailed(AppError::Io(indexing_failed_error(error)))
+}
+
+/// The error text of a failed pass with no card listed.
+fn indexing_failed_error(error: &std::io::Error) -> std::io::Error {
+    std::io::Error::other(format!(
+        "indexing sessions failed: {}",
+        failure_message(error)
+    ))
 }
 
 /// `NoHistoryFound` for the scope (and time range) shown.
@@ -1348,7 +1441,10 @@ struct ReconcileJob {
     log_path: Option<PathBuf>,
     /// The newest `CURRENT` the watcher saw, shared with the loader.
     latest: Arc<Mutex<Option<String>>>,
-    /// Called when the watcher sees a newer `CURRENT`.
+    /// What `PROGRESS` said at the watcher's last check, shared with the
+    /// loader.
+    progress: Arc<Mutex<Option<Indexing>>>,
+    /// Called when the watcher sees a newer `CURRENT` or new progress.
     waker: Option<Waker>,
 }
 
@@ -1369,6 +1465,7 @@ fn reconcile_store(job: ReconcileJob) -> PassResult {
         cancel,
         log_path,
         latest,
+        progress,
         waker,
     } = job;
     let cancelled = || cancel.is_set();
@@ -1390,7 +1487,7 @@ fn reconcile_store(job: ReconcileJob) -> PassResult {
             .name("store-watch".into())
             .stack_size(8 * 1024 * 1024)
             .spawn_scoped(scope, || {
-                watch_current(&root, &latest, waker.as_ref(), &done, &cancel)
+                watch_current(&root, &latest, &progress, waker.as_ref(), &done, &cancel)
             });
         let mut busy_logged = false;
         let result = pool.and_then(|pool| {
@@ -1435,6 +1532,9 @@ fn reconcile_store(job: ReconcileJob) -> PassResult {
         && !given_up
     {
         log(&format!("Failed to build list snapshot: {err}"));
+        // Upstream's `--reconcile` entry point left the message for the TUI
+        // that started it; here the loader takes it from the error.
+        progress::record_failure(&root, &err.to_string());
     }
     PassResult {
         current: Generation::current_name(&root),
@@ -1444,33 +1544,43 @@ fn reconcile_store(job: ReconcileJob) -> PassResult {
 }
 
 /// The `store-watch` thread: until `done` (or `cancel`), checks `CURRENT`
-/// every [`GENERATION_POLL`] and records a newer generation in `latest`,
-/// then calls the waker.
+/// and `PROGRESS` every [`GENERATION_POLL`], records a newer generation in
+/// `latest` and the progress of the pass indexing the store (by this process
+/// or another; upstream read it whenever it polled `CURRENT`) in `progress`,
+/// and calls the waker when either changed. Clears `progress` when it ends.
 fn watch_current(
     root: &Path,
     latest: &Mutex<Option<String>>,
+    progress: &Mutex<Option<Indexing>>,
     waker: Option<&Waker>,
     done: &Cancel,
     cancel: &Cancel,
 ) {
     while !done.sleep(GENERATION_POLL) && !cancel.is_set() {
-        let Some(current) = Generation::current_name(root) else {
-            continue;
+        let indexing = match progress::read(root) {
+            Some(progress::Status::Indexing(indexing)) => Some(indexing),
+            Some(progress::Status::Failed(_)) | None => None,
         };
-        {
+        let mut changed = {
+            let mut shown = progress.lock().unwrap_or_else(PoisonError::into_inner);
+            std::mem::replace(&mut *shown, indexing) != indexing
+        };
+        if let Some(current) = Generation::current_name(root) {
             let mut seen = latest.lock().unwrap_or_else(PoisonError::into_inner);
             if seen
                 .as_deref()
-                .is_some_and(|seen| generation_number(seen) >= generation_number(&current))
+                .is_none_or(|seen| generation_number(seen) < generation_number(&current))
             {
-                continue;
+                *seen = Some(current);
+                changed = true;
             }
-            *seen = Some(current);
         }
-        if let Some(waker) = waker {
+        if changed && let Some(waker) = waker {
             waker();
         }
     }
+    // The pass is over: what it reported no longer applies.
+    *progress.lock().unwrap_or_else(PoisonError::into_inner) = None;
 }
 
 /// Forward loader messages through a new channel, calling `waker` after

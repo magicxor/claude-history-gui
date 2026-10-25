@@ -64,6 +64,14 @@
 //!   every [`generation::LOCK_WAIT_POLL`]) and the card reads up once a flag
 //!   is set. Each pass's outcome goes to the debug sink at the caller's
 //!   level (upstream used the level only when it parsed the files instead).
+//! * **Indexing progress in-process.** A pass's [`progress::Reporter`]
+//!   writes `PROGRESS` from a thread of the GUI process that runs the pass
+//!   (upstream: of the detached `--reconcile` child), and the list reads it
+//!   on the pass's `store-watch` thread, which wakes the poll when it
+//!   changes (upstream's TUI read it at every `CURRENT` poll). A failed pass
+//!   still records `failed <message>`, but the GUI takes the message from
+//!   the pass's error. Off Unix [`progress::read`] cannot tell a dead
+//!   process's line (as upstream); the next pass to take `LOCK` removes it.
 //! * **Old caches.** [`legacy`] cleans the GUI's own cache dir, where fork
 //!   releases wrote the same per-project and Pi/OMP caches as upstream; a
 //!   pass never cleans a cache dir inside the installed CLI's
@@ -89,6 +97,7 @@ pub mod card;
 pub mod generation;
 pub mod legacy;
 pub mod lexindex;
+pub mod progress;
 pub mod reconcile;
 pub mod search;
 pub mod segments;

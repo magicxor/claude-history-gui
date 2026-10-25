@@ -9,7 +9,9 @@
 //! refresh or a reload runs a reconcile pass and ends when the generation it
 //! left is shown, a time filter re-scopes the cards, and a generation swapped
 //! in outside a refresh only reports `LoaderPoll::swapped` (the corpus
-//! changed under the list).
+//! changed under the list). A pass shown as indexing that ends, or a failed
+//! pass no load event reports, leaves an `IndexNotice` (upstream 04c714b's
+//! status messages), shown as a toast that replaces the refresh toasts.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -17,7 +19,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use claude_history_core::browser::{
-    ListSearchMode, LoadEvent, PreparedSession, RefreshPolicy, UuidLookup,
+    IndexNotice, ListSearchMode, LoadEvent, PreparedSession, RefreshPolicy, UuidLookup,
 };
 use claude_history_core::history;
 use claude_history_core::time_filter::TimeFilter;
@@ -122,6 +124,8 @@ impl ListPane {
             Some(LoadEvent::Refreshed { .. }) => Some(BusySpan::RefreshEnd),
             _ => None,
         };
+        // Before the event: a refresh's toast replaces the notice of its pass.
+        self.check_index_notice(window, cx);
         match loader_poll.event {
             Some(event) => self.on_load_event(event, window, cx),
             // A newer generation swapped in by a background pass.
@@ -346,6 +350,36 @@ impl ListPane {
         }
         cx.emit(ListPaneEvent::LoadStateChanged);
         cx.notify();
+    }
+
+    /// What a reconcile pass left for the status line (upstream 04c714b):
+    /// `Indexed <n> conversations` once a pass shown as indexing ends, or
+    /// `Indexing failed: <message>` for a failed pass that no load event
+    /// reports (§11.2). One toast at a time with the refresh toasts, as
+    /// upstream's status line held one message.
+    fn check_index_notice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(notice) = self.browser.take_index_notice() else {
+            return;
+        };
+        match &notice {
+            IndexNotice::Indexed { .. } => {
+                let text = crate::notify::gui_text(&notice.status_message());
+                self.toast(
+                    Toast::success(text).replacing::<RefreshToast>("refresh"),
+                    Vec::new(),
+                    window,
+                    cx,
+                );
+            }
+            IndexNotice::Failed(_) => {
+                let toast = Toast::error(notice.status_message())
+                    .replacing::<RefreshToast>("refresh")
+                    .action("Show debug log", |window, cx| {
+                        window.dispatch_action(Box::new(ShowDebugLog), cx);
+                    });
+                self.toast(toast, vec!["Show debug log".to_string()], window, cx);
+            }
+        }
     }
 
     /// `N project(s) could not be loaded. See Tools → Debug log.` (§11.2).

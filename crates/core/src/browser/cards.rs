@@ -51,12 +51,20 @@
 //!   the frames of the visible rows the worker left without evidence on a
 //!   `row-evidence` thread (upstream: on the TUI thread, every frame), which
 //!   the browser joins when it is dropped.
+//! * **Indexing status (upstream 04c714b).** The browser has no status
+//!   line: the completion and failure messages a reconcile pass shown as
+//!   indexing leaves are an [`IndexNotice`] the GUI takes
+//!   ([`Browser::take_index_notice`]), and [`Browser::index_progress`]
+//!   gives the counts for a progress bar. A failure that a load event
+//!   reports ends the indicator without a notice.
 
 use super::index::{CardScope, CorpusIndex, ScopeIndex};
-use super::{Browser, CorpusSnapshot, ListSearchMode, SNAPSHOT_ROWS, UuidLookup};
+use super::{Browser, CorpusSnapshot, IndexNotice, ListSearchMode, SNAPSHOT_ROWS, UuidLookup};
+use crate::display_format::group_digits;
 use crate::history::Conversation;
 use crate::search::LexicalEvidence;
 use crate::search::query::ParsedQuery;
+use crate::store::progress::Indexing;
 use crate::store::{SearchIndex, Snapshot};
 use crate::time_filter::TimeFilter;
 use std::collections::{HashMap, HashSet};
@@ -647,6 +655,65 @@ impl Browser {
         } else {
             super::ReconcileState::Done
         };
+    }
+
+    /// Records the progress the running reconcile pass reports, if any,
+    /// and whether a pass still runs. The indicator stays up until no pass
+    /// runs, and a pass that was shown then leaves a completion notice
+    /// ([`Browser::take_index_notice`]; upstream 04c714b: a status
+    /// message).
+    pub fn set_index_progress(&mut self, progress: Option<Indexing>, running: bool) {
+        if progress.is_some() {
+            self.indexing = progress;
+        } else if !running && let Some(shown) = self.indexing.take() {
+            self.index_notice = Some(IndexNotice::Indexed { total: shown.total });
+        }
+    }
+
+    /// Reports a reconcile pass that failed with `message`.
+    pub fn index_failed(&mut self, message: &str) {
+        self.indexing = None;
+        self.index_notice = Some(IndexNotice::Failed(message.to_owned()));
+    }
+
+    /// Ends the indicator of a failed pass without a notice (fork: a load
+    /// event reports that failure instead, or decides later whether one
+    /// does).
+    pub(super) fn end_index_progress(&mut self) {
+        self.indexing = None;
+    }
+
+    /// Bottom bar text while a reconcile pass is shown as indexing.
+    pub fn indexing_status_text(&self) -> Option<String> {
+        let progress = self.indexing?;
+        let mut text = if progress.done < progress.total {
+            format!(
+                "Indexing sessions\u{2026} {} / {}",
+                group_digits(progress.done),
+                group_digits(progress.total)
+            )
+        } else {
+            format!(
+                "Finishing index\u{2026} {} sessions",
+                group_digits(progress.total)
+            )
+        };
+        if !self.query.trim().is_empty() {
+            text.push_str("  \u{b7}  results may be incomplete");
+        }
+        Some(text)
+    }
+
+    /// The progress of the pass shown as indexing (fork: the GUI draws it
+    /// as a bar).
+    pub fn index_progress(&self) -> Option<Indexing> {
+        self.indexing
+    }
+
+    /// Takes what the last pass shown as indexing, or a failed one, left
+    /// for the status line (fork: upstream set the TUI's status message).
+    pub fn take_index_notice(&mut self) -> Option<IndexNotice> {
+        self.index_notice.take()
     }
 
     /// Hides the rows of `paths` in generation mode (upstream

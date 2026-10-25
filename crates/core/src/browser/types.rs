@@ -129,6 +129,34 @@ pub enum ReconcileState {
     Done,
 }
 
+/// What a reconcile pass left for the status line (upstream 04c714b: the
+/// TUI's status message), taken once with
+/// [`super::Browser::take_index_notice`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IndexNotice {
+    /// A pass shown as indexing ended: `total` sessions were indexed.
+    Indexed { total: usize },
+    /// A pass failed with this message (the first line of its error), and
+    /// no load event reports it.
+    Failed(String),
+}
+
+impl IndexNotice {
+    /// The upstream status message (`Indexed 7,185 sessions`,
+    /// `Indexing failed: <message>`).
+    pub fn status_message(&self) -> String {
+        match self {
+            IndexNotice::Indexed { total } => {
+                format!(
+                    "Indexed {} sessions",
+                    crate::display_format::group_digits(*total)
+                )
+            }
+            IndexNotice::Failed(message) => format!("Indexing failed: {message}"),
+        }
+    }
+}
+
 /// Result of [`super::Browser::escape`] (upstream: Esc in the list).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EscapeOutcome {

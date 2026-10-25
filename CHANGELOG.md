@@ -4,6 +4,11 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 ## Unreleased
 
+- While the conversation index is being built (the first start, or after an update changed its format), the list
+  footer shows its progress ("Indexing conversations… 2,345 / 7,185") and says that search results may be
+  incomplete while you type; a message says when it is done. A failed index update is reported ("Indexing
+  failed: …", with the debug log one click away) instead of only in the debug log, and when nothing could be
+  listed at all the list shows the error with Retry.
 - Codex exec runs and subagent threads can be listed on request: Ctrl+G (View > Show automated and subagent
   conversations, rebindable as `[keys] all_kinds`) or `--all-kinds` brings them into the list and its keyword search,
   tagged `auto` or `sub`, keeping the query and the selection. Deep Search's "Include exec and subagent runs" (`agent
