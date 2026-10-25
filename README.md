@@ -245,9 +245,38 @@ alias claude-history='claude-history-gui'
 @claude-history-gui.exe %*
 ```
 
-Semantic modes load the embedding model like the original (downloaded on first use into
-`~/.cache/claude-history-gui/semantic/fastembed`). The model is snowflake-arctic-embed-xs; after an update that
-changes the embedding model the history is re-embedded in the background and the old model download is removed.
+### Semantic search
+
+This section is about the GUI's search box and the `--generate-semantic-cache` flag, not the agent subcommand above.
+
+Semantic search finds conversations by meaning, so `fix flaky reconnect after laptop sleep` can find a
+conversation that never uses those exact words. Results blend meaning with keyword matches and show the passage
+that matched best. It runs entirely on your machine: the first semantic search downloads the embedding model,
+[snowflake-arctic-embed-xs](https://huggingface.co/Snowflake/snowflake-arctic-embed-xs) (about 90 MB), to `~/.cache/claude-history-gui/semantic/fastembed`.
+
+**Indexing.** Each conversation has to be embedded before semantic search can find it. Embedding never blocks you:
+
+* While the app is open, new conversations are embedded in the background, newest first, at low priority on half
+  the CPU cores. Startup, the list and keyword search never wait for it.
+* Semantic searches answer right away from the conversations embedded so far. The footer shows `sem indexing` with
+  progress, and the results refresh when it finishes.
+* If nothing embedded matches yet, exact keyword matches are shown instead.
+
+Background embedding only runs while the app is open. To embed everything at once, use Tools > Generate semantic
+cache (or start with `--generate-semantic-cache`, which opens that dialog). Run it again any time; it only embeds
+what is new. After an update that changes the embedding model, the history is re-embedded in the background and the
+old model download is removed. Codex exec runs and subagent transcripts are never embedded, so only keyword search
+finds them.
+
+**Exact text.** Quoted text works in semantic mode too: `deployment "DEPLOYMENT_TOKEN"` finds conversations about
+deployment whose matching passage also contains `DEPLOYMENT_TOKEN`. A query that is only quoted text returns exact
+matches, newest first.
+
+**Deep search.** Its semantic and hybrid modes rank what is already embedded and never start embedding themselves,
+so indexing never slows a search down. Searching within one conversation embeds at most 32 of its missing passages.
+Run Generate semantic cache first to make sure everything is covered.
+
+**Switching modes.** Ctrl+T toggles between lexical and semantic search in the list.
 
 ### Windows console output
 
