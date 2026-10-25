@@ -22,6 +22,7 @@
 use crate::debug::DebugLevel;
 use crate::env::{HistoryEnv, WorkspaceScope};
 use crate::error::{AppError, Result};
+use crate::history::sources::Registry;
 use crate::history::{self, Conversation, ParseError, Source};
 use crate::search;
 use crate::search::literal::CaseMode;
@@ -495,8 +496,18 @@ impl From<Box<SessionDeleteFailure>> for AppError {
 /// * OMP: `path`, if it is a `.jsonl` OMP session, plus its artifact
 ///   directory when it exists.
 ///
-/// Nothing is removed.
+/// A source whose adapter cannot delete (`Adapter::capabilities`, upstream
+/// 9799550) is refused with [`AppError::Unsupported`]. Nothing is removed.
 pub fn plan_session_delete(env: &HistoryEnv, path: &Path, source: Source) -> Result<DeletePlan> {
+    if !Registry::from_env(env)
+        .for_source(source)
+        .capabilities()
+        .delete
+    {
+        return Err(AppError::Unsupported(history::actions::refusal(
+            source, "Deleting",
+        )));
+    }
     let not_found = || AppError::SessionNotFound(path.display().to_string());
     let is_jsonl = path.extension().and_then(|extension| extension.to_str()) == Some("jsonl");
     match source {

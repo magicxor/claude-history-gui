@@ -12,6 +12,7 @@
 //! - `parser` - Parsing individual JSONL files
 //! - `path` - Path encoding/decoding utilities
 
+pub mod actions;
 pub mod adapter;
 #[cfg(test)]
 mod feature_tests;

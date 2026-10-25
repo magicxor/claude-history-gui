@@ -1,8 +1,10 @@
 //! Pi and OMP: one JSONL session file per conversation, in per-project
 //! directories of a session root or directly in a flat one.
 
+use crate::env::{HistoryEnv, WorkspaceScope};
 use crate::error::Result;
 use crate::history::ParseError;
+use crate::history::actions::{Capabilities, Target};
 use crate::history::adapter::{Adapter, Completeness, Discovery, Located};
 use crate::history::model::{
     ConversationKey, EventKind, ExecutionMode, HeadStatus, Origin, Relationship, Revision, Role,
@@ -11,6 +13,7 @@ use crate::history::model::{
 use crate::history::omp_loader::{self, OmpSessionRoot};
 use crate::history::pi::PiProjection;
 use crate::history::pi_loader::{self, PiSessionRoot};
+use crate::resume::{ResumeKind, ResumePlan};
 use chrono::{DateTime, Utc};
 use std::path::Path;
 use std::time::SystemTime;
@@ -74,6 +77,47 @@ impl Adapter for PiAdapter {
     fn decode(&self, located: &Located) -> Result<Option<Transcript>> {
         let omp_owned = self.instance.kind == SourceKind::Omp && omp_owned(&self.instance.root);
         super::decode_file(located, omp_owned)
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::ALL
+    }
+
+    /// Pi resumes a session file in place (`pi --session`, `omp --resume`)
+    /// or forks it into a new one (`--fork`). Planned by
+    /// `resume::plan_native`, which runs a fork in the workspace (upstream's
+    /// cwd).
+    fn resume(
+        &self,
+        _env: &HistoryEnv,
+        target: Target<'_>,
+        workspace: Option<&WorkspaceScope>,
+        fork: bool,
+        _default_args: &[String],
+        program_override: Option<&Path>,
+    ) -> Result<ResumePlan> {
+        Ok(crate::resume::plan_native(
+            self.instance.kind,
+            target,
+            workspace,
+            ResumeKind::from_fork(fork),
+            program_override,
+        ))
+    }
+
+    fn delete(&self, _env: &HistoryEnv, path: &Path) -> Result<usize> {
+        match self.instance.kind {
+            SourceKind::Omp => omp_loader::delete_session(path),
+            _ => pi_loader::delete_session(path),
+        }
+        .map(|()| 1)
+    }
+
+    fn rename(&self, path: &Path, title: &str) -> Result<()> {
+        match self.instance.kind {
+            SourceKind::Omp => crate::history::pi::append_omp_session_rename(path, title),
+            _ => crate::history::pi::append_session_rename(path, title),
+        }
     }
 }
 

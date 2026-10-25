@@ -1,5 +1,6 @@
 //! Resume / fork planning and cross-project session copy (upstream
-//! `main.rs:1788-2020`).
+//! `main.rs:1788-2020`; since 9799550 the `resume` of upstream's Claude and Pi
+//! adapters).
 //!
 //! Upstream resolved what to run from the process cwd and then `exec`ed
 //! `claude`/`pi`/`omp` in the terminal it was running in. A GUI has neither a
@@ -12,6 +13,15 @@
 //! 2. [`execute_copy`] performs that copy (after the GUI confirmed it).
 //! 3. [`terminal`] turns the plan into a command that opens a terminal window
 //!    running it, and [`launch`] spawns that.
+//!
+//! Planning goes through the source adapter of the conversation (upstream
+//! 9799550): [`plan_resume_target`] takes the adapter of the target's source
+//! (`history::sources::Registry::for_source`), refuses an action it does not
+//! support (`Adapter::capabilities`; upstream's `<source> sessions cannot be
+//! resumed` / `forked`) and has it plan: the Claude adapter with `plan_claude`,
+//! the Pi adapter (Pi and OMP) with `plan_native`. Unlike upstream, whose
+//! command builders moved into the adapters, the planners stay here with the
+//! plan types and their tests.
 //!
 //! # Claude semantics (GUI)
 //!
@@ -52,6 +62,8 @@ pub mod terminal;
 use crate::config::GuiSettings;
 use crate::env::{HistoryEnv, WorkspaceScope};
 use crate::error::{AppError, Result};
+use crate::history::actions::Target;
+use crate::history::sources::Registry;
 use crate::history::{Conversation, Source};
 use crate::program::ResolvedProgram;
 use std::ffi::OsString;
@@ -68,16 +80,18 @@ pub const WORKSPACE_REQUIRED_RESUME: &str = "Choose a workspace folder to resume
 /// and none is selected.
 pub const WORKSPACE_REQUIRED_FORK: &str = "Choose a workspace folder to fork this session";
 
-/// Upstream's decision for Claude sessions (`main.rs:1795-1799`), kept for
-/// parity and tests. The GUI uses [`plan_resume`].
+/// Upstream's decision for Claude sessions (`ResumeAction` of
+/// `sources/claude.rs`, before 9799550 `main.rs:1795-1799`), kept for parity
+/// and tests. The GUI uses [`plan_resume`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClaudeResumeAction {
     Run { current_dir: PathBuf },
     CopyToCurrent { cwd_projects_dir: PathBuf },
 }
 
-/// Upstream `resolve_claude_resume_action` (`main.rs:1801-1834`), verbatim
-/// except that `cwd` is explicit and paths come from `env`.
+/// Upstream `resolve_resume_action` (`sources/claude.rs`, before 9799550
+/// `resolve_claude_resume_action` in `main.rs:1801-1834`), verbatim except
+/// that `cwd` is explicit and paths come from `env`.
 ///
 /// * the project path is missing or not a directory, or (`fork_session` and
 ///   the cwd's projects dir differs from the session's): copy into the cwd's
@@ -211,6 +225,16 @@ pub struct ResumeTarget {
     pub project_path: Option<PathBuf>,
 }
 
+impl ResumeTarget {
+    /// The conversation an adapter acts on.
+    pub fn target(&self) -> Target<'_> {
+        Target {
+            path: &self.path,
+            project: self.project_path.as_deref(),
+        }
+    }
+}
+
 impl From<&Conversation> for ResumeTarget {
     fn from(conversation: &Conversation) -> Self {
         Self {
@@ -336,6 +360,11 @@ pub fn plan_resume(
 
 /// [`plan_resume`] for a session given by path (for example a JSONL file
 /// that is not part of the loaded list).
+///
+/// The adapter of the target's source plans it (`Adapter::resume`), after
+/// checking that it supports the action (`Adapter::capabilities`; upstream's
+/// `Failed to run Claude CLI: <source> sessions cannot be resumed|forked`
+/// otherwise).
 pub fn plan_resume_target(
     env: &HistoryEnv,
     target: &ResumeTarget,
@@ -344,21 +373,38 @@ pub fn plan_resume_target(
     default_args: &[String],
     programs: &ProgramOverrides,
 ) -> Result<ResumePlan> {
-    let kind = ResumeKind::from_fork(fork);
-    let program_override = programs.for_source(target.source).map(Path::to_path_buf);
-    match target.source {
-        Source::Claude => plan_claude(env, target, workspace, kind, default_args, program_override),
-        Source::Pi | Source::Omp => Ok(plan_native(target, workspace, kind, program_override)),
+    let source = target.source;
+    let adapter = Registry::from_env(env).for_source(source);
+    let capabilities = adapter.capabilities();
+    if !(if fork {
+        capabilities.fork
+    } else {
+        capabilities.resume
+    }) {
+        return Err(AppError::ClaudeExecutionError(format!(
+            "{} sessions cannot be {}",
+            source.list_label(),
+            if fork { "forked" } else { "resumed" }
+        )));
     }
+    adapter.resume(
+        env,
+        target.target(),
+        workspace,
+        fork,
+        default_args,
+        programs.for_source(source),
+    )
 }
 
-fn plan_claude(
+/// The Claude adapter's resume plan (see the module docs for its rules).
+pub(crate) fn plan_claude(
     env: &HistoryEnv,
-    target: &ResumeTarget,
+    target: Target<'_>,
     workspace: Option<&WorkspaceScope>,
     kind: ResumeKind,
     default_args: &[String],
-    program_override: Option<PathBuf>,
+    program_override: Option<&Path>,
 ) -> Result<ResumePlan> {
     let conversation_id = target
         .path
@@ -371,14 +417,13 @@ fn plan_claude(
     // A stray `..jsonl` (stem `.`) or `abc..jsonl` (stem `abc.`, a Windows
     // alias of `abc`) is not a session: `--resume .` is meaningless and the
     // copy below would treat the whole project directory as the session's.
-    if !is_session_transcript(&target.path, &conversation_id) {
-        return Err(not_a_session_transcript(&target.path));
+    if !is_session_transcript(target.path, &conversation_id) {
+        return Err(not_a_session_transcript(target.path));
     }
     let conv_projects_dir = target.path.parent().ok_or_else(no_project_dir_error)?;
 
     let project_dir = target
-        .project_path
-        .as_deref()
+        .project
         .filter(|path| path.is_dir())
         .map(Path::to_path_buf);
     let project_maps = match &project_dir {
@@ -437,7 +482,7 @@ fn plan_claude(
     let copy = if strategy == ResumeStrategy::CopyToWorkspace {
         let target_dir = workspace_projects_dir.expect("strategy implies a workspace");
         let plan = plan_session_copy(
-            &target.path,
+            target.path,
             &conversation_id,
             conv_projects_dir,
             &target_dir,
@@ -464,9 +509,9 @@ fn plan_claude(
         source: Source::Claude,
         kind,
         strategy,
-        session_path: target.path.clone(),
+        session_path: target.path.to_path_buf(),
         program: program_name(Source::Claude).to_string(),
-        program_override,
+        program_override: program_override.map(Path::to_path_buf),
         args,
         cwd: Some(cwd),
         copy,
@@ -474,21 +519,24 @@ fn plan_claude(
     })
 }
 
-/// Upstream `build_pi_resume_command` / `build_omp_resume_command`
-/// (`main.rs:1860-1886`) as data. Resume runs in the session's project
-/// directory; fork inherited upstream's cwd, which is the workspace here.
-fn plan_native(
-    target: &ResumeTarget,
+/// The Pi adapter's resume plan for a `source` (Pi or OMP) session: upstream
+/// `build_pi_resume_command` / `build_omp_resume_command` (`sources/pi.rs`,
+/// before 9799550 `main.rs:1860-1886`) as data. Resume runs in the session's
+/// project directory; fork inherited upstream's cwd, which is the workspace
+/// here.
+pub(crate) fn plan_native(
+    source: Source,
+    target: Target<'_>,
     workspace: Option<&WorkspaceScope>,
     kind: ResumeKind,
-    program_override: Option<PathBuf>,
+    program_override: Option<&Path>,
 ) -> ResumePlan {
-    let flag = match (target.source, kind) {
+    let flag = match (source, kind) {
         (_, ResumeKind::Fork) => "--fork",
         (Source::Omp, ResumeKind::Resume) => "--resume",
         (_, ResumeKind::Resume) => "--session",
     };
-    let existing_project = target.project_path.as_deref().filter(|path| path.is_dir());
+    let existing_project = target.project.filter(|path| path.is_dir());
     let existing_workspace = workspace
         .map(WorkspaceScope::dir)
         .filter(|dir| dir.is_dir());
@@ -498,7 +546,7 @@ fn plan_native(
             if let Some(project) = existing_project {
                 Some(project.to_path_buf())
             } else {
-                if let Some(project) = &target.project_path {
+                if let Some(project) = target.project {
                     warnings.push(format!(
                         "Session directory {} does not exist",
                         project.display()
@@ -512,13 +560,13 @@ fn plan_native(
             .map(Path::to_path_buf),
     };
     ResumePlan {
-        source: target.source,
+        source,
         kind,
         strategy: ResumeStrategy::Native,
-        session_path: target.path.clone(),
-        program: program_name(target.source).to_string(),
-        program_override,
-        args: vec![OsString::from(flag), target.path.clone().into_os_string()],
+        session_path: target.path.to_path_buf(),
+        program: program_name(source).to_string(),
+        program_override: program_override.map(Path::to_path_buf),
+        args: vec![OsString::from(flag), target.path.as_os_str().to_os_string()],
         cwd,
         copy: None,
         warnings,
@@ -746,7 +794,8 @@ mod tests {
         args.iter().map(OsString::from).collect()
     }
 
-    // --- Upstream tests (main.rs:1716-1785), with a sandbox env. ---
+    // --- Upstream tests (`sources/claude.rs`, before 9799550
+    // `main.rs:1716-1785`), with a sandbox env. ---
 
     #[test]
     fn resume_action_uses_cwd_when_it_maps_to_selected_project_dir() {
@@ -822,7 +871,8 @@ mod tests {
         );
     }
 
-    // --- Upstream Pi/OMP command tests (main.rs:568-605) as plans. ---
+    // --- Upstream Pi/OMP command tests (`sources/pi.rs`, before 9799550
+    // `main.rs:568-605`) as plans. ---
 
     #[test]
     fn pi_resume_and_fork_commands_use_native_paths_without_claude_defaults() {

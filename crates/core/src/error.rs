@@ -45,6 +45,12 @@ pub enum AppError {
     #[error("Failed to launch terminal: {0}")]
     TerminalLaunch(String),
 
+    /// An action the adapter of the conversation's source does not support
+    /// (upstream 9799550 shows the text as a TUI status message,
+    /// `history::actions::refusal`). The text is shown verbatim.
+    #[error("{0}")]
+    Unsupported(String),
+
     #[error("Configuration error: {0}")]
     ConfigError(String),
 
@@ -140,6 +146,10 @@ mod tests {
             (
                 AppError::TerminalLaunch("no terminal".into()),
                 "Failed to launch terminal: no terminal".into(),
+            ),
+            (
+                AppError::Unsupported("Deleting Pi sessions is not supported".into()),
+                "Deleting Pi sessions is not supported".into(),
             ),
         ];
         for (error, expected) in cases {

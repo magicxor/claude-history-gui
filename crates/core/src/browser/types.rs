@@ -4,6 +4,7 @@
 
 use crate::error::AppError;
 use crate::history::Source;
+use crate::history::actions::refusal;
 use crate::search::mode::TuiSearchMode;
 use crate::search::query::ParsedQuery;
 use crate::semantic::types::{SemanticExplanation, SemanticScoreBreakdown};
@@ -177,6 +178,9 @@ pub enum RenameError {
     NoTarget,
     /// The session re-parsed to nothing after the rename was written.
     BecameEmpty,
+    /// The adapter of the session's source cannot rename its conversations
+    /// (upstream 9799550; the TUI's status message).
+    Unsupported(Source),
     /// Writing or re-parsing the session failed.
     Failed(AppError),
 }
@@ -187,6 +191,7 @@ impl fmt::Display for RenameError {
         match self {
             RenameError::NoTarget => f.write_str("Failed to rename: session not found"),
             RenameError::BecameEmpty => f.write_str("Failed to rename: conversation became empty"),
+            RenameError::Unsupported(source) => f.write_str(&refusal(*source, "Renaming")),
             RenameError::Failed(error) => write!(f, "Failed to rename: {error}"),
         }
     }
@@ -211,6 +216,9 @@ pub enum DeleteError {
     NoTarget,
     /// Single-file mode has no list; upstream disabled delete there.
     SingleFileMode,
+    /// The adapter of the session's source cannot delete its conversations
+    /// (upstream 9799550; the TUI's status message).
+    Unsupported(Source),
     /// The files could not be removed (upstream only logged this).
     Failed { path: PathBuf, error: AppError },
 }
@@ -222,6 +230,7 @@ impl fmt::Display for DeleteError {
             DeleteError::SingleFileMode => {
                 f.write_str("Deleting is not available for a single opened file")
             }
+            DeleteError::Unsupported(source) => f.write_str(&refusal(*source, "Deleting")),
             // Upstream's debug-log line.
             DeleteError::Failed { path, error } => {
                 write!(f, "Failed to delete session {}: {}", path.display(), error)
@@ -279,6 +288,15 @@ mod tests {
             }
             .to_string(),
             "Failed to delete session a.jsonl: Session not found: a"
+        );
+        // Upstream 9799550's TUI status messages for refused actions.
+        assert_eq!(
+            RenameError::Unsupported(Source::Omp).to_string(),
+            "Renaming OMP sessions is not supported"
+        );
+        assert_eq!(
+            DeleteError::Unsupported(Source::Pi).to_string(),
+            "Deleting Pi sessions is not supported"
         );
         assert_eq!(
             UuidLookup::NotFound {

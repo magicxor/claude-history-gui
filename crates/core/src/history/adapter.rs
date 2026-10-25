@@ -4,12 +4,29 @@
 //! its conversations with one `stat` per artifact (`discover`), picking the
 //! history a conversation's key selects (`resolve`), and decoding that
 //! history into a `Transcript`. Everything downstream works on transcripts.
+//! It also plans the actions the source's own tool offers (`actions`).
 //!
 //! Discovery feeds reconcile's fingerprint diff, so it must be cheap and must
 //! say when it is incomplete: a conversation that a partial or degraded
 //! listing did not report may still exist, and its stored state is kept.
+//!
+//! # Differences from upstream
+//!
+//! * **Actions with the fork's types and an explicit env.**
+//!   [`Adapter::resume`] plans a [`ResumePlan`] from the [`HistoryEnv`], the
+//!   workspace that replaces upstream's process cwd and the user's program
+//!   path, instead of a `Resume` holding a `std::process::Command` (see
+//!   [`super::actions`]). [`Adapter::delete`] takes the env (Claude deletes
+//!   every copy of the session under the env's projects root, as upstream
+//!   does under the process environment's) and returns the number of
+//!   transcripts removed. A GUI plans a deletion and confirms it first
+//!   (`maintenance::plan_session_delete`, gated by
+//!   [`Adapter::capabilities`]).
 
+use super::actions::{Capabilities, Target};
 use super::model::{ConversationKey, SourceInstance, Transcript};
+use crate::env::{HistoryEnv, WorkspaceScope};
+use crate::resume::ResumePlan;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -124,6 +141,32 @@ pub trait Adapter: Send + Sync {
     /// Decodes the history `located` selects; `None` when its artifacts
     /// hold no conversation.
     fn decode(&self, located: &Located) -> crate::error::Result<Option<Transcript>>;
+
+    fn capabilities(&self) -> Capabilities;
+
+    /// Plans resuming `target` in the tool that wrote it, or forking it
+    /// into a new conversation. `default_args` are the user's extra
+    /// arguments for tools that take them.
+    ///
+    /// Not in upstream: `env`, `workspace` (it stands in for upstream's
+    /// process cwd) and `program_override` (the user's path of the tool's
+    /// program).
+    fn resume(
+        &self,
+        env: &HistoryEnv,
+        target: Target<'_>,
+        workspace: Option<&WorkspaceScope>,
+        fork: bool,
+        default_args: &[String],
+        program_override: Option<&Path>,
+    ) -> crate::error::Result<ResumePlan>;
+
+    /// Deletes the conversation whose own artifact is `path`, returning the
+    /// number of transcripts removed (not in upstream, like `env`).
+    fn delete(&self, env: &HistoryEnv, path: &Path) -> crate::error::Result<usize>;
+
+    /// Sets the title of the conversation whose own artifact is `path`.
+    fn rename(&self, path: &Path, title: &str) -> crate::error::Result<()>;
 }
 
 #[cfg(test)]

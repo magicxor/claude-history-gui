@@ -2,7 +2,8 @@
 //! the delete branch of `tui/runtime.rs`).
 
 use super::{Browser, DeleteError, DeletedSession, ListSearchMode, PreparedSession, RenameError};
-use crate::history::{self, Conversation, Source};
+use crate::history::sources::Registry;
+use crate::history::{self, Conversation};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -120,7 +121,8 @@ impl Browser {
     /// Delete the loaded session at `path` from disk and from the list
     /// (capture the path when the confirmation opens; addendum A1).
     ///
-    /// The implementation follows that conversation's own source (A2):
+    /// The adapter of that conversation's own source (A2) deletes it
+    /// (`Adapter::delete`, upstream 9799550):
     ///
     /// * Claude: every `<uuid>.jsonl` with the file's stem in **all** Claude
     ///   project directories (cross-project fork copies) and each
@@ -129,10 +131,11 @@ impl Browser {
     /// * OMP: the file, if it parses as an OMP session, and its artifact
     ///   directory.
     ///
-    /// On success the row is removed (other copies of the same session
-    /// already in the list stay until a refresh, as upstream). On failure
-    /// nothing changes, the upstream debug-log line is written, and the
-    /// error is returned so the GUI can show it.
+    /// [`DeleteError::Unsupported`] when the adapter cannot delete (nothing
+    /// changes). On success the row is removed (other copies of the same
+    /// session already in the list stay until a refresh, as upstream). On
+    /// failure nothing changes, the upstream debug-log line is written, and
+    /// the error is returned so the GUI can show it.
     ///
     /// Synchronous convenience; a GUI uses
     /// [`crate::maintenance::plan_session_delete`] and
@@ -146,15 +149,11 @@ impl Browser {
             .position_of_path(path)
             .map(|idx| (idx, self.conversations[idx].source))
             .ok_or(DeleteError::NoTarget)?;
-        let result = match source {
-            Source::Claude => {
-                let uuid = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                history::delete_session_by_uuid(&self.env, uuid)
-            }
-            Source::Pi => history::pi_loader::delete_session(path).map(|()| 1),
-            Source::Omp => history::omp_loader::delete_session(path).map(|()| 1),
-        };
-        match result {
+        let adapter = Registry::from_env(&self.env).for_source(source);
+        if !adapter.capabilities().delete {
+            return Err(DeleteError::Unsupported(source));
+        }
+        match adapter.delete(&self.env, path) {
             Ok(files_removed) => {
                 self.remove_conversation(idx);
                 Ok(DeletedSession {

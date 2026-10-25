@@ -6,8 +6,10 @@
 //! records, so their adapters share the conversion (`Records`).
 
 use crate::claude::{AgentContent, ContentBlock, LogEntry, TokenUsage, UserContent};
+use crate::env::{HistoryEnv, WorkspaceScope};
 use crate::error::Result;
 use crate::history::ParseError;
+use crate::history::actions::{Capabilities, Target};
 use crate::history::adapter::{Adapter, Completeness, Discovery, Located};
 use crate::history::model::{
     ConversationKey, Event, EventKind, ExecutionMode, HeadStatus, Message, Origin, Part,
@@ -15,6 +17,7 @@ use crate::history::model::{
     Transcript, Usage, Visibility,
 };
 use crate::history::path::decode_project_dir_name_to_path;
+use crate::resume::{ResumeKind, ResumePlan};
 use chrono::{DateTime, Utc};
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -57,6 +60,45 @@ impl Adapter for ClaudeAdapter {
 
     fn decode(&self, located: &Located) -> Result<Option<Transcript>> {
         super::decode_file(located, false)
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::ALL
+    }
+
+    /// Claude resumes a session only from the project directory that holds
+    /// it: run there, else copy the session into the workspace's project
+    /// directory first. Planned by `resume::plan_claude`, with the workspace
+    /// in place of upstream's process cwd (its rules are in the `resume`
+    /// module docs).
+    fn resume(
+        &self,
+        env: &HistoryEnv,
+        target: Target<'_>,
+        workspace: Option<&WorkspaceScope>,
+        fork: bool,
+        default_args: &[String],
+        program_override: Option<&Path>,
+    ) -> Result<ResumePlan> {
+        crate::resume::plan_claude(
+            env,
+            target,
+            workspace,
+            ResumeKind::from_fork(fork),
+            default_args,
+            program_override,
+        )
+    }
+
+    /// Deletes every transcript of the session, in any project, with its
+    /// session directory.
+    fn delete(&self, env: &HistoryEnv, path: &Path) -> Result<usize> {
+        let uuid = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        crate::history::delete_session_by_uuid(env, uuid)
+    }
+
+    fn rename(&self, path: &Path, title: &str) -> Result<()> {
+        crate::history::append_session_rename(path, title)
     }
 }
 
