@@ -24,6 +24,7 @@
 use crate::debug::DebugLevel;
 use crate::env::{HistoryEnv, WorkspaceScope};
 use crate::error::{AppError, Result};
+use crate::history::actions::Launcher;
 use crate::history::model::SourceKind;
 use crate::history::sources::{Registry, codex};
 use crate::history::{self, Conversation, ParseError};
@@ -630,22 +631,28 @@ pub fn execute_session_delete(
     env: &HistoryEnv,
     plan: &DeletePlan,
 ) -> std::result::Result<DeleteReport, Box<SessionDeleteFailure>> {
-    execute_session_delete_with(env, plan, None, &mut |spec| {
-        run_to_completion(spec).map_err(|error| error.to_string())
-    })
+    execute_session_delete_with(
+        env,
+        plan,
+        &Launcher::default_for(SourceKind::Codex),
+        &mut |spec| run_to_completion(spec).map_err(|error| error.to_string()),
+    )
 }
 
 /// [`execute_session_delete`], with the Codex CLI a Codex plan runs: the
-/// program at `codex_program` (`[gui] codex_path`), else `codex` on the env's
-/// `PATH`, run to completion by `run` (a GUI passes its platform services,
-/// which record it in tests). Upstream eea6d37 runs `codex delete --force
-/// <thread id>` with `CODEX_HOME` set to the thread's home and reports its
-/// stderr when it fails (`codex delete failed (<status>): <stderr>`). The
-/// report lists the planned rollouts that are gone afterwards as removed.
+/// program `codex_launcher` starts, with its leading arguments (upstream 8a99ccc:
+/// `config::LayeredConfig::launcher`, the `[resume.codex] command`, a
+/// `[gui] codex_path`, else `codex` on the env's `PATH`; a missing program
+/// fails with [`AppError::AgentLaunch`] before anything runs), run to
+/// completion by `run` (a GUI passes its platform services, which record it
+/// in tests). Upstream eea6d37 runs `codex delete --force <thread id>` with
+/// `CODEX_HOME` set to the thread's home and reports its stderr when it
+/// fails (`codex delete failed (<status>): <stderr>`). The report lists the
+/// planned rollouts that are gone afterwards as removed.
 pub fn execute_session_delete_with(
     env: &HistoryEnv,
     plan: &DeletePlan,
-    codex_program: Option<&Path>,
+    codex_launcher: &Launcher,
     run: &mut dyn FnMut(&LaunchSpec) -> std::result::Result<RunOutput, String>,
 ) -> std::result::Result<DeleteReport, Box<SessionDeleteFailure>> {
     if let Err(error) = validate_delete_plan(env, plan) {
@@ -655,7 +662,7 @@ pub fn execute_session_delete_with(
         }));
     }
     if plan.source == SourceKind::Codex {
-        return execute_codex_delete(env, plan, codex_program, run);
+        return execute_codex_delete(env, plan, codex_launcher, run);
     }
     let mut report = DeleteReport::default();
     for file in &plan.files {
@@ -693,7 +700,7 @@ pub fn execute_session_delete_with(
 fn execute_codex_delete(
     env: &HistoryEnv,
     plan: &DeletePlan,
-    codex_program: Option<&Path>,
+    codex_launcher: &Launcher,
     run: &mut dyn FnMut(&LaunchSpec) -> std::result::Result<RunOutput, String>,
 ) -> std::result::Result<DeleteReport, Box<SessionDeleteFailure>> {
     let fail = |error: AppError, partial: DeleteReport| {
@@ -702,7 +709,7 @@ fn execute_codex_delete(
             partial,
         })
     };
-    let spec = codex::delete_spec(env, &plan.path, Path::new(""), codex_program)
+    let spec = codex::delete_spec(env, &plan.path, Path::new(""), codex_launcher)
         .map_err(|error| fail(error, DeleteReport::default()))?;
     let output = run(&spec).map_err(|message| {
         fail(
@@ -1799,10 +1806,15 @@ mod tests {
                 dirs: Vec::new(),
             },
         ] {
-            let failure = execute_session_delete_with(&sandbox.env, &tampered, None, &mut |spec| {
-                ran.push(spec.clone());
-                Err("ran".to_string())
-            })
+            let failure = execute_session_delete_with(
+                &sandbox.env,
+                &tampered,
+                &Launcher::default_for(SourceKind::Codex),
+                &mut |spec| {
+                    ran.push(spec.clone());
+                    Err("ran".to_string())
+                },
+            )
             .unwrap_err();
             assert!(
                 matches!(failure.error, AppError::SessionNotFound(_)),
@@ -1811,19 +1823,53 @@ mod tests {
         }
         assert!(ran.is_empty());
 
+        // A missing configured CLI is named before anything runs (upstream
+        // 8a99ccc).
+        let missing = Launcher::configured(
+            &sandbox.env,
+            &["not-installed-codex".to_string()],
+            crate::history::actions::ConfiguredAt::Gui("[resume.codex]"),
+        );
+        let failure = execute_session_delete_with(&sandbox.env, &plan, &missing, &mut |spec| {
+            ran.push(spec.clone());
+            Err("ran".to_string())
+        })
+        .unwrap_err();
+        assert!(matches!(failure.error, AppError::AgentLaunch(_)));
+        assert!(
+            failure
+                .error
+                .to_string()
+                .contains("check `command` under [resume.codex] in gui.toml"),
+            "{}",
+            failure.error
+        );
+        assert!(ran.is_empty());
+
         // The configured CLI runs `codex delete --force <id>` on the home.
         let codex = sandbox.root.path().join("bin").join("codex.exe");
         std::fs::create_dir_all(codex.parent().unwrap()).unwrap();
         std::fs::write(&codex, "").unwrap();
-        let failed = execute_session_delete_with(&sandbox.env, &plan, Some(&codex), &mut |spec| {
-            ran.push(spec.clone());
-            Ok(RunOutput {
-                success: false,
-                status: "exit status: 2".to_string(),
-                stderr: "thread is busy\n".to_string(),
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let codex_launcher = Launcher::program_path(
+            &sandbox.env,
+            &codex,
+            crate::history::actions::ConfiguredAt::GuiPath("codex_path"),
+        );
+        let failed =
+            execute_session_delete_with(&sandbox.env, &plan, &codex_launcher, &mut |spec| {
+                ran.push(spec.clone());
+                Ok(RunOutput {
+                    success: false,
+                    status: "exit status: 2".to_string(),
+                    stderr: "thread is busy\n".to_string(),
+                })
             })
-        })
-        .unwrap_err();
+            .unwrap_err();
         assert_eq!(
             failed.error.to_string(),
             "I/O error: codex delete failed (exit status: 2): thread is busy"
@@ -1834,19 +1880,20 @@ mod tests {
             log.contains(&format!("Failed to delete session {}", listed.display())),
             "{log}"
         );
-        let report = execute_session_delete_with(&sandbox.env, &plan, Some(&codex), &mut |spec| {
-            ran.push(spec.clone());
-            // What Codex does: remove every rollout of the thread.
-            for file in &plan.files {
-                std::fs::remove_file(file).unwrap();
-            }
-            Ok(RunOutput {
-                success: true,
-                status: "exit status: 0".to_string(),
-                stderr: String::new(),
+        let report =
+            execute_session_delete_with(&sandbox.env, &plan, &codex_launcher, &mut |spec| {
+                ran.push(spec.clone());
+                // What Codex does: remove every rollout of the thread.
+                for file in &plan.files {
+                    std::fs::remove_file(file).unwrap();
+                }
+                Ok(RunOutput {
+                    success: true,
+                    status: "exit status: 0".to_string(),
+                    stderr: String::new(),
+                })
             })
-        })
-        .unwrap();
+            .unwrap();
         assert_eq!(report.removed_files, plan.files);
         assert_eq!(ran.len(), 2);
         let spec = &ran[1];

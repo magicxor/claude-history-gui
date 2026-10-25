@@ -5,7 +5,10 @@
 //! `PlatformServices::spawn_terminal`. A cross-project copy is confirmed first
 //! (§5.8) and runs only through `ResumePlan::execute_copy` after that
 //! confirmation. The GUI never calls `core::resume::launch` (it copies without
-//! asking).
+//! asking). The program that starts the agent (upstream 8a99ccc: a configured
+//! `command`, a `[gui]` program path or the agent's binary,
+//! `LayeredConfig::launcher`) is checked before planning, so a missing one is
+//! an error toast before any copy confirmation.
 //!
 //! The target is captured by the caller (PD15) and every step here uses it:
 //! the conversation behind it is looked up by path, never by the selection.
@@ -19,13 +22,13 @@ use std::time::Duration;
 use claude_history_core::AppError;
 use claude_history_core::HistoryEnv;
 use claude_history_core::WorkspaceScope;
+use claude_history_core::history::actions::{ConfiguredAt, Launch};
+use claude_history_core::history::model::SourceKind;
 use claude_history_core::history::process_conversation_file;
 use claude_history_core::resume::terminal::{
     LaunchOptions, LaunchSpec, TerminalCommand, launcher_candidates, prepare_launcher_command,
 };
-use claude_history_core::resume::{
-    CopyPlan, ProgramOverrides, ResumePlan, ResumeTarget, plan_resume_target,
-};
+use claude_history_core::resume::{CopyPlan, ResumePlan, ResumeTarget, plan_resume_target};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -162,12 +165,15 @@ fn act_of(fork: bool) -> SessionAct {
 struct PlanInput {
     env: HistoryEnv,
     workspace: Option<WorkspaceScope>,
-    default_args: Vec<String>,
-    programs: ProgramOverrides,
+    /// The program that starts the agent and its default arguments
+    /// (upstream 8a99ccc; `LayeredConfig::launcher`).
+    launch: Launch,
     resume_target: ResumeTarget,
     /// The target is not in the corpus and has no project path: read it.
     read_file: bool,
     fork: bool,
+    /// macOS/Linux: the login-shell `PATH` probe the program check waits for.
+    waiter: Option<LoginShellWaiter>,
 }
 
 fn plan_input(target: &ConversationTarget, fork: bool, cx: &App) -> Option<PlanInput> {
@@ -178,13 +184,18 @@ fn plan_input(target: &ConversationTarget, fork: bool, cx: &App) -> Option<PlanI
     // update, which must not be read back); a conversation that is not in the
     // corpus has none and its file is read for the working directory.
     let project_path = target.project_path.clone();
+    let env = state.env_with_workspace();
     Some(PlanInput {
-        env: state.env_with_workspace(),
+        // The configured command, `[gui] <agent>_path` or the agent's binary
+        // (upstream 8a99ccc, decision 17); `[resume].default_args` for
+        // Claude, `[resume.codex]` for Codex (upstream eea6d37).
+        launch: Launch {
+            launcher: state.config.launcher(&env, source),
+            default_args: state.settings.resume_default_args_for(source).to_vec(),
+        },
+        env,
         workspace: state.workspace.clone(),
-        // `[resume].default_args` for Claude, `[resume.codex]` for Codex
-        // (upstream eea6d37).
-        default_args: state.settings.resume_default_args_for(source).to_vec(),
-        programs: ProgramOverrides::from_gui_settings(&state.config.gui),
+        waiter: login_shell_waiter(cx),
         read_file: project_path.is_none(),
         resume_target: ResumeTarget {
             source,
@@ -197,6 +208,13 @@ fn plan_input(target: &ConversationTarget, fork: bool, cx: &App) -> Option<PlanI
 }
 
 fn run_plan(mut input: PlanInput) -> Result<ResumePlan, AppError> {
+    // Upstream 8a99ccc: a missing program fails before any session copy
+    // (here: before the copy confirmation), naming it and its config key.
+    wait_for_login_path(&mut input.env, input.waiter.as_ref());
+    input
+        .launch
+        .launcher
+        .check(&input.env, input.resume_target.source)?;
     if input.read_file
         && let Ok(Some(conversation)) =
             process_conversation_file(input.resume_target.path.clone(), None, None)
@@ -208,9 +226,53 @@ fn run_plan(mut input: PlanInput) -> Result<ResumePlan, AppError> {
         &input.resume_target,
         input.workspace.as_ref(),
         input.fork,
-        &input.default_args,
-        &input.programs,
+        &input.launch,
     )
+}
+
+/// macOS/Linux: the login-shell `PATH` may still be loading (§14.2); wait for
+/// it (at most 3 s) and use it.
+fn wait_for_login_path(env: &mut HistoryEnv, waiter: Option<&LoginShellWaiter>) {
+    if let Some(waiter) = waiter
+        && !waiter.is_finished()
+        && let Some(path) = waiter.wait(Duration::from_secs(3))
+    {
+        env.path_var = Some(path);
+    }
+}
+
+/// The Settings page where the program of `source` is set: Resume for a
+/// `command` (also when nothing is configured: the hint names `command`), else General
+/// (a `[gui]` program path).
+fn program_settings_page(source: Option<SourceKind>, cx: &App) -> SettingsPage {
+    let state = app_state(cx);
+    let configured_at = source.and_then(|source| {
+        state
+            .config
+            .launcher(&state.env_with_workspace(), source)
+            .configured_at
+    });
+    match configured_at {
+        Some(ConfiguredAt::Config(_) | ConfiguredAt::Gui(_)) | None => SettingsPage::Resume,
+        Some(ConfiguredAt::GuiPath(_)) => SettingsPage::General,
+    }
+}
+
+/// A program that cannot be started (upstream 8a99ccc's text, naming the
+/// program and its config key): an error toast that opens Settings where it
+/// is set.
+fn agent_launch_toast(
+    error: &AppError,
+    source: Option<SourceKind>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let page = program_settings_page(source, cx);
+    Toast::error(error.to_string())
+        .action("Open Settings", move |window, cx| {
+            crate::settings::open_settings(Some(page), window, cx)
+        })
+        .show(window, cx);
 }
 
 /// Plan the resume/fork of `target` (workspace, overrides, default args) and,
@@ -269,6 +331,11 @@ fn planned(
                 })
                 .show(window, cx);
             then(Err(message), window, cx);
+            return;
+        }
+        Err(error @ AppError::AgentLaunch(_)) => {
+            agent_launch_toast(&error, target.source, window, cx);
+            then(Err(error.to_string()), window, cx);
             return;
         }
         Err(error) => {
@@ -518,13 +585,7 @@ fn run_launch(input: LaunchInput) -> LaunchOutcome {
         waiter,
         services,
     } = input;
-    // macOS/Linux: the login-shell PATH may still be loading (§14.2).
-    if let Some(waiter) = waiter
-        && !waiter.is_finished()
-        && let Some(path) = waiter.wait(Duration::from_secs(3))
-    {
-        env.path_var = Some(path);
-    }
+    wait_for_login_path(&mut env, waiter.as_ref());
     let spec = match plan.launch_spec(&env) {
         Ok(spec) => spec,
         Err(error) => return LaunchOutcome::Spec(error),
@@ -594,6 +655,7 @@ pub fn launch_with(
 ) {
     let input = launch_input(plan, cx);
     let command_line = plan.display_command();
+    let source = plan.source;
     let task = cx
         .background_executor()
         .spawn(async move { run_launch(input) });
@@ -601,7 +663,7 @@ pub fn launch_with(
         .spawn(&*cx, async move |cx| {
             let outcome = task.await;
             cx.update(|window, cx| {
-                let started = report_launch(outcome, &title, &command_line, window, cx);
+                let started = report_launch(outcome, &title, &command_line, source, window, cx);
                 if let Some(done) = done {
                     done(started, window, cx);
                 }
@@ -616,6 +678,7 @@ fn report_launch(
     outcome: LaunchOutcome,
     title: &str,
     command_line: &str,
+    source: SourceKind,
     window: &mut Window,
     cx: &mut App,
 ) -> bool {
@@ -628,15 +691,8 @@ fn report_launch(
         }
         LaunchOutcome::Spec(error) => {
             match &error {
-                AppError::ClaudeExecutionError(message)
-                    if message.starts_with("Could not find '") =>
-                {
-                    Toast::error(format!("{message}. Set its path in Settings → General."))
-                        .action("Open Settings", |window, cx| {
-                            crate::settings::open_settings(Some(SettingsPage::General), window, cx)
-                        })
-                        .show(window, cx);
-                }
+                // The program went away after the plan's check.
+                AppError::AgentLaunch(_) => agent_launch_toast(&error, Some(source), window, cx),
                 _ => Toast::error(error.to_string()).show(window, cx),
             }
             false

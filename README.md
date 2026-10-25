@@ -76,7 +76,7 @@ All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-h
 **Session actions**
 * **Resume** and **Fork** in a new terminal window (Windows Terminal or console, Terminal.app or osascript,
   common Linux emulators, or your own template). Resuming into another workspace offers to copy the conversation
-  into that project first.
+  into that project first. Each agent can start through your own command or wrapper (`[resume] command`, below).
 * **Rename** (custom title), **Delete** (every copy of the session, with a confirmation that lists the files),
   **Export** (ledger, plain text, Markdown, raw JSONL), **Copy** (conversation in the same formats, message,
   path, session ID), reveal in the file manager.
@@ -347,6 +347,34 @@ is not remembered. An invalid file shows a dialog naming it (Quit / Continue wit
 `osascript`, a Linux emulator name, or a template with `{cwd}`, `{args}`, `{cmd}`), `claude_path`, `pi_path`,
 `omp_path`, `codex_path`, `default_workspace`, `restore_session`. `[resume] default_args` (Claude) and
 `[resume.codex] default_args` (Codex) hold extra arguments for Resume and Fork.
+
+Resume and Fork run `claude`, `pi`, `omp` or `codex`, and the Codex delete runs `codex`. To start an agent another
+way (a mise or nix wrapper, a script that sets environment variables first, a binary with another name), set
+`command` for it, in `gui.toml` (Settings > Resume, one word per line) or `config.toml`:
+
+```toml
+[resume]
+command = "my-claude"                     # Claude Code
+
+[resume.pi]
+command = "~/bin/pi-wrapper"
+
+[resume.omp]
+command = ["mise", "exec", "--", "omp"]
+
+[resume.codex]
+command = ["nix", "run", "nixpkgs#codex", "--"]
+```
+
+A string is one program and is never split on spaces; an array is a program followed by the arguments that always
+come first. The agent's own arguments follow (`mise exec -- omp --resume <path>`), and `default_args` come after the
+command. The program is a name looked up on `PATH` or a path; `~/` is your home and a relative path is relative to
+the folder the app was started from. It must be an executable file, not a shell alias or function, because the agent
+is started without a shell: put an alias in a script and set `command` to the script (on Windows a `.cmd` or `.exe`;
+`cmd.exe` limits the arguments a `.cmd` can take). For each agent the first that is set applies: `command` in
+`gui.toml`, the program path under `[gui]` (`claude_path`, ...), `command` in `config.toml`, the agent's name on
+`PATH`. A program that cannot be found is reported, naming it and where it is set, before anything is copied or
+started.
 
 `[display] no_tools` sets the viewer's starting tool display: `true` = Off, `false` = Full, unset = Summary (or the
 remembered mode). Settings → Display offers Off / Summary / Full; Summary removes the key from `gui.toml`, so a

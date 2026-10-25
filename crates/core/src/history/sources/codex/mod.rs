@@ -27,8 +27,10 @@
 //!   hermetic builds). A GUI plans the deletion first and runs the same
 //!   command through its own services after a confirmation
 //!   (`maintenance::plan_session_delete`,
-//!   `maintenance::execute_session_delete_with`). The CLI may be configured
-//!   (`[gui] codex_path`), else it is found on `PATH`.
+//!   `maintenance::execute_session_delete_with`). The CLI is the
+//!   [`Launcher`] the caller passes (upstream 8a99ccc: `[resume.codex]
+//!   command`, here also `[gui] codex_path`, see `config::agent_launcher`),
+//!   else `codex` on the env's `PATH`.
 
 mod decode;
 pub mod discover;
@@ -38,7 +40,7 @@ pub mod view;
 
 use crate::env::{HistoryEnv, WorkspaceScope};
 use crate::error::{AppError, Result};
-use crate::history::actions::{Capabilities, Target};
+use crate::history::actions::{Capabilities, Launch, Launcher, Target};
 use crate::history::adapter::{Adapter, Completeness, Discovery, Located, Native};
 use crate::history::model::{Event, SourceInstance, SourceKind, Transcript};
 use crate::resume::terminal::{LaunchSpec, RunOutput, run_to_completion};
@@ -221,24 +223,30 @@ pub fn thread_rollouts(path: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// Fork: upstream's `codex delete --force <thread id>` for the thread of the
-/// rollout at `path`, as a run of the CLI (`program_override`, else `codex`
-/// on the env's `PATH`) with `CODEX_HOME` set to the rollout's home, else
-/// `home`.
+/// rollout at `path`, as a run of the CLI `launcher` starts (upstream
+/// 8a99ccc: the `[resume.codex] command` with its leading arguments, a
+/// `[gui] codex_path`, else `codex` on the env's `PATH`; checked first, an
+/// [`AppError::AgentLaunch`] naming it when it is missing) with
+/// `CODEX_HOME` set to the rollout's home, else `home`.
 pub fn delete_spec(
     env: &HistoryEnv,
     path: &Path,
     home: &Path,
-    program_override: Option<&Path>,
+    launcher: &Launcher,
 ) -> Result<LaunchSpec> {
     let thread_id = thread_id_of(path)?;
+    let program = launcher.resolve(env, SourceKind::Codex)?;
     Ok(LaunchSpec {
-        program: env.resolve_program(
-            crate::resume::program_name(SourceKind::Codex),
-            program_override,
-        )?,
-        args: ["delete", "--force", thread_id.as_str()]
-            .into_iter()
+        program,
+        args: launcher
+            .args
+            .iter()
             .map(OsString::from)
+            .chain(
+                ["delete", "--force", thread_id.as_str()]
+                    .into_iter()
+                    .map(OsString::from),
+            )
             .collect(),
         cwd: None,
         env: codex_env(path, home),
@@ -326,25 +334,23 @@ impl Adapter for CodexAdapter {
         target: Target<'_>,
         workspace: Option<&WorkspaceScope>,
         fork: bool,
-        default_args: &[String],
-        program_override: Option<&Path>,
+        launch: &Launch,
     ) -> Result<ResumePlan> {
         crate::resume::plan_codex(
             target,
             &self.instance.root,
             workspace,
             ResumeKind::from_fork(fork),
-            default_args,
-            program_override,
+            launch,
         )
     }
 
     /// `codex delete --force <thread id>`, which removes every rollout of
-    /// the thread and its state. Fork: run by [`run_to_completion`] (refused
-    /// in tests and hermetic builds); returns the number of rollouts the
-    /// thread had.
-    fn delete(&self, env: &HistoryEnv, path: &Path) -> Result<usize> {
-        let spec = delete_spec(env, path, &self.instance.root, None)?;
+    /// the thread and its state, run by the CLI `launcher` starts (checked
+    /// first). Fork: run by [`run_to_completion`] (refused in tests and
+    /// hermetic builds); returns the number of rollouts the thread had.
+    fn delete(&self, env: &HistoryEnv, path: &Path, launcher: &Launcher) -> Result<usize> {
+        let spec = delete_spec(env, path, &self.instance.root, launcher)?;
         let rollouts = thread_rollouts(path).map_or(1, |rollouts| rollouts.len());
         let output = run_to_completion(&spec).map_err(AppError::Io)?;
         delete_outcome(&output)?;

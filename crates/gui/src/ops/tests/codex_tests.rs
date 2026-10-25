@@ -103,7 +103,8 @@ fn codex_threads_resume_fork_and_delete_but_do_not_rename(cx: &mut TestAppContex
     assert_eq!(plan.files, vec![path.clone()]);
     assert_eq!(plan.session_id, THREAD);
     assert!(
-        delete::consequence_text(&plan).starts_with(&format!("Runs codex delete --force {THREAD}")),
+        delete::consequence_text(&plan)
+            .starts_with(&format!("Runs the Codex CLI's delete --force {THREAD}")),
         "{}",
         delete::consequence_text(&plan)
     );
@@ -131,6 +132,58 @@ fn codex_threads_resume_fork_and_delete_but_do_not_rename(cx: &mut TestAppContex
     assert!(path.is_file(), "the recorder deletes nothing");
     assert!(!f.list.paths(cx).contains(&path), "the row left the list");
     assert!(toast(cx).starts_with("Deleted \""), "{}", toast(cx));
+}
+
+/// A-068 (upstream 8a99ccc): `[resume.codex] command` starts Codex for
+/// resume and delete, its arguments before Codex's own (and before
+/// `[resume.codex] default_args`).
+#[gpui_kit::test]
+fn a_configured_codex_command_resumes_and_deletes(cx: &mut TestAppContext) {
+    let world = TestWorld::new();
+    let wrapper = fake_program(&world, "codex-wrapper");
+    write_gui_config(
+        &world,
+        "",
+        &format!(
+            "[resume.codex]\ncommand = [{}, \"--profile\", \"work\"]\ndefault_args = [\"--yolo\"]",
+            toml_path(&wrapper)
+        ),
+    );
+    let path = codex_thread(&world);
+    let f = OpsFixture::open(cx, &world, &[]);
+    f.select(cx, &path);
+    f.press(cx, "ctrl-r");
+    f.settle(cx);
+    let commands = f.terminal_commands();
+    assert_eq!(commands.len(), 1, "{commands:?}");
+    assert!(
+        commands[0].contains(&wrapper.display().to_string()),
+        "{}",
+        commands[0]
+    );
+    assert!(
+        commands[0].contains(&format!("--profile work --yolo resume {THREAD}")),
+        "{}",
+        commands[0]
+    );
+
+    f.recording.clear_calls();
+    f.select(cx, &path);
+    f.press(cx, "ctrl-x");
+    f.settle(cx);
+    assert_eq!(dialog_id(cx), DIALOG_ID);
+    render(cx, f.handle());
+    f.press(cx, "shift-y");
+    f.settle(cx);
+    let runs = f.recording.program_runs();
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0].program.path, wrapper);
+    assert_eq!(
+        runs[0].args,
+        ["--profile", "work", "delete", "--force", THREAD]
+            .map(OsString::from)
+            .to_vec()
+    );
 }
 
 /// A failed `codex delete` keeps the row and shows Codex's error.

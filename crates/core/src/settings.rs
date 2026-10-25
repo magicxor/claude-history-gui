@@ -1216,7 +1216,9 @@ mod tests {
                 default_args: Some(vec!["--model".into(), "opus".into()]),
                 codex: Some(crate::config::AgentResumeConfig {
                     default_args: Some(vec!["--yolo".into()]),
+                    ..Default::default()
                 }),
+                ..Default::default()
             }),
             tui: Some(TuiConfig {
                 exclude_projects: vec!["secret".into()],

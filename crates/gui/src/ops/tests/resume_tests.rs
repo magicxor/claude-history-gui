@@ -13,8 +13,8 @@ use super::{dialog_id, has_dialog, render, toast};
 use crate::model::ConversationTarget;
 use crate::ops::resume::{self, CANCELLED, plan_and_confirm};
 use crate::test_support::fixtures_ops::{
-    OpsFixture, claude_session, claude_session_gone, claude_session_in, omp_session, pi_session,
-    project_dir, write_gui_config,
+    OpsFixture, claude_session, claude_session_gone, claude_session_in, fake_program, omp_session,
+    pi_session, project_dir, toml_path, write_gui_config,
 };
 use crate::test_support::{TestWorld, synth};
 
@@ -422,13 +422,17 @@ fn plan_for(
             .read(cx)
             .conversation(&target.path)
             .expect("listed");
+        let env = state.env_with_workspace();
+        let launch = claude_history_core::history::actions::Launch {
+            launcher: state.config.launcher(&env, conversation.source),
+            default_args: state.settings.resume_default_args.clone(),
+        };
         claude_history_core::resume::plan_resume(
-            &state.env_with_workspace(),
+            &env,
             &conversation,
             state.workspace.as_ref(),
             fork,
-            &state.settings.resume_default_args,
-            &claude_history_core::resume::ProgramOverrides::from_gui_settings(&state.config.gui),
+            &launch,
         )
     });
     result.expect("a plan")
@@ -583,7 +587,9 @@ fn pi_session_with_a_missing_directory_warns(cx: &mut TestAppContext) {
     );
 }
 
-/// A program that cannot be found: the documented toast, no terminal call.
+/// A program that cannot be found: upstream 8a99ccc's error, naming the
+/// program and where to set a command (the toast opens Settings), and no
+/// terminal call.
 #[gpui_kit::test]
 fn missing_program_toasts_with_a_settings_hint(cx: &mut TestAppContext) {
     let world = TestWorld::new();
@@ -595,9 +601,75 @@ fn missing_program_toasts_with_a_settings_hint(cx: &mut TestAppContext) {
     f.settle(cx);
     assert_eq!(
         toast(cx),
-        "Could not find 'claude' on PATH. Set its path in Settings → General."
+        "Cannot start agent: `claude` was not found on PATH; if you start Claude through a \
+         wrapper, set `command` under [resume] in gui.toml or config.toml"
     );
     assert!(f.terminal_commands().is_empty());
+}
+
+/// A-068 (upstream 8a99ccc): gui.toml's `[resume] command` starts Claude
+/// through the wrapper, before `[gui] claude_path`: the wrapper's arguments
+/// first, then the resume arguments and `default_args`.
+#[gpui_kit::test]
+fn a_configured_command_starts_the_agent_through_the_wrapper(cx: &mut TestAppContext) {
+    let world = TestWorld::new();
+    let wrapper = fake_program(&world, "wrapper");
+    write_gui_config(
+        &world,
+        "",
+        &format!(
+            "[resume]\ncommand = [{}, \"--flag\"]\ndefault_args = [\"--model\", \"opus\"]",
+            toml_path(&wrapper)
+        ),
+    );
+    let path = claude_session(&world, "proj", 1, "Fix login bug");
+    let f = OpsFixture::open(cx, &world, &[]);
+    f.select(cx, &path);
+    f.press(cx, "ctrl-r");
+    f.settle(cx);
+    let command = only_command(&f);
+    assert!(command.contains("fake-wrapper"), "{command}");
+    assert!(!command.contains("fake-claude"), "{command}");
+    assert!(
+        command.contains(&format!("--flag --resume {} --model opus", stem(&path))),
+        "{command}"
+    );
+}
+
+/// A-069 (upstream 8a99ccc): a configured program that cannot be found is
+/// reported with its key before the copy confirmation; nothing is copied or
+/// run.
+#[gpui_kit::test]
+fn a_missing_configured_command_is_reported_before_the_copy(cx: &mut TestAppContext) {
+    let world = TestWorld::new();
+    write_gui_config(&world, "", "[resume]\ncommand = \"not-installed-claude\"");
+    let path = claude_session(&world, "proj", 1, "Fix login bug");
+    let workspace = project_dir(&world, "newproj");
+    let f = OpsFixture::open(
+        cx,
+        &world,
+        &["--workspace", &workspace.display().to_string()],
+    );
+    f.select(cx, &path);
+    f.press(cx, "ctrl-f");
+    f.settle(cx);
+    assert!(!has_dialog(cx, f.handle()), "no copy confirmation");
+    assert!(f.terminal_commands().is_empty());
+    assert_eq!(
+        toast(cx),
+        "Cannot start agent: `not-installed-claude` was not found on PATH; check `command` \
+         under [resume] in gui.toml"
+    );
+    let target_dir = cx.read(|cx| {
+        crate::globals::app_state(cx)
+            .env
+            .claude_projects_dir_for(&workspace)
+            .unwrap()
+    });
+    assert!(
+        !target_dir.join(format!("{}.jsonl", stem(&path))).exists(),
+        "nothing was copied"
+    );
 }
 
 /// An early non-zero exit is an error (no retry: it ran).

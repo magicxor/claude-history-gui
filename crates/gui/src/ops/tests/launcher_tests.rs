@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use claude_history_core::HistoryEnv;
+use claude_history_core::history::actions::{ConfiguredAt, Launcher};
 use claude_history_core::resume::terminal::{LaunchOptions, LaunchSpec, Platform, TerminalCommand};
 use claude_history_core::resume::{ResumeKind, ResumePlan, ResumeStrategy};
 use claude_history_core::update::UpdateStatus;
@@ -128,8 +129,7 @@ fn setup() -> Setup {
         kind: ResumeKind::Resume,
         strategy: ResumeStrategy::InProject,
         session_path: PathBuf::from("session.jsonl"),
-        program: "claude".to_string(),
-        program_override: Some(program),
+        launcher: Launcher::program_path(&env, &program, ConfiguredAt::GuiPath("claude_path")),
         args: vec![OsString::from("--resume"), OsString::from("abc")],
         cwd: Some(dir.path().to_path_buf()),
         copy: None,

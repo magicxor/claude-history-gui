@@ -156,7 +156,10 @@ impl Browser {
         if !adapter.capabilities().delete {
             return Err(DeleteError::Unsupported(source));
         }
-        match adapter.delete(&self.env, path) {
+        // The agent's own binary: a `Browser` has no configuration (the GUI
+        // deletes through `maintenance` with `LayeredConfig::launcher`).
+        let launcher = crate::history::actions::Launcher::default_for(source);
+        match adapter.delete(&self.env, path, &launcher) {
             Ok(files_removed) => {
                 self.remove_conversation(idx);
                 Ok(DeletedSession {

@@ -54,7 +54,7 @@ pub fn dialog_title(target: &ConversationTarget) -> String {
 pub fn consequence_text(plan: &DeletePlan) -> String {
     if plan.source == SourceKind::Codex {
         format!(
-            "Runs codex delete --force {}, which removes the thread and its state. This can't \
+            "Runs the Codex CLI's delete --force {}, which removes the thread and its state. This can't \
              be undone.",
             plan.session_id
         )
@@ -217,8 +217,9 @@ fn execute(
     let env = state.env_with_workspace();
     // A Codex thread is deleted by the Codex CLI (upstream eea6d37), run
     // through the platform services (recorded in tests and QA, refused by
-    // the debug-build launch guard).
-    let codex_program = state.config.gui.codex_path.clone();
+    // the debug-build launch guard), started as configured (upstream
+    // 8a99ccc: `[resume.codex] command`, `[gui] codex_path`, else `codex`).
+    let codex = state.config.launcher(&env, SourceKind::Codex);
     let services = services(cx);
     let task = {
         let plan = plan.clone();
@@ -226,7 +227,7 @@ fn execute(
             let mut run = |spec: &LaunchSpec| services.run_program(spec);
             // A failure carries the partial report: the transcripts core
             // already removed must still leave the list.
-            match execute_session_delete_with(&env, &plan, codex_program.as_deref(), &mut run) {
+            match execute_session_delete_with(&env, &plan, &codex, &mut run) {
                 Ok(_) => (Ok(()), plan.files.clone()),
                 Err(failure) => {
                     let mut gone = failure.partial.removed_files;

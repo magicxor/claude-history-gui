@@ -19,6 +19,7 @@ use crate::model::{KeyAction, OpenPathsOptions, SettingsPage};
 use crate::services::ServiceCall;
 use crate::settings::draft::{Field, Value};
 use crate::settings::{self, SettingsDialog, current_dialog};
+use crate::test_support::fixtures_ops::fake_program;
 use crate::test_support::{TestWorld, global_lock, kbd, open_main, recording};
 
 fn render(cx: &mut TestAppContext, handle: AnyWindowHandle) {
@@ -597,7 +598,9 @@ fn typing_into_a_field_updates_the_draft(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn browse_fills_the_field_from_the_platform_prompt(cx: &mut TestAppContext) {
     let world = TestWorld::new();
-    let program = world.add_fixture("bin/claude-harmless.cmd", b"@echo off\r\n");
+    // A program the launcher check accepts: a `.cmd` on Windows, a script
+    // with the executable bit on Unix.
+    let program = fake_program(&world, "claude-harmless");
     let (handle, _ws) = open_main(cx, &world, &[]);
     let dialog = open_dialog(cx, handle);
     let services = recording(cx);
@@ -622,9 +625,7 @@ fn browse_fills_the_field_from_the_platform_prompt(cx: &mut TestAppContext) {
                 prompt: "Choose program".into(),
             }))
     );
-    let status = dialog.read_with(cx, |d, cx| {
-        d.program_status(Field::ClaudePath, "claude", cx)
-    });
+    let status = dialog.read_with(cx, |d, cx| d.program_status(Field::ClaudePath, cx));
     assert_eq!(status, format!("resolved: {}", program.display()));
     // A folder for the workspace; a cancelled prompt changes nothing.
     let folder = world.home().join("work");
@@ -666,6 +667,48 @@ fn browse_fills_the_field_from_the_platform_prompt(cx: &mut TestAppContext) {
             .starts_with("File not found")
     );
     assert!(!dialog.read_with(cx, |d, _| d.can_save()));
+}
+
+/// C-071 (upstream 8a99ccc): an agent's command is typed one word per line
+/// on the Resume page, probed in the background and saved as
+/// `[resume.pi] command`, which then starts Pi.
+#[gpui_kit::test]
+fn an_agent_command_is_edited_probed_and_saved(cx: &mut TestAppContext) {
+    use claude_history_core::history::model::SourceKind as Agent;
+    let world = TestWorld::new();
+    let (handle, _ws) = open_main(cx, &world, &[]);
+    let dialog = open_dialog(cx, handle);
+    set_text(
+        cx,
+        handle,
+        &dialog,
+        Field::PiCommand,
+        "mise\n exec \n\n--\npi\n",
+    );
+    assert_eq!(
+        dialog.read_with(cx, |d, _| d.draft().value(Field::PiCommand)),
+        Value::List(vec!["mise".into(), "exec".into(), "--".into(), "pi".into()])
+    );
+    let status = dialog.read_with(cx, |d, _| d.program_status_text(Field::PiCommand));
+    assert!(status.starts_with("runs mise exec -- pi · "), "{status}");
+    // The path row of the same agent says which key decides.
+    let status = dialog.read_with(cx, |d, _| d.program_status_text(Field::PiPath));
+    assert!(
+        status.starts_with("runs mise exec -- pi; from `command` under [resume.pi] in gui.toml · "),
+        "{status}"
+    );
+    save(cx, handle, &dialog);
+    let text = read_gui(&world);
+    assert!(text.contains("[resume.pi]"), "{text}");
+    assert!(
+        text.contains(r#"command = ["mise", "exec", "--", "pi"]"#),
+        "{text}"
+    );
+    let launcher = cx.read(|cx| {
+        let state = app_state(cx);
+        state.config.launcher(&state.env, Agent::Pi)
+    });
+    assert_eq!(launcher.words(), ["mise", "exec", "--", "pi"]);
 }
 
 /// The terminal preview shows the command a sample resume would run, and a

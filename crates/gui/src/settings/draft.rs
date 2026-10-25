@@ -11,10 +11,11 @@
 use std::path::PathBuf;
 
 use claude_history_core::config::{
-    AgentOverrides, AgentResumeConfig, AgentScopeConfig, ConfigFile, DisplayConfig, GuiConfigFile,
-    GuiSettings, KeyBindings, KeyChord, KeysConfig, LayeredConfig, ResumeConfig, SearchConfig,
-    TuiOverrides, parse_key_binding,
+    AgentCommand, AgentOverrides, AgentResumeConfig, AgentScopeConfig, ConfigFile, DisplayConfig,
+    GuiConfigFile, GuiSettings, KeyBindings, KeyChord, KeysConfig, LauncherConfig, LayeredConfig,
+    ResumeConfig, SearchConfig, TuiOverrides, parse_key_binding,
 };
+use claude_history_core::history::model::SourceKind as AgentKind;
 use claude_history_core::search::mode::SearchMode;
 use claude_history_core::settings::InitialToolDisplay;
 use claude_history_core::theme::ThemePreference;
@@ -41,7 +42,12 @@ pub enum Field {
     ExcludeProjects,
     ExcludePaths,
     Key(KeyAction),
+    /// `[resume] command` (upstream 8a99ccc), and the other agents' below.
+    ClaudeCommand,
     ResumeArgs,
+    PiCommand,
+    OmpCommand,
+    CodexCommand,
     CodexResumeArgs,
     AgentScope,
     AgentMode,
@@ -78,7 +84,7 @@ impl Field {
     }
 
     /// Every field, page by page, in display order.
-    pub const ALL: [Field; 35] = [
+    pub const ALL: [Field; 39] = [
         Field::Theme,
         Field::Terminal,
         Field::ClaudePath,
@@ -101,7 +107,11 @@ impl Field {
         Field::Key(KeyAction::Refresh),
         Field::Key(KeyAction::AllKinds),
         Field::Key(KeyAction::UserOnly),
+        Field::ClaudeCommand,
         Field::ResumeArgs,
+        Field::PiCommand,
+        Field::OmpCommand,
+        Field::CodexCommand,
         Field::CodexResumeArgs,
         Field::AgentScope,
         Field::AgentMode,
@@ -134,7 +144,12 @@ impl Field {
                 SettingsPage::Search
             }
             Field::Key(_) => SettingsPage::Keys,
-            Field::ResumeArgs | Field::CodexResumeArgs => SettingsPage::Resume,
+            Field::ClaudeCommand
+            | Field::ResumeArgs
+            | Field::PiCommand
+            | Field::OmpCommand
+            | Field::CodexCommand
+            | Field::CodexResumeArgs => SettingsPage::Resume,
             _ => SettingsPage::Agent,
         }
     }
@@ -158,7 +173,11 @@ impl Field {
             Field::ExcludeProjects => "Excluded projects",
             Field::ExcludePaths => "Excluded working directories",
             Field::Key(action) => action.label(),
+            Field::ClaudeCommand => "Claude Code command",
             Field::ResumeArgs => "Default arguments",
+            Field::PiCommand => "Pi command",
+            Field::OmpCommand => "OMP command",
+            Field::CodexCommand => "Codex command",
             Field::CodexResumeArgs => "Codex default arguments",
             Field::AgentScope => "Scope",
             Field::AgentMode => "Mode",
@@ -199,7 +218,11 @@ impl Field {
             Field::Key(KeyAction::Refresh) => "[keys] refresh",
             Field::Key(KeyAction::AllKinds) => "[keys] all_kinds",
             Field::Key(KeyAction::UserOnly) => "[keys] user_only",
+            Field::ClaudeCommand => "[resume] command",
             Field::ResumeArgs => "[resume] default_args",
+            Field::PiCommand => "[resume.pi] command",
+            Field::OmpCommand => "[resume.omp] command",
+            Field::CodexCommand => "[resume.codex] command",
             Field::CodexResumeArgs => "[resume.codex] default_args",
             Field::AgentScope => "[agent] scope",
             Field::AgentMode => "[agent] mode",
@@ -238,7 +261,11 @@ impl Field {
             | Field::PiPath
             | Field::OmpPath
             | Field::CodexPath
+            | Field::ClaudeCommand
             | Field::ResumeArgs
+            | Field::PiCommand
+            | Field::OmpCommand
+            | Field::CodexCommand
             | Field::CodexResumeArgs => "Applies to the next resume",
             Field::DefaultWorkspace | Field::RestoreSession => "Applies at the next start",
             Field::PreviewLast => "Applies when the list refreshes",
@@ -256,6 +283,39 @@ impl Field {
     pub fn is_gui_table_field(self) -> bool {
         matches!(self, Field::Theme | Field::RestoreSession)
     }
+
+    /// The agent whose `command` this field sets (upstream 8a99ccc).
+    pub fn command_agent(self) -> Option<AgentKind> {
+        match self {
+            Field::ClaudeCommand => Some(AgentKind::Claude),
+            Field::PiCommand => Some(AgentKind::Pi),
+            Field::OmpCommand => Some(AgentKind::Omp),
+            Field::CodexCommand => Some(AgentKind::Codex),
+            _ => None,
+        }
+    }
+
+    /// The `command` field of `agent`.
+    pub fn command_of(agent: AgentKind) -> Field {
+        match agent {
+            AgentKind::Claude => Field::ClaudeCommand,
+            AgentKind::Pi => Field::PiCommand,
+            AgentKind::Omp => Field::OmpCommand,
+            AgentKind::Codex => Field::CodexCommand,
+        }
+    }
+}
+
+/// A configured command as a list value (its words, one per line).
+fn command_value(command: Option<&AgentCommand>) -> Value {
+    command.map_or(Value::Unset, |command| {
+        Value::List(command.words().to_vec())
+    })
+}
+
+/// The `command` of `agent` in a `[resume]` table.
+fn resume_command(resume: Option<&ResumeConfig>, agent: AgentKind) -> Value {
+    command_value(resume.and_then(|resume| resume.command(agent)))
 }
 
 /// The value of a [`Field`]: [`Value::Unset`] = the key is absent.
@@ -354,6 +414,9 @@ pub fn get(field: Field, gui: &GuiConfigFile) -> Value {
                 .and_then(|codex| codex.default_args.clone()),
             Value::List,
         ),
+        Field::ClaudeCommand | Field::PiCommand | Field::OmpCommand | Field::CodexCommand => {
+            resume_command(gui.resume.as_ref(), field.command_agent().unwrap())
+        }
         Field::AgentScope => opt(agent.scope, Value::Scope),
         Field::AgentMode => opt(agent.mode, Value::Mode),
         Field::AgentOutputChars => opt(agent.output_chars, Value::Number),
@@ -480,6 +543,33 @@ pub fn set(field: Field, gui: &mut GuiConfigFile, value: Value) {
                 .get_or_insert_with(AgentResumeConfig::default)
                 .default_args = list(&value)
         }
+        // A list that names no program (empty, blank first word) removes
+        // the key, as config files refuse it.
+        Field::ClaudeCommand => {
+            gui.resume.get_or_insert_with(ResumeConfig::default).command =
+                list(&value).and_then(AgentCommand::new)
+        }
+        Field::PiCommand => {
+            gui.resume
+                .get_or_insert_with(ResumeConfig::default)
+                .pi
+                .get_or_insert_with(LauncherConfig::default)
+                .command = list(&value).and_then(AgentCommand::new)
+        }
+        Field::OmpCommand => {
+            gui.resume
+                .get_or_insert_with(ResumeConfig::default)
+                .omp
+                .get_or_insert_with(LauncherConfig::default)
+                .command = list(&value).and_then(AgentCommand::new)
+        }
+        Field::CodexCommand => {
+            gui.resume
+                .get_or_insert_with(ResumeConfig::default)
+                .codex
+                .get_or_insert_with(AgentResumeConfig::default)
+                .command = list(&value).and_then(AgentCommand::new)
+        }
         Field::AgentScope => {
             agent(gui).scope = match value {
                 Value::Scope(scope) => Some(scope),
@@ -548,6 +638,9 @@ pub fn cli_value(field: Field, cli: &ConfigFile) -> Value {
                 .and_then(|codex| codex.default_args.clone()),
             Value::List,
         ),
+        Field::ClaudeCommand | Field::PiCommand | Field::OmpCommand | Field::CodexCommand => {
+            resume_command(cli.resume.as_ref(), field.command_agent().unwrap())
+        }
         Field::AgentScope => opt(agent.scope, Value::Scope),
         Field::AgentMode => opt(agent.mode, Value::Mode),
         Field::AgentOutputChars => opt(agent.output_chars, Value::Number),
@@ -590,6 +683,10 @@ pub fn default_value(field: Field) -> Value {
         | Field::AgentThinking
         | Field::AgentSubagents => Value::Bool(false),
         Field::Terminal => Value::Text("auto".to_string()),
+        // The agent's own binary (upstream 8a99ccc's defaults).
+        Field::ClaudeCommand | Field::PiCommand | Field::OmpCommand | Field::CodexCommand => {
+            Value::List(vec![field.command_agent().unwrap().label().to_string()])
+        }
         _ => Value::Unset,
     }
 }
@@ -609,6 +706,8 @@ pub fn describe(field: Field, value: &Value) -> String {
             _ => if *flag { "on" } else { "off" }.into(),
         },
         Value::Text(text) => text.clone(),
+        // A command reads as it would be typed.
+        Value::List(words) if field.command_agent().is_some() => words.join(" "),
         Value::List(list) => {
             if list.is_empty() {
                 "none".into()

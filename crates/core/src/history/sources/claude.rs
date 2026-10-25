@@ -8,7 +8,7 @@ use crate::claude::{AgentContent, ContentBlock, LogEntry, TokenUsage, UserConten
 use crate::env::{HistoryEnv, WorkspaceScope};
 use crate::error::Result;
 use crate::history::ParseError;
-use crate::history::actions::{Capabilities, Target};
+use crate::history::actions::{Capabilities, Launch, Launcher, Target};
 use crate::history::adapter::{Adapter, Completeness, Discovery, Located};
 use crate::history::model::{
     ConversationKey, Event, EventKind, ExecutionMode, HeadStatus, Message, Origin, Part,
@@ -89,22 +89,14 @@ impl Adapter for ClaudeAdapter {
         target: Target<'_>,
         workspace: Option<&WorkspaceScope>,
         fork: bool,
-        default_args: &[String],
-        program_override: Option<&Path>,
+        launch: &Launch,
     ) -> Result<ResumePlan> {
-        crate::resume::plan_claude(
-            env,
-            target,
-            workspace,
-            ResumeKind::from_fork(fork),
-            default_args,
-            program_override,
-        )
+        crate::resume::plan_claude(env, target, workspace, ResumeKind::from_fork(fork), launch)
     }
 
     /// Deletes every transcript of the session, in any project, with its
     /// session directory.
-    fn delete(&self, env: &HistoryEnv, path: &Path) -> Result<usize> {
+    fn delete(&self, env: &HistoryEnv, path: &Path, _launcher: &Launcher) -> Result<usize> {
         let uuid = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         crate::history::delete_session_by_uuid(env, uuid)
     }

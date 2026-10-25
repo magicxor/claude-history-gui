@@ -14,9 +14,10 @@
 //!
 //! * **Actions with the fork's types and an explicit env.**
 //!   [`Adapter::resume`] plans a [`ResumePlan`] from the [`HistoryEnv`], the
-//!   workspace that replaces upstream's process cwd and the user's program
-//!   path, instead of a `Resume` holding a `std::process::Command` (see
-//!   [`super::actions`]). [`Adapter::delete`] takes the env (Claude deletes
+//!   workspace that replaces upstream's process cwd and the [`Launch`]
+//!   (upstream 8a99ccc), instead of a `Resume` holding a
+//!   `std::process::Command` (see [`super::actions`]). [`Adapter::delete`]
+//!   takes the env and the [`Launcher`] (Claude deletes
 //!   every copy of the session under the env's projects root, as upstream
 //!   does under the process environment's) and returns the number of
 //!   transcripts removed. A GUI plans a deletion and confirms it first
@@ -28,7 +29,7 @@
 //!   V-101). The Claude, Pi and OMP adapters check it at every read of the
 //!   session file; others before and after decoding.
 
-use super::actions::{Capabilities, Target};
+use super::actions::{Capabilities, Launch, Launcher, Target};
 use super::model::{ConversationKey, Event, SourceInstance, Transcript};
 use crate::env::{HistoryEnv, WorkspaceScope};
 use crate::resume::ResumePlan;
@@ -209,26 +210,29 @@ pub trait Adapter: Send + Sync {
 
     fn capabilities(&self) -> Capabilities;
 
-    /// Plans resuming `target` in the tool that wrote it, or forking it
-    /// into a new conversation. `default_args` are the user's extra
-    /// arguments for tools that take them.
+    /// Plans resuming `target` in the tool that wrote it, started as
+    /// `launch` says, or forking it into a new conversation.
     ///
-    /// Not in upstream: `env`, `workspace` (it stands in for upstream's
-    /// process cwd) and `program_override` (the user's path of the tool's
-    /// program).
+    /// Not in upstream: `env` and `workspace` (it stands in for upstream's
+    /// process cwd).
     fn resume(
         &self,
         env: &HistoryEnv,
         target: Target<'_>,
         workspace: Option<&WorkspaceScope>,
         fork: bool,
-        default_args: &[String],
-        program_override: Option<&Path>,
+        launch: &Launch,
     ) -> crate::error::Result<ResumePlan>;
 
-    /// Deletes the conversation whose own artifact is `path`, returning the
+    /// Deletes the conversation whose own artifact is `path`, with the tool
+    /// `launcher` starts when the tool does the deleting, returning the
     /// number of transcripts removed (not in upstream, like `env`).
-    fn delete(&self, env: &HistoryEnv, path: &Path) -> crate::error::Result<usize>;
+    fn delete(
+        &self,
+        env: &HistoryEnv,
+        path: &Path,
+        launcher: &Launcher,
+    ) -> crate::error::Result<usize>;
 
     /// Sets the title of the conversation whose own artifact is `path`.
     fn rename(&self, path: &Path, title: &str) -> crate::error::Result<()>;

@@ -71,10 +71,14 @@ pub const TEXT_FIELDS: [Field; 17] = [
 ];
 
 /// Fields edited as one item per line.
-pub const LIST_FIELDS: [Field; 5] = [
+pub const LIST_FIELDS: [Field; 9] = [
     Field::ExcludeProjects,
     Field::ExcludePaths,
+    Field::ClaudeCommand,
     Field::ResumeArgs,
+    Field::PiCommand,
+    Field::OmpCommand,
+    Field::CodexCommand,
     Field::CodexResumeArgs,
     Field::AgentExclude,
 ];
@@ -297,10 +301,8 @@ impl SettingsDialog {
                 .as_ref()
                 .map(|workspace| workspace.dir().to_path_buf())
                 .or_else(|| state.env.home_dir.clone()),
-            programs: probe::PROGRAM_FIELDS
-                .iter()
-                .map(|(field, name)| (*field, self.draft.value(*field), *name))
-                .collect(),
+            cli: self.config.cli.clone(),
+            draft: self.draft.edited.clone(),
             paths: self
                 .pending_paths
                 .iter()
@@ -314,6 +316,7 @@ impl SettingsDialog {
         if field == Field::Terminal
             || self.pending_paths.contains_key(&field)
             || probe::PROGRAM_FIELDS.iter().any(|(f, _)| *f == field)
+            || field.command_agent().is_some()
         {
             self.schedule_probe(cx);
         }
@@ -538,7 +541,11 @@ impl SettingsDialog {
             }
             Field::ExcludeProjects
             | Field::ExcludePaths
+            | Field::ClaudeCommand
             | Field::ResumeArgs
+            | Field::PiCommand
+            | Field::OmpCommand
+            | Field::CodexCommand
             | Field::CodexResumeArgs
             | Field::AgentExclude => {
                 let list = lines_to_list(text);

@@ -172,6 +172,11 @@ fn sample(field: Field) -> Value {
         | Field::ResumeArgs
         | Field::CodexResumeArgs
         | Field::AgentExclude => Value::List(vec!["a".into(), "b c".into()]),
+        // A program alone is written as a string, with arguments as an array.
+        Field::ClaudeCommand | Field::OmpCommand => Value::List(vec!["my agent".into()]),
+        Field::PiCommand | Field::CodexCommand => {
+            Value::List(vec!["mise".into(), "exec".into(), "--".into()])
+        }
         Field::Key(_) => Value::Key(parse_key_binding("alt+z").unwrap()),
         Field::AgentScope => Value::Scope(AgentScopeConfig::Local),
         Field::AgentOutputChars | Field::AgentTop | Field::AgentWithinTop | Field::AgentHits => {
@@ -187,7 +192,7 @@ fn sample(field: Field) -> Value {
 /// Every field round-trips through the gui.toml model and Reset removes it.
 #[test]
 fn every_field_sets_gets_and_resets() {
-    assert_eq!(Field::ALL.len(), 35);
+    assert_eq!(Field::ALL.len(), 39);
     for field in Field::ALL {
         let mut gui = GuiConfigFile::default();
         assert!(get(field, &gui).is_unset(), "{field:?} starts unset");
@@ -242,6 +247,82 @@ fn source_lines_name_where_the_value_comes_from() {
     assert_eq!(
         source_of(Field::Theme, &layered("", ""), &ui).text,
         "Default: system"
+    );
+}
+
+/// C-071 (upstream 8a99ccc): an agent's `command` reads from either file
+/// as typed (words joined by spaces), defaults to the agent's binary, and a
+/// list that names no program removes the key.
+#[test]
+fn command_fields_read_both_files_and_default_to_the_agent() {
+    let ui = UiState::default();
+    let cfg = layered(
+        "[resume.pi]\ncommand = [\"mise\", \"exec\", \"--\", \"pi\"]\n",
+        "[resume]\ncommand = \"my-claude\"\n",
+    );
+    assert_eq!(
+        source_of(Field::ClaudeCommand, &cfg, &ui).text,
+        "From gui.toml"
+    );
+    assert_eq!(
+        source_of(Field::PiCommand, &cfg, &ui).text,
+        "From config.toml: mise exec -- pi"
+    );
+    assert_eq!(source_of(Field::OmpCommand, &cfg, &ui).text, "Default: omp");
+    assert_eq!(
+        source_of(Field::CodexCommand, &cfg, &ui).text,
+        "Default: codex"
+    );
+    assert_eq!(
+        get(Field::ClaudeCommand, &cfg.gui_file),
+        Value::List(vec!["my-claude".into()])
+    );
+    assert_eq!(
+        Field::PiCommand.qa_name(),
+        "resume.pi.command",
+        "a QA id per agent"
+    );
+    let mut gui = GuiConfigFile::default();
+    set(Field::OmpCommand, &mut gui, Value::List(vec![" ".into()]));
+    assert!(get(Field::OmpCommand, &gui).is_unset());
+}
+
+/// C-071 (decision 17): the program status of a path or command row names
+/// what runs and where it is configured when another key decides.
+#[test]
+fn program_status_names_the_launcher_that_applies() {
+    use crate::settings::pages::program_status_for;
+    use claude_history_core::history::model::SourceKind as Agent;
+    let tmp = tempfile::tempdir().unwrap();
+    let env = HistoryEnv::sandbox(tmp.path());
+    let cli: ConfigFile = layered("[resume.pi]\ncommand = [\"pi-wrapper\", \"--x\"]\n", "").cli;
+    let draft = gui_from("[resume]\ncommand = \"my-claude\"\n");
+    // The sandbox has no PATH: nothing is found by name.
+    assert_eq!(
+        program_status_for(&env, &cli, &draft, Field::ClaudeCommand, Agent::Claude),
+        "runs my-claude · not found on PATH"
+    );
+    assert_eq!(
+        program_status_for(&env, &cli, &draft, Field::ClaudePath, Agent::Claude),
+        "runs my-claude; from `command` under [resume] in gui.toml · not found on PATH"
+    );
+    assert_eq!(
+        program_status_for(&env, &cli, &draft, Field::PiPath, Agent::Pi),
+        "runs pi-wrapper --x; from `command` under [resume.pi] in config.toml · not found \
+         on PATH"
+    );
+    assert_eq!(
+        program_status_for(&env, &cli, &draft, Field::OmpPath, Agent::Omp),
+        "not found on PATH"
+    );
+    let missing = tmp.path().join("bin").join("codex.exe");
+    let draft = gui_from(&format!("[gui]\ncodex_path = '{}'\n", missing.display()));
+    assert_eq!(
+        program_status_for(&env, &cli, &draft, Field::CodexCommand, Agent::Codex),
+        format!(
+            "runs {}; from `codex_path` under [gui] in gui.toml · not an executable file",
+            missing.display()
+        )
     );
 }
 

@@ -4,6 +4,12 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 ## Unreleased
 
+- Resume, Fork and the Codex delete can start an agent through your own command or wrapper (a mise or nix shim, a
+  script that sets environment variables first, a differently named binary): set it in Settings > Resume (one word
+  per line) or as `command` under `[resume]` (Claude Code), `[resume.pi]`, `[resume.omp]` or `[resume.codex]`, for
+  example `command = ["mise", "exec", "--", "claude"]`. A command in gui.toml wins over the program path on the
+  General page, which wins over a command in config.toml. When the program cannot be found, the error names it and
+  where it is set, before anything is copied or started.
 - The viewer has a new **Off** tool display (toolbar, View > Tool display, and first in the `t` cycle: Off, Summary,
   Truncated, Full) that shows only the conversation text: tool calls, results and summaries are hidden, messages
   that hold only tools disappear, and message navigation skips them. `--no-tools` and `no_tools = true` now start

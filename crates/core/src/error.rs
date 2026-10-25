@@ -23,6 +23,11 @@ pub enum AppError {
     #[error("Failed to run Claude CLI: {0}")]
     ClaudeExecutionError(String),
 
+    /// The program that starts an agent (its own binary or the user's
+    /// `command`) is missing (upstream 8a99ccc, `history::actions::Launcher`).
+    #[error("Cannot start agent: {0}")]
+    AgentLaunch(String),
+
     /// The action needs a workspace folder and none is selected (GUI; the
     /// upstream CLI used its process cwd). The text is shown verbatim.
     #[error("{0}")]
@@ -109,6 +114,10 @@ mod tests {
             (
                 AppError::ClaudeExecutionError("boom".into()),
                 "Failed to run Claude CLI: boom".into(),
+            ),
+            (
+                AppError::AgentLaunch("`pi` was not found on PATH".into()),
+                "Cannot start agent: `pi` was not found on PATH".into(),
             ),
             (
                 AppError::ConfigError("bad".into()),

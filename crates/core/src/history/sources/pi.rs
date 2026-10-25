@@ -4,7 +4,7 @@
 use crate::env::{HistoryEnv, WorkspaceScope};
 use crate::error::Result;
 use crate::history::ParseError;
-use crate::history::actions::{Capabilities, Target};
+use crate::history::actions::{Capabilities, Launch, Launcher, Target};
 use crate::history::adapter::{Adapter, Completeness, Discovery, Located};
 use crate::history::model::{
     ConversationKey, Event, EventKind, ExecutionMode, HeadStatus, Relationship, Revision, Role,
@@ -107,19 +107,18 @@ impl Adapter for PiAdapter {
         target: Target<'_>,
         workspace: Option<&WorkspaceScope>,
         fork: bool,
-        _default_args: &[String],
-        program_override: Option<&Path>,
+        launch: &Launch,
     ) -> Result<ResumePlan> {
         Ok(crate::resume::plan_native(
             self.instance.kind,
             target,
             workspace,
             ResumeKind::from_fork(fork),
-            program_override,
+            &launch.launcher,
         ))
     }
 
-    fn delete(&self, _env: &HistoryEnv, path: &Path) -> Result<usize> {
+    fn delete(&self, _env: &HistoryEnv, path: &Path, _launcher: &Launcher) -> Result<usize> {
         match self.instance.kind {
             SourceKind::Omp => omp_loader::delete_session(path),
             _ => pi_loader::delete_session(path),

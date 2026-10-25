@@ -1,4 +1,5 @@
 use super::*;
+use crate::history::actions::ConfiguredAt;
 use crate::history::index;
 use crate::history::model::{
     EventKind, ExecutionMode, HeadStatus, Message, Part, Relationship, Role, Visibility,
@@ -446,36 +447,82 @@ fn actions_run_the_codex_cli_on_the_rollouts_home() {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
     };
-    let resume = adapter
-        .resume(&env, target, None, false, &["--yolo".to_owned()], None)
-        .unwrap();
+    let launch = Launch {
+        launcher: Launcher::default_for(SourceKind::Codex),
+        default_args: vec!["--yolo".to_owned()],
+    };
+    let resume = adapter.resume(&env, target, None, false, &launch).unwrap();
     assert!(resume.copy.is_none());
-    assert_eq!(resume.program, "codex");
+    assert_eq!(resume.launcher.program, Path::new("codex"));
     assert_eq!(args(&resume), ["--yolo", "resume", PAGED]);
     assert_eq!(resume.cwd.as_deref(), Some(project.path()));
     assert_eq!(
         resume.env,
         [(OsString::from("CODEX_HOME"), home.clone().into_os_string())]
     );
-    let fork = adapter.resume(&env, target, None, true, &[], None).unwrap();
+    // Upstream 8a99ccc: a configured command and its arguments start Codex.
+    let wrapped = Launch {
+        launcher: Launcher::configured(
+            &env,
+            &[
+                "codex-wrapper".to_owned(),
+                "--profile".to_owned(),
+                "work".to_owned(),
+            ],
+            ConfiguredAt::Config("[resume.codex]"),
+        ),
+        default_args: Vec::new(),
+    };
+    let fork = adapter.resume(&env, target, None, true, &wrapped).unwrap();
+    assert_eq!(fork.launcher.program, Path::new("codex-wrapper"));
     assert_eq!(args(&fork), ["fork", PAGED]);
+    assert_eq!(
+        fork.display_command(),
+        format!("codex-wrapper --profile work fork {PAGED}")
+    );
+    let missing = Launcher::configured(
+        &env,
+        &["/nonexistent/claude-history-test/codex".to_owned()],
+        ConfiguredAt::Config("[resume.codex]"),
+    );
+    let error = adapter
+        .delete(&env, &path, &missing)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("[resume.codex]"), "{error}");
     assert!(!adapter.capabilities().rename);
     assert!(adapter.rename(&path, "x").is_err());
 
-    // `codex delete --force <id>` on the rollout's home, never run by a test.
+    // `codex delete --force <id>` on the rollout's home, never run by a test,
+    // through the configured program and its leading arguments.
     let codex = sandbox.path().join("codex.exe");
     std::fs::write(&codex, "").unwrap();
-    let spec = delete_spec(&env, &path, Path::new(""), Some(&codex)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let configured = Launcher {
+        args: vec!["--profile".to_owned(), "work".to_owned()],
+        ..Launcher::program_path(&env, &codex, ConfiguredAt::GuiPath("codex_path"))
+    };
+    let spec = delete_spec(&env, &path, Path::new(""), &configured).unwrap();
     assert_eq!(spec.program.path, codex);
     assert_eq!(
         spec.args,
-        ["delete", "--force", PAGED].map(OsString::from).to_vec()
+        ["--profile", "work", "delete", "--force", PAGED]
+            .map(OsString::from)
+            .to_vec()
     );
     assert_eq!(spec.env, resume.env);
     assert_eq!(thread_rollouts(&path).unwrap(), std::slice::from_ref(&path));
-    let refused = adapter.delete(&env, &path).unwrap_err();
+    let refused = adapter
+        .delete(&env, &path, &Launcher::default_for(SourceKind::Codex))
+        .unwrap_err();
     assert!(
-        refused.to_string().contains("Could not find 'codex'"),
+        refused
+            .to_string()
+            .contains("`codex` was not found on PATH"),
         "{refused}"
     );
     assert!(path.is_file(), "a test never deletes a rollout");
