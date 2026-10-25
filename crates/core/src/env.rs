@@ -503,12 +503,6 @@ impl WorkspaceScope {
     pub fn project_dir_name(&self) -> &str {
         &self.project_dir_name
     }
-
-    /// The workspace directory, canonicalized when possible (for path
-    /// equality checks against Pi/OMP session working directories).
-    pub fn canonical_dir(&self) -> PathBuf {
-        self.dir.canonicalize().unwrap_or_else(|_| self.dir.clone())
-    }
 }
 
 /// Claude's project directory name for a directory.

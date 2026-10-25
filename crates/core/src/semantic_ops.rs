@@ -79,29 +79,22 @@ pub fn no_conversations_message(local: bool) -> &'static str {
 }
 
 /// Indices of the conversations a semantic operation works on: all of them,
-/// or (with a workspace, upstream `--local`) those whose Claude project
-/// directory name is the workspace's (worktree-aware). Pi/OMP conversations
-/// never match a workspace here, exactly as upstream (`semantic_cli.rs:446-472`).
+/// or (with a workspace, upstream `--local`) those that belong to the
+/// workspace ([`history::Workspace::contains`], upstream 82b355a): a Claude
+/// project directory that is the workspace's (worktree-aware), a Pi, OMP or
+/// Codex project at or below it, or a recorded cwd at or below it.
 pub fn select_conversation_indices(
     conversations: &[Conversation],
     workspace: Option<&WorkspaceScope>,
 ) -> Vec<usize> {
+    let workspace = workspace.map(|scope| history::Workspace::new(scope, None));
     conversations
         .iter()
         .enumerate()
         .filter(|(_, conversation)| {
-            workspace.is_none_or(|workspace| {
-                conversation
-                    .path
-                    .parent()
-                    .and_then(|parent| parent.file_name())
-                    .is_some_and(|name| {
-                        history::is_same_project(
-                            &name.to_string_lossy(),
-                            workspace.project_dir_name(),
-                        )
-                    })
-            })
+            workspace
+                .as_ref()
+                .is_none_or(|workspace| workspace.contains(conversation))
         })
         .map(|(index, _)| index)
         .collect()
@@ -1483,10 +1476,11 @@ mod tests {
     }
 
     #[test]
-    fn t014_local_selection_matches_claude_project_dirs_only() {
-        // Upstream matched only the Claude project directory name: Pi/OMP
-        // sessions (in their own session directories) are never local, even
-        // when their working directory is the workspace.
+    fn t014_local_selection_follows_the_workspace_rule() {
+        // Upstream 82b355a: Pi/OMP sessions belong to the workspace by their
+        // project or a recorded cwd (before, only the Claude project
+        // directory name counted), and a Claude session stored elsewhere by
+        // a recorded cwd below the workspace.
         let dir = tempfile::tempdir().unwrap();
         let workspace = WorkspaceScope::new(dir.path()).unwrap();
         let project = workspace.project_dir_name().to_string();
@@ -1499,20 +1493,35 @@ mod tests {
         pi.project_path = Some(dir.path().to_path_buf());
         let mut omp = test_conversation("sessions/omp.jsonl", "omp", vec!["omp".to_string()]);
         omp.source = crate::history::model::SourceKind::Omp;
-        omp.cwd = Some(dir.path().to_path_buf());
+        omp.cwd = Some(dir.path().join("sub"));
+        omp.cwds = vec![dir.path().join("sub")];
         let claude = test_conversation(
             &format!("projects/{project}/claude.jsonl"),
             "claude",
             vec!["claude".to_string()],
         );
-        let conversations = vec![pi, omp, claude];
+        let mut moved = test_conversation(
+            "projects/-elsewhere/moved.jsonl",
+            "moved",
+            vec!["moved".to_string()],
+        );
+        moved.cwds = vec![PathBuf::from("/elsewhere"), dir.path().join("src")];
+        let mut sibling = test_conversation(
+            "projects/-elsewhere/sibling.jsonl",
+            "sibling",
+            vec!["sibling".to_string()],
+        );
+        let mut beside = dir.path().as_os_str().to_owned();
+        beside.push("-other");
+        sibling.cwds = vec![PathBuf::from(beside)];
+        let conversations = vec![pi, omp, claude, moved, sibling];
         assert_eq!(
             select_conversation_indices(&conversations, Some(&workspace)),
-            vec![2]
+            vec![0, 1, 2, 3]
         );
         assert_eq!(
             select_conversation_indices(&conversations, None),
-            vec![0, 1, 2]
+            vec![0, 1, 2, 3, 4]
         );
     }
 

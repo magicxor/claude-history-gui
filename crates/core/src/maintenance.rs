@@ -971,46 +971,24 @@ pub fn format_debug_age(age: chrono::Duration) -> String {
     }
 }
 
-/// Whether a conversation belongs to the workspace, as upstream's
-/// `--debug-search --local` decided: Claude by worktree-aware project
-/// directory name, Pi/OMP by canonical working directory.
-pub fn conversation_in_workspace(conversation: &Conversation, workspace: &WorkspaceScope) -> bool {
-    if conversation.source != SourceKind::Claude {
-        let current = workspace.canonical_dir();
-        return conversation
-            .project_path
-            .as_ref()
-            .or(conversation.cwd.as_ref())
-            .is_some_and(|path| {
-                crate::history::path::same_path(
-                    &path.canonicalize().unwrap_or_else(|_| path.clone()),
-                    &current,
-                )
-            });
-    }
-    conversation
-        .path
-        .parent()
-        .and_then(|p| p.file_name())
-        .is_some_and(|name| {
-            history::is_same_project(&name.to_string_lossy(), workspace.project_dir_name())
-        })
-}
-
 /// Lexical scoring breakdown for `query` (upstream `--debug-search`,
 /// `main.rs:244-335`). `conversations` should be newest first (see
-/// [`load_sorted_conversations`]); `workspace` restricts to the workspace
-/// (`--local`).
+/// [`load_sorted_conversations`]); `workspace` restricts to the
+/// conversations that belong to the workspace (`--local`,
+/// [`history::Workspace::contains`]: started there, or a recorded cwd at or
+/// below it, upstream 82b355a).
 pub fn debug_search_report(
     conversations: &[Conversation],
     query: &str,
     now: DateTime<Local>,
     workspace: Option<&WorkspaceScope>,
 ) -> DebugSearchReport {
+    let workspace = workspace.map(|scope| history::Workspace::new(scope, None));
     let searchable = search::precompute_search_text(conversations);
     let debug = search::debug_search(conversations, &searchable, query, now, |index| {
         workspace
-            .is_none_or(|workspace| conversation_in_workspace(&conversations[index], workspace))
+            .as_ref()
+            .is_none_or(|workspace| workspace.contains(&conversations[index]))
     });
     let total_results = debug.results.len();
     let rows = debug
@@ -2247,17 +2225,39 @@ mod tests {
     #[test]
     fn pi_conversations_match_the_workspace_by_directory() {
         let root = tempfile::tempdir().unwrap();
+        let in_workspace = |pi: &Conversation, dir: &Path| {
+            history::Workspace::new(&WorkspaceScope::new(dir).unwrap(), None).contains(pi)
+        };
         let mut pi = conversation("/sessions/x.jsonl", "pi");
         pi.source = SourceKind::Pi;
         pi.project_path = Some(root.path().to_path_buf());
-        assert!(conversation_in_workspace(
-            &pi,
-            &WorkspaceScope::new(root.path()).unwrap()
-        ));
-        assert!(!conversation_in_workspace(
-            &pi,
-            &WorkspaceScope::new(root.path().join("sub")).unwrap()
-        ));
+        assert!(in_workspace(&pi, root.path()));
+        assert!(!in_workspace(&pi, &root.path().join("sub")));
+        // Upstream 82b355a: a session of a folder below the workspace
+        // belongs to it too.
+        pi.project_path = Some(root.path().join("sub"));
+        assert!(in_workspace(&pi, root.path()));
+    }
+
+    /// Upstream 82b355a: `--debug-search --local` also takes in a Claude
+    /// session stored under another project that worked in the workspace.
+    #[test]
+    fn debug_search_report_scopes_by_recorded_cwds() {
+        let now = Local::now();
+        let mut moved = conversation("/p/-nowhere/moved.jsonl", "needle");
+        moved.cwds = vec![
+            PathBuf::from("/nowhere"),
+            PathBuf::from("/nowhere/proj/src"),
+        ];
+        moved.cwd = moved.cwds.first().cloned();
+        let mut sibling = conversation("/p/-nowhere/sibling.jsonl", "needle");
+        sibling.cwds = vec![PathBuf::from("/nowhere/proj-other")];
+        sibling.cwd = sibling.cwds.first().cloned();
+        let conversations = vec![moved, sibling];
+        let workspace = WorkspaceScope::from_parts("/nowhere/proj", "-nowhere-proj");
+        let report = debug_search_report(&conversations, "needle", now, Some(&workspace));
+        let sessions: Vec<&str> = report.rows.iter().map(|row| row.session.as_str()).collect();
+        assert_eq!(sessions, ["moved"]);
     }
 
     #[test]

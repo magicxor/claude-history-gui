@@ -11,7 +11,9 @@ use gpui_kit::{Focusable as _, Keystroke, ScrollDelta, TestAppContext, point, px
 use crate::exit;
 use crate::keymap;
 use crate::list::ListPaneEvent;
-use crate::test_support::fixtures_list::{ListFixture, listed_corpus, workspace_corpus};
+use crate::test_support::fixtures_list::{
+    ListFixture, SessionSpec, listed_corpus, workspace_corpus,
+};
 use crate::test_support::{TestWorld, recording, synth};
 
 fn corpus(n: usize) -> TestWorld {
@@ -614,7 +616,16 @@ fn scope_toggles_with_tab_and_a_workspace(cx: &mut TestAppContext) {
     );
     assert!(f.read(cx, |list, _| list.has_workspace()));
     assert!(f.read(cx, |list, _| list.scope_is_workspace()), "C-003");
-    assert_eq!(f.read(cx, |list, _| list.prompt_text()), "Project ❯");
+    assert_eq!(
+        f.read(cx, |list, _| list.prompt_text()),
+        format!(
+            "{} ❯",
+            std::path::Path::new("~")
+                .join("work")
+                .join("proj")
+                .display()
+        )
+    );
     f.wait_idle(cx);
     let titles = f.titles(cx);
     assert_eq!(titles.len(), 4, "{titles:?}: proj and its worktree only");
@@ -635,6 +646,49 @@ fn scope_toggles_with_tab_and_a_workspace(cx: &mut TestAppContext) {
     f.wait_idle(cx);
     assert!(f.read(cx, |list, _| list.scope_is_workspace()));
     assert_eq!(f.titles(cx), titles);
+}
+
+/// L-044, L-045 (upstream 82b355a): the Workspace scope also lists a
+/// conversation stored under another project that worked in the workspace
+/// or a folder below it, but not one that only worked beside it.
+#[gpui_kit::test]
+fn workspace_scope_lists_conversations_that_worked_in_it(cx: &mut TestAppContext) {
+    let world = TestWorld::new();
+    let (proj, _worktree, _api) = workspace_corpus(&world);
+    let work = proj.parent().unwrap().to_path_buf();
+    let messages = [
+        ("user", "started in the parent"),
+        ("assistant", "ok"),
+        ("user", "then moved"),
+    ];
+    for (number, summary, moved_to) in [
+        (201, "moved session", proj.join("src")),
+        (202, "sibling session", work.join("proj-other")),
+    ] {
+        SessionSpec::new("work", number)
+            .cwd(work.clone())
+            .moves_to(moved_to)
+            .messages(&messages)
+            .summary(summary)
+            .write(&world);
+    }
+    let f = ListFixture::open_loaded(
+        cx,
+        &world,
+        &["--workspace", &proj.display().to_string(), "-L"],
+    );
+    f.wait_idle(cx);
+    let titles = f.titles(cx);
+    assert!(titles.iter().any(|t| t == "moved session"), "{titles:?}");
+    assert!(!titles.iter().any(|t| t == "sibling session"), "{titles:?}");
+    assert_eq!(
+        titles.len(),
+        5,
+        "{titles:?}: proj, its worktree and the moved one"
+    );
+    f.press(cx, "tab");
+    f.wait_idle(cx);
+    assert_eq!(f.paths(cx).len(), 8);
 }
 
 /// L-046: without a workspace Tab does not toggle the scope and moves focus on.

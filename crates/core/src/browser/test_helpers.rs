@@ -144,6 +144,7 @@ pub(crate) fn plain_conversation(path: PathBuf) -> Conversation {
         project_name: None,
         project_path: None,
         cwd: None,
+        cwds: Vec::new(),
         message_count: 0,
         parse_errors: Vec::new(),
         summary: None,

@@ -234,6 +234,83 @@ fn snapshot_pi_rows_match_workspace_by_canonical_project_path() {
     assert!(!app.has_multiple_sources());
 }
 
+/// Upstream 82b355a. Fork: the workspace folders are in the sandbox, so the
+/// workspace is absolute on every platform.
+#[test]
+fn snapshot_rows_match_workspace_by_recorded_cwds() {
+    use crate::history::model::SourceKind;
+    let sandbox = Sandbox::new();
+    let work = sandbox.path().join("work");
+    let group = work.join("group");
+    let repo = group.join("repo");
+    let group_project = crate::env::workspace_project_dir_name(&group);
+    let repo_project = crate::env::workspace_project_dir_name(&repo);
+    let card = |path: String, at: i64, source: SourceKind, cwds: &[PathBuf]| {
+        let mut card = conversation(&path, at * HOUR_MS);
+        card.source = source;
+        card.cwds = cwds.to_vec();
+        card.cwd = card.cwds.first().cloned();
+        card.project_path = card.cwd.clone();
+        card.full_text = "needle".into();
+        card
+    };
+    let moved = format!("/p/{group_project}/moved.jsonl");
+    let home = format!("/p/{repo_project}/home.jsonl");
+    let corpus = vec![
+        // Started in the parent folder, then worked in the repo.
+        card(
+            moved.clone(),
+            1,
+            SourceKind::Claude,
+            &[group.clone(), group.join("repo-b"), repo.join("src")],
+        ),
+        card(
+            format!("/p/{group_project}/sibling.jsonl"),
+            2,
+            SourceKind::Claude,
+            &[group.clone(), group.join("repo-other")],
+        ),
+        card(home.clone(), 3, SourceKind::Claude, &[]),
+        card(
+            "/s/codex.jsonl".to_string(),
+            4,
+            SourceKind::Codex,
+            &[work.join("x"), repo.clone()],
+        ),
+        card(
+            "/s/pi.jsonl".to_string(),
+            5,
+            SourceKind::Pi,
+            &[repo.join("deep")],
+        ),
+        card(
+            "/s/pi-other.jsonl".to_string(),
+            6,
+            SourceKind::Pi,
+            std::slice::from_ref(&group),
+        ),
+    ];
+    let root = publish(&corpus);
+    let snapshot = crate::store::Snapshot::open(root.path(), true, TimeFilter::default()).unwrap();
+    let doc = snapshot.find(Path::new(&moved)).unwrap();
+    assert_eq!(snapshot.card(doc).cwds, corpus[0].cwds);
+
+    let mut app = loading_app(&sandbox, Some(&repo), vec![]);
+    show(&mut app, &root, TimeFilter::default());
+    let in_scope = [
+        "/s/pi.jsonl".to_string(),
+        "/s/codex.jsonl".to_string(),
+        home,
+        moved,
+    ];
+    assert_eq!(listed_paths(&app), in_scope);
+
+    assert!(app.open_search_index());
+    type_query(&mut app, "needle");
+    wait_for_search(&mut app);
+    assert_eq!(listed_paths(&app), in_scope);
+}
+
 #[test]
 fn the_source_label_follows_the_generation() {
     let sandbox = Sandbox::new();

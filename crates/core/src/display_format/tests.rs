@@ -28,6 +28,7 @@ fn test_conversation() -> Conversation {
         project_name: Some("project sentinel".to_string()),
         project_path: None,
         cwd: Some(PathBuf::from("/cwd/sentinel")),
+        cwds: vec![PathBuf::from("/cwd/sentinel")],
         message_count: 1,
         parse_errors: Vec::new(),
         summary: Some("summary sentinel".to_string()),

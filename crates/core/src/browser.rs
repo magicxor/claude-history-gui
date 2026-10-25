@@ -62,8 +62,10 @@
 //!
 //! * **Workspace (D2).** The workspace scope comes from
 //!   [`BrowserOptions::workspace`] (a [`WorkspaceScope`]), never from the
-//!   process working directory. Pi/OMP rows are compared with the workspace
-//!   directory after canonicalization and Windows path normalization (W1).
+//!   process working directory; membership is upstream's
+//!   [`crate::history::Workspace::contains`] (82b355a: the project, or a
+//!   recorded cwd at or below the workspace), which compares canonical paths
+//!   after Windows path normalization (W1).
 //! * **Quirk 6.** A UUID query that matches nothing reports
 //!   [`UuidLookup::NotFound`] through [`Browser::uuid_lookup`]. The previous
 //!   rows stay visible, as upstream.
@@ -107,8 +109,9 @@
 //!   applies while loading (the query runs with it once it can run);
 //!   upstream's Ctrl+V was ignored until the rows were listed. It is a no-op
 //!   in single-file mode, which has no list.
-//! * **Generation mode.** The cards' workspace test is [`WorkspaceScope`]'s
-//!   (D2, W1), not the process cwd. Every card is materialized and the index
+//! * **Generation mode.** The cards' workspace test
+//!   ([`crate::store::Snapshot::scope`]) uses the [`WorkspaceScope`] (D2,
+//!   W1), not the process cwd. Every card is materialized and the index
 //!   opened off the UI thread, and a swap keeps a query's rows until it
 //!   answers (see `cards`). The store is used only when
 //!   [`LoaderOptions::snapshot`] is on (the GUI's main list; upstream used it
@@ -751,6 +754,15 @@ impl Browser {
     /// The workspace used by the project scope.
     pub fn workspace(&self) -> Option<&WorkspaceScope> {
         self.workspace.as_ref()
+    }
+
+    /// The workspace folder with the env's home directory written as `~`
+    /// (upstream 82b355a `Workspace::display`, which the TUI's search prompt
+    /// shows while the project scope is on). No file system access.
+    pub fn workspace_display(&self) -> Option<String> {
+        self.workspace.as_ref().map(|scope| {
+            crate::history::path::tilde_path(scope.dir(), self.env.home_dir.as_deref())
+        })
     }
 
     /// Whether a workspace is set (the scope toggle is a no-op without one).

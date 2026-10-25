@@ -70,6 +70,7 @@ fn parse(args: &[&str]) -> AgentRequest {
                     ("exact", None) => search.search_mode.exact = true,
                     ("all-kinds", None) => search.all_kinds = true,
                     ("user-only", None) => search.user_only = true,
+                    ("local", None) => search.local = true,
                     ("mode", Some(mode)) => {
                         search.search_mode.mode = Some(mode.parse::<SearchMode>().unwrap())
                     }
@@ -538,6 +539,86 @@ fn search_reports_partial_warnings_and_preserves_compact_success_output() {
         "{}",
         read.stderr
     );
+}
+
+/// Upstream 82b355a. Fork: the workspace is the sandbox env's (upstream ran
+/// the binary in the repo folder), given in plain form: Claude Code records
+/// the working directory without Windows' `\\?\` prefix.
+#[test]
+fn local_search_includes_sessions_that_worked_in_the_workspace() {
+    let (home, config, _) = dirs();
+    let group = config.path().join("work").join("group");
+    let repo = group.join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo");
+    // The process sees the resolved directory, as the recorded cwd does.
+    let resolved = |dir: &Path| {
+        crate::env::normalize_windows_path(&dir.canonicalize().expect("canonical dir"))
+    };
+    let group = resolved(&group);
+    let repo = resolved(&repo);
+    let project = config
+        .path()
+        .join("projects")
+        .join(crate::env::workspace_project_dir_name(&group));
+    std::fs::create_dir_all(&project).expect("create project");
+    let write = |name: &str, cwds: &[&Path]| {
+        let lines: Vec<String> = cwds
+            .iter()
+            .map(|cwd| {
+                serde_json::json!({
+                    "type": "user",
+                    "timestamp": "2026-07-20T00:00:00Z",
+                    "cwd": cwd,
+                    "message": {"role": "user", "content": "scoped cwd needle"}
+                })
+                .to_string()
+            })
+            .collect();
+        std::fs::write(project.join(name), lines.join("\n") + "\n").expect("write transcript");
+    };
+    write(
+        "12345678-1234-4234-9234-123456789abc.jsonl",
+        &[&group, &repo.join("src")],
+    );
+    write(
+        "87654321-1234-4234-9234-123456789abc.jsonl",
+        &[&group, &group.join("repo-other")],
+    );
+
+    let env = sandbox(
+        home.path(),
+        config.path(),
+        &config.path().join("empty-agent-sessions"),
+    )
+    .with_workspace(&repo);
+    let search = run_env(
+        &env,
+        &[
+            "agent",
+            "search",
+            "--local",
+            "--lexical",
+            "scoped cwd needle",
+        ],
+    );
+    assert!(search.success, "{}", search.stderr);
+    assert!(
+        search.stdout.contains("uuid=12345678-"),
+        "{}",
+        search.stdout
+    );
+    assert!(
+        !search.stdout.contains("uuid=87654321-"),
+        "{}",
+        search.stdout
+    );
+    let outline = run(
+        home.path(),
+        config.path(),
+        &["agent", "outline", &first_ref(&search.stdout)],
+    );
+    assert!(outline.success, "{}", outline.stderr);
+    assert!(outline.stdout.contains("12345678"));
 }
 
 #[test]

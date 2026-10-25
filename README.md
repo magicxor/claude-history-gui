@@ -54,7 +54,12 @@ All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-h
   instead.
 * Scope **All** or **Workspace** (project folder; on Windows the match ignores letter case, so `C:\Users\Foo\myproject` also finds `C:\Users\Foo\MyProject`), a workspace picker with recent folders, a time filter
   (`--since`/`--before` grammar such as `2d`, `1d6h`, `6mo`, `2026-07-20`), excluded projects and working
-  directories.
+  directories. A conversation belongs to the workspace when it was started there (or in one of its worktrees), or
+  when any working directory it recorded is that folder or a folder below it: a session started in `~/code` that
+  moved into `~/code/repo` is in `~/code/repo`'s scope, and a workspace at `~/code` takes in the sessions of every
+  repo below it. Folders match whole path components (`~/code/repo` does not include `~/code/repo-old`). This holds
+  for Claude Code, Pi, OMP and Codex, in the list, Deep search's Workspace scope and the Tools. While the scope is
+  on, the search prompt shows the folder (`~/code/repo ❯`, cut from the start when it is long).
 * Paste a session UUID to jump to that conversation. Preview shows the first or last messages.
 * Row context menu, F5/Ctrl+L refresh, command palette (Ctrl+Shift+P or F10) with every menu command.
 
@@ -381,7 +386,7 @@ remembered mode). Settings → Display offers Off / Summary / Full; Summary remo
 `config.toml` value or the remembered mode applies again.
 
 `[tui] exclude_projects` hides exact project names from the list, its searches and Deep search (`agent search`) (`repo` also hides `repo/<worktree>`).
-`[tui] exclude_paths` hides the conversations whose recorded working directory starts with a listed prefix, from the
+`[tui] exclude_paths` hides the conversations whose first recorded working directory starts with a listed prefix, from the
 list, its searches and Deep search (`agent search`), for every source. Matching is literal and case-sensitive (case-insensitive on
 Windows, where paths differing only in case are the same directory): `/tmp/`
 matches `/tmp/eval-123` but not `/tmp` or `/tmp-other`; nothing is resolved or expanded (`~`, variables, globs), empty

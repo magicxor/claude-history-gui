@@ -79,6 +79,9 @@ pub struct SessionSpec<'a> {
     pub spacing_minutes: i64,
     /// The session's working directory (default: under `synth::cwd_base()`).
     pub cwd: Option<PathBuf>,
+    /// The working directory of the messages after the first record (the
+    /// session changed directory; it stays stored under `cwd`'s project).
+    pub moved_to: Option<PathBuf>,
 }
 
 impl<'a> SessionSpec<'a> {
@@ -95,12 +98,20 @@ impl<'a> SessionSpec<'a> {
             start: None,
             spacing_minutes: 1,
             cwd: None,
+            moved_to: None,
         }
     }
 
     /// Use `cwd` as the working directory (it determines the project).
     pub fn cwd(mut self, cwd: PathBuf) -> Self {
         self.cwd = Some(cwd);
+        self
+    }
+
+    /// Record `dir` as the working directory of every message after the
+    /// first (upstream 82b355a's recorded cwds).
+    pub fn moves_to(mut self, dir: PathBuf) -> Self {
+        self.moved_to = Some(dir);
         self
     }
 
@@ -140,6 +151,10 @@ impl<'a> SessionSpec<'a> {
             .unwrap_or_else(|| synth::cwd_base().join(self.project));
         let uuid = synth::uuid(self.number);
         let cwd_json = serde_json::to_string(&cwd.display().to_string()).unwrap();
+        let moved_json = self
+            .moved_to
+            .as_ref()
+            .map(|dir| serde_json::to_string(&dir.display().to_string()).unwrap());
         let mut lines = Vec::new();
         if let Some(summary) = self.summary {
             lines.push(format!(
@@ -159,6 +174,10 @@ impl<'a> SessionSpec<'a> {
                 .format("%Y-%m-%dT%H:%M:%SZ")
                 .to_string();
             let text_json = serde_json::to_string(text).unwrap();
+            let cwd_json = match &moved_json {
+                Some(moved) if ix > 0 => moved,
+                _ => &cwd_json,
+            };
             let line = if *role == "user" {
                 format!(
                     r#"{{"type":"user","sessionId":"{uuid}","cwd":{cwd_json},"timestamp":"{stamp}","message":{{"role":"user","content":{text_json}}}}}"#

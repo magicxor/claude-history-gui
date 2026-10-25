@@ -29,6 +29,7 @@ fn conversation(project: Option<&str>, project_dir: &str, uuid: &str, text: &str
         project_name: project.map(str::to_string),
         project_path: None,
         cwd: None,
+        cwds: Vec::new(),
         message_count: 1,
         parse_errors: Vec::new(),
         summary: None,
@@ -112,6 +113,52 @@ fn workspace_scope_matches_claude_rows_whatever_the_workspace_spelling() {
         );
         assert_eq!(app.filter_indices(0..2), vec![0], "{spelling}");
     }
+}
+
+/// Upstream 82b355a, for the in-memory rows: a conversation stored under
+/// another project belongs to the workspace by a recorded cwd at or below
+/// it (whole path components), and a Pi row by a project below it.
+#[test]
+fn workspace_scope_includes_conversations_by_recorded_cwds() {
+    let sandbox = Sandbox::new();
+    let mut moved = conversation(Some("group"), "-work-group", "moved-id", "moved");
+    moved.cwds = vec![
+        PathBuf::from("/work/group"),
+        PathBuf::from("/work/group/repo/src"),
+    ];
+    let mut sibling = conversation(Some("group"), "-work-group", "sibling-id", "sibling");
+    sibling.cwds = vec![PathBuf::from("/work/group/repo-other")];
+    let home = conversation(Some("repo"), "-work-group-repo", "home-id", "home");
+    let mut pi = conversation(Some("deep"), "ignored", "pi-id", "pi");
+    pi.source = crate::history::model::SourceKind::Pi;
+    pi.project_path = Some(PathBuf::from("/work/group/repo/deep"));
+    pi.path = PathBuf::from("/tmp/flat-pi-sessions/pi.jsonl");
+
+    let mut app = app(&sandbox, vec![moved, sibling, home, pi], vec![]);
+    app.workspace_filter = true;
+    app.workspace = Some(workspace("/work/group/repo", "-work-group-repo"));
+    assert_eq!(app.filter_indices(0..4), vec![0, 2, 3]);
+}
+
+/// Upstream 82b355a's prompt folder: the workspace with the env's home
+/// written as `~`.
+#[test]
+fn workspace_display_abbreviates_the_env_home() {
+    let sandbox = Sandbox::new();
+    let mut app = app(&sandbox, vec![], vec![]);
+    assert_eq!(app.workspace_display(), None);
+    let dir = sandbox.path().join("code").join("repo");
+    app.workspace = Some(WorkspaceScope::new(&dir).unwrap());
+    assert_eq!(
+        app.workspace_display(),
+        Some(
+            std::path::Path::new("~")
+                .join("code")
+                .join("repo")
+                .display()
+                .to_string()
+        )
+    );
 }
 
 fn app(sandbox: &Sandbox, conversations: Vec<Conversation>, excluded: Vec<&str>) -> Browser {

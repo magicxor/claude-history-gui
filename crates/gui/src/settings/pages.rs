@@ -608,8 +608,8 @@ impl SettingsDialog {
                 Field::ExcludePaths,
                 exclude_paths,
                 Some(self.note(
-                    "One prefix of the recorded working directory per line (literal and \
-                     case-sensitive, e.g. `/tmp/` or `C:\\Users\\me\\AppData\\Local\\Temp\\`); \
+                    "One prefix of the first recorded working directory per line (literal; \
+                     case-insensitive on Windows, e.g. `/tmp/` or `C:\\Users\\me\\AppData\\Local\\Temp\\`); \
                      also hidden from Deep search.",
                     cx,
                 )),

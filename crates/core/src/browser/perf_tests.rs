@@ -73,6 +73,7 @@ fn synthetic(root: &Path, index: usize) -> Conversation {
         project_name: Some(format!("project-{:02}", index % PROJECTS)),
         project_path: Some(project_dir(index % PROJECTS)),
         cwd: None,
+        cwds: Vec::new(),
         message_count: 2,
         parse_errors: Vec::new(),
         summary: Some(format!("Summary {index}")),

@@ -57,7 +57,7 @@ use claude_history_core::browser::{
 };
 #[cfg(test)]
 use claude_history_core::browser::{LoadEvent, UuidLookup};
-use claude_history_core::display_format::HighlightQuery;
+use claude_history_core::display_format::{HighlightQuery, truncate_start};
 use claude_history_core::export::ExportOptions;
 use claude_history_core::history::Conversation;
 use claude_history_core::time_filter::TimeFilter;
@@ -158,12 +158,30 @@ const ROW_MENU_TOKENS_KEPT: usize = 8;
 const DEFAULT_VISIBLE_ROWS: usize = 10;
 /// The pane width assumed before the first layout (rem).
 const DEFAULT_PANE_REM: f32 = 30.0;
+/// The rem size assumed before the first frame (px).
+const DEFAULT_REM_PX: f32 = 16.0;
+/// The search input's text size (`Input::small`: `text_sm`), rem.
+const PROMPT_FONT_REM: f32 = 0.875;
+/// The share of the pane the prompt's folder takes before it is cut from
+/// the start (upstream 82b355a: a third of the search bar).
+const PROMPT_FOLDER_SHARE: f32 = 1.0 / 3.0;
+/// The fewest characters the prompt's folder keeps (upstream: 8 cells).
+const PROMPT_FOLDER_MIN_CHARS: usize = 8;
+
+/// How many characters of the prompt's folder fit about a third of a pane
+/// `pane_px` wide (average glyph width, like the rows' budgets).
+pub fn prompt_folder_chars(pane_px: f32, rem_px: f32) -> usize {
+    let avg = (PROMPT_FONT_REM * rem_px * rows::AVG_CHAR_WIDTH_EM).max(1.0);
+    ((pane_px * PROMPT_FOLDER_SHARE / avg).floor() as usize).max(PROMPT_FOLDER_MIN_CHARS)
+}
 
 /// Measurements the render pass records for the next frame.
 #[derive(Clone, Copy, Debug, Default)]
 struct Metrics {
     /// The pane's width in px (last layout).
     pane_width: Option<Pixels>,
+    /// The window's rem size in px (last frame).
+    rem: Option<Pixels>,
 }
 
 /// The conversation list.
@@ -689,13 +707,32 @@ impl ListPane {
         self.browser.has_project_context()
     }
 
-    /// The prompt in front of the query: `❯`, or `Project ❯` with the
+    /// The folder in front of the prompt while the Workspace scope is on
+    /// (L-031, upstream 82b355a): the workspace with `~` for the home
+    /// directory (core `Browser::workspace_display`), cut from the start
+    /// (`…/group/repo`) when it would take more than about a third of the
+    /// pane; `Project` without a workspace.
+    pub fn prompt_folder(&self) -> Option<String> {
+        if !self.scope_is_workspace() {
+            return None;
+        }
+        let metrics = self.metrics.get();
+        let rem = metrics.rem.map_or(DEFAULT_REM_PX, |rem| rem.as_f32());
+        let pane = metrics
+            .pane_width
+            .map_or(DEFAULT_PANE_REM * rem, |width| width.as_f32());
+        Some(match self.browser.workspace_display() {
+            Some(folder) => truncate_start(&folder, prompt_folder_chars(pane, rem)),
+            None => "Project".to_string(),
+        })
+    }
+
+    /// The prompt in front of the query: `❯`, or `<folder> ❯` with the
     /// Workspace scope (L-031).
-    pub fn prompt_text(&self) -> &'static str {
-        if self.scope_is_workspace() {
-            "Project ❯"
-        } else {
-            "❯"
+    pub fn prompt_text(&self) -> String {
+        match self.prompt_folder() {
+            Some(folder) => format!("{folder} ❯"),
+            None => "❯".to_string(),
         }
     }
 
@@ -1490,14 +1527,24 @@ impl Render for ListPane {
         let sidebar = theme.sidebar;
         let roles = crate::theme_tokens::roles(cx);
         let status = self.search_status();
-        let prompt = if self.scope_is_workspace() {
-            div()
+        let mut metrics = self.metrics.get();
+        if metrics.rem != Some(window.rem_size()) {
+            metrics.rem = Some(window.rem_size());
+            self.metrics.set(metrics);
+        }
+        let prompt = match self.prompt_folder() {
+            Some(folder) => div()
                 .flex()
                 .gap_1()
-                .child(div().text_color(roles.muted_foreground).child("Project"))
-                .child(div().text_color(roles.accent).child("❯"))
-        } else {
-            div().text_color(roles.accent).child("❯")
+                .child(
+                    div()
+                        .flex_none()
+                        .whitespace_nowrap()
+                        .text_color(roles.muted_foreground)
+                        .child(folder),
+                )
+                .child(div().text_color(roles.accent).child("❯")),
+            None => div().text_color(roles.accent).child("❯"),
         };
         let search = self.search.clone();
         let toolbar = toolbar::render_toolbar(self, cx);

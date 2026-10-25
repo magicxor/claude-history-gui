@@ -30,6 +30,7 @@ pub mod service;
 mod session;
 pub mod sources;
 pub mod view;
+mod workspace;
 
 pub(crate) use messages::{MessageOrdinals, Placement};
 pub(crate) use session::apply_preview_mode;
@@ -53,6 +54,7 @@ pub(crate) use messages::{authored_text, extract_skill_preview, retained_user_te
 pub use parser::process_conversation_file;
 pub use path::{convert_path_to_project_dir_name, format_short_name_from_path, is_same_project};
 pub use rename::append_session_rename;
+pub use workspace::Workspace;
 
 /// Represents a JSONL parsing error with context for debugging
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -92,6 +94,10 @@ pub struct Conversation {
     pub project_path: Option<PathBuf>,
     /// The working directory extracted from the JSONL file (the actual cwd)
     pub cwd: Option<PathBuf>,
+    /// Every distinct working directory the conversation recorded, in order
+    /// of first appearance and at most `model::MAX_CWDS`; the first is `cwd`.
+    /// A session that changes directory partway records each one.
+    pub cwds: Vec<PathBuf>,
     /// Number of user and assistant messages in the conversation
     pub message_count: usize,
     /// Parse errors encountered while processing this conversation file

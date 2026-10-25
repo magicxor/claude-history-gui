@@ -38,7 +38,8 @@ fn relative_times_follow_the_ticker(cx: &mut TestAppContext) {
     assert_eq!(timestamp(cx), "4 min ago");
 }
 
-/// L-031: the prompt is `❯`, `Project ❯` with the Workspace scope.
+/// L-031: the prompt is `❯`, `<folder> ❯` with the Workspace scope
+/// (upstream 82b355a: the workspace with `~` for the home directory).
 #[gpui_kit::test]
 fn the_prompt_follows_the_scope(cx: &mut TestAppContext) {
     let world = TestWorld::new();
@@ -46,9 +47,47 @@ fn the_prompt_follows_the_scope(cx: &mut TestAppContext) {
     let f = ListFixture::open_loaded(cx, &world, &["--workspace", &proj.display().to_string()]);
     assert_eq!(f.read(cx, |list, _| list.prompt_text()), "❯");
     f.press(cx, "tab");
-    assert_eq!(f.read(cx, |list, _| list.prompt_text()), "Project ❯");
+    let folder = std::path::Path::new("~").join("work").join("proj");
+    assert_eq!(
+        f.read(cx, |list, _| list.prompt_text()),
+        format!("{} ❯", folder.display())
+    );
     f.press(cx, "tab");
     assert_eq!(f.read(cx, |list, _| list.prompt_text()), "❯");
+}
+
+/// L-031 (upstream 82b355a): a folder longer than about a third of the
+/// pane keeps its end, cut from the start with `…`.
+#[gpui_kit::test]
+fn a_long_prompt_folder_keeps_its_end(cx: &mut TestAppContext) {
+    let world = TestWorld::new();
+    let deep = world
+        .home()
+        .join("work")
+        .join("a-rather-long-group-folder-name")
+        .join("another-long-nested-folder")
+        .join("repository-with-a-long-name");
+    std::fs::create_dir_all(&deep).unwrap();
+    let f = ListFixture::open_loaded(
+        cx,
+        &world,
+        &["--workspace", &deep.display().to_string(), "-L"],
+    );
+    let folder = f
+        .read(cx, |list, _| list.prompt_folder())
+        .expect("the Workspace scope is on");
+    let full = std::path::Path::new("~")
+        .join(deep.strip_prefix(world.home()).unwrap())
+        .display()
+        .to_string();
+    let kept = folder.strip_prefix('…').expect("cut from the start");
+    assert!(full.ends_with(kept), "{folder} of {full}");
+    assert!(kept.ends_with("long-name"), "{folder}");
+    assert!(kept.chars().count() >= 7, "{folder}");
+    assert_eq!(
+        f.read(cx, |list, _| list.prompt_text()),
+        format!("{folder} ❯")
+    );
 }
 
 /// L-032: the status suffix reads `Loading… 3`, `1/8`, `0/0`, `sem 1/8`.

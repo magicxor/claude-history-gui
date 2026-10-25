@@ -58,7 +58,7 @@
 //!   gives the counts for a progress bar. A failure that a load event
 //!   reports ends the indicator without a notice.
 
-use super::index::{CardScope, CorpusIndex, ScopeIndex};
+use super::index::{CorpusIndex, ScopeIndex, card_project_visible};
 use super::{Browser, CorpusSnapshot, IndexNotice, ListSearchMode, SNAPSHOT_ROWS, UuidLookup};
 use crate::display_format::group_digits;
 use crate::history::Conversation;
@@ -246,16 +246,23 @@ impl Browser {
 
     /// Every card's scope under the current settings (automated and child
     /// conversations only with `all_kinds`, excluded working directories
-    /// out) and time filter, with the deleted cards out (O(cards), memory
-    /// only; each project is decided once).
+    /// out, the workspace's when its scope is on) and time filter, with the
+    /// deleted cards out (O(cards), memory only once the workspace is
+    /// resolved; each project is decided once, and a card outside the
+    /// workspace's projects by its recorded cwds, upstream 82b355a).
     fn card_scope(&self) -> Vec<bool> {
         let Some(snapshot) = &self.snapshot else {
             return Vec::new();
         };
-        let scope = CardScope::new(&self.excluded_projects, self.effective_workspace());
-        let mut docs = snapshot.scope(self.all_kinds, &self.excluded_paths, |project| {
-            scope.project_visible(project)
-        });
+        let workspace = self
+            .effective_workspace()
+            .map(|scope| crate::history::Workspace::new(scope, None));
+        let mut docs = snapshot.scope(
+            self.all_kinds,
+            &self.excluded_paths,
+            workspace.as_ref(),
+            |project| card_project_visible(project, &self.excluded_projects),
+        );
         if !self.cards.removed.is_empty() {
             let by_key = snapshot.docs_by_key();
             for key in &self.cards.removed {
@@ -311,9 +318,11 @@ impl Browser {
     /// filter. Exclusions do not count (upstream 982aea9 too): a history
     /// that every exclusion hides is not "no history".
     pub fn generation_is_empty(&self) -> bool {
-        self.snapshot
-            .as_ref()
-            .is_none_or(|snapshot| snapshot.head(1, self.all_kinds, &[], |_| true).is_empty())
+        self.snapshot.as_ref().is_none_or(|snapshot| {
+            snapshot
+                .head(1, self.all_kinds, &[], None, |_| true)
+                .is_empty()
+        })
     }
 
     /// The time filter the cards are listed under (inactive outside

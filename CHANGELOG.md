@@ -4,6 +4,12 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 ## Unreleased
 
+- The Workspace scope also lists conversations that worked in the workspace or a folder below it, not only those
+  started there: a session started in `~/code` that moved into `~/code/repo` shows up in `~/code/repo`'s scope.
+  Pi, OMP and Codex sessions now also count from a parent folder, so a workspace at `~/code` includes the sessions
+  of every repo below it. The same rule applies to Deep search's Workspace scope, Debug search and the semantic
+  tools. While the scope is on, the search prompt shows the workspace folder (`~/code/repo ❯`) instead of
+  `Project`. The list index is rebuilt once after the update.
 - Resume, Fork and the Codex delete can start an agent through your own command or wrapper (a mise or nix shim, a
   script that sets environment variables first, a differently named binary): set it in Settings > Resume (one word
   per line) or as `command` under `[resume]` (Claude Code), `[resume.pi]`, `[resume.omp]` or `[resume.codex]`, for

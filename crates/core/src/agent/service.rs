@@ -20,7 +20,7 @@ use crate::agent::response::{
     AgentSearchResult, conversations_for_output,
 };
 use crate::config::{AgentConfig, AgentScopeConfig, ConfigFile};
-use crate::env::{HistoryEnv, WorkspaceScope};
+use crate::env::HistoryEnv;
 use crate::error::{AppError, Result};
 use crate::history;
 use crate::search;
@@ -470,18 +470,12 @@ impl AgentService {
         // the environment's workspace (W1: encoded from the non-canonical
         // path).
         let workspace = if scope == agent::search::AgentSearchScope::Local {
-            self.env.workspace()?
+            history::Workspace::of_env(&self.env)?
         } else {
             None
         };
-        let current_project_dir_name = workspace
-            .as_ref()
-            .map(|workspace| workspace.project_dir_name().to_string());
-        let scoped = agent::search::scoped_conversation_inputs(
-            &conversations,
-            scope,
-            current_project_dir_name.as_deref(),
-        )?;
+        let scoped =
+            agent::search::scoped_conversation_inputs(&conversations, scope, workspace.as_ref())?;
         let mut request = agent::search::AgentSearchRequest {
             query: args.query.clone(),
             top: configured_usize(args.top, DEFAULT_SEARCH_TOP, agent_config.top),
@@ -530,6 +524,21 @@ impl AgentService {
             Some(&conversations),
             args.all_kinds,
         )?;
+        // The workspace also takes in sessions stored under other projects
+        // that recorded a cwd inside it; their references must resolve too.
+        let registry = history::sources::Registry::from_env(&self.env);
+        let keyed: std::collections::HashSet<PathBuf> =
+            keys.iter().map(|key| key.path.clone()).collect();
+        for &index in &scoped {
+            let conversation = &conversations[index];
+            if !keyed.contains(&conversation.path)
+                && let Ok(key) =
+                    agent::refs::AgentConversationKey::from_conversation_in(conversation, &registry)
+            {
+                keys.push(key);
+            }
+        }
+        keys.sort_by(|left, right| left.path.cmp(&right.path));
         keys.retain(|key| {
             !excluded_paths.contains(&key.path)
                 && !project_is_excluded(&key.path, &agent_config.exclude_projects)
@@ -778,19 +787,18 @@ impl AgentService {
 /// of the listed Codex threads among `listed`, else among the store's cards;
 /// automated and child threads only with `all_kinds`. Codex keys need the
 /// thread's working directory, which only decoding reveals, so they come from
-/// the cards the store keeps. With `local`, only the workspace's Claude
+/// the cards the store keeps. With a `workspace`, only the workspace's Claude
 /// project directories (worktree-aware) and the Pi/OMP sessions whose working
-/// directory is the workspace are returned; Codex keys are not narrowed
-/// (as upstream), search scopes its conversations itself.
+/// directory or project is the workspace or a folder below it are returned
+/// (upstream 82b355a); Codex keys are not narrowed (as upstream), search
+/// scopes its conversations itself and keys the ones a recorded cwd puts in
+/// the workspace.
 pub fn discover_agent_keys(
     env: &HistoryEnv,
-    local: Option<&WorkspaceScope>,
+    workspace: Option<&history::Workspace>,
     listed: Option<&[history::Conversation]>,
     all_kinds: bool,
 ) -> Result<(Vec<agent::refs::AgentConversationKey>, Vec<AgentWarning>)> {
-    let project_filter = local.map(WorkspaceScope::project_dir_name);
-    // Upstream compared against the canonicalized process cwd.
-    let current = local.map(WorkspaceScope::canonical_dir);
     let root = env.claude_projects_root().map_err(structured_agent_error)?;
     let projects = if root.exists() {
         std::fs::read_dir(&root)
@@ -825,7 +833,7 @@ pub fn discover_agent_keys(
         let Some(project_name) = project_path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if project_filter.is_some_and(|filter| !history::is_same_project(project_name, filter)) {
+        if workspace.is_some_and(|workspace| !workspace.contains_project_key(project_name, false)) {
             continue;
         }
         let entries = match std::fs::read_dir(&project_path) {
@@ -885,30 +893,18 @@ pub fn discover_agent_keys(
             else {
                 continue;
             };
-            if project_filter.is_some() {
-                // Upstream additionally re-encoded the canonicalized cwd and
-                // compared it with the filter derived from the same cwd. On
-                // Windows the canonical form (`\\?\C:\...`) never matched,
-                // so local Pi/OMP sessions were always dropped (W1). The
-                // workspace scope already is that project, so only the
-                // working-directory equality remains.
-                let cwd = header
-                    .cwd
-                    .canonicalize()
-                    .unwrap_or_else(|_| header.cwd.clone());
-                if !current
-                    .as_ref()
-                    .is_some_and(|current| history::path::same_path(current, &cwd))
-                {
-                    continue;
-                }
-            }
             let project_identity = header
                 .cwd
                 .canonicalize()
-                .unwrap_or(header.cwd)
+                .unwrap_or_else(|_| header.cwd.clone())
                 .to_string_lossy()
                 .into_owned();
+            if workspace.is_some_and(|workspace| {
+                !workspace.contains_cwd(&header.cwd)
+                    && !workspace.contains_project_key(&project_identity, true)
+            }) {
+                continue;
+            }
             if path.file_name().and_then(|name| name.to_str()).is_none() {
                 continue;
             }
@@ -930,30 +926,18 @@ pub fn discover_agent_keys(
             else {
                 continue;
             };
-            if project_filter.is_some() {
-                // Upstream additionally re-encoded the canonicalized cwd and
-                // compared it with the filter derived from the same cwd. On
-                // Windows the canonical form (`\\?\C:\...`) never matched,
-                // so local Pi/OMP sessions were always dropped (W1). The
-                // workspace scope already is that project, so only the
-                // working-directory equality remains.
-                let cwd = header
-                    .cwd
-                    .canonicalize()
-                    .unwrap_or_else(|_| header.cwd.clone());
-                if !current
-                    .as_ref()
-                    .is_some_and(|current| history::path::same_path(current, &cwd))
-                {
-                    continue;
-                }
-            }
             let project_identity = header
                 .cwd
                 .canonicalize()
-                .unwrap_or(header.cwd)
+                .unwrap_or_else(|_| header.cwd.clone())
                 .to_string_lossy()
                 .into_owned();
+            if workspace.is_some_and(|workspace| {
+                !workspace.contains_cwd(&header.cwd)
+                    && !workspace.contains_project_key(&project_identity, true)
+            }) {
+                continue;
+            }
             if path.file_name().and_then(|name| name.to_str()).is_none() {
                 continue;
             }
@@ -1116,6 +1100,7 @@ fn conversation_from_agent_transcript(
         project_name: None,
         project_path: None,
         cwd: None,
+        cwds: Vec::new(),
         message_count: transcript.messages.len(),
         parse_errors: Vec::new(),
         summary: transcript.summary.clone(),
@@ -1321,6 +1306,7 @@ fn stripped_semantic_conversation(
         project_name: None,
         project_path: None,
         cwd: None,
+        cwds: Vec::new(),
         message_count: conversation.message_count,
         parse_errors: Vec::new(),
         summary: None,
@@ -2310,8 +2296,13 @@ mode = "hybrid"
 
         // The flat session directory feeds both the Pi and the OMP discovery
         // (upstream behavior), so the same file may yield one key per source.
-        let (local, _) =
-            discover_agent_keys(&env, env.workspace().unwrap().as_ref(), None, false).unwrap();
+        let (local, _) = discover_agent_keys(
+            &env,
+            history::Workspace::of_env(&env).unwrap().as_ref(),
+            None,
+            false,
+        )
+        .unwrap();
         assert!(
             local
                 .iter()
@@ -2320,9 +2311,17 @@ mode = "hybrid"
             "{local:?}"
         );
 
-        let other = WorkspaceScope::new(&elsewhere).unwrap();
-        let (keys, _) = discover_agent_keys(&env, Some(&other), None, false).unwrap();
+        let at = |dir: &Path| {
+            history::Workspace::new(&crate::env::WorkspaceScope::new(dir).unwrap(), None)
+        };
+        let (keys, _) = discover_agent_keys(&env, Some(&at(&elsewhere)), None, false).unwrap();
         assert!(keys.is_empty(), "{keys:?}");
+        let (keys, _) =
+            discover_agent_keys(&env, Some(&at(&workspace.join("sub"))), None, false).unwrap();
+        assert!(keys.is_empty(), "{keys:?}");
+        // Upstream 82b355a: a workspace above the session's folder takes it in.
+        let (above, _) = discover_agent_keys(&env, Some(&at(home.path())), None, false).unwrap();
+        assert_eq!(above, local);
 
         let (global, _) = discover_agent_keys(&env, None, None, false).unwrap();
         assert_eq!(global, local);

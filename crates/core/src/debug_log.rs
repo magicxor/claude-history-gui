@@ -155,6 +155,7 @@ mod tests {
             project_name: None,
             project_path: None,
             cwd: None,
+            cwds: Vec::new(),
             message_count: 0,
             parse_errors: vec![ParseError {
                 line_number: 3,

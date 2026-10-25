@@ -40,6 +40,7 @@ fn conversation(path: PathBuf, text: &str) -> Conversation {
         project_name: Some("project".to_string()),
         project_path: None,
         cwd: None,
+        cwds: Vec::new(),
         message_count: 1,
         parse_errors: Vec::new(),
         summary: None,
