@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 
 use chrono::{Duration, Utc};
-use claude_history_core::maintenance::load_sorted_conversations;
+use claude_history_core::history::load_all_conversations;
 use claude_history_core::store;
 use claude_history_core::store::card::Fingerprint;
 use claude_history_core::store::generation::{self, Doc, Publish, PublishLock, Update};
@@ -34,11 +34,13 @@ use crate::test_support::{TestWorld, recording, synth};
 /// `Card <n>` (newest first), so card rows are told apart from parsed rows.
 /// The fingerprints are unknown, so the reconcile pass of the initial load
 /// parses every session again and publishes the real titles. Returns the
-/// card paths, newest first.
+/// card paths, newest first. The corpus is parsed from the session files
+/// (`maintenance::load_sorted_conversations` would publish a generation of
+/// its own first).
 fn publish_cards(world: &TestWorld) -> Vec<PathBuf> {
     let mut conversations =
-        load_sorted_conversations(&world.env, true, None, &TimeFilter::default())
-            .expect("load the world's corpus");
+        load_all_conversations(&world.env, true, None).expect("load the world's corpus");
+    conversations.sort_by_key(|c| std::cmp::Reverse(c.timestamp));
     for (ix, conversation) in conversations.iter_mut().enumerate() {
         conversation.custom_title = Some(format!("Card {ix}"));
     }

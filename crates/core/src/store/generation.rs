@@ -51,6 +51,8 @@ const KEEP_BEHIND: u64 = 1;
 /// Files modified this close to the start of loading may have changed after
 /// the loader read them.
 const MTIME_SLACK: Duration = Duration::from_secs(2);
+/// How often [`PublishLock::wait_cancellable`] asks for `LOCK` (fork).
+pub const LOCK_WAIT_POLL: Duration = Duration::from_millis(100);
 
 /// A validated, memory-mapped generation manifest.
 pub struct Generation {
@@ -238,6 +240,12 @@ impl Generation {
         let index = IndexSet::open(&self.dir, self.segs(), self.locs())?;
         let text = TextSegments::open(&self.dir, text::TEXT, self.rows().iter().map(|r| r.text))?;
         Some((index, text))
+    }
+
+    /// Opens this generation's text segments. `None` when one is missing
+    /// or invalid.
+    pub fn open_text_files(&self) -> Option<TextSegments> {
+        TextSegments::open(&self.dir, text::TEXT, self.rows().iter().map(|r| r.text))
     }
 
     /// Opens this generation's semantic segments. `None` when one is
@@ -757,6 +765,43 @@ pub struct PublishLock {
 }
 
 impl PublishLock {
+    /// Waits until no process or thread holds `LOCK` under `root`.
+    pub fn wait(root: &Path) -> io::Result<()> {
+        let file = File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(root.join(LOCK))?;
+        file.lock()?;
+        file.unlock()
+    }
+
+    /// [`PublishLock::wait`] that gives up, with `Ok(false)`, soon after
+    /// `cancelled()` returns true; `Ok(true)` once `LOCK` is free (fork: a
+    /// GUI worker that waits for the list's pass stays cancellable). It asks
+    /// for the lock every [`LOCK_WAIT_POLL`] instead of blocking on it.
+    pub fn wait_cancellable(root: &Path, cancelled: &dyn Fn() -> bool) -> io::Result<bool> {
+        let file = File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(root.join(LOCK))?;
+        loop {
+            match file.try_lock() {
+                Ok(()) => {
+                    file.unlock()?;
+                    return Ok(true);
+                }
+                Err(fs::TryLockError::WouldBlock) => {}
+                Err(fs::TryLockError::Error(err)) => return Err(err),
+            }
+            if cancelled() {
+                return Ok(false);
+            }
+            std::thread::sleep(LOCK_WAIT_POLL);
+        }
+    }
+
     /// Takes `LOCK` under `root` without waiting; `None` when another
     /// process or thread holds it.
     pub fn try_acquire(root: &Path) -> io::Result<Option<Self>> {

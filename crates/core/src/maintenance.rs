@@ -36,14 +36,42 @@ pub const DEBUG_SEARCH_TOP: usize = 30;
 
 /// Load every conversation (Claude, Pi, OMP), keep those inside
 /// `time_filter`, newest first: the corpus upstream's one-shot flags
-/// (`--debug-search`, the semantic flags) worked on.
+/// (`--debug-search`, the semantic flags) worked on. Like upstream (16cc49c)
+/// it comes from the store with full text and semantic data
+/// ([`crate::store::load_conversations`]: a reconcile pass first, waiting
+/// for the one another thread or process runs), or from the session files
+/// when the store cannot be used.
 pub fn load_sorted_conversations(
     env: &HistoryEnv,
     show_last: bool,
     debug: Option<DebugLevel>,
     time_filter: &TimeFilter,
 ) -> Result<Vec<Conversation>> {
-    let mut conversations = history::load_all_conversations(env, show_last, debug)?;
+    let mut conversations =
+        crate::store::load_conversations(env, show_last, debug, crate::store::Contents::Full)?;
+    conversations.retain(|conversation| time_filter.matches(conversation.timestamp));
+    conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    Ok(conversations)
+}
+
+/// [`load_sorted_conversations`] that gives up soon after `cancelled()`
+/// returns true (fork: the load may wait for the GUI list's reconcile pass;
+/// see [`crate::store::load_conversations_cancellable`]). The error is then an
+/// `Interrupted` I/O error.
+pub fn load_sorted_conversations_cancellable(
+    env: &HistoryEnv,
+    show_last: bool,
+    debug: Option<DebugLevel>,
+    time_filter: &TimeFilter,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<Vec<Conversation>> {
+    let mut conversations = crate::store::load_conversations_cancellable(
+        env,
+        show_last,
+        debug,
+        crate::store::Contents::Full,
+        cancelled,
+    )?;
     conversations.retain(|conversation| time_filter.matches(conversation.timestamp));
     conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     Ok(conversations)

@@ -7,7 +7,8 @@
 //! empties the semantic directory and keeps the directory and
 //! `embeddings.lock` (core K6), after the shared model was dropped.
 
-use claude_history_core::maintenance::load_sorted_conversations;
+use claude_history_core::error::AppError;
+use claude_history_core::maintenance::load_sorted_conversations_cancellable;
 use claude_history_core::semantic::types::SemanticCancellationToken;
 use claude_history_core::semantic_ops::{
     GenerateProgress, GenerateReport, clear_semantic_cache, generate_semantic_cache,
@@ -139,21 +140,35 @@ impl GenerateDialog {
         let level = Some(crate::debug_sink::capture_level(cx));
         let rx = spawn_progress_thread("semantic-generate", move |tx| {
             let progress_tx = tx.clone();
-            let result = load_sorted_conversations(&env, show_last, level, &TimeFilter::default())
-                .and_then(|conversations| {
-                    generate_semantic_cache(
-                        &env,
-                        &conversations,
-                        workspace.as_ref(),
-                        &TimeFilter::default(),
-                        &mut *factory,
-                        &mut |progress| {
-                            let _ = progress_tx.send_blocking(Msg::Progress(progress));
-                        },
-                        &cancel,
-                    )
-                })
-                .map_err(|error| error_text(&error));
+            // The load may wait for the list's reconcile pass: Cancel ends
+            // that wait too (the gate is left on `Msg::Done`).
+            let result = load_sorted_conversations_cancellable(
+                &env,
+                show_last,
+                level,
+                &TimeFilter::default(),
+                &|| cancel.is_cancelled(),
+            )
+            .map_err(|error| match &error {
+                AppError::Io(io) if io.kind() == std::io::ErrorKind::Interrupted => {
+                    AppError::SemanticSearchCancelled
+                }
+                _ => error,
+            })
+            .and_then(|conversations| {
+                generate_semantic_cache(
+                    &env,
+                    &conversations,
+                    workspace.as_ref(),
+                    &TimeFilter::default(),
+                    &mut *factory,
+                    &mut |progress| {
+                        let _ = progress_tx.send_blocking(Msg::Progress(progress));
+                    },
+                    &cancel,
+                )
+            })
+            .map_err(|error| error_text(&error));
             let _ = tx.send_blocking(Msg::Done(result));
         });
         // Detached on purpose: the gate must be left when the run ends, even

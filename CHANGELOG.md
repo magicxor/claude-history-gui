@@ -34,6 +34,11 @@ Release notes are taken from the `## v<version>` section of this file by the rel
   that is read in place instead of being loaded into memory by each search. The existing cache is converted once
   on the first semantic search after the update. The list, Deep search and another running instance of the
   app no longer overwrite each other's newly computed embeddings when they save the cache.
+- Debug search, the semantic search report and debug dump, Generate semantic cache and Deep search read the
+  conversations from the history index (after bringing it up to date, waiting while the list is still indexing)
+  instead of parsing every session file again. Deep search still warns about malformed transcripts: the index now
+  keeps their parse errors, so it is rebuilt once on the first start after the update. When the Pi and OMP session
+  folders are the same folder, its OMP conversations are no longer left out of the list.
 
 ## v0.1.1
 

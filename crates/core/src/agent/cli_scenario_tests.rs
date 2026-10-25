@@ -2,7 +2,8 @@
 //!
 //! Upstream ran the CLI binary with `CLAUDE_CONFIG_DIR` and
 //! `PI_CODING_AGENT_SESSION_DIR` pointing at temp dirs (but the real home,
-//! so caches and `config.toml` leaked in). Here every scenario runs
+//! so caches and `config.toml` leaked in, until 16cc49c set `HOME` to a temp
+//! dir as well). Here every scenario runs
 //! [`AgentService::execute`] with a [`HistoryEnv::sandbox`] whose home is a
 //! temp dir as well, and with the default configuration. The argv of each
 //! upstream invocation is kept and translated by a tiny test-only parser, so
@@ -838,12 +839,14 @@ fn scenario_caches_stay_inside_the_sandbox_home() {
 
     let cache_root = env.cache_root().unwrap();
     assert!(cache_root.starts_with(home.path()));
-    let history_cache = env.history_cache_dir().unwrap();
+    // Agent search loads from the store (upstream 16cc49c): its pass
+    // published a generation under the sandbox's cache root.
+    let store = crate::store::default_root(&env).unwrap();
+    assert!(store.starts_with(&cache_root), "{store:?}");
     assert!(
-        history_cache.join("-tmp-agent-phase3-tests.bin").is_file(),
-        "project cache written under the sandbox: {history_cache:?}"
+        store.join("CURRENT").is_file(),
+        "store written under the sandbox: {store:?}"
     );
-    assert!(cache_root.join("pi").is_dir());
 }
 
 #[test]

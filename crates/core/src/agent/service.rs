@@ -414,8 +414,18 @@ impl AgentService {
         // a full corpus parse.
         let time = args.time.resolve()?;
         self.check_cancelled()?;
-        let mut conversations = history::load_all_conversations(&self.env, false, None)?;
+        // Fork: the load may wait for the GUI list's reconcile pass, so a
+        // cancel (K7) also ends that wait.
+        let cancellation = self.semantic_cancellation();
+        let loaded = crate::store::load_conversations_cancellable(
+            &self.env,
+            false,
+            None,
+            crate::store::Contents::Full,
+            &|| cancellation.is_cancelled(),
+        );
         self.check_cancelled()?;
+        let mut conversations = loaded?;
         conversations.retain(|conversation| {
             !project_is_excluded(&conversation.path, &agent_config.exclude_projects)
                 && time.matches(conversation.timestamp)
@@ -1844,7 +1854,8 @@ pub(crate) fn resolve_agent_read_args(
     let keys = if let Some(keys) = keys {
         keys
     } else {
-        let conversations = history::load_all_conversations(env, false, None)?;
+        let conversations =
+            crate::store::load_conversations(env, false, None, crate::store::Contents::Cards)?;
         loaded_keys = agent::refs::conversation_keys_from_conversations(&conversations)?;
         &loaded_keys
     };
@@ -1919,7 +1930,8 @@ pub(crate) fn resolve_agent_conversation_arg(
     let keys = if let Some(keys) = keys {
         keys
     } else {
-        let conversations = history::load_all_conversations(env, false, None)?;
+        let conversations =
+            crate::store::load_conversations(env, false, None, crate::store::Contents::Cards)?;
         loaded_keys = agent::refs::conversation_keys_from_conversations(&conversations)?;
         &loaded_keys
     };
@@ -2548,6 +2560,35 @@ mode = "hybrid"
         )));
         assert!(response.is_success(), "{}", response.stderr);
         assert!(!response.is_cancelled());
+    }
+
+    /// K7 with upstream 16cc49c: a search waiting for the store's lock (the
+    /// GUI list's pass holds it) ends when its token is cancelled.
+    #[test]
+    fn a_search_waiting_for_the_store_lock_ends_when_cancelled() {
+        let (_home, env) = semantic_sandbox();
+        let root = crate::store::default_root(&env).unwrap();
+        let held = crate::store::generation::PublishLock::try_acquire(&root)
+            .unwrap()
+            .expect("the lock is free");
+        let token = semantic::types::SemanticCancellationToken::new();
+        let searching = {
+            let token = token.clone();
+            std::thread::spawn(move || {
+                let mut service =
+                    AgentService::new(env, ConfigFile::default()).with_cancellation(token);
+                service.respond(AgentRequest::Search(AgentSearchArgs::new(
+                    "semantic needle",
+                )))
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!searching.is_finished(), "the search waits for the lock");
+        token.cancel();
+        let response = searching.join().unwrap();
+        assert!(response.is_cancelled(), "{}", response.stderr);
+        assert_eq!(response.stderr, "Error: Semantic search cancelled\n");
+        drop(held);
     }
 
     #[test]

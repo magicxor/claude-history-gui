@@ -49,6 +49,20 @@
 //!   across store roots like [`Snapshot::generation_id`].
 //!   [`Snapshot::show_last`] stays: the browser's generation opens use it
 //!   (upstream ecc2f2f removed it with its last TUI user).
+//! * **Whole conversations from the store.** [`load_conversations`] takes
+//!   the [`HistoryEnv`] for the root, the sources and the fallback
+//!   ([`crate::history::load_all_conversations`]). Its pass is upstream's
+//!   uncancellable [`reconcile::reconcile`] on the caller's thread (a GUI
+//!   tool or Deep search worker) and rayon's global pool. The `LOCK` it may
+//!   wait on is usually held by the list's own `store-reconcile` thread
+//!   rather than another process: the lock belongs to an open file handle,
+//!   so a thread of the same process waits for it like another process.
+//!   [`load_conversations_cancellable`] (agent search, whose jobs the GUI
+//!   cancels) gives the pass, that wait
+//!   ([`generation::PublishLock::wait_cancellable`], which asks for the lock
+//!   every [`generation::LOCK_WAIT_POLL`]) and the card reads up once a flag
+//!   is set. Each pass's outcome goes to the debug sink at the caller's
+//!   level (upstream used the level only when it parsed the files instead).
 //!
 //! The format, the publish protocol and the collection rules are upstream's.
 //! On Windows (NTFS) `std::fs` removes and renames over files that another
@@ -121,6 +135,139 @@ fn source_roots_namespace(pi: Option<&Path>, omp: Option<&Path>) -> String {
         }
     }
     format!("roots-{}", &hasher.finalize().to_hex()[..16])
+}
+
+/// What `load_conversations` reads besides the cards.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Contents {
+    /// Only what the cards hold, as the list shows them.
+    Cards,
+    /// The cards with their full text and semantic data, as the parser
+    /// produces them.
+    Full,
+}
+
+/// Every conversation, newest first, from the store: a reconcile pass first
+/// brings the current generation up to date with the session files (or
+/// waits for the process doing so), then its cards are read with
+/// `contents`. Without a cache dir, or when the store cannot be read, the
+/// session files are parsed instead. Fork: each pass's outcome is a
+/// `debug_level` message (`Reconcile: {outcome:?}` at Debug), so the GUI's
+/// Debug log level still shows something of a load from the store.
+pub fn load_conversations(
+    env: &HistoryEnv,
+    show_last: bool,
+    debug_level: Option<crate::debug::DebugLevel>,
+    contents: Contents,
+) -> crate::error::Result<Vec<Conversation>> {
+    load(env, show_last, debug_level, contents, None)
+}
+
+/// [`load_conversations`] that gives up soon after `cancelled()` returns
+/// true, with [`generation::cancelled_build`] and without parsing the
+/// session files instead (fork: agent search, whose jobs the GUI cancels,
+/// may wait for the list's own pass). Its pass is
+/// [`reconcile::reconcile_cancellable`], it waits for `LOCK` with
+/// [`generation::PublishLock::wait_cancellable`], and it stops reading
+/// cards once cancelled.
+pub fn load_conversations_cancellable(
+    env: &HistoryEnv,
+    show_last: bool,
+    debug_level: Option<crate::debug::DebugLevel>,
+    contents: Contents,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> crate::error::Result<Vec<Conversation>> {
+    load(env, show_last, debug_level, contents, Some(cancelled))
+}
+
+fn load(
+    env: &HistoryEnv,
+    show_last: bool,
+    debug_level: Option<crate::debug::DebugLevel>,
+    contents: Contents,
+    cancelled: Option<&(dyn Fn() -> bool + Sync)>,
+) -> crate::error::Result<Vec<Conversation>> {
+    if let Some(conversations) = default_root(env)
+        .and_then(|root| load_from_store(env, &root, show_last, debug_level, contents, cancelled))
+    {
+        return Ok(conversations);
+    }
+    if cancelled.is_some_and(|cancelled| cancelled()) {
+        return Err(generation::cancelled_build().into());
+    }
+    crate::history::load_all_conversations(env, show_last, debug_level)
+}
+
+fn load_from_store(
+    env: &HistoryEnv,
+    root: &Path,
+    show_last: bool,
+    debug_level: Option<crate::debug::DebugLevel>,
+    contents: Contents,
+    cancellable: Option<&(dyn Fn() -> bool + Sync)>,
+) -> Option<Vec<Conversation>> {
+    let never = || false;
+    let cancelled = cancellable.unwrap_or(&never);
+    let sources = reconcile::Sources::from_env(env);
+    for _ in 0..2 {
+        // `reconcile::reconcile` is this pass never cancelled.
+        let outcome = reconcile::reconcile_cancellable(
+            root,
+            &sources,
+            generation::MergePolicy::DEFAULT,
+            cancelled,
+        )
+        .ok()?;
+        crate::debug::debug(debug_level, &format!("Reconcile: {outcome:?}"));
+        if outcome.publish != generation::Publish::Busy {
+            break;
+        }
+        let free = match cancellable {
+            None => generation::PublishLock::wait(root).map(|()| true),
+            Some(cancelled) => generation::PublishLock::wait_cancellable(root, cancelled),
+        };
+        if !free.ok()? {
+            return None;
+        }
+    }
+    let cards = Snapshot::open(root, show_last, TimeFilter::default())?;
+    read_conversations(&cards, contents, cancelled)
+}
+
+/// Every card of `cards` with `contents`, in doc order; `None` once
+/// `cancelled()` (fork).
+fn read_conversations(
+    cards: &Snapshot,
+    contents: Contents,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Option<Vec<Conversation>> {
+    let generation = &cards.generation;
+    let files = match contents {
+        Contents::Cards => None,
+        Contents::Full => Some((
+            generation.open_text_files()?,
+            generation.open_semantic_files()?,
+        )),
+    };
+    (0..generation.rows().len() as u32)
+        .into_par_iter()
+        .map(|doc| {
+            if cancelled() {
+                return None;
+            }
+            let mut conversation = cards.card(doc);
+            if let Some((text, semantic)) = &files {
+                let row = &generation.rows()[doc as usize];
+                conversation.full_text = text.read(row.text)?.into();
+                let sem = &generation.sems()[doc as usize];
+                if sem.hash != 0 {
+                    semantic::SemanticDoc::decode(&semantic.read_bytes(sem.blob)?)?
+                        .apply(&mut conversation);
+                }
+            }
+            Some(conversation)
+        })
+        .collect()
 }
 
 /// Cards of one generation.
@@ -685,6 +832,176 @@ mod tests {
         assert_eq!(
             index.cards().card(alpha).path,
             projects.join("-tmp-work").join("a.jsonl")
+        );
+    }
+
+    /// A sandbox with two Claude sessions, one holding a malformed line,
+    /// dated an hour back so their fingerprints are known.
+    fn sessions_with_a_parse_error(home: &Path) -> HistoryEnv {
+        let env = HistoryEnv::sandbox(home);
+        let dir = env.claude_projects_root().unwrap().join("-tmp-work");
+        fs::create_dir_all(&dir).unwrap();
+        let line = |text: &str, minute: u32| {
+            serde_json::json!({
+                "type": "user",
+                "timestamp": format!("2024-01-01T00:{minute:02}:00Z"),
+                "cwd": "/tmp/work",
+                "message": {"role": "user", "content": text}
+            })
+            .to_string()
+        };
+        for (name, lines) in [
+            ("good.jsonl", vec![line("alpha words", 1)]),
+            (
+                "broken.jsonl",
+                vec![line("beta words", 2), "{not json".to_owned()],
+            ),
+        ] {
+            let path = dir.join(name);
+            fs::write(&path, lines.join("\n") + "\n").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+                .unwrap();
+        }
+        env
+    }
+
+    /// Fork: upstream has no test of `load_conversations`. Whole
+    /// conversations from the store carry what the parser gives them, parse
+    /// errors included; cards only carry what the list shows.
+    #[test]
+    fn load_conversations_reads_the_store_like_the_loader() {
+        let home = tempfile::tempdir().unwrap();
+        let env = sessions_with_a_parse_error(home.path());
+        let parsed = crate::history::load_all_conversations(&env, false, None).unwrap();
+        assert_eq!(parsed.len(), 2);
+
+        let full = load_conversations(&env, false, None, Contents::Full).unwrap();
+        let root = default_root(&env).unwrap();
+        assert!(root.join("CURRENT").is_file(), "the pass published");
+        assert_eq!(full.len(), 2);
+        for conversation in &parsed {
+            let stored = full
+                .iter()
+                .find(|stored| stored.path == conversation.path)
+                .unwrap_or_else(|| panic!("no conversation for {:?}", conversation.path));
+            assert_eq!(stored.session_id, conversation.session_id);
+            assert_eq!(stored.preview, conversation.preview);
+            assert_eq!(stored.project_name, conversation.project_name);
+            assert_eq!(stored.message_count, conversation.message_count);
+            assert_eq!(stored.full_text, conversation.full_text);
+            assert_eq!(stored.agent_search_text, conversation.agent_search_text);
+            assert_eq!(stored.semantic_route_text, conversation.semantic_route_text);
+            assert_eq!(stored.semantic_turns, conversation.semantic_turns);
+            assert_eq!(stored.parse_errors, conversation.parse_errors);
+        }
+        assert!(
+            full.iter()
+                .any(|conversation| conversation.parse_errors.len() == 1)
+        );
+
+        let cards = load_conversations(&env, false, None, Contents::Cards).unwrap();
+        assert_eq!(cards.len(), 2);
+        assert!(cards.iter().all(|card| card.full_text.is_empty()
+            && card.parse_errors.is_empty()
+            && !card.preview.is_empty()));
+    }
+
+    /// Fork: the pass another thread of the process runs (the list's
+    /// `store-reconcile` thread) holds `LOCK`; loading waits for it, then
+    /// runs its own pass.
+    #[test]
+    fn load_conversations_waits_for_a_pass_another_thread_holds() {
+        let home = tempfile::tempdir().unwrap();
+        let env = sessions_with_a_parse_error(home.path());
+        let root = default_root(&env).unwrap();
+        let lock = generation::PublishLock::try_acquire(&root)
+            .unwrap()
+            .expect("the lock is free");
+        let loading = {
+            let env = env.clone();
+            std::thread::spawn(move || load_conversations(&env, false, None, Contents::Full))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !loading.is_finished(),
+            "loading waits while the lock is held"
+        );
+        assert!(!root.join("CURRENT").exists());
+        drop(lock);
+        let loaded = loading.join().unwrap().unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(root.join("CURRENT").is_file(), "the second pass published");
+    }
+
+    /// Fork: a cancellable load gives up its wait for `LOCK` once
+    /// cancelled, without parsing the session files instead; the wait itself
+    /// answers whether the lock came free.
+    #[test]
+    fn a_cancelled_load_stops_waiting_for_the_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let home = tempfile::tempdir().unwrap();
+        let env = sessions_with_a_parse_error(home.path());
+        let root = default_root(&env).unwrap();
+        let lock = generation::PublishLock::try_acquire(&root)
+            .unwrap()
+            .expect("the lock is free");
+        assert!(!generation::PublishLock::wait_cancellable(&root, &|| true).unwrap());
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let loading = {
+            let (env, cancel) = (env.clone(), cancel.clone());
+            std::thread::spawn(move || {
+                load_conversations_cancellable(&env, false, None, Contents::Full, &|| {
+                    cancel.load(Ordering::SeqCst)
+                })
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !loading.is_finished(),
+            "loading waits while the lock is held"
+        );
+        cancel.store(true, Ordering::SeqCst);
+        let error = loading.join().unwrap().unwrap_err();
+        assert!(
+            matches!(&error, crate::error::AppError::Io(error)
+                if error.kind() == std::io::ErrorKind::Interrupted),
+            "{error:?}"
+        );
+        let history_cache = env.history_cache_dir().unwrap();
+        assert!(
+            !history_cache.join("-tmp-work.bin").exists(),
+            "no fallback parse of the session files"
+        );
+
+        drop(lock);
+        assert!(generation::PublishLock::wait_cancellable(&root, &|| false).unwrap());
+        let loaded =
+            load_conversations_cancellable(&env, false, None, Contents::Cards, &|| false).unwrap();
+        assert_eq!(loaded.len(), 2);
+    }
+
+    /// Without a usable store (here its cache root is a file), the session
+    /// files are parsed.
+    #[test]
+    fn load_conversations_parses_the_files_when_the_store_cannot_be_used() {
+        let home = tempfile::tempdir().unwrap();
+        let blocked = home.path().join("not-a-dir");
+        fs::write(&blocked, "").unwrap();
+        let env = sessions_with_a_parse_error(home.path()).with_cache_root(&blocked);
+        assert!(default_root(&env).unwrap().starts_with(&blocked));
+
+        let loaded = load_conversations(&env, false, None, Contents::Cards).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(
+            loaded
+                .iter()
+                .all(|conversation| !conversation.full_text.is_empty()),
+            "parsed, not read from cards"
         );
     }
 }
