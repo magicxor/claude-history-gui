@@ -4,6 +4,7 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 ## Unreleased
 
+- Search finds a word that starts inside a longer match: `1.1` now matches `v1.1.1`.
 - Searching only your own messages, and list previews, keep text after an unclosed tag or an `[Image...` lookalike:
   `[Image upload fails` and a typed `<system-reminder>` stay as typed text (only `[Image]`, `[Image #N]` and
   `[Image: description]` are placeholders), and previews drop a tag only when its opening and closing tag both
