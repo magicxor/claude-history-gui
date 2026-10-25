@@ -12,6 +12,7 @@
 //! - `parser` - Parsing individual JSONL files
 //! - `path` - Path encoding/decoding utilities
 
+pub mod adapter;
 #[cfg(test)]
 mod feature_tests;
 mod loader;
@@ -26,6 +27,7 @@ pub mod pi_loader;
 mod rename;
 mod session;
 mod session_loader;
+pub mod sources;
 
 pub(crate) use messages::{MessageOrdinals, Placement};
 pub(crate) use session::apply_preview_mode;

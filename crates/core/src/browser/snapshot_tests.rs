@@ -1229,7 +1229,7 @@ fn a_start_shows_the_generation_then_swaps_in_what_the_pass_publishes() {
     let sandbox = Sandbox::new();
     let paths = write_sessions(&sandbox);
     let root = crate::store::default_root(&sandbox.env).unwrap();
-    let sources = crate::store::reconcile::Sources::from_env(&sandbox.env);
+    let sources = crate::history::sources::Registry::from_env(&sandbox.env);
     crate::store::reconcile::reconcile(&root, &sources).unwrap();
     let d = write_session(&sandbox, "-tmp-beta", "d.jsonl", 4, "fourth prompt");
 

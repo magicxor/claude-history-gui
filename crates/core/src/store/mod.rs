@@ -19,7 +19,8 @@
 //! * **Time filter at runtime.** [`Snapshot::with_time_filter`] gives a
 //!   snapshot of the same mapped generation under another time filter: the
 //!   GUI changes the filter while it runs (upstream fixed it at launch).
-//! * **Sources from the env.** [`reconcile::Sources::from_env`] takes the
+//! * **Sources from the env.** Reconcile lists the instances of
+//!   [`crate::history::sources::Registry::from_env`], which takes the
 //!   [`HistoryEnv`] (the Claude projects root and the Pi/OMP session roots
 //!   the history loader reads) instead of the process environment.
 //! * **In-process, cancellable reconcile.** The GUI runs the reconcile pass
@@ -66,7 +67,8 @@
 //! * **Old caches.** [`legacy`] cleans the GUI's own cache dir, where fork
 //!   releases wrote the same per-project and Pi/OMP caches as upstream; a
 //!   pass never cleans a cache dir inside the installed CLI's
-//!   ([`reconcile::Sources::cli_cache`]), and a pass given up skips it.
+//!   ([`crate::history::sources::Registry::cli_cache`]), and a pass given
+//!   up skips it.
 //!
 //! The format, the publish protocol and the collection rules are upstream's.
 //! On Windows (NTFS) `std::fs` removes and renames over files that another
@@ -213,7 +215,7 @@ fn load_from_store(
 ) -> Option<Vec<Conversation>> {
     let never = || false;
     let cancelled = cancellable.unwrap_or(&never);
-    let sources = reconcile::Sources::from_env(env);
+    let sources = crate::history::sources::Registry::from_env(env);
     for _ in 0..2 {
         // `reconcile::reconcile` is this pass never cancelled.
         let outcome = reconcile::reconcile_cancellable(
@@ -653,6 +655,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::sources::Registry;
     use std::fs;
 
     #[test]
@@ -793,8 +796,12 @@ mod tests {
         )
         .unwrap();
 
-        let sources = reconcile::Sources::from_env(&env);
-        assert_eq!(sources.claude.as_deref(), Some(projects.as_path()));
+        let sources = Registry::from_env(&env);
+        let claude = sources
+            .of_kind(crate::history::Source::Claude)
+            .next()
+            .unwrap();
+        assert_eq!(claude.instance().root, projects);
         let outcome = reconcile::reconcile(&root, &sources).unwrap();
         assert!(
             matches!(outcome.publish, generation::Publish::Published(_)),
@@ -1034,7 +1041,7 @@ mod tests {
         fs::create_dir_all(launch.parent().unwrap()).unwrap();
         fs::write(&launch, "x").unwrap();
         let root = default_root(&env).unwrap();
-        let sources = reconcile::Sources::from_env(&env);
+        let sources = Registry::from_env(&env);
 
         let outcome = reconcile::reconcile(&root, &sources).unwrap();
         assert!(outcome.published > 0, "{outcome:?}");
@@ -1070,7 +1077,7 @@ mod tests {
         let root = default_root(&env).unwrap();
         assert_eq!(legacy::cache_dir_of(&root), Some(cli_cache.as_path()));
 
-        let outcome = reconcile::reconcile(&root, &reconcile::Sources::from_env(&env)).unwrap();
+        let outcome = reconcile::reconcile(&root, &Registry::from_env(&env)).unwrap();
         assert!(outcome.published > 0, "{outcome:?}");
         assert_eq!(outcome.removed, legacy::Removed::default());
         assert!(project.exists() && pi.exists());

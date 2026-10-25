@@ -76,9 +76,10 @@ use super::{Browser, PreparedCorpus, Waker};
 use crate::debug::DebugLevel;
 use crate::env::HistoryEnv;
 use crate::error::AppError;
+use crate::history::sources::Registry;
 use crate::history::{Conversation, LoaderMessage};
 use crate::store::generation::{MergePolicy, Publish};
-use crate::store::reconcile::{self, Outcome, Sources};
+use crate::store::reconcile::{self, Outcome};
 use crate::store::{Generation, Snapshot};
 use crate::time_filter::TimeFilter;
 use std::path::{Path, PathBuf};
@@ -1376,7 +1377,7 @@ fn reconcile_store(job: ReconcileJob) -> PassResult {
             let _ = crate::debug_log::log_debug(log_path, message);
         }
     };
-    let sources = Sources::from_env(&env);
+    let sources = Registry::from_env(&env);
     let threads = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(1, 4));
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)

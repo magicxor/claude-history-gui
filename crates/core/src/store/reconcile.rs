@@ -15,26 +15,25 @@
 //! A pass that published removes the caches older versions kept beside the
 //! store (`legacy`).
 //!
-//! Fork: the sources come from a [`HistoryEnv`] ([`Sources::from_env`]),
-//! and [`reconcile_cancellable`] gives a pass up soon after a flag is set,
+//! Fork: the registry of sources comes from a
+//! [`HistoryEnv`](crate::env::HistoryEnv) ([`Registry::from_env`]), and
+//! [`reconcile_cancellable`] gives a pass up soon after a flag is set,
 //! because the GUI runs it in-process (see `store`'s differences from
 //! upstream). Old caches are never removed from the installed CLI's cache
-//! dir ([`Sources::cli_cache`]), nor once the pass is given up.
+//! dir ([`Registry::cli_cache`]), nor once the pass is given up.
 
 use super::card::Fingerprint;
 use super::generation::{
     self, Doc, Generation, MergePolicy, Publish, PublishLock, Update, Written,
 };
 use super::legacy;
-use crate::env::HistoryEnv;
-use crate::history::omp_loader::{self, OmpSessionRoot};
+use crate::history::adapter::{Completeness, FileId, Located};
 use crate::history::parser::{process_conversation_file, process_omp_conversation_file};
 use crate::history::path::decode_project_dir_name_to_path;
-use crate::history::pi_loader::{self, PiSessionRoot};
+use crate::history::sources::Registry;
 use crate::history::{Conversation, Source, format_short_name_from_path};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -43,33 +42,6 @@ use std::time::{Duration, Instant, SystemTime};
 const FIRST_BATCH: usize = 200;
 /// Parsing time after which the conversations parsed so far are published.
 const BATCH_TIME: Duration = Duration::from_secs(2);
-
-/// Where each source keeps its session files.
-#[derive(Clone, Debug, Default)]
-pub struct Sources {
-    /// Claude's `projects` directory.
-    pub claude: Option<PathBuf>,
-    pub pi: Option<PiSessionRoot>,
-    pub omp: Option<OmpSessionRoot>,
-    /// Fork: the installed CLI's cache root
-    /// ([`HistoryEnv::cli_cache_root`]). A pass never removes old caches
-    /// from a cache dir inside it, even when the env's cache root was
-    /// pointed there.
-    pub cli_cache: Option<PathBuf>,
-}
-
-impl Sources {
-    /// The session roots `env` selects (upstream: the process environment),
-    /// the ones the history loader reads.
-    pub fn from_env(env: &HistoryEnv) -> Self {
-        Self {
-            claude: env.claude_projects_root().ok(),
-            pi: pi_loader::session_root(env).ok(),
-            omp: omp_loader::session_root(env).ok(),
-            cli_cache: env.cli_cache_root(),
-        }
-    }
-}
 
 /// What one pass did.
 #[derive(Debug)]
@@ -88,12 +60,12 @@ pub struct Outcome {
     pub removed: legacy::Removed,
 }
 
-/// Runs one pass over `sources` into the store at `root`.
-pub fn reconcile(root: &Path, sources: &Sources) -> io::Result<Outcome> {
+/// Runs one pass over the instances of `sources` into the store at `root`.
+pub fn reconcile(root: &Path, sources: &Registry) -> io::Result<Outcome> {
     reconcile_with(root, sources, MergePolicy::DEFAULT)
 }
 
-pub fn reconcile_with(root: &Path, sources: &Sources, policy: MergePolicy) -> io::Result<Outcome> {
+pub fn reconcile_with(root: &Path, sources: &Registry, policy: MergePolicy) -> io::Result<Outcome> {
     reconcile_cancellable(root, sources, policy, &|| false)
 }
 
@@ -110,7 +82,7 @@ pub fn reconcile_with(root: &Path, sources: &Sources, policy: MergePolicy) -> io
 /// publishes does.
 pub fn reconcile_cancellable(
     root: &Path,
-    sources: &Sources,
+    sources: &Registry,
     policy: MergePolicy,
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> io::Result<Outcome> {
@@ -144,14 +116,15 @@ pub fn reconcile_cancellable(
     let mut pending = plan.parse;
     // Newest first, so the first batches cover what the list shows first.
     pending.sort_by(|a, b| {
-        b.modified
-            .cmp(&a.modified)
-            .then_with(|| a.path.cmp(&b.path))
+        b.located
+            .modified
+            .cmp(&a.located.modified)
+            .then_with(|| a.located.path.cmp(&b.located.path))
     });
     let omp_owned = sources
-        .omp
-        .as_ref()
-        .is_some_and(|root| omp_owned(&root.path));
+        .of_kind(Source::Omp)
+        .next()
+        .is_some_and(|adapter| crate::history::sources::pi::omp_owned(&adapter.instance().root));
 
     let mut first = true;
     loop {
@@ -196,8 +169,7 @@ pub fn reconcile_cancellable(
     if outcome.published > 0
         && let Some(cache) = legacy::cache_dir_of(root)
         && !sources
-            .cli_cache
-            .as_deref()
+            .cli_cache()
             .is_some_and(|cli_cache| crate::env::is_within(cache, cli_cache))
         && !cancelled()
     {
@@ -221,173 +193,74 @@ fn open_base(root: &Path) -> Option<Generation> {
     Generation::open(root).filter(|generation| generation.open_search_files().is_some())
 }
 
-/// A session file found by the scan.
+/// A conversation found by the scan.
 #[derive(Clone, Debug)]
 struct Found {
-    path: PathBuf,
-    source: Source,
+    located: Located,
     /// Other sources whose root holds this same file.
     also: Vec<Source>,
-    size: u64,
-    modified: Option<SystemTime>,
     fingerprint: Fingerprint,
+}
+
+impl Found {
+    fn source(&self) -> Source {
+        self.located.key.instance.kind
+    }
 }
 
 #[derive(Default)]
 struct Scan {
     files: Vec<Found>,
-    /// Sources whose root could not be listed.
-    degraded_sources: HashSet<Source>,
-    /// Directories that could not be listed.
-    degraded_dirs: HashSet<PathBuf>,
+    /// How much of each instance the scan saw.
+    completeness: Vec<(Source, Completeness)>,
 }
 
 impl Scan {
     /// Whether the scan may have missed `path` of `source`.
     fn misses(&self, path: &Path, source: Source) -> bool {
-        self.degraded_sources.contains(&source)
-            || path
-                .parent()
-                .is_some_and(|dir| self.degraded_dirs.contains(dir))
+        self.completeness
+            .iter()
+            .any(|(kind, completeness)| *kind == source && completeness.may_miss(path))
     }
 }
 
-/// Lists every session file with its metadata. A file reachable through
-/// more than one path is kept once, under the first path in source order
-/// (Claude, Pi, OMP).
-fn scan(sources: &Sources) -> Scan {
+/// Every conversation of every instance. A file reachable through more than
+/// one instance is kept once, under the first in registry order.
+fn scan(sources: &Registry) -> Scan {
     let started = SystemTime::now();
     let mut scan = Scan::default();
-    let mut candidates: Vec<(PathBuf, Source)> = Vec::new();
-    if let Some(root) = &sources.claude {
-        scan_claude(root, &mut scan, &mut candidates);
-    }
-    if let Some(root) = &sources.pi {
-        match pi_loader::discover_files(root) {
-            Ok(files) => candidates.extend(files.into_iter().map(|path| (path, Source::Pi))),
-            Err(_) => {
-                scan.degraded_sources.insert(Source::Pi);
-            }
-        }
-    }
-    if let Some(root) = &sources.omp {
-        match omp_loader::discover_files(root) {
-            Ok(files) => candidates.extend(files.into_iter().map(|path| (path, Source::Omp))),
-            Err(_) => {
-                scan.degraded_sources.insert(Source::Omp);
-            }
-        }
-    }
-
-    let stats: Vec<Option<(Found, Option<FileId>)>> = candidates
-        .into_par_iter()
-        .map(|(path, source)| {
-            let metadata = fs::metadata(&path).ok()?;
-            let modified = metadata.modified().ok();
-            let size = metadata.len();
-            Some((
-                Found {
-                    fingerprint: generation::fingerprint_from(size, modified, started),
-                    path,
-                    source,
-                    also: Vec::new(),
-                    size,
-                    modified,
-                },
-                file_id(&metadata),
-            ))
-        })
+    let discoveries: Vec<_> = sources
+        .adapters()
+        .par_iter()
+        .map(|adapter| (adapter.instance().kind, adapter.discover(started)))
         .collect();
     // A file listed by several sources, as when the Pi and OMP roots are
     // one directory, is parsed once and kept for whichever source it holds.
     let mut ids: HashMap<FileId, usize> = HashMap::new();
     let mut paths: HashMap<PathBuf, usize> = HashMap::new();
-    for (found, id) in stats.into_iter().flatten() {
-        let next = scan.files.len();
-        let kept = match id {
-            Some(id) => *ids.entry(id).or_insert(next),
-            None => *paths.entry(found.path.clone()).or_insert(next),
-        };
-        if kept == next {
-            scan.files.push(found);
-        } else {
-            let kept = &mut scan.files[kept];
-            if kept.source != found.source && !kept.also.contains(&found.source) {
-                kept.also.push(found.source);
+    for (kind, discovery) in discoveries {
+        scan.completeness.push((kind, discovery.completeness));
+        for located in discovery.found {
+            let next = scan.files.len();
+            let kept = match located.file_id {
+                Some(id) => *ids.entry(id).or_insert(next),
+                None => *paths.entry(located.path.clone()).or_insert(next),
+            };
+            if kept == next {
+                scan.files.push(Found {
+                    fingerprint: located.stamp.into(),
+                    located,
+                    also: Vec::new(),
+                });
+            } else {
+                let kept = &mut scan.files[kept];
+                if kept.source() != kind && !kept.also.contains(&kind) {
+                    kept.also.push(kind);
+                }
             }
         }
     }
     scan
-}
-
-/// Claude sessions: `*.jsonl` directly inside each project directory,
-/// except subagent transcripts (`agent-*`).
-fn scan_claude(root: &Path, scan: &mut Scan, candidates: &mut Vec<(PathBuf, Source)>) {
-    let entries = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
-        Err(_) => {
-            scan.degraded_sources.insert(Source::Claude);
-            return;
-        }
-    };
-    let mut dirs = Vec::new();
-    for entry in entries {
-        match entry {
-            Ok(entry) => dirs.push(entry.path()),
-            Err(_) => {
-                scan.degraded_sources.insert(Source::Claude);
-            }
-        }
-    }
-    let listed: Vec<(PathBuf, io::Result<Vec<PathBuf>>)> = dirs
-        .into_par_iter()
-        .filter(|dir| dir.is_dir())
-        .map(|dir| {
-            let files = list_claude_dir(&dir);
-            (dir, files)
-        })
-        .collect();
-    for (dir, files) in listed {
-        match files {
-            Ok(files) => candidates.extend(files.into_iter().map(|path| (path, Source::Claude))),
-            Err(_) => {
-                scan.degraded_dirs.insert(dir);
-            }
-        }
-    }
-}
-
-fn list_claude_dir(dir: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
-        let is_session = path
-            .extension()
-            .is_some_and(|extension| extension == "jsonl")
-            && !path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("agent-"));
-        if is_session {
-            files.push(path);
-        }
-    }
-    Ok(files)
-}
-
-/// Device and inode of a file.
-type FileId = (u64, u64);
-
-#[cfg(unix)]
-fn file_id(metadata: &fs::Metadata) -> Option<FileId> {
-    use std::os::unix::fs::MetadataExt;
-    Some((metadata.dev(), metadata.ino()))
-}
-
-#[cfg(not(unix))]
-fn file_id(_metadata: &fs::Metadata) -> Option<FileId> {
-    None
 }
 
 /// The scan compared with the base generation.
@@ -426,8 +299,8 @@ fn diff(base: Option<&Generation>, scan: &Scan) -> Plan {
     let mut seen_rows = vec![false; rows.len()];
     let mut seen_ignored: HashSet<&str> = HashSet::new();
     for found in &scan.files {
-        let path = found.path.to_string_lossy();
-        let known = found.fingerprint.mtime_ns != 0;
+        let path = found.located.path.to_string_lossy();
+        let known = found.located.stamp.is_known();
         let row = by_path.get(path.as_ref()).copied();
         if let Some(row) = row {
             seen_rows[row as usize] = true;
@@ -522,10 +395,11 @@ fn parse_all(
 
 /// Parses `found` the way the history loader does for its source.
 fn parse(found: &Found, omp_owned: bool) -> Parsed {
-    let path = found.path.clone();
-    let result = match found.source {
-        Source::Omp if omp_owned => process_omp_conversation_file(path, found.modified, None),
-        _ => process_conversation_file(path, found.modified, None),
+    let path = found.located.path.clone();
+    let modified = found.located.modified;
+    let result = match found.source() {
+        Source::Omp if omp_owned => process_omp_conversation_file(path, modified, None),
+        _ => process_conversation_file(path, modified, None),
     };
     let mut conversation = match result {
         Ok(Some(conversation)) => conversation,
@@ -535,9 +409,10 @@ fn parse(found: &Found, omp_owned: bool) -> Parsed {
         }
         Err(_) => return Parsed::Failed,
     };
-    let project_path = match found.source {
+    let project_path = match found.source() {
         Source::Claude => conversation.cwd.clone().unwrap_or_else(|| {
             found
+                .located
                 .path
                 .parent()
                 .and_then(Path::file_name)
@@ -559,12 +434,6 @@ fn parse(found: &Found, omp_owned: bool) -> Parsed {
     Parsed::Conversation(Box::new(conversation))
 }
 
-/// Whether OMP sessions under `root` are OMP's own format rather than Pi's.
-fn omp_owned(root: &Path) -> bool {
-    root.components()
-        .any(|component| matches!(component.as_os_str().to_str(), Some(".omp" | "omp")))
-}
-
 /// The docs of the next generation: `keep` without the rows `batch`
 /// replaces, plus the batch's conversations. Updates `ignored` with the
 /// batch's outcome.
@@ -576,7 +445,7 @@ fn apply_batch(
 ) -> Vec<Doc> {
     let parsed_paths: HashSet<String> = batch
         .iter()
-        .map(|(found, _)| found.path.to_string_lossy().into_owned())
+        .map(|(found, _)| found.located.path.to_string_lossy().into_owned())
         .collect();
     ignored.retain(|(path, _)| !parsed_paths.contains(path));
     let row_of: HashMap<&str, u32> = base
@@ -591,13 +460,13 @@ fn apply_batch(
     let mut failed: Vec<(u32, Fingerprint)> = Vec::new();
     let mut new = Vec::new();
     for (found, parsed) in batch {
-        let path = found.path.to_string_lossy().into_owned();
+        let path = found.located.path.to_string_lossy().into_owned();
         let row = row_of.get(path.as_str()).copied();
         if let Some(row) = row {
             replaced.insert(row);
         }
         let unknown = Fingerprint {
-            size: found.size,
+            size: found.located.size,
             mtime_ns: 0,
         };
         match parsed {
@@ -626,13 +495,17 @@ fn apply_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::omp_loader::OmpSessionRoot;
+    use crate::history::pi_loader::PiSessionRoot;
+    use std::fs;
     use std::time::Duration;
 
     struct Fixture {
         _dir: tempfile::TempDir,
         root: PathBuf,
         projects: PathBuf,
-        sources: Sources,
+        pi: PiSessionRoot,
+        omp: OmpSessionRoot,
     }
 
     impl Fixture {
@@ -657,17 +530,13 @@ mod tests {
             .unwrap();
             Self {
                 root: dir.path().join("store"),
-                sources: Sources {
-                    claude: Some(projects.clone()),
-                    pi: Some(PiSessionRoot {
-                        path: pi,
-                        flat: false,
-                    }),
-                    omp: Some(OmpSessionRoot {
-                        path: omp,
-                        flat: false,
-                    }),
-                    cli_cache: None,
+                pi: PiSessionRoot {
+                    path: pi,
+                    flat: false,
+                },
+                omp: OmpSessionRoot {
+                    path: omp,
+                    flat: false,
                 },
                 projects,
                 _dir: dir,
@@ -692,7 +561,12 @@ mod tests {
         }
 
         fn run(&self) -> Outcome {
-            reconcile(&self.root, &self.sources).unwrap()
+            let sources = Registry::with_roots(
+                Some(self.projects.clone()),
+                Some(self.pi.clone()),
+                Some(self.omp.clone()),
+            );
+            reconcile(&self.root, &sources).unwrap()
         }
 
         fn current(&self) -> Generation {
@@ -776,15 +650,15 @@ mod tests {
     #[test]
     fn sessions_of_a_root_pi_and_omp_share_are_kept_for_their_source() {
         let mut fixture = Fixture::new();
-        let shared = fixture.sources.pi.as_ref().unwrap().path.clone();
+        let shared = fixture.pi.path.clone();
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let omp = shared.join("--tmp-pi--").join("omp.jsonl");
         fs::copy(fixtures.join("omp/v3.jsonl"), &omp).unwrap();
         settle_all(&shared);
-        fixture.sources.omp = Some(OmpSessionRoot {
+        fixture.omp = OmpSessionRoot {
             path: shared,
             flat: false,
-        });
+        };
         fixture.run();
 
         let generation = fixture.current();

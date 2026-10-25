@@ -12,7 +12,7 @@
 //! [`crate::env::HistoryEnv::cache_root`]), where fork releases before
 //! the store wrote the same files under the same names and tags. `reconcile`
 //! never calls [`remove_old_caches`] for a cache dir inside the installed
-//! CLI's (`reconcile::Sources::cli_cache`). The fork-only `launch/` dir
+//! CLI's (`history::sources::Registry::cli_cache`). The fork-only `launch/` dir
 //! (the macOS Terminal launcher's scripts) is left alone like every other
 //! entry this module does not recognize.
 
