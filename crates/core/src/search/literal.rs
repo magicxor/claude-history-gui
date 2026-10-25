@@ -1,5 +1,5 @@
 use crate::history::Conversation;
-use crate::text_match::{is_word_start, next_lowercase_candidate};
+use crate::text_match::{is_word_start, next_lowercase_candidate, nfc};
 use rayon::prelude::*;
 use std::borrow::Borrow;
 
@@ -17,6 +17,8 @@ pub struct Literal {
 
 impl Literal {
     pub fn new(text: String) -> Self {
+        // Conversation texts are NFC (see `history::index`).
+        let text = nfc(&text).into_owned();
         let case_mode = if text.chars().any(char::is_uppercase) {
             CaseMode::Sensitive
         } else {

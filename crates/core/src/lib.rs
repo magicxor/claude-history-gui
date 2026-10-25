@@ -22,6 +22,7 @@
 
 pub mod agent;
 pub mod bench;
+pub mod case_fold;
 pub mod claude;
 pub mod commands;
 pub mod config;

@@ -939,6 +939,7 @@ dependencies = [
  "fst",
  "hf-hub",
  "home",
+ "icu_normalizer",
  "libc",
  "memchr",
  "memmap2",

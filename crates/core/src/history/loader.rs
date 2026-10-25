@@ -16,6 +16,7 @@ use crate::debug;
 use crate::debug::DebugLevel;
 use crate::env::{HistoryEnv, WorkspaceScope};
 use crate::error::{AppError, Result};
+use crate::text_match::nfc;
 use crate::time_filter::TimeFilter;
 use rayon::prelude::*;
 use std::fs::read_dir;
@@ -160,7 +161,8 @@ fn load_claude_streaming(
 
                 for conv in &mut convs {
                     let project_path = conv.cwd.clone().unwrap_or_else(|| fallback_path.clone());
-                    conv.project_name = Some(format_short_name_from_path(&project_path));
+                    conv.project_name =
+                        Some(nfc(&format_short_name_from_path(&project_path)).into_owned());
                     conv.project_path = Some(project_path);
                 }
 
@@ -611,9 +613,10 @@ pub(crate) fn load_conversations(
     for (idx, conv) in conversations.iter_mut().enumerate() {
         conv.index = idx;
 
-        // Prefer the cwd extracted from the JSONL file, fall back to decoded path
+        // Prefer the cwd extracted from the JSONL file, fall back to decoded
+        // path. The name is NFC like the indexer's (upstream a76d5df).
         let project_path = conv.cwd.clone().unwrap_or_else(|| fallback_path.clone());
-        conv.project_name = Some(format_short_name_from_path(&project_path));
+        conv.project_name = Some(nfc(&format_short_name_from_path(&project_path)).into_owned());
         conv.project_path = Some(project_path);
     }
 
@@ -675,6 +678,48 @@ mod tests {
     fn user_search_text_handles_missing_and_empty_results() {
         assert_eq!(user_search_text(&[result(None)]), "");
         assert_eq!(user_search_text(&[result(Some(json!("")))]), "");
+    }
+
+    #[test]
+    fn project_names_and_texts_are_nfc() {
+        // The indexer keeps texts and project names in NFC (upstream
+        // a76d5df); this loader names projects itself, the same way.
+        let dir = tempfile::tempdir().unwrap();
+        let lines = [
+            json!({
+                "type": "user",
+                "cwd": "/work/cafe\u{301}",
+                "timestamp": "2024-01-01T00:00:00Z",
+                "message": {"role": "user", "content": "Cafe\u{301} menu"}
+            }),
+            json!({
+                "type": "assistant",
+                "timestamp": "2024-01-01T00:01:00Z",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}
+            }),
+        ];
+        let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        std::fs::write(
+            dir.path()
+                .join("11111111-1111-4111-8111-111111111111.jsonl"),
+            text,
+        )
+        .unwrap();
+
+        let conversations = load_conversations(dir.path(), false, None).unwrap();
+        assert_eq!(conversations.len(), 1);
+        let conversation = &conversations[0];
+        assert_eq!(conversation.project_name.as_deref(), Some("caf\u{e9}"));
+        assert!(
+            conversation.full_text.contains("Caf\u{e9} menu"),
+            "{}",
+            conversation.full_text
+        );
+        // The recorded working directory stays as recorded.
+        assert_eq!(
+            conversation.cwd.as_deref(),
+            Some(Path::new("/work/cafe\u{301}"))
+        );
     }
 
     fn write_transcript(lines: &[&str]) -> tempfile::NamedTempFile {

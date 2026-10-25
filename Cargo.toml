@@ -56,6 +56,9 @@ memmap2 = "0.9"
 # crate (fst 0.4.7, no dependencies of its own).
 fst = "0.4"
 memchr = "2"
+# NFC for keyword search (text_match::nfc), as upstream; icu_normalizer 2.2.0
+# is already in the tree through idna, so it adds no crates.
+icu_normalizer = { version = "2", default-features = false, features = ["compiled_data"] }
 # Store text segments (store::text: one zstd frame per conversation), as
 # upstream; adds zstd 0.13.3, zstd-safe 7.3.0 and zstd-sys 2.1.1 (the zstd C
 # library, built with cc; cc, jobserver and pkg-config are already in the tree).
