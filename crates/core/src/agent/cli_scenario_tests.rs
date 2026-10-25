@@ -283,6 +283,43 @@ fn pi_sessions_support_agent_search_read_and_outline_without_claude_storage() {
 }
 
 #[test]
+fn codex_threads_support_agent_search_read_and_outline() {
+    const FORK: &str = "01a00000-0000-7000-8000-000000000003";
+    const EXEC: &str = "01a00000-0000-7000-8000-000000000006";
+    let (home, config, sessions) = dirs();
+    let codex = crate::history::sources::codex::tests::home_copy(home.path());
+    let env = sandbox(home.path(), config.path(), sessions.path()).with_codex_home(&codex);
+
+    let search = run_env(&env, &["agent", "search", "--lexical", "ocelot example"]);
+    assert!(search.success, "{}", search.stderr);
+    assert!(
+        search.stdout.contains(&format!("uuid={FORK}")),
+        "{}",
+        search.stdout
+    );
+    let reference = first_ref(&search.stdout);
+
+    let read = run_env(&env, &["agent", "read", &reference]);
+    assert!(read.success, "{}", read.stderr);
+    assert!(
+        read.stdout.contains("Here is an ocelot example."),
+        "{}",
+        read.stdout
+    );
+    // The history the fork continues from is the base thread's own.
+    assert!(!read.stdout.contains("walrus"), "{}", read.stdout);
+
+    let outline = run_env(&env, &["agent", "outline", &reference]);
+    assert!(outline.success, "{}", outline.stderr);
+    assert!(outline.stdout.contains("ocelot"));
+
+    // exec runs stay out of agent search like they stay out of the list.
+    let hidden = run_env(&env, &["agent", "search", "--lexical", "iguana report"]);
+    assert!(hidden.success, "{}", hidden.stderr);
+    assert!(!hidden.stdout.contains(EXEC), "{}", hidden.stdout);
+}
+
+#[test]
 fn omp_sessions_support_agent_search() {
     let (home, config, sessions) = dirs();
     std::fs::copy(fixture("omp/v3.jsonl"), sessions.path().join("omp.jsonl"))

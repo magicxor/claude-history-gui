@@ -388,9 +388,11 @@ fn full_ref_candidates(response: &mut AgentResponse, env: &HistoryEnv, cancelled
         // The discovery is blocking and not cancellable: skip it for a job
         // that was cancelled or replaced (the handles stay).
         let keys = if !cancelled
-            && (error.detail.contains(" source=pi ") || error.detail.contains(" source=omp "))
+            && (error.detail.contains(" source=pi ")
+                || error.detail.contains(" source=omp ")
+                || error.detail.contains(" source=codex "))
         {
-            claude_history_core::agent::service::discover_agent_keys(env, None)
+            claude_history_core::agent::service::discover_agent_keys(env, None, None)
                 .map(|(keys, _)| keys)
                 .unwrap_or_default()
         } else {

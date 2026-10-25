@@ -168,6 +168,27 @@ fn candidate_handles_expand_to_full_refs() {
     );
 }
 
+/// 9718bf8: a Codex candidate becomes a durable full ref through its
+/// discovered key (the ref digests only the thread id).
+#[test]
+fn codex_candidate_handles_expand_through_discovered_keys() {
+    let detail = "ambiguous conversation ref; retry with one of these ch_ handles; candidates: ch_cccccccccccc project=pr_3 source=codex directory=/work/x file=rollout-a.jsonl";
+    assert_eq!(expand_handles(detail, &[]), detail);
+    let mut codex = claude_history_core::agent::refs::AgentConversationKey::new(
+        "/work/x",
+        "rollout-a.jsonl",
+        std::path::PathBuf::from("rollout-a.jsonl"),
+    );
+    codex.source = claude_history_core::history::Source::Codex;
+    codex.session_id = "01a00000-0000-7000-8000-000000000003".to_string();
+    let expanded = expand_handles(detail, std::slice::from_ref(&codex));
+    let full = codex.conversation_ref().full_ref();
+    assert!(
+        expanded.contains(&format!("candidates: {full} project=pr_3")),
+        "{expanded}"
+    );
+}
+
 /// D-014: the real ambiguity of one UUID in two projects offers full refs.
 #[gpui_kit::test]
 fn ambiguous_candidates_are_full_refs(cx: &mut TestAppContext) {

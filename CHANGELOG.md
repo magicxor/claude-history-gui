@@ -4,6 +4,8 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 ## Unreleased
 
+- Deep Search and the agent panel find, read and outline Codex threads; Codex exec runs and subagent threads stay out
+  of agent search, for every source.
 - First rows appear sooner with large Pi or OMP histories: Claude, Pi and OMP conversations load at the same time
   and stream into the list in small batches, and the list keeps drawing while they arrive.
 - Lower memory use: conversation text is shared instead of copied, and search no longer keeps a second copy of it.

@@ -475,9 +475,11 @@ pub fn full_ref_for_candidate(
         .map(|key| key.conversation_ref().full_ref())
 }
 
-/// The agent key of the transcript at `path` (K8): among every Claude, Pi
-/// and OMP transcript the agent commands discover for `env` (all roots, no
-/// workspace scope), the one whose canonical path equals `path`'s. `None`
+/// The agent key of the transcript at `path` (K8): among every Claude, Pi,
+/// OMP and Codex transcript the agent commands discover for `env` (all roots,
+/// no workspace scope), the one whose canonical path equals `path`'s. A Codex
+/// rollout inside the env's Codex home maps by thread id instead, so an older
+/// or archived rollout resolves to its thread's key. `None`
 /// for a file outside the session roots (an export, an attachment, a copy)
 /// or one that does not exist: a file with the same name elsewhere never
 /// resolves to another transcript. Use [`AgentConversationKey::conversation_ref`]
@@ -498,7 +500,30 @@ pub fn conversation_key_for_path(
     let Some(file_name) = target.file_name() else {
         return Ok(None);
     };
-    let (keys, _) = crate::agent::service::discover_agent_keys(env, None)?;
+    // A Codex rollout is also keyed by its thread: the thread's key holds the
+    // head rollout, so an older rollout or an archived copy maps to it too.
+    // Codex keys come from the store's cards, loaded only for such a file.
+    // Only a rollout inside the env's own Codex home counts.
+    let in_codex_home = env.codex_home().is_some_and(|home| {
+        crate::history::sources::codex::discover::home_of(&target)
+            .zip(home.canonicalize().ok())
+            .is_some_and(|(found, home)| found == home)
+    });
+    let rollout =
+        crate::history::sources::codex::discover::rollout_of(path, false).filter(|_| in_codex_home);
+    let no_cards: &[Conversation] = &[];
+    let (keys, _) = crate::agent::service::discover_agent_keys(
+        env,
+        None,
+        rollout.is_none().then_some(no_cards),
+    )?;
+    if let Some(rollout) = rollout
+        && let Some(key) = keys.iter().find(|key| {
+            key.source == Source::Codex && key.session_id.eq_ignore_ascii_case(&rollout.thread_id)
+        })
+    {
+        return Ok(Some(key.clone()));
+    }
     Ok(keys.into_iter().find(|key| {
         // Cheap name check first: canonicalizing every key is slow.
         key.path
@@ -654,6 +679,25 @@ mod tests {
     }
 
     #[test]
+    fn conversation_key_for_path_resolves_codex_rollouts_by_thread() {
+        let home = tempfile::tempdir().unwrap();
+        let codex = crate::history::sources::codex::tests::home_copy(home.path());
+        let env = crate::env::HistoryEnv::sandbox(home.path()).with_codex_home(&codex);
+        let config = crate::config::ConfigFile::default();
+        const FORK: &str = "01a00000-0000-7000-8000-000000000003";
+        let rollout = crate::history::sources::codex::discover::list(&codex)
+            .unwrap()
+            .into_iter()
+            .find(|rollout| rollout.thread_id == FORK)
+            .expect("fork rollout");
+        let key = conversation_key_for_path(&env, &config, &rollout.path)
+            .unwrap()
+            .expect("a Codex rollout has a key");
+        assert_eq!(key.source, Source::Codex);
+        assert_eq!(key.session_id, FORK);
+    }
+
+    #[test]
     fn conversation_key_for_path_resolves_only_discovered_transcripts() {
         // K8: the viewer's file maps to its own agent key; exports, copies
         // and same-named files elsewhere never resolve to another file.
@@ -685,7 +729,7 @@ mod tests {
             fork_key.conversation_ref().full_ref()
         );
         // The full ref addresses exactly this transcript.
-        let keys = crate::agent::service::discover_agent_keys(&env, None)
+        let keys = crate::agent::service::discover_agent_keys(&env, None, None)
             .unwrap()
             .0;
         let resolved = resolve_conversation_ref(&keys, &key.conversation_ref().full_ref()).unwrap();

@@ -3940,7 +3940,7 @@ changes WP-I must know:
   cx)`); `Workspace::on_corpus_notice` still marks the agent panel. The agent panel's hit menu leaves out Search
   within / Outline / Read range. A multi-conversation Read keeps the viewer's conversation as its target when it was
   read, else the first one read (titles of other conversations fall back to the file stem). Ambiguous-ref
-  candidates are expanded to full refs for every source (Pi/OMP through `discover_agent_keys` and `full_ref_for_candidate`, WP-C3; skipped for a cancelled job). Result
+  candidates are expanded to full refs for every source (Pi/OMP and Codex through `discover_agent_keys` and `full_ref_for_candidate`, WP-C3, 9718bf8; skipped for a cancelled job). Result
   rows stay `div`s (multi-line cards with nested buttons) with stable domain ids. Probes: `deep.*`, and `agent.*` —
   **the main window now routes `agent.*` to the panel** (integrator; `deep.agent.*` still works); single-file
   windows route only `viewer.*`, `focus`, `window.kind`.
