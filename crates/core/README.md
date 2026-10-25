@@ -1,7 +1,7 @@
 # claude-history-core
 
 The UI-agnostic core of **claude-history-gui**: loading, parsing, searching and
-rendering-preparation for Claude Code, Pi and OMP conversation history. The GUI
+rendering-preparation for Claude Code, Codex, Pi and OMP conversation history. The GUI
 crate (`crates/gui`) depends only on the APIs of this crate; nothing here
 depends on a terminal or GUI toolkit.
 

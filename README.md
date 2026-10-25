@@ -1,7 +1,7 @@
 # claude-history-gui
 
 A cross-platform desktop app (Windows, macOS, Linux) for browsing, searching and resuming your
-**Claude Code, Pi and OMP conversation history**. It is a GUI port of the terminal app
+**Claude Code, Codex, Pi and OMP conversation history**. It is a GUI port of the terminal app
 [claude-history](https://github.com/raine/claude-history) and aims to cover every feature of the original,
 built on [gpui-kit](https://crates.io/crates/gpui-kit) (GPUI) and a UI-agnostic core (`crates/core`).
 
@@ -29,7 +29,7 @@ All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-h
 ## Features
 
 **Conversation list**
-* Claude Code, Pi and OMP conversations in one virtualized list, listed and searched from an on-disk index that is
+* Claude Code, Codex, Pi and OMP conversations in one virtualized list, listed and searched from an on-disk index that is
   kept up to date in the background (reading only the conversation files that changed, at start, on refresh and
   after a rename or delete): the newest ones are shown at once and the full history is never loaded into memory
   for the list. The first run indexes the history in the background, newest first.
