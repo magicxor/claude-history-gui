@@ -167,7 +167,20 @@ pub fn load_conversations(
     debug_level: Option<crate::debug::DebugLevel>,
     contents: Contents,
 ) -> crate::error::Result<Vec<Conversation>> {
-    load(env, show_last, debug_level, contents, None)
+    load_conversations_where(env, show_last, debug_level, contents, &|_| true)
+}
+
+/// The conversations of [`load_conversations`] whose card `keep` accepts.
+/// Contents beyond the card are read only for those; a card whose contents
+/// cannot be read still fails the whole load.
+pub fn load_conversations_where(
+    env: &HistoryEnv,
+    show_last: bool,
+    debug_level: Option<crate::debug::DebugLevel>,
+    contents: Contents,
+    keep: &(dyn Fn(&Conversation) -> bool + Sync),
+) -> crate::error::Result<Vec<Conversation>> {
+    load(env, show_last, debug_level, contents, None, keep)
 }
 
 /// [`load_conversations`] that gives up soon after `cancelled()` returns
@@ -184,7 +197,22 @@ pub fn load_conversations_cancellable(
     contents: Contents,
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> crate::error::Result<Vec<Conversation>> {
-    load(env, show_last, debug_level, contents, Some(cancelled))
+    load_conversations_where_cancellable(env, show_last, debug_level, contents, cancelled, &|_| {
+        true
+    })
+}
+
+/// [`load_conversations_where`] that is cancellable like
+/// [`load_conversations_cancellable`].
+pub fn load_conversations_where_cancellable(
+    env: &HistoryEnv,
+    show_last: bool,
+    debug_level: Option<crate::debug::DebugLevel>,
+    contents: Contents,
+    cancelled: &(dyn Fn() -> bool + Sync),
+    keep: &(dyn Fn(&Conversation) -> bool + Sync),
+) -> crate::error::Result<Vec<Conversation>> {
+    load(env, show_last, debug_level, contents, Some(cancelled), keep)
 }
 
 fn load(
@@ -193,16 +221,27 @@ fn load(
     debug_level: Option<crate::debug::DebugLevel>,
     contents: Contents,
     cancelled: Option<&(dyn Fn() -> bool + Sync)>,
+    keep: &(dyn Fn(&Conversation) -> bool + Sync),
 ) -> crate::error::Result<Vec<Conversation>> {
-    if let Some(conversations) = default_root(env)
-        .and_then(|root| load_from_store(env, &root, show_last, debug_level, contents, cancelled))
-    {
+    if let Some(conversations) = default_root(env).and_then(|root| {
+        load_from_store(
+            env,
+            &root,
+            show_last,
+            debug_level,
+            contents,
+            cancelled,
+            keep,
+        )
+    }) {
         return Ok(conversations);
     }
     if cancelled.is_some_and(|cancelled| cancelled()) {
         return Err(generation::cancelled_build().into());
     }
-    load_in_memory(env, show_last)
+    let mut conversations = load_in_memory(env, show_last)?;
+    conversations.retain(|conversation| keep(conversation));
+    Ok(conversations)
 }
 
 /// Every conversation the environment's instances hold, parsed in memory
@@ -243,6 +282,7 @@ fn load_from_store(
     debug_level: Option<crate::debug::DebugLevel>,
     contents: Contents,
     cancellable: Option<&(dyn Fn() -> bool + Sync)>,
+    keep: &(dyn Fn(&Conversation) -> bool + Sync),
 ) -> Option<Vec<Conversation>> {
     let never = || false;
     let cancelled = cancellable.unwrap_or(&never);
@@ -269,15 +309,16 @@ fn load_from_store(
         }
     }
     let cards = Snapshot::open(root, show_last, TimeFilter::default())?;
-    read_conversations(&cards, contents, cancelled)
+    read_conversations(&cards, contents, cancelled, keep)
 }
 
-/// Every card of `cards` with `contents`, in doc order; `None` once
-/// `cancelled()` (fork).
+/// Every card of `cards` that `keep` accepts, with `contents`, in doc
+/// order; `None` once `cancelled()` (fork).
 fn read_conversations(
     cards: &Snapshot,
     contents: Contents,
     cancelled: &(dyn Fn() -> bool + Sync),
+    keep: &(dyn Fn(&Conversation) -> bool + Sync),
 ) -> Option<Vec<Conversation>> {
     let generation = &cards.generation;
     let files = match contents {
@@ -287,13 +328,17 @@ fn read_conversations(
             generation.open_semantic_files()?,
         )),
     };
-    (0..generation.rows().len() as u32)
+    // A card whose contents cannot be read fails the whole load.
+    let read: Option<Vec<Option<Conversation>>> = (0..generation.rows().len() as u32)
         .into_par_iter()
         .map(|doc| {
             if cancelled() {
                 return None;
             }
             let mut conversation = cards.card(doc);
+            if !keep(&conversation) {
+                return Some(None);
+            }
             if let Some((text, semantic)) = &files {
                 let row = &generation.rows()[doc as usize];
                 conversation.full_text = text.read(row.text)?.into();
@@ -303,9 +348,10 @@ fn read_conversations(
                         .apply(&mut conversation);
                 }
             }
-            Some(conversation)
+            Some(Some(conversation))
         })
-        .collect()
+        .collect();
+    Some(read?.into_iter().flatten().collect())
 }
 
 /// Cards of one generation.
@@ -960,6 +1006,26 @@ mod tests {
         assert!(cards.iter().all(|card| card.full_text.is_empty()
             && card.parse_errors.is_empty()
             && !card.preview.is_empty()));
+    }
+
+    /// Fork (upstream d05e135 has no test): `keep` drops cards by their
+    /// card alone, from the store and from the in-memory fallback.
+    #[test]
+    fn load_conversations_where_keeps_only_accepted_cards() {
+        let home = tempfile::tempdir().unwrap();
+        let env = sessions_with_a_parse_error(home.path());
+        let all = load_conversations(&env, false, None, Contents::Full).unwrap();
+        assert_eq!(all.len(), 2);
+        let wanted = all[0].path.clone();
+        let kept = load_conversations_where(&env, false, None, Contents::Full, &|card| {
+            card.path == wanted
+        })
+        .unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].path, wanted);
+        assert!(!kept[0].full_text.is_empty());
+        let none = load_conversations_where(&env, false, None, Contents::Full, &|_| false).unwrap();
+        assert!(none.is_empty());
     }
 
     /// Fork: the pass another thread of the process runs (the list's

@@ -430,20 +430,20 @@ impl AgentService {
         // Fork: the load may wait for the GUI list's reconcile pass, so a
         // cancel (K7) also ends that wait.
         let cancellation = self.semantic_cancellation();
-        let loaded = crate::store::load_conversations_cancellable(
+        let loaded = crate::store::load_conversations_where_cancellable(
             &self.env,
             false,
             None,
             crate::store::Contents::Full,
             &|| cancellation.is_cancelled(),
+            &|conversation| {
+                !conversation.provenance.hidden_by_default()
+                    && !project_is_excluded(&conversation.path, &agent_config.exclude_projects)
+                    && time.matches(conversation.timestamp)
+            },
         );
         self.check_cancelled()?;
         let mut conversations = loaded?;
-        conversations.retain(|conversation| {
-            !conversation.provenance.hidden_by_default()
-                && !project_is_excluded(&conversation.path, &agent_config.exclude_projects)
-                && time.matches(conversation.timestamp)
-        });
         conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         let scope = configured_scope(args, &agent_config);
         // Upstream derived the local scope from the process cwd; core uses
@@ -831,13 +831,11 @@ pub fn discover_agent_keys(
         && let Ok(pi_files) = history::pi_loader::discover_files(&pi_root)
     {
         for path in pi_files {
-            let Ok(Some(projection)) = history::pi::parse_file(&path) else {
+            let Ok(Some((history::model::SourceKind::Pi, header))) =
+                history::pi::read_header(&path, None)
+            else {
                 continue;
             };
-            if projection.source != history::model::SourceKind::Pi {
-                continue;
-            }
-            let header = projection.header;
             if project_filter.is_some() {
                 // Upstream additionally re-encoded the canonicalized cwd and
                 // compared it with the filter derived from the same cwd. On
@@ -875,10 +873,11 @@ pub fn discover_agent_keys(
         && let Ok(omp_files) = history::omp_loader::discover_files(&omp_root)
     {
         for path in omp_files {
-            let Ok(Some(projection)) = history::pi::parse_omp_file(&path) else {
+            let Ok(Some((_, header))) =
+                history::pi::read_header(&path, Some(history::model::SourceKind::Omp))
+            else {
                 continue;
             };
-            let header = projection.header;
             if project_filter.is_some() {
                 // Upstream additionally re-encoded the canonicalized cwd and
                 // compared it with the filter derived from the same cwd. On
