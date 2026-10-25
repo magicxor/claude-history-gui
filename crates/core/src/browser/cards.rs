@@ -90,7 +90,7 @@ pub(super) struct CardRows {
     /// `0..n` (doc = row).
     open: Option<usize>,
     /// Per doc: inside the time filter, its project in scope (exclusions,
-    /// workspace) and not deleted here.
+    /// workspace), its cwd not excluded and not deleted here.
     pub(super) scope: Vec<bool>,
     /// Sessions deleted here, by `CardRow::key_hash` (the path's key, also
     /// for a session read from disk), hidden until a generation without
@@ -245,14 +245,17 @@ impl Browser {
     }
 
     /// Every card's scope under the current settings (automated and child
-    /// conversations only with `all_kinds`) and time filter, with the deleted
-    /// cards out (O(cards), memory only; each project is decided once).
+    /// conversations only with `all_kinds`, excluded working directories
+    /// out) and time filter, with the deleted cards out (O(cards), memory
+    /// only; each project is decided once).
     fn card_scope(&self) -> Vec<bool> {
         let Some(snapshot) = &self.snapshot else {
             return Vec::new();
         };
         let scope = CardScope::new(&self.excluded_projects, self.effective_workspace());
-        let mut docs = snapshot.scope(self.all_kinds, |project| scope.project_visible(project));
+        let mut docs = snapshot.scope(self.all_kinds, &self.excluded_paths, |project| {
+            scope.project_visible(project)
+        });
         if !self.cards.removed.is_empty() {
             let by_key = snapshot.docs_by_key();
             for key in &self.cards.removed {
@@ -305,11 +308,12 @@ impl Browser {
 
     /// Whether no card of the generation shown is listed (automated and
     /// child conversations count only with `all_kinds`) inside the time
-    /// filter.
+    /// filter. Exclusions do not count (upstream 982aea9 too): a history
+    /// that every exclusion hides is not "no history".
     pub fn generation_is_empty(&self) -> bool {
         self.snapshot
             .as_ref()
-            .is_none_or(|snapshot| snapshot.head(1, self.all_kinds, |_| true).is_empty())
+            .is_none_or(|snapshot| snapshot.head(1, self.all_kinds, &[], |_| true).is_empty())
     }
 
     /// The time filter the cards are listed under (inactive outside

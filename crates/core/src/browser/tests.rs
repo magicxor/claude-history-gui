@@ -1679,6 +1679,72 @@ fn exclude_projects_filters_incremental_loading() {
     assert_eq!(app.count_text(), "Loading... 2");
 }
 
+/// Upstream 982aea9 (`exclude_paths_filters_shown_conversations_search_and_semantic_scope`):
+/// the in-memory path hides conversations whose recorded cwd starts with an
+/// excluded prefix, for every source, while loading, once loaded, in
+/// lexical results and in the semantic scope. A conversation without a cwd
+/// stays (its decoded project path is not consulted). Upstream installed
+/// the rows with `show_conversations`; the fork streams and finishes the
+/// load.
+#[test]
+fn exclude_paths_filters_shown_conversations_search_and_semantic_scope() {
+    let sandbox = Sandbox::new();
+    let mut rows = Vec::new();
+    for (index, source) in [
+        crate::history::model::SourceKind::Claude,
+        crate::history::model::SourceKind::Pi,
+        crate::history::model::SourceKind::Omp,
+        crate::history::model::SourceKind::Codex,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut hidden = conversation(
+            Some("Eval"),
+            "-tmp-eval",
+            &format!("hidden-{index}"),
+            "needle",
+        );
+        hidden.source = source;
+        hidden.cwd = Some(PathBuf::from("/tmp/deleted-eval"));
+        rows.push(hidden);
+    }
+    let mut missing = conversation(None, "-tmp-no-cwd", "missing", "needle");
+    missing.project_path = Some(PathBuf::from("/tmp/decoded-fallback"));
+    rows.push(missing);
+    rows.push(conversation(
+        Some("ProjectHidden"),
+        "-work-hidden",
+        "project-hidden",
+        "needle",
+    ));
+    let mut visible = conversation(Some("Visible"), "-work-visible", "visible", "needle");
+    visible.cwd = Some(PathBuf::from("/work/project"));
+    rows.push(visible);
+
+    let mut app = Browser::new_loading(
+        sandbox
+            .options()
+            .with_exclude_projects(vec!["ProjectHidden".into()])
+            .with_exclude_paths(vec!["/tmp/".into()]),
+    );
+    app.append_conversations(rows);
+    assert_eq!(filtered_projects(&app), vec![None, Some("Visible")]);
+    app.finish_loading();
+    assert_eq!(filtered_projects(&app), vec![None, Some("Visible")]);
+    assert_eq!(*app.semantic_scope_indices(), vec![4, 6]);
+
+    app.set_query("needle");
+    wait_for_search(&mut app);
+    assert_eq!(filtered_projects(&app), vec![None, Some("Visible")]);
+
+    // Fork: changed at runtime, the prefixes re-filter the results.
+    app.set_excluded_paths(Vec::new());
+    wait_for_search(&mut app);
+    assert_eq!(filtered_projects(&app).len(), 6);
+    assert_eq!(app.semantic_scope_indices().len(), 6);
+}
+
 #[test]
 fn empty_exclusions_preserve_browse_results() {
     let sandbox = Sandbox::new();
@@ -1729,11 +1795,13 @@ fn single_file_mode_has_no_project_exclusions() {
         sandbox
             .options()
             .with_exclude_projects(vec!["Hidden".into()])
+            .with_exclude_paths(vec!["/".into()])
             .with_default_mode(ListSearchMode::Semantic)
             .with_workspace_filter(true),
     );
 
     assert!(app.excluded_projects.is_empty());
+    assert!(app.excluded_paths.is_empty());
     assert!(app.is_single_file_mode());
     assert!(!app.semantic_available());
     assert_eq!(app.list_search_mode(), ListSearchMode::Lexical);

@@ -5,9 +5,11 @@
 //! so caches and `config.toml` leaked in, until 16cc49c set `HOME` to a temp
 //! dir as well). Here every scenario runs
 //! [`AgentService::execute`] with a [`HistoryEnv::sandbox`] whose home is a
-//! temp dir as well, and with the default configuration. The argv of each
-//! upstream invocation is kept and translated by a tiny test-only parser, so
-//! the scenarios read like the originals. "stdout" is the returned protocol
+//! temp dir as well, and with the default configuration (the
+//! `exclude_paths` scenarios load the sandbox's `config.toml` like the GUI's
+//! `agent` command). The argv of each upstream invocation is kept and
+//! translated by a tiny test-only parser, so the scenarios read like the
+//! originals. "stdout" is the returned protocol
 //! text, "stderr" the protocol error envelope (or the collected notices).
 //!
 //! The `--render` parts (`direct_render_*`) exercise the terminal display
@@ -113,7 +115,21 @@ fn parse(args: &[&str]) -> AgentRequest {
 }
 
 fn run_env(env: &HistoryEnv, args: &[&str]) -> Output {
-    let mut service = AgentService::new(env.clone(), ConfigFile::default());
+    run_env_with(env, ConfigFile::default(), args)
+}
+
+/// [`run_env`] with the configuration the GUI's `agent` command uses: the
+/// sandbox's `config.toml` layered with its `gui.toml` (upstream read the
+/// shared `config.toml` from its temp home).
+fn run_configured(env: &HistoryEnv, args: &[&str]) -> Output {
+    let config = crate::config::load_layered_config(env)
+        .expect("load the sandbox configuration")
+        .effective;
+    run_env_with(env, config, args)
+}
+
+fn run_env_with(env: &HistoryEnv, config: ConfigFile, args: &[&str]) -> Output {
+    let mut service = AgentService::new(env.clone(), config);
     let result = service.execute(parse(args));
     let notices = service
         .take_notices()
@@ -950,4 +966,179 @@ fn invalid_arguments_become_protocol_errors() {
     };
     assert!(text.starts_with("protocol agent-error kind=invalid-ref ref=command"));
     assert!(text.contains("greater%20than%20zero"), "{text}");
+}
+
+// --- [tui] exclude_paths (upstream 982aea9) ----------------------------------
+
+/// Upstream `write_tui_config`: the shared `config.toml` of the sandbox
+/// home, read by [`run_configured`].
+fn write_tui_config(env: &HistoryEnv, body: &str) -> PathBuf {
+    let file = env.config_file().expect("sandbox config file");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, body).unwrap();
+    file
+}
+
+/// Upstream `shared_exclude_paths_filters_search_without_skips_and_preserves_explicit_access`.
+/// The `--render` half (the terminal display, not core) is left out like
+/// the other `direct_render_*` parts: a file path opens in the GUI's
+/// single-file mode, which has no exclusions (`browser::tests`).
+#[test]
+fn shared_exclude_paths_filters_search_without_skips_and_preserves_explicit_access() {
+    let (home, config, _) = dirs();
+    let env = sandbox(
+        home.path(),
+        config.path(),
+        &config.path().join("empty-agent-sessions"),
+    );
+    let project = project(config.path());
+    let hidden_id = "11111111-1111-4111-8111-111111111111";
+    let visible_id = "22222222-2222-4222-8222-222222222222";
+    let missing_id = "33333333-3333-4333-8333-333333333333";
+    let hidden = project.join(format!("{hidden_id}.jsonl"));
+    let visible = project.join(format!("{visible_id}.jsonl"));
+    let missing = project.join(format!("{missing_id}.jsonl"));
+    for path in [&hidden, &visible, &missing] {
+        write_transcript(path, "path exclusion needle");
+    }
+    let text = std::fs::read_to_string(&visible).unwrap();
+    std::fs::write(
+        &visible,
+        text.replace("/tmp/agent-phase3-tests", "/work/real-project"),
+    )
+    .unwrap();
+    let text = std::fs::read_to_string(&missing).unwrap();
+    let without_cwd = text.replace(r#""cwd":"/tmp/agent-phase3-tests","#, "");
+    assert_ne!(without_cwd, text, "the transcript records a cwd");
+    std::fs::write(&missing, without_cwd).unwrap();
+    let unfiltered = run_configured(&env, &["agent", "within", hidden_id, "needle", "--lexical"]);
+    assert!(unfiltered.success, "{}", unfiltered.stderr);
+    let reference = first_ref(&unfiltered.stdout);
+    let config_file = write_tui_config(
+        &env,
+        "[tui]\nexclude_paths = [\"/tmp/\", \"/private/tmp/\"]\n",
+    );
+
+    // Repeated invocations exercise both a freshly published and an
+    // unchanged store generation.
+    for mode in ["--lexical", "--exact", "--lexical"] {
+        let output = run_configured(&env, &["agent", "search", mode, "path exclusion needle"]);
+        assert!(output.success, "{}", output.stderr);
+        let text = &output.stdout;
+        assert!(!text.contains(hidden_id), "{text}");
+        assert!(text.contains(visible_id), "{text}");
+        assert!(text.contains(missing_id), "{text}");
+        assert!(!text.contains("kind=skipped"), "{text}");
+    }
+    for args in [
+        vec!["agent", "read", reference.as_str()],
+        vec!["agent", "outline", hidden_id],
+        vec!["agent", "within", hidden_id, "needle", "--lexical"],
+    ] {
+        let output = run_configured(&env, &args);
+        assert!(output.success, "{}", output.stderr);
+        assert!(
+            output.stdout.contains("path exclusion needle"),
+            "{}",
+            output.stdout
+        );
+    }
+    assert!(hidden.exists());
+
+    std::fs::write(
+        project.join("44444444-4444-4444-8444-444444444444.jsonl"),
+        "{malformed\n",
+    )
+    .unwrap();
+    let output = run_configured(&env, &["agent", "search", "--lexical", "needle"]);
+    assert!(output.success, "{}", output.stderr);
+    assert!(
+        output.stdout.contains("kind=malformed-transcript"),
+        "{}",
+        output.stdout
+    );
+    std::fs::remove_file(config_file).unwrap();
+    let restored = run_configured(&env, &["agent", "search", "--lexical", "needle"]);
+    assert!(restored.success, "{}", restored.stderr);
+    assert!(restored.stdout.contains(hidden_id), "{}", restored.stdout);
+}
+
+/// Upstream `shared_exclude_paths_filters_pi_and_omp_header_cwd`.
+#[test]
+fn shared_exclude_paths_filters_pi_and_omp_header_cwd() {
+    for (fixture_name, uuid, query) in [
+        (
+            "pi/v3-branched.jsonl",
+            "01912345-6789-7abc-8def-0123456789ab",
+            "active root question",
+        ),
+        (
+            "omp/v3.jsonl",
+            "omp_session_custom_id",
+            "OMP active question",
+        ),
+    ] {
+        let (home, config, sessions) = dirs();
+        let env = sandbox(home.path(), config.path(), sessions.path());
+        std::fs::copy(fixture(fixture_name), sessions.path().join("session.jsonl")).unwrap();
+        let config_file = write_tui_config(&env, "[tui]\nexclude_paths = [\"/tmp/\"]\n");
+        for _ in 0..2 {
+            let output = run_configured(&env, &["agent", "search", "--lexical", query]);
+            assert!(output.success, "{fixture_name}: {}", output.stderr);
+            let text = &output.stdout;
+            assert!(!text.contains(uuid), "{fixture_name}: {text}");
+            assert!(!text.contains("kind=skipped"), "{fixture_name}: {text}");
+        }
+        std::fs::remove_file(&config_file).unwrap();
+        let restored = run_configured(&env, &["agent", "search", "--lexical", query]);
+        assert!(restored.success, "{fixture_name}: {}", restored.stderr);
+        assert!(
+            restored.stdout.contains(uuid),
+            "{fixture_name}: {}",
+            restored.stdout
+        );
+        let reference = first_ref(&restored.stdout);
+        write_tui_config(&env, "[tui]\nexclude_paths = [\"/tmp/\"]\n");
+        let direct = run_configured(&env, &["agent", "outline", &reference]);
+        assert!(direct.success, "{fixture_name}: {}", direct.stderr);
+        assert!(
+            direct.stdout.contains(query),
+            "{fixture_name}: {}",
+            direct.stdout
+        );
+    }
+}
+
+/// Upstream `shared_exclude_paths_filters_codex_threads`.
+#[test]
+fn shared_exclude_paths_filters_codex_threads() {
+    const FORK: &str = "01a00000-0000-7000-8000-000000000003";
+    let (home, config, sessions) = dirs();
+    let codex = crate::history::sources::codex::tests::home_copy(home.path());
+    let env = sandbox(home.path(), config.path(), sessions.path()).with_codex_home(&codex);
+    let claude_id = "11111111-1111-4111-8111-111111111111";
+    write_transcript(
+        &project(config.path()).join(format!("{claude_id}.jsonl")),
+        "ocelot example",
+    );
+    let search = run_configured(&env, &["agent", "search", "--lexical", "ocelot example"]);
+    assert!(search.success, "{}", search.stderr);
+    assert!(
+        search.stdout.contains(&format!("uuid={FORK}")),
+        "{}",
+        search.stdout
+    );
+    let reference = first_ref(&search.stdout);
+
+    // The fixture threads all run in /work/demo.
+    write_tui_config(&env, "[tui]\nexclude_paths = [\"/work/\"]\n");
+    let hidden = run_configured(&env, &["agent", "search", "--lexical", "ocelot example"]);
+    assert!(hidden.success, "{}", hidden.stderr);
+    let text = &hidden.stdout;
+    assert!(!text.contains(FORK), "{text}");
+    assert!(text.contains(claude_id), "{text}");
+    assert!(!text.contains("kind=skipped"), "{text}");
+    let read = run_configured(&env, &["agent", "read", &reference]);
+    assert!(read.success, "{}", read.stderr);
+    assert!(read.stdout.contains("ocelot example"), "{}", read.stdout);
 }

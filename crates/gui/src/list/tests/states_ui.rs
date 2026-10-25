@@ -166,3 +166,54 @@ fn exclusions_hiding_everything_are_named(cx: &mut TestAppContext) {
     assert!(has_dialog(&f, cx), "Open Settings opens the dialog");
     let _ = recording(cx);
 }
+
+/// L-079 with `exclude_paths` (upstream 982aea9): excluded working
+/// directories hiding every conversation are named like excluded projects;
+/// with both, the state names both lists.
+#[gpui_kit::test]
+fn excluded_working_directories_hiding_everything_are_named(cx: &mut TestAppContext) {
+    let world = TestWorld::new();
+    SessionSpec::new("solo", 1)
+        .summary("Only one")
+        .write(&world);
+    let base = crate::test_support::synth::cwd_base();
+    world.write_config(
+        None,
+        Some(&format!("[tui]\nexclude_paths = ['{}']\n", base.display())),
+    );
+    let f = ListFixture::open_loaded(cx, &world, &[]);
+    f.wait_idle(cx);
+    assert!(f.paths(cx).is_empty());
+    let state = f.read(cx, |list, cx| list.empty_state(cx)).unwrap();
+    assert_eq!(
+        state.title,
+        "Every conversation is in an excluded working directory"
+    );
+    let description = state.description.clone().unwrap_or_default();
+    assert_eq!(
+        description,
+        format!("Excluded in Settings (exclude_paths): {}.", base.display())
+    );
+    assert_eq!(
+        rendered_state(&f, cx),
+        Some(vec!["Open Settings".to_string()])
+    );
+
+    f.list.update(cx, |list, cx| {
+        list.set_exclude_projects(vec!["solo".into()], cx)
+    });
+    f.wait_idle(cx);
+    let state = f.read(cx, |list, cx| list.empty_state(cx)).unwrap();
+    assert_eq!(state.title, "Every conversation is excluded");
+    assert_eq!(
+        state.description.as_deref(),
+        Some(
+            format!(
+                "Excluded in Settings (exclude_projects): solo; (exclude_paths): {}.",
+                base.display()
+            )
+            .as_str()
+        )
+    );
+    let _ = recording(cx);
+}

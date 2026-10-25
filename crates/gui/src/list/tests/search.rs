@@ -678,6 +678,44 @@ fn excluded_projects_are_hidden(cx: &mut TestAppContext) {
     );
 }
 
+/// L-107 (upstream 982aea9): the shared `[tui] exclude_paths` hides the
+/// conversations whose recorded working directory starts with a listed
+/// prefix, Claude, Pi and OMP alike (a prefix also covers the worktrees
+/// below it); a pasted session ID still shows one (L-050), and clearing the
+/// query hides it again.
+#[gpui_kit::test]
+fn excluded_working_directories_are_hidden(cx: &mut TestAppContext) {
+    let world = TestWorld::new();
+    listed_corpus(&world);
+    let proj = synth::cwd_base().join("proj");
+    world.write_config(
+        Some(&format!(
+            "[tui]\nexclude_paths = ['/tmp/', '{}']\n",
+            proj.display()
+        )),
+        None,
+    );
+    let f = ListFixture::open_loaded(cx, &world, &[]);
+    let names = |cx: &TestAppContext| -> Vec<Option<String>> {
+        f.read(cx, |list, _| {
+            (0..list.browser().filtered().len())
+                .map(|pos| list.browser().row(pos).unwrap().project_name.clone())
+                .collect()
+        })
+    };
+    assert_eq!(
+        names(cx),
+        vec![Some("api".to_string()), Some("api".to_string())],
+        "only the conversations outside /tmp/ and the proj tree stay"
+    );
+    f.type_text(cx, &synth::uuid(1));
+    f.wait_idle(cx);
+    assert_eq!(f.paths(cx).len(), 1, "the session ID opens an excluded row");
+    f.press(cx, "escape");
+    f.wait_idle(cx);
+    assert_eq!(names(cx).len(), 2, "the excluded row is hidden again");
+}
+
 /// L-023: the preview shows the last messages first, or the first with `--first`.
 #[gpui_kit::test]
 fn previews_follow_first_and_last(cx: &mut TestAppContext) {

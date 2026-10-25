@@ -1532,6 +1532,18 @@ impl Browser {
         self.scope_changed();
     }
 
+    /// Change the excluded working-directory prefixes (`[tui].exclude_paths`,
+    /// upstream 982aea9; fork: changeable at runtime, like
+    /// [`Browser::set_excluded_projects`]). No-op in single-file mode or when
+    /// unchanged.
+    pub fn set_excluded_paths(&mut self, prefixes: Vec<String>) {
+        if self.single_file_mode || self.excluded_paths == prefixes {
+            return;
+        }
+        self.excluded_paths = prefixes;
+        self.scope_changed();
+    }
+
     /// List or hide automated (Codex exec) and child (subagent)
     /// conversations (upstream `toggle_all_kinds`, Ctrl+G), keeping the query
     /// and the selected session. They are lexical only: indexing gives them

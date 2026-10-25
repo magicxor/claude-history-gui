@@ -236,12 +236,13 @@ impl SourceCounts {
     }
 }
 
-/// What decides whether a row is in scope: the excluded project names, when
-/// the workspace scope is on, the workspace, and whether automated and child
-/// conversations are listed.
+/// What decides whether a row is in scope: the excluded project names, the
+/// excluded working-directory prefixes, when the workspace scope is on, the
+/// workspace, and whether automated and child conversations are listed.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct ScopeSettings {
     pub(super) excluded: HashSet<String>,
+    pub(super) excluded_paths: Vec<String>,
     pub(super) workspace: Option<WorkspaceScope>,
     pub(super) all_kinds: bool,
 }
@@ -252,6 +253,9 @@ pub(super) struct ScopeSettings {
 /// * A conversation is excluded when its project name is in the excluded
 ///   names, or is a worktree `parent/branch` whose parent is. Conversations
 ///   without a project name are never excluded.
+/// * A conversation whose recorded cwd starts with one of the excluded
+///   paths is excluded (upstream 982aea9: literal, case-sensitive prefixes;
+///   without a cwd it stays).
 /// * Automated and child conversations are listed only with `all_kinds`
 ///   (upstream 8f60c5f, cb990e6).
 /// * With a workspace, Claude conversations are kept when their project
@@ -260,6 +264,7 @@ pub(super) struct ScopeSettings {
 ///   directory. Upstream compared with the process cwd.
 pub(super) struct ScopeFilter<'a> {
     excluded: &'a HashSet<String>,
+    excluded_paths: &'a [String],
     workspace: Option<&'a WorkspaceScope>,
     all_kinds: bool,
     /// The workspace canonicalized once (upstream: once per row).
@@ -269,11 +274,13 @@ pub(super) struct ScopeFilter<'a> {
 impl<'a> ScopeFilter<'a> {
     pub(super) fn new(
         excluded: &'a HashSet<String>,
+        excluded_paths: &'a [String],
         workspace: Option<&'a WorkspaceScope>,
         all_kinds: bool,
     ) -> Self {
         Self {
             excluded,
+            excluded_paths,
             workspace,
             all_kinds,
             workspace_dir: None,
@@ -284,6 +291,7 @@ impl<'a> ScopeFilter<'a> {
     pub(super) fn of(settings: &'a ScopeSettings) -> Self {
         Self::new(
             &settings.excluded,
+            &settings.excluded_paths,
             settings.workspace.as_ref(),
             settings.all_kinds,
         )
@@ -298,6 +306,9 @@ impl<'a> ScopeFilter<'a> {
             .as_deref()
             .is_some_and(|name| project_is_excluded(name, self.excluded))
         {
+            return false;
+        }
+        if crate::history::path::cwd_is_excluded(conversation.cwd.as_deref(), self.excluded_paths) {
             return false;
         }
         let Some(workspace) = self.workspace else {
@@ -458,6 +469,7 @@ impl ScopeIndex {
     pub(super) fn is_current(
         &self,
         excluded: &HashSet<String>,
+        excluded_paths: &[String],
         workspace: Option<&WorkspaceScope>,
         all_kinds: bool,
         len: usize,
@@ -467,6 +479,7 @@ impl ScopeIndex {
             && self.settings.all_kinds == all_kinds
             && self.settings.workspace.as_ref() == workspace
             && self.settings.excluded == *excluded
+            && self.settings.excluded_paths == excluded_paths
     }
 
     /// The positions in scope, ascending (shared with the semantic worker).

@@ -128,6 +128,8 @@ where
 pub struct TuiConfig {
     #[serde(default)]
     pub exclude_projects: Vec<String>,
+    #[serde(default)]
+    pub exclude_paths: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_search: Option<bool>,
 }
@@ -552,12 +554,15 @@ impl GuiSettings {
 }
 
 /// `[tui]` overrides in `gui.toml`. Unlike [`TuiConfig`], an explicitly
-/// empty `exclude_projects = []` is distinguishable from "not set".
+/// empty `exclude_projects = []` or `exclude_paths = []` is distinguishable
+/// from "not set".
 #[derive(Clone, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TuiOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exclude_projects: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclude_paths: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_search: Option<bool>,
 }
@@ -710,6 +715,7 @@ impl ConfigFile {
                         .exclude_projects
                         .clone()
                         .unwrap_or(base.exclude_projects),
+                    exclude_paths: top.exclude_paths.clone().unwrap_or(base.exclude_paths),
                     semantic_search: overlay(base.semantic_search, &top.semantic_search),
                 })
             }
@@ -1166,6 +1172,25 @@ exclude_projects = ["Hidden", "hidden", " spaced "]
             config.tui.unwrap().exclude_projects,
             vec!["Hidden", "hidden", " spaced "]
         );
+    }
+
+    #[test]
+    fn tui_exclude_paths_defaults_and_preserves_literal_prefixes() {
+        for input in ["", "[tui]", "[tui]\nexclude_paths = []"] {
+            let config: ConfigFile = toml::from_str(input).unwrap();
+            assert!(config.tui.unwrap_or_default().exclude_paths.is_empty());
+        }
+        let config: ConfigFile = toml::from_str(
+            r#"[tui]
+exclude_paths = ["/tmp/", "/private/tmp/", "", " spaced "]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.tui.unwrap().exclude_paths,
+            ["/tmp/", "/private/tmp/", "", " spaced "]
+        );
+        assert!(toml::from_str::<ConfigFile>("[tui]\nexclude_paths = [1]").is_err());
     }
 
     #[test]
@@ -1644,6 +1669,36 @@ restore_session = false
         assert_eq!(tui.semantic_search, Some(false));
     }
 
+    /// `[tui] exclude_paths` (upstream 982aea9) layers like
+    /// `exclude_projects`: omitted in gui.toml keeps config.toml's prefixes,
+    /// a gui.toml list wins and `[]` clears them.
+    #[test]
+    fn gui_toml_overrides_exclude_paths_and_an_empty_list_clears_them() {
+        let cli: ConfigFile =
+            toml::from_str("[tui]\nexclude_paths = [\"/tmp/\"]\nexclude_projects = [\"x\"]\n")
+                .unwrap();
+        let gui: GuiConfigFile = toml::from_str("[tui]\nexclude_projects = []\n").unwrap();
+        let tui = cli.clone().overlaid_with(&gui).tui.unwrap();
+        assert_eq!(tui.exclude_paths, vec!["/tmp/"]);
+        assert!(tui.exclude_projects.is_empty());
+
+        let gui: GuiConfigFile =
+            toml::from_str("[tui]\nexclude_paths = ['C:\\Temp\\', \"/var/tmp/\"]\n").unwrap();
+        let tui = cli.clone().overlaid_with(&gui).tui.unwrap();
+        assert_eq!(tui.exclude_paths, vec![r"C:\Temp\", "/var/tmp/"]);
+        assert_eq!(tui.exclude_projects, vec!["x"]);
+
+        let gui: GuiConfigFile = toml::from_str("[tui]\nexclude_paths = []\n").unwrap();
+        assert!(
+            cli.overlaid_with(&gui)
+                .tui
+                .unwrap()
+                .exclude_paths
+                .is_empty()
+        );
+        assert!(toml::from_str::<GuiConfigFile>("[tui]\nexclude_paths = [1]").is_err());
+    }
+
     #[test]
     fn save_writes_only_gui_toml_and_round_trips() {
         let root = tempfile::tempdir().unwrap();
@@ -1663,6 +1718,7 @@ restore_session = false
             }),
             tui: Some(TuiOverrides {
                 exclude_projects: Some(Vec::new()),
+                exclude_paths: Some(vec!["/tmp/".to_string()]),
                 semantic_search: None,
             }),
             search: Some(SearchConfig {
@@ -1687,6 +1743,7 @@ restore_session = false
         assert!(text.contains("rename = \"alt+n\""), "{text}");
         assert!(text.contains("theme = \"light\""), "{text}");
         assert!(text.contains("exclude_projects = []"), "{text}");
+        assert!(text.contains("exclude_paths = [\"/tmp/\"]"), "{text}");
         assert!(
             !text.contains("no_tools"),
             "unset values are omitted: {text}"
@@ -1847,6 +1904,7 @@ terminal = \"wt -w 0\"
         edited.tui = Some(TuiOverrides {
             exclude_projects: Some(vec!["scratch".to_string()]),
             semantic_search: None,
+            ..Default::default()
         });
         save_gui_config_changes(&env, &base, &edited).unwrap();
 

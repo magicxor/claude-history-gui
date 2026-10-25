@@ -1966,3 +1966,106 @@ fn hidden_kinds_toggle_in_and_out_of_the_list_and_its_search() {
     app.escape();
     assert_eq!(listed_paths(&app), shown);
 }
+
+/// Upstream 982aea9: `[tui] exclude_paths` hides cards by their recorded
+/// cwd from the first cards, the browse list, lexical queries and the
+/// semantic scope, for every source; a full session id still opens one.
+/// Fork: the prefixes change at runtime ([`Browser::set_excluded_paths`]).
+#[test]
+fn exclude_paths_hide_cards_by_cwd_in_list_search_and_semantic_scope() {
+    use crate::history::model::SourceKind;
+    let sandbox = Sandbox::new();
+    let hidden_uuid = "6dd62dc0-8b64-4f5e-a651-5bd95216478e";
+    let card = |path: &str, at: i64, source: SourceKind, cwd: Option<&str>| {
+        let mut card = conversation(path, at * HOUR_MS);
+        card.source = source;
+        card.cwd = cwd.map(PathBuf::from);
+        card.project_path = cwd.map(PathBuf::from);
+        card.full_text = "needle".into();
+        card.semantic_turns = vec!["needle turn".to_string()].into();
+        card
+    };
+    let mut corpus = vec![
+        card(
+            &format!("/p/-tmp-eval/{hidden_uuid}.jsonl"),
+            1,
+            SourceKind::Claude,
+            Some("/tmp/eval-1"),
+        ),
+        card(
+            "/s/pi.jsonl",
+            2,
+            SourceKind::Pi,
+            Some("/private/tmp/eval-2"),
+        ),
+        card("/s/omp.jsonl", 3, SourceKind::Omp, Some("/tmp/eval-3")),
+        card("/s/codex.jsonl", 4, SourceKind::Codex, Some("/tmp/eval-4")),
+        card("/s/tmpfoo.jsonl", 5, SourceKind::Codex, Some("/tmpfoo/x")),
+        card("/s/bare.jsonl", 6, SourceKind::Pi, Some("/tmp")),
+        card("/p/-tmp-nocwd/n.jsonl", 7, SourceKind::Claude, None),
+        card(
+            "/p/-work-gone/g.jsonl",
+            8,
+            SourceKind::Claude,
+            Some("/work"),
+        ),
+    ];
+    // Without a recorded cwd the decoded project path is not consulted.
+    corpus[6].project_path = Some(PathBuf::from("/tmp/nocwd"));
+    let root = publish(&corpus);
+    let mut app = Browser::new_loading(
+        sandbox
+            .options()
+            .with_exclude_projects(vec!["gone".to_string()])
+            .with_exclude_paths(vec!["/tmp/".to_string(), "/private/tmp/".to_string()]),
+    );
+    show(&mut app, &root, TimeFilter::default());
+    let visible = ["/p/-tmp-nocwd/n.jsonl", "/s/bare.jsonl", "/s/tmpfoo.jsonl"];
+    assert_eq!(listed_paths(&app), visible);
+    assert!(
+        !app.generation_is_empty(),
+        "exclusions are not an empty history"
+    );
+
+    assert!(app.open_search_index());
+    assert_eq!(listed_paths(&app), visible);
+    type_query(&mut app, "needle");
+    wait_for_search(&mut app);
+    assert_eq!(listed_paths(&app), visible);
+
+    assert!(!app.ensure_semantic_corpus());
+    wait_for_search(&mut app);
+    let loaded = app.semantic_corpus.loaded.clone().unwrap();
+    let mut scoped: Vec<_> = app
+        .semantic_scope_indices()
+        .iter()
+        .map(|&index| loaded.conversations()[index].path.display().to_string())
+        .collect();
+    scoped.sort();
+    assert_eq!(scoped, visible);
+
+    // A full session id still opens an excluded session.
+    app.set_query(hidden_uuid);
+    wait_for_search(&mut app);
+    assert_eq!(
+        listed_paths(&app),
+        [format!("/p/-tmp-eval/{hidden_uuid}.jsonl")]
+    );
+    app.escape();
+    assert_eq!(listed_paths(&app), visible);
+
+    // Fork: changed at runtime, the prefixes re-scope the cards.
+    app.set_excluded_paths(vec!["/tmp/eval-".to_string()]);
+    assert_eq!(app.excluded_paths(), ["/tmp/eval-"]);
+    assert_eq!(
+        listed_paths(&app),
+        [
+            "/p/-tmp-nocwd/n.jsonl",
+            "/s/bare.jsonl",
+            "/s/tmpfoo.jsonl",
+            "/s/pi.jsonl"
+        ]
+    );
+    app.set_excluded_paths(Vec::new());
+    assert_eq!(listed_paths(&app).len(), 7);
+}

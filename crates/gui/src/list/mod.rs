@@ -328,6 +328,7 @@ impl ListPane {
                 state.ui.recent_workspaces.clone(),
             )
         };
+        let excluded_paths = app_state(cx).settings.exclude_paths.clone();
         let level = Some(crate::debug_sink::capture_level(cx));
 
         // The waker: worker threads post to a one-slot channel, the poll task
@@ -341,6 +342,7 @@ impl ListPane {
             .with_show_last(show_last)
             .with_default_mode(mode)
             .with_exclude_projects(excluded.clone())
+            .with_exclude_paths(excluded_paths)
             .with_workspace(workspace.clone())
             .with_workspace_filter(local && workspace.is_some())
             .with_all_kinds(all_kinds)
@@ -759,6 +761,18 @@ impl ListPane {
     /// The excluded project names the list currently applies.
     pub fn excluded_projects(&self) -> &std::collections::HashSet<String> {
         self.browser.excluded_projects()
+    }
+
+    /// `[tui] exclude_paths` changed in Settings (upstream 982aea9; the
+    /// fork applies it without a restart, like `exclude_projects`).
+    pub fn set_exclude_paths(&mut self, excluded: Vec<String>, cx: &mut Context<Self>) {
+        self.browser.set_excluded_paths(excluded);
+        self.after_filter_change(cx);
+    }
+
+    /// The excluded working-directory prefixes the list currently applies.
+    pub fn excluded_paths(&self) -> &[String] {
+        self.browser.excluded_paths()
     }
 
     /// Whether previews show the last messages.

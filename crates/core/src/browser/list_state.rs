@@ -28,6 +28,7 @@ impl Browser {
             indices,
             &self.conversations,
             &self.excluded_projects,
+            &self.excluded_paths,
             self.all_kinds,
             self.workspace_filter,
             self.workspace.as_ref(),
@@ -44,6 +45,7 @@ impl Browser {
     pub(super) fn scope_settings(&self) -> ScopeSettings {
         ScopeSettings {
             excluded: self.excluded_projects.clone(),
+            excluded_paths: self.excluded_paths.clone(),
             workspace: self.effective_workspace().cloned(),
             all_kinds: self.all_kinds,
         }
@@ -53,6 +55,7 @@ impl Browser {
     pub(super) fn scope_is_current(&self) -> bool {
         self.index.scope.is_current(
             &self.excluded_projects,
+            &self.excluded_paths,
             self.effective_workspace(),
             self.all_kinds,
             self.conversations.len(),
@@ -245,13 +248,14 @@ impl Browser {
     }
 }
 
-/// Hidden kinds (unless `all_kinds`), exclusions, then the workspace scope
-/// (upstream `filter_conversation_indices`); see [`ScopeFilter`] for the
-/// rules.
+/// Hidden kinds (unless `all_kinds`), project and working-directory
+/// exclusions, then the workspace scope (upstream
+/// `filter_conversation_indices`); see [`ScopeFilter`] for the rules.
 pub(super) fn filter_conversation_indices<I>(
     indices: I,
     conversations: &[Arc<Conversation>],
     excluded_projects: &HashSet<String>,
+    excluded_paths: &[String],
     all_kinds: bool,
     workspace_filter: bool,
     workspace: Option<&WorkspaceScope>,
@@ -261,6 +265,7 @@ where
 {
     let mut filter = ScopeFilter::new(
         excluded_projects,
+        excluded_paths,
         workspace.filter(|_| workspace_filter),
         all_kinds,
     );

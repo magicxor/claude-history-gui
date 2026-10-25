@@ -8,8 +8,9 @@
 //! * Save (disabled while gui.toml cannot be parsed) writes only the changed
 //!   keys through core's change-set save (K12, config.toml is never written),
 //!   reloads both files into `AppState`, applies the changes live (key
-//!   bindings, theme, excluded projects, previews) and toasts
-//!   `Settings saved to <path>`; errors stay inline and keep the draft.
+//!   bindings, theme, excluded projects and working directories, previews)
+//!   and toasts `Settings saved to <path>`; errors stay inline and keep the
+//!   draft.
 //! * Cancel discards the draft and writes nothing.
 
 pub mod draft;
@@ -69,8 +70,9 @@ pub const TEXT_FIELDS: [Field; 16] = [
 ];
 
 /// Fields edited as one item per line.
-pub const LIST_FIELDS: [Field; 4] = [
+pub const LIST_FIELDS: [Field; 5] = [
     Field::ExcludeProjects,
+    Field::ExcludePaths,
     Field::ResumeArgs,
     Field::CodexResumeArgs,
     Field::AgentExclude,
@@ -534,6 +536,7 @@ impl SettingsDialog {
                 }
             }
             Field::ExcludeProjects
+            | Field::ExcludePaths
             | Field::ResumeArgs
             | Field::CodexResumeArgs
             | Field::AgentExclude => {
@@ -714,8 +717,9 @@ fn finish_save(
 }
 
 /// The live effects of a saved change (§11.18): key bindings, excluded
-/// projects, preview refresh. (Theme: the caller; terminal, programs,
-/// `[agent]`, view defaults: read from `AppState` when they are used.)
+/// projects and working directories, preview refresh. (Theme: the caller;
+/// terminal, programs, `[agent]`, view defaults: read from `AppState` when
+/// they are used.)
 fn apply_saved(fields: &[Field], cx: &mut App) {
     let settings = app_state(cx).settings.clone();
     if fields.iter().any(|field| matches!(field, Field::Key(_))) {
@@ -726,6 +730,10 @@ fn apply_saved(fields: &[Field], cx: &mut App) {
         if fields.contains(&Field::ExcludeProjects) {
             let excluded = settings.exclude_projects.clone();
             list.update(cx, |list, cx| list.set_exclude_projects(excluded, cx));
+        }
+        if fields.contains(&Field::ExcludePaths) {
+            let excluded = settings.exclude_paths.clone();
+            list.update(cx, |list, cx| list.set_exclude_paths(excluded, cx));
         }
         if fields.contains(&Field::PreviewLast) {
             list.update(cx, |list, cx| list.set_show_last(settings.show_last, cx));
@@ -749,9 +757,9 @@ fn install_keys(cx: &mut App) {
 
 /// The live effects of a config retry in the startup error dialog (C-023):
 /// the files were re-read into `AppState` ([`reload_config`]); the key
-/// bindings, the excluded projects, the preview mode and an explicit
-/// gui.toml theme now take effect without a restart. `before` is the
-/// effective settings from before the reload.
+/// bindings, the excluded projects and working directories, the preview
+/// mode and an explicit gui.toml theme now take effect without a restart.
+/// `before` is the effective settings from before the reload.
 pub fn apply_reloaded(
     before: &claude_history_core::settings::EffectiveSettings,
     window: &mut Window,
@@ -774,6 +782,10 @@ pub fn apply_reloaded(
         if settings.exclude_projects != before.exclude_projects {
             let excluded = settings.exclude_projects.clone();
             list.update(cx, |list, cx| list.set_exclude_projects(excluded, cx));
+        }
+        if settings.exclude_paths != before.exclude_paths {
+            let excluded = settings.exclude_paths.clone();
+            list.update(cx, |list, cx| list.set_exclude_paths(excluded, cx));
         }
         if settings.show_last != before.show_last {
             list.update(cx, |list, cx| list.set_show_last(settings.show_last, cx));

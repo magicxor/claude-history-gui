@@ -183,6 +183,10 @@ pub struct BrowserOptions {
     pub default_mode: ListSearchMode,
     /// Project names hidden from the list (`[tui].exclude_projects`).
     pub exclude_projects: Vec<String>,
+    /// Working-directory prefixes hidden from the list (`[tui].exclude_paths`,
+    /// upstream 982aea9): literal, case-sensitive prefixes of a
+    /// conversation's recorded cwd; empty entries are ignored.
+    pub exclude_paths: Vec<String>,
     /// The workspace for the "project" scope. [`BrowserOptions::new`] takes
     /// it from [`HistoryEnv::workspace`] (a workspace that is not an
     /// absolute path is left out there; validate it with
@@ -216,6 +220,7 @@ impl BrowserOptions {
             show_last: true,
             default_mode: ListSearchMode::Lexical,
             exclude_projects: Vec::new(),
+            exclude_paths: Vec::new(),
             workspace,
             workspace_filter: false,
             all_kinds: false,
@@ -237,6 +242,11 @@ impl BrowserOptions {
 
     pub fn with_exclude_projects(mut self, projects: Vec<String>) -> Self {
         self.exclude_projects = projects;
+        self
+    }
+
+    pub fn with_exclude_paths(mut self, prefixes: Vec<String>) -> Self {
+        self.exclude_paths = prefixes;
         self
     }
 
@@ -278,6 +288,7 @@ impl std::fmt::Debug for BrowserOptions {
             .field("show_last", &self.show_last)
             .field("default_mode", &self.default_mode)
             .field("exclude_projects", &self.exclude_projects)
+            .field("exclude_paths", &self.exclude_paths)
             .field("workspace", &self.workspace)
             .field("workspace_filter", &self.workspace_filter)
             .field("all_kinds", &self.all_kinds)
@@ -357,6 +368,8 @@ pub struct Browser {
     workspace: Option<WorkspaceScope>,
     /// Exact project names hidden from list-mode display
     excluded_projects: HashSet<String>,
+    /// Working-directory prefixes hidden from list-mode display
+    excluded_paths: Vec<String>,
     /// Channel to send commands to the background search worker
     search_tx: mpsc::Sender<SearchCommand>,
     /// Channel to receive results from the background search worker
@@ -436,23 +449,25 @@ impl Browser {
         } else {
             ListSearchMode::Lexical
         };
-        let (workspace, workspace_filter, all_kinds, excluded_projects) = if parts.single_file_mode
-        {
-            (None, false, false, HashSet::new())
-        } else {
-            (
-                opts.workspace,
-                opts.workspace_filter,
-                opts.all_kinds,
-                opts.exclude_projects.into_iter().collect(),
-            )
-        };
+        let (workspace, workspace_filter, all_kinds, excluded_projects, excluded_paths) =
+            if parts.single_file_mode {
+                (None, false, false, HashSet::new(), Vec::new())
+            } else {
+                (
+                    opts.workspace,
+                    opts.workspace_filter,
+                    opts.all_kinds,
+                    opts.exclude_projects.into_iter().collect(),
+                    opts.exclude_paths,
+                )
+            };
         let conversations: CorpusSnapshot =
             Arc::new(parts.conversations.into_iter().map(Arc::new).collect());
         let index = CorpusIndex::build(
             &conversations,
             Some(ScopeSettings {
                 excluded: excluded_projects.clone(),
+                excluded_paths: excluded_paths.clone(),
                 workspace: workspace.clone().filter(|_| workspace_filter),
                 all_kinds,
             }),
@@ -491,6 +506,7 @@ impl Browser {
             all_kinds,
             workspace,
             excluded_projects,
+            excluded_paths,
             search_tx: parts.search_tx,
             search_rx: parts.search_rx,
             search_generation: 0,
@@ -747,6 +763,11 @@ impl Browser {
     /// Project names hidden from the list.
     pub fn excluded_projects(&self) -> &HashSet<String> {
         &self.excluded_projects
+    }
+
+    /// Working-directory prefixes hidden from the list.
+    pub fn excluded_paths(&self) -> &[String] {
+        &self.excluded_paths
     }
 
     /// Outcome of the current query if it is a session UUID. A

@@ -574,6 +574,7 @@ impl SettingsDialog {
             cx,
         );
         let exclude = self.list_input(Field::ExcludeProjects, 6.0);
+        let exclude_paths = self.list_input(Field::ExcludePaths, 4.0);
         let rows = vec![
             self.row(
                 Field::SearchMode,
@@ -589,6 +590,17 @@ impl SettingsDialog {
                 exclude,
                 Some(self.note(
                     "One project name per line; `repo` also hides `repo/<worktree>`.",
+                    cx,
+                )),
+                cx,
+            ),
+            self.row(
+                Field::ExcludePaths,
+                exclude_paths,
+                Some(self.note(
+                    "One prefix of the recorded working directory per line (literal and \
+                     case-sensitive, e.g. `/tmp/` or `C:\\Users\\me\\AppData\\Local\\Temp\\`); \
+                     also hidden from Deep search.",
                     cx,
                 )),
                 cx,

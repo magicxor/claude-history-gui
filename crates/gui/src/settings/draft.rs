@@ -38,6 +38,7 @@ pub enum Field {
     Plain,
     SearchMode,
     ExcludeProjects,
+    ExcludePaths,
     Key(KeyAction),
     ResumeArgs,
     CodexResumeArgs,
@@ -76,7 +77,7 @@ impl Field {
     }
 
     /// Every field, page by page, in display order.
-    pub const ALL: [Field; 33] = [
+    pub const ALL: [Field; 34] = [
         Field::Theme,
         Field::Terminal,
         Field::ClaudePath,
@@ -91,6 +92,7 @@ impl Field {
         Field::Plain,
         Field::SearchMode,
         Field::ExcludeProjects,
+        Field::ExcludePaths,
         Field::Key(KeyAction::Resume),
         Field::Key(KeyAction::Fork),
         Field::Key(KeyAction::Rename),
@@ -126,7 +128,9 @@ impl Field {
             Field::PreviewLast | Field::ToolDisplay | Field::ShowThinking | Field::Plain => {
                 SettingsPage::Display
             }
-            Field::SearchMode | Field::ExcludeProjects => SettingsPage::Search,
+            Field::SearchMode | Field::ExcludeProjects | Field::ExcludePaths => {
+                SettingsPage::Search
+            }
             Field::Key(_) => SettingsPage::Keys,
             Field::ResumeArgs | Field::CodexResumeArgs => SettingsPage::Resume,
             _ => SettingsPage::Agent,
@@ -150,6 +154,7 @@ impl Field {
             Field::Plain => "Ctrl+O prints plain text",
             Field::SearchMode => "Default search mode",
             Field::ExcludeProjects => "Excluded projects",
+            Field::ExcludePaths => "Excluded working directories",
             Field::Key(action) => action.label(),
             Field::ResumeArgs => "Default arguments",
             Field::CodexResumeArgs => "Codex default arguments",
@@ -184,6 +189,7 @@ impl Field {
             Field::Plain => "[display] plain",
             Field::SearchMode => "[search] mode",
             Field::ExcludeProjects => "[tui] exclude_projects",
+            Field::ExcludePaths => "[tui] exclude_paths",
             Field::Key(KeyAction::Resume) => "[keys] resume",
             Field::Key(KeyAction::Fork) => "[keys] fork",
             Field::Key(KeyAction::Rename) => "[keys] rename",
@@ -223,6 +229,7 @@ impl Field {
     pub fn applies(self) -> &'static str {
         match self {
             Field::Theme | Field::ExcludeProjects | Field::Key(_) => "Applies immediately",
+            Field::ExcludePaths => "Applies immediately; Deep search at its next run",
             Field::Terminal
             | Field::ClaudePath
             | Field::PiPath
@@ -305,6 +312,10 @@ pub fn get(field: Field, gui: &GuiConfigFile) -> Value {
             gui.tui
                 .as_ref()
                 .and_then(|tui| tui.exclude_projects.clone()),
+            Value::List,
+        ),
+        Field::ExcludePaths => opt(
+            gui.tui.as_ref().and_then(|tui| tui.exclude_paths.clone()),
             Value::List,
         ),
         Field::Key(KeyAction::Resume) => opt(keys.resume, Value::Key),
@@ -419,6 +430,11 @@ pub fn set(field: Field, gui: &mut GuiConfigFile, value: Value) {
                 .get_or_insert_with(TuiOverrides::default)
                 .exclude_projects = list(&value)
         }
+        Field::ExcludePaths => {
+            gui.tui
+                .get_or_insert_with(TuiOverrides::default)
+                .exclude_paths = list(&value)
+        }
         Field::Key(KeyAction::Resume) => keys(gui).resume = key(&value),
         Field::Key(KeyAction::Fork) => keys(gui).fork = key(&value),
         Field::Key(KeyAction::Rename) => keys(gui).rename = key(&value),
@@ -479,6 +495,12 @@ pub fn cli_value(field: Field, cli: &ConfigFile) -> Value {
             cli.tui
                 .as_ref()
                 .map(|tui| tui.exclude_projects.clone())
+                .unwrap_or_default(),
+        ),
+        Field::ExcludePaths => non_empty(
+            cli.tui
+                .as_ref()
+                .map(|tui| tui.exclude_paths.clone())
                 .unwrap_or_default(),
         ),
         Field::Key(KeyAction::Resume) => opt(keys.resume, Value::Key),

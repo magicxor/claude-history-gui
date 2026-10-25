@@ -94,6 +94,9 @@ pub struct EffectiveSettings {
     pub list_search_mode: TuiSearchMode,
     /// `[tui].exclude_projects`: display names hidden from the list.
     pub exclude_projects: Vec<String>,
+    /// `[tui].exclude_paths` (upstream 982aea9): working-directory prefixes
+    /// hidden from the list (literal, case-sensitive).
+    pub exclude_paths: Vec<String>,
     /// `[keys]` with defaults.
     pub keys: KeyBindings,
     /// Whether the lexical/semantic toggle (Ctrl+T) is available: upstream
@@ -186,6 +189,7 @@ pub fn effective_settings(
         search_mode: resolve_search_mode(resolution),
         list_search_mode: resolve_tui_search_mode(resolution),
         exclude_projects: tui.exclude_projects,
+        exclude_paths: tui.exclude_paths,
         semantic_toggle_enabled: !keys.conflicts_with_ctrl_t(),
         keys,
         resume_default_args: config
@@ -1089,6 +1093,7 @@ mod tests {
                 search_mode: SearchMode::Lexical,
                 list_search_mode: TuiSearchMode::Lexical,
                 exclude_projects: Vec::new(),
+                exclude_paths: Vec::new(),
                 keys: KeyBindings::default(),
                 semantic_toggle_enabled: true,
                 resume_default_args: Vec::new(),
@@ -1205,6 +1210,7 @@ mod tests {
             }),
             tui: Some(TuiConfig {
                 exclude_projects: vec!["secret".into()],
+                exclude_paths: vec!["/tmp/".into()],
                 semantic_search: None,
             }),
             keys: Some(KeysConfig {
@@ -1228,6 +1234,7 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(settings.exclude_projects, vec!["secret"]);
+        assert_eq!(settings.exclude_paths, vec!["/tmp/"]);
         assert_eq!(settings.keys.rename, KeyChord::ctrl('t'));
         assert!(!settings.semantic_toggle_enabled);
 
@@ -1247,8 +1254,8 @@ mod tests {
     fn search_mode_resolution_includes_the_deprecated_tui_key() {
         let legacy = |semantic: Option<bool>, mode: Option<SearchMode>| ConfigFile {
             tui: Some(TuiConfig {
-                exclude_projects: Vec::new(),
                 semantic_search: semantic,
+                ..TuiConfig::default()
             }),
             search: Some(SearchConfig { mode }),
             ..ConfigFile::default()

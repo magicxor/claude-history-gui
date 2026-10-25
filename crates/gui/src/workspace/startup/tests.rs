@@ -1716,7 +1716,7 @@ fn config_retry_applies_keys_exclusions_preview_and_theme_live(cx: &mut TestAppC
     let list = cx.read(|cx| ws.read(cx).list().clone());
     assert!(cx.read(|cx| list.read(cx).show_last()));
     world.write_config(
-        Some("[keys]\nresume = \"ctrl+t\"\n[display]\nlast = false\n[tui]\nexclude_projects = [\"skipme\"]\n"),
+        Some("[keys]\nresume = \"ctrl+t\"\n[display]\nlast = false\n[tui]\nexclude_projects = [\"skipme\"]\nexclude_paths = ['/tmp/']\n"),
         Some("[gui]\ntheme = \"dark\"\n"),
     );
     cx.update_window(handle, |_, window, cx| {
@@ -1740,6 +1740,7 @@ fn config_retry_applies_keys_exclusions_preview_and_theme_live(cx: &mut TestAppC
         );
         let list = list.read(cx);
         assert!(list.excluded_projects().contains("skipme"));
+        assert_eq!(list.excluded_paths(), ["/tmp/"]);
         assert!(!list.show_last(), "the preview mode follows [display] last");
     });
 }

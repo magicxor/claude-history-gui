@@ -45,7 +45,8 @@ All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-h
   **semantic** search (local embedding model, downloaded on first use; falls back to lexical while the cache is
   not ready). Ctrl+T toggles the mode.
 * Scope **All** or **Workspace** (project folder), a workspace picker with recent folders, a time filter
-  (`--since`/`--before` grammar such as `2d`, `1d6h`, `6mo`, `2026-07-20`), excluded projects.
+  (`--since`/`--before` grammar such as `2d`, `1d6h`, `6mo`, `2026-07-20`), excluded projects and working
+  directories.
 * Paste a session UUID to jump to that conversation. Preview shows the first or last messages.
 * Row context menu, F5/Ctrl+L refresh, command palette (Ctrl+Shift+P or F10) with every menu command.
 
@@ -193,8 +194,9 @@ first when stdout is a terminal.
 | `agent read` | `<REFS>...` (`ch_` handle, UUID or filename, optionally `:mN..mM`) | `--anchor`, `--focus`, `--lines`, `--match`, `--context`, `--budget`, `--no-budget`, `--tools`, `--tool-results`, `--thinking`, `--subagents` |
 | `agent outline` | `<CONVERSATION>` | `--budget`, `--no-budget`, `--tools`, `--tool-results`, `--thinking`, `--subagents` |
 
-`agent search` leaves automated (Codex exec) and subagent conversations out unless `--all-kinds` is given;
-`agent read`, `outline` and `within` resolve their refs either way.
+`agent search` leaves automated (Codex exec) and subagent conversations out unless `--all-kinds` is given, and
+conversations under a `[tui] exclude_paths` prefix out always; `agent read`, `outline` and `within` resolve their refs
+either way.
 `claude-history-gui agent <command> --help` lists the exact options. The companion Claude Code skill of the
 original project calls `claude-history agent ...`. **This repository installs nothing** and never writes to
 `.claude/skills`. To let that skill use the GUI binary, make `claude-history` resolve to it yourself:
@@ -332,6 +334,15 @@ is not remembered. An invalid file shows a dialog naming it (Quit / Continue wit
 `osascript`, a Linux emulator name, or a template with `{cwd}`, `{args}`, `{cmd}`), `claude_path`, `pi_path`,
 `omp_path`, `codex_path`, `default_workspace`, `restore_session`. `[resume] default_args` (Claude) and
 `[resume.codex] default_args` (Codex) hold extra arguments for Resume and Fork.
+
+`[tui] exclude_projects` hides exact project names from the list (`repo` also hides `repo/<worktree>`).
+`[tui] exclude_paths` hides the conversations whose recorded working directory starts with a listed prefix, from the
+list, its searches and Deep search (`agent search`), for every source. Matching is literal and case-sensitive: `/tmp/`
+matches `/tmp/eval-123` but not `/tmp` or `/tmp-other`; nothing is resolved or expanded (`~`, variables, globs), empty
+entries are ignored, and a conversation without a recorded working directory stays listed. On Windows write the prefix
+as Claude Code records it, in a TOML literal string: `exclude_paths = ['C:\Users\me\AppData\Local\Temp\']`. Excluded
+conversations stay on disk: a pasted session ID or a file path still opens them, and `agent read`, `outline` and
+`within` still read them. Both lists can also be edited in Settings → Search and apply at once.
 
 **Environment variables**
 * `CLAUDE_CONFIG_DIR`: Claude data directory (must be absolute; default `~/.claude`).

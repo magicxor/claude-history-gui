@@ -4,6 +4,10 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 ## Unreleased
 
+- New setting `[tui] exclude_paths` (Settings → Search → Excluded working directories): conversations whose recorded
+  working directory starts with a listed prefix, such as throwaway runs under `/tmp/` or your Temp folder, are hidden
+  from the list, its searches and Deep Search, for Claude, Pi, OMP and Codex alike. Prefixes match literally and
+  case-sensitively. Hidden conversations stay on disk and still open by session ID, file path or agent ref.
 - Conversations are dated by their last message, not the file's modified time: a session that Claude touched on
   reopening, or whose Codex rollout got a settings record, no longer jumps to the top of the list as just used. This
   also moves the time column, the time filter and the viewer's date; sessions last used long ago can leave a recent
