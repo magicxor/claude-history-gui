@@ -66,8 +66,13 @@ icu_normalizer.workspace = true
 rusqlite.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-# getrusage for bench::mark_peak_rss; kill(pid, 0) for store::progress.
+# getrusage for bench::mark_peak_rss; kill(pid, 0) for store::progress;
+# lowering a background thread's priority (semantic::fastembed).
 libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# SetThreadPriority for background threads (semantic::fastembed).
+windows-sys.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -8,10 +8,16 @@
 //!   `SemanticIndexState::new()`), written back through
 //!   [`crate::semantic::cache::embedding_cache_writer`], and the embedder is
 //!   created by an injectable [`SemanticEmbedderFactory`] (upstream:
-//!   `FastembedEmbedder::new_quiet()`). The default factory loads fastembed
-//!   from [`SemanticWorkerConfig::model_dir`] without download progress
-//!   output. Under `cfg(test)` the default factory refuses to run, so a test
-//!   can never download the model by accident.
+//!   `FastembedEmbedder::new_quiet(EmbedPriority::Background)`). The default
+//!   factory loads fastembed from [`SemanticWorkerConfig::model_dir`]
+//!   without download progress output, on half the cores (upstream
+//!   8322afe). Under `cfg(test)` the default factory refuses to run, so a
+//!   test can never download the model by accident.
+//! * The worker lowers its own thread's scheduling priority before it makes
+//!   an embedder, whatever the factory (upstream: `new_quiet(Background)`
+//!   lowered the thread that called it, so only with the default factory);
+//!   on Windows too, and not in tests (see
+//!   [`crate::semantic::fastembed::lower_background_thread_priority`]).
 //! * After posting every message the worker calls the optional
 //!   [`SemanticWorkerConfig::waker`], so a GUI can wake its poller instead of
 //!   polling on a timer (upstream c6d0421's TUI polled every 250 ms while
@@ -114,7 +120,12 @@ impl SemanticWorkerConfig {
         self
     }
 
+    /// Makes the embedder, on the worker thread, after lowering that
+    /// thread's scheduling priority (upstream 8322afe:
+    /// `FastembedEmbedder::new_quiet(EmbedPriority::Background)` lowered it;
+    /// fork: the worker does, for an injected factory too).
     fn create_embedder(&self) -> Result<Box<dyn SemanticEmbedder>> {
+        crate::semantic::fastembed::lower_background_thread_priority();
         match &self.embedder_factory {
             Some(factory) => factory(),
             None => default_embedder(self.model_dir.as_deref()),
@@ -142,7 +153,10 @@ fn default_embedder(model_dir: Option<&Path>) -> Result<Box<dyn SemanticEmbedder
             "semantic model directory is unavailable (no home directory)".to_string(),
         )
     })?;
-    crate::semantic::fastembed::quiet_embedder_in(model_dir.to_path_buf())
+    crate::semantic::fastembed::quiet_embedder_in(
+        model_dir.to_path_buf(),
+        crate::semantic::fastembed::EmbedPriority::Background,
+    )
 }
 
 #[derive(Clone)]

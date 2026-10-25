@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use claude_history_core::browser::ListSearchMode;
+use claude_history_core::semantic::types::DEFAULT_EMBEDDING_BATCH_SIZE;
 use std::sync::atomic::Ordering;
 
 use gpui_kit::AppContext as _;
@@ -39,6 +40,11 @@ fn footer(f: &ListFixture, cx: &mut TestAppContext) -> FooterModel {
     })
     .unwrap()
 }
+
+/// Sessions (a passage each) that the first indexing slice does not cover:
+/// it embeds `DEFAULT_EMBEDDING_BATCH_SIZE` passages in one call, and the
+/// next call waits at the batch gate.
+const MORE_THAN_A_BATCH: usize = DEFAULT_EMBEDDING_BATCH_SIZE + DEFAULT_EMBEDDING_BATCH_SIZE / 2;
 
 fn semantic_world(sessions: usize) -> TestWorld {
     let world = TestWorld::new();
@@ -123,7 +129,7 @@ fn activity_counts(text: &str, prefix: &str) -> (u32, usize, usize) {
 /// rows never have scores.
 #[gpui_kit::test]
 fn embedding_progress_and_scores(cx: &mut TestAppContext) {
-    let world = semantic_world(60);
+    let world = semantic_world(MORE_THAN_A_BATCH);
     ListFixture::init_app(cx, &world, &[]);
     let control = install_fake_embedder(cx);
     let gate = Gate::closed();
@@ -203,7 +209,7 @@ fn embedding_progress_and_scores(cx: &mut TestAppContext) {
 /// answered with scores once indexing finishes.
 #[gpui_kit::test]
 fn a_search_waits_for_indexing_with_its_lexical_rows(cx: &mut TestAppContext) {
-    let world = semantic_world(60);
+    let world = semantic_world(MORE_THAN_A_BATCH);
     ListFixture::init_app(cx, &world, &[]);
     let control = install_fake_embedder(cx);
     let init = Gate::closed();

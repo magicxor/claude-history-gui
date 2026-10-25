@@ -60,9 +60,10 @@
 //!   on from them. A pass that finds the store locked by another process (a
 //!   second GUI) tries again every [`BUSY_RETRY`] on its thread (upstream:
 //!   the child exited with status 75 and the TUI started another a second
-//!   later). The fork does not lower the threads' priority yet: the
-//!   thread-priority port (upstream 8322afe/9ee0a03) covers
-//!   `store-reconcile` and its pool as well as the semantic worker.
+//!   later). The pool's threads lower their own scheduling priority when
+//!   they start (nice 10 on Linux, utility QoS on macOS, below normal on
+//!   Windows; not in tests), with the semantic worker's helper (8322afe),
+//!   where upstream lowered the whole child process on Unix.
 //! * **Waker-driven `CURRENT` checks.** Upstream's event loop read `CURRENT`
 //!   (and `PROGRESS`, 04c714b) every 200 ms while a pass could publish; here
 //!   the pass's `store-watch` thread does, so an idle GUI never polls. A
@@ -1479,6 +1480,8 @@ fn reconcile_store(job: ReconcileJob) -> PassResult {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .thread_name(|i| format!("store-reconcile-{i}"))
+        // Upstream's reconcile child ran at nice 10.
+        .start_handler(|_| crate::semantic::fastembed::lower_background_thread_priority())
         .build()
         .map_err(std::io::Error::other);
     let done = Cancel::default();

@@ -330,8 +330,13 @@ impl AgentService {
                 "Could not determine home directory",
             ))
         })?;
-        // Refuses under cfg(test): tests inject an embedder factory.
-        semantic::fastembed::quiet_embedder_in(model_dir)
+        // Refuses under cfg(test): tests inject an embedder factory. Every
+        // core, as upstream's `FastembedEmbedder::new()` (8322afe): a
+        // command the person is waiting on.
+        semantic::fastembed::quiet_embedder_in(
+            model_dir,
+            semantic::fastembed::EmbedPriority::Foreground,
+        )
     }
 
     /// Run `request` and return the compact protocol text (errors carry the

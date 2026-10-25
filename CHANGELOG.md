@@ -4,6 +4,9 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 ## Unreleased
 
+- Semantic indexing is several times faster: the embedding model now runs on half of the processor cores instead of
+  one, and embeds passages of similar length together. The background pass that updates the list index runs at a
+  lower priority, so the app and other programs stay responsive meanwhile.
 - Semantic search answers right away from the conversations it has already embedded, and embeds new ones in the
   background ("sem indexing 40%  1200/3000 chunks" with a progress bar in the list footer) instead of making every
   search wait until all of them are embedded. When indexing finishes, the results are refreshed, keeping the row you

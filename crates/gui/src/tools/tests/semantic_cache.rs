@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use claude_history_core::semantic::types::DEFAULT_EMBEDDING_BATCH_SIZE;
 use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, TestAppContext};
 
 use crate::deep_search::worker::AgentWorkerHandle;
@@ -18,6 +19,10 @@ use crate::tools::semantic_cache::{
     GenerateDialog, GenerateState, current_generate, open_clear_semantic_cache,
     open_generate_semantic_cache,
 };
+
+/// Conversations whose passages (two each) take three embedder calls: two
+/// full batches of `DEFAULT_EMBEDDING_BATCH_SIZE` and half a batch.
+const THREE_BATCHES: usize = DEFAULT_EMBEDDING_BATCH_SIZE + DEFAULT_EMBEDDING_BATCH_SIZE / 4;
 
 /// Opens the gates when the test ends (a worker blocked on a gate would
 /// otherwise outlive it).
@@ -117,9 +122,9 @@ fn embedded_counts(text: &str) -> Option<(usize, usize)> {
 /// event is `y/y`.
 #[gpui_kit::test]
 fn progress_events_reach_the_dialog_while_running(cx: &mut TestAppContext) {
-    // 40 conversations = 80 passages = three batches of 32: the first batch
-    // is embedded, the second waits at the gate.
-    let (_world, control, _f, handle) = setup(cx, &[], 40);
+    // Three batches: the first batch is embedded, the second waits at the
+    // gate.
+    let (_world, control, _f, handle) = setup(cx, &[], THREE_BATCHES);
     let gate = Gate::closed();
     *control.batch_gate.lock().unwrap() = Some(gate.clone());
     let _open = OpenOnDrop(vec![gate.clone()]);
@@ -196,9 +201,9 @@ fn a_second_window_does_not_cancel_a_running_generate(cx: &mut TestAppContext) {
 /// T-008: Cancel stops the run (`Semantic search cancelled`).
 #[gpui_kit::test]
 fn cancel_stops_a_run(cx: &mut TestAppContext) {
-    // 40 conversations = 80 passages = three batches of 32: the second batch
-    // waits at the gate, the cancel is seen before the third.
-    let (_world, control, _f, handle) = setup(cx, &[], 40);
+    // Three batches: the second batch waits at the gate, the cancel is seen
+    // before the third.
+    let (_world, control, _f, handle) = setup(cx, &[], THREE_BATCHES);
     let init = Gate::closed();
     *control.batch_gate.lock().unwrap() = Some(init.clone());
     let _open = OpenOnDrop(vec![init.clone()]);

@@ -11,10 +11,13 @@
 //! and Clear semantic cache can drop it ([`drop_model`]).
 //!
 //! [`install`] sets up fastembed
-//! (`FastembedEmbedder::new_in(env.semantic_model_dir(), false)`, or
-//! `--qa-model-dir`); the model is loaded lazily, off the UI thread, by the
-//! first consumer. Tests get a refusing factory from `init_for_test` and opt
-//! in to a fake with [`install_fake`].
+//! (`FastembedEmbedder::new_in(env.semantic_model_dir(), false, Background)`,
+//! or `--qa-model-dir`); the model is loaded lazily, off the UI thread, by the
+//! first consumer. It embeds on half the cores (`EmbedPriority::Background`,
+//! upstream 8322afe) for every consumer, Tools included (upstream's CLI
+//! commands used every core); the list's semantic worker also lowers its own
+//! thread's scheduling priority (core). Tests get a refusing factory from
+//! `init_for_test` and opt in to a fake with [`install_fake`].
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -24,7 +27,7 @@ use claude_history_core::AppError;
 use claude_history_core::agent::service::EmbedderFactory as AgentEmbedderFactory;
 use claude_history_core::browser::SemanticEmbedderFactory;
 use claude_history_core::semantic::embed::SemanticEmbedder;
-use claude_history_core::semantic::fastembed::FastembedEmbedder;
+use claude_history_core::semantic::fastembed::{EmbedPriority, FastembedEmbedder};
 use gpui_kit::{App, Global};
 
 use crate::globals::AppState;
@@ -159,14 +162,14 @@ pub fn refusing_factory(message: &'static str) -> ModelFactory {
 
 /// The production factory: the fastembed BGE-small model, downloaded on first
 /// use into `model_dir` (`HistoryEnv::semantic_model_dir`, or the QA run's
-/// pre-downloaded `--qa-model-dir`). Without a model directory (no home) it
-/// fails with a readable message.
+/// pre-downloaded `--qa-model-dir`), embedding on half the cores. Without a
+/// model directory (no home) it fails with a readable message.
 pub fn fastembed_factory(model_dir: Option<PathBuf>) -> ModelFactory {
     Arc::new(move || {
         let dir = model_dir.clone().ok_or_else(|| {
             AppError::ConfigError("No home directory: cannot place the semantic model".to_string())
         })?;
-        let model = FastembedEmbedder::new_in(dir, false)?;
+        let model = FastembedEmbedder::new_in(dir, false, EmbedPriority::Background)?;
         Ok(Box::new(model) as Box<dyn SemanticEmbedder + Send>)
     })
 }

@@ -52,7 +52,8 @@ use std::sync::Arc;
 pub type EmbedderFactory<'a> = &'a mut dyn FnMut() -> Result<Box<dyn SemanticEmbedder>>;
 
 /// The production embedder: fastembed BGE-small, downloaded on first use
-/// into [`HistoryEnv::semantic_model_dir`], without a progress bar. Under
+/// into [`HistoryEnv::semantic_model_dir`], without a progress bar, on
+/// every core (upstream's `FastembedEmbedder::new()`, 8322afe). Under
 /// `cfg(test)` the embedder refuses to load: tests inject their own.
 pub fn fastembed_factory(
     env: &HistoryEnv,
@@ -60,7 +61,10 @@ pub fn fastembed_factory(
     let model_dir = env.semantic_model_dir();
     move || {
         let model_dir = model_dir.clone().ok_or_else(missing_home)?;
-        crate::semantic::fastembed::quiet_embedder_in(model_dir)
+        crate::semantic::fastembed::quiet_embedder_in(
+            model_dir,
+            crate::semantic::fastembed::EmbedPriority::Foreground,
+        )
     }
 }
 

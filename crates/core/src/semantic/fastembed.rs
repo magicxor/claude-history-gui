@@ -1,6 +1,25 @@
+//! The fastembed embedder (upstream `semantic/fastembed.rs`).
+//!
+//! Differences from upstream:
+//!
+//! * The model is loaded from a directory the caller passes
+//!   ([`FastembedEmbedder::new_in`], normally
+//!   [`crate::env::HistoryEnv::semantic_model_dir`]), fetched with hf-hub
+//!   directly (see `new_in`), and refused in tests and `hermetic` builds
+//!   ([`HERMETIC_REFUSAL`]).
+//! * [`EmbedPriority`] (upstream 8322afe) only sizes the inference thread
+//!   pool here. Upstream's `new_quiet(Background)` also lowered the
+//!   scheduling priority of the thread making the embedder; the GUI's one
+//!   shared model may be made on the agent worker or a Tools thread, so the
+//!   semantic worker lowers its own thread instead
+//!   ([`lower_background_thread_priority`]), and so does the store's
+//!   reconcile pool (upstream ran reconcile in a child process at nice 10).
+//!   Lowering also covers Windows (`THREAD_PRIORITY_BELOW_NORMAL`), which
+//!   upstream left out, and is skipped in tests and `hermetic` builds.
+
 use crate::error::{AppError, Result};
 use crate::semantic::embed::SemanticEmbedder;
-use crate::semantic::types::DEFAULT_EMBEDDING_BATCH_SIZE;
+use crate::semantic::types::MODEL_BATCH_SIZE;
 use fastembed::{
     EmbeddingModel, InitOptionsUserDefined, TextEmbedding, TokenizerFiles,
     UserDefinedEmbeddingModel,
@@ -22,6 +41,27 @@ pub struct FastembedEmbedder {
     model: TextEmbedding,
 }
 
+/// How much of the machine embedding may use.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmbedPriority {
+    /// A command the person is waiting on: every core.
+    Foreground,
+    /// Indexing behind the list: half the cores (fork: at a lower
+    /// scheduling priority where the semantic worker runs it, see the
+    /// module notes), so the list and lexical search stay responsive.
+    Background,
+}
+
+impl EmbedPriority {
+    fn threads(self) -> usize {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        match self {
+            Self::Foreground => cores,
+            Self::Background => (cores / 2).max(1),
+        }
+    }
+}
+
 impl FastembedEmbedder {
     /// Load (downloading on first use) the BGE-small model into `model_dir`
     /// (normally [`crate::env::HistoryEnv::semantic_model_dir`]).
@@ -37,18 +77,28 @@ impl FastembedEmbedder {
     ///
     /// GUI callers must pass `show_download_progress = false`: `true` makes
     /// hf-hub draw an indicatif progress bar on stderr (upstream CLI only).
+    /// `priority` sizes the inference thread pool; it never changes the
+    /// calling thread's scheduling priority (see the module notes).
     ///
     /// Guard rail (K13): in this crate's tests and in every `hermetic` build
     /// (the GUI's tests) it fails with [`HERMETIC_REFUSAL`] before touching
     /// `model_dir` or the network, also when a caller bypasses the default
     /// embedder factories.
-    pub fn new_in(model_dir: PathBuf, show_download_progress: bool) -> Result<Self> {
+    pub fn new_in(
+        model_dir: PathBuf,
+        show_download_progress: bool,
+        priority: EmbedPriority,
+    ) -> Result<Self> {
         refuse_in_hermetic_builds()?;
-        Self::load_in(model_dir, show_download_progress)
+        Self::load_in(model_dir, show_download_progress, priority)
     }
 
     /// The loader behind [`FastembedEmbedder::new_in`], without its guard.
-    fn load_in(model_dir: PathBuf, show_download_progress: bool) -> Result<Self> {
+    fn load_in(
+        model_dir: PathBuf,
+        show_download_progress: bool,
+        priority: EmbedPriority,
+    ) -> Result<Self> {
         init_onnx_runtime()?;
         let info = TextEmbedding::get_model_info(&MODEL).map_err(to_config_error)?;
         if !info.additional_files.is_empty() {
@@ -69,7 +119,7 @@ impl FastembedEmbedder {
         user_defined.output_key = info.output_key.clone();
         let model = TextEmbedding::try_new_from_user_defined(
             user_defined,
-            InitOptionsUserDefined::new().with_intra_threads(1),
+            InitOptionsUserDefined::new().with_intra_threads(priority.threads()),
         )
         .map_err(to_config_error)?;
         Ok(Self { model })
@@ -79,11 +129,15 @@ impl FastembedEmbedder {
 /// The production embedder in `model_dir`, quiet (no hf-hub progress bar
 /// on stderr). Every default embedder (semantic worker, agent service,
 /// semantic operations) goes through here, so in tests and `hermetic`
-/// builds it refuses like [`FastembedEmbedder::new_in`].
+/// builds it refuses like [`FastembedEmbedder::new_in`]. Upstream's
+/// `new_quiet(priority)`, without lowering the calling thread's priority.
 pub(crate) fn quiet_embedder_in(
     model_dir: PathBuf,
+    priority: EmbedPriority,
 ) -> Result<Box<dyn crate::semantic::embed::SemanticEmbedder>> {
-    Ok(Box::new(FastembedEmbedder::new_in(model_dir, false)?))
+    Ok(Box::new(FastembedEmbedder::new_in(
+        model_dir, false, priority,
+    )?))
 }
 
 /// The error of [`FastembedEmbedder::new_in`] in tests and `hermetic`
@@ -107,7 +161,7 @@ fn refuse_in_hermetic_builds() -> Result<()> {
 /// (`#[ignore]` plus `CLAUDE_HISTORY_NETWORK_TESTS=1`).
 #[cfg(test)]
 pub(crate) fn real_model_for_network_test(model_dir: PathBuf) -> Result<FastembedEmbedder> {
-    FastembedEmbedder::load_in(model_dir, false)
+    FastembedEmbedder::load_in(model_dir, false, EmbedPriority::Background)
 }
 
 /// The hf-hub API over the cache in `model_dir` only: the fixed public
@@ -146,24 +200,90 @@ fn read_model_files(repo: &ApiRepo, model_file: &str) -> Result<ModelFiles> {
 }
 
 impl SemanticEmbedder for FastembedEmbedder {
+    /// Embeds `passages` in small batches of similar length: a batch is
+    /// padded to its longest passage, so mixing lengths wastes inference on
+    /// padding, and small batches keep the activation memory small.
     fn embed_passages(&mut self, passages: &[String]) -> Result<Vec<Vec<f32>>> {
-        self.model
-            .embed(
-                prefixed_passages(passages),
-                Some(DEFAULT_EMBEDDING_BATCH_SIZE),
-            )
-            .map_err(to_config_error)
+        let order = length_order(passages);
+        let sorted = order
+            .iter()
+            .map(|&index| passages[index].as_str())
+            .collect::<Vec<_>>();
+        let embeddings = self
+            .model
+            .embed(prefixed_passages(&sorted), Some(MODEL_BATCH_SIZE))
+            .map_err(to_config_error)?;
+        Ok(unsort(&order, embeddings))
     }
 
     fn embed_query(&mut self, query: &str) -> Result<Option<Vec<f32>>> {
         let embeddings = self
             .model
-            .embed(
-                vec![prefixed_query(query)],
-                Some(DEFAULT_EMBEDDING_BATCH_SIZE),
-            )
+            .embed(vec![prefixed_query(query)], Some(MODEL_BATCH_SIZE))
             .map_err(to_config_error)?;
         Ok(embeddings.first().cloned())
+    }
+}
+
+/// Indices of `passages` from shortest to longest.
+fn length_order(passages: &[String]) -> Vec<usize> {
+    let mut order = (0..passages.len()).collect::<Vec<_>>();
+    order.sort_by_key(|&index| passages[index].len());
+    order
+}
+
+/// Puts `values`, computed for the passages in `order`, back in passage
+/// order.
+fn unsort<T: Default>(order: &[usize], values: Vec<T>) -> Vec<T> {
+    let mut out = (0..values.len()).map(|_| T::default()).collect::<Vec<_>>();
+    for (&index, value) in order.iter().zip(values) {
+        out[index] = value;
+    }
+    out
+}
+
+/// Lowers the calling thread's scheduling priority for background work
+/// (the semantic worker, the store's reconcile pool), with
+/// [`lower_current_thread_priority`].
+///
+/// Guard rail: in this crate's tests and in `hermetic` builds (the GUI's
+/// tests) the thread keeps its priority. A worker below the test threads'
+/// priority could wait seconds for a core on a busy machine and make
+/// timing-bound tests flaky; upstream's tests never lowered one either
+/// (only the real embedder's constructor did).
+pub(crate) fn lower_background_thread_priority() {
+    if !cfg!(any(test, feature = "hermetic")) {
+        lower_current_thread_priority();
+    }
+}
+
+/// Lowers the scheduling priority of the calling thread: the utility QoS
+/// class on macOS, nice 10 on Linux, and (fork) `THREAD_PRIORITY_BELOW_NORMAL`
+/// on Windows. Threads the calling thread creates afterwards inherit it on
+/// Linux only.
+fn lower_current_thread_priority() {
+    #[cfg(target_os = "macos")]
+    // SAFETY: changes only the calling thread's QoS class.
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
+    }
+    #[cfg(target_os = "linux")]
+    // SAFETY: changes only the calling thread's nice value; Linux applies
+    // PRIO_PROCESS with a thread id to that thread alone.
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+        libc::setpriority(libc::PRIO_PROCESS, tid, 10);
+    }
+    #[cfg(windows)]
+    // SAFETY: `GetCurrentThread` is the calling thread's pseudo handle, so
+    // only that thread's priority changes. Below normal, not
+    // THREAD_MODE_BACKGROUND_BEGIN, which would also lower the priority of
+    // the thread's file I/O (the embedding cache writes).
+    unsafe {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+        };
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     }
 }
 
@@ -171,8 +291,11 @@ pub fn prefixed_query(query: &str) -> String {
     format!("Represent this sentence for searching relevant passages: {query}")
 }
 
-pub fn prefixed_passages(passages: &[String]) -> Vec<String> {
-    passages.to_vec()
+pub fn prefixed_passages(passages: &[&str]) -> Vec<String> {
+    passages
+        .iter()
+        .map(|passage| (*passage).to_owned())
+        .collect()
 }
 
 #[cfg(feature = "release-dynamic-ort")]
@@ -302,27 +425,109 @@ mod tests {
         // (DESIGN §7.6); a test that reaches it must not download.
         let temp = tempfile::tempdir().unwrap();
         let model_dir = temp.path().join("semantic").join("fastembed");
-        for progress in [false, true] {
-            let error = match FastembedEmbedder::new_in(model_dir.clone(), progress) {
+        for priority in [EmbedPriority::Foreground, EmbedPriority::Background] {
+            for progress in [false, true] {
+                let error = match FastembedEmbedder::new_in(model_dir.clone(), progress, priority) {
+                    Ok(_) => panic!("the real model must not load in tests"),
+                    Err(error) => error.to_string(),
+                };
+                assert!(error.contains(HERMETIC_REFUSAL), "{error}");
+            }
+            let error = match quiet_embedder_in(model_dir.clone(), priority) {
                 Ok(_) => panic!("the real model must not load in tests"),
                 Err(error) => error.to_string(),
             };
             assert!(error.contains(HERMETIC_REFUSAL), "{error}");
         }
-        let error = match quiet_embedder_in(model_dir.clone()) {
-            Ok(_) => panic!("the real model must not load in tests"),
-            Err(error) => error.to_string(),
-        };
-        assert!(error.contains(HERMETIC_REFUSAL), "{error}");
         assert!(!temp.path().join("semantic").exists(), "nothing created");
     }
 
     #[test]
     fn leaves_passages_unprefixed_for_fastembed() {
         assert_eq!(
-            prefixed_passages(&["one".to_string(), "two".to_string()]),
+            prefixed_passages(&["one", "two"]),
             vec!["one".to_string(), "two".to_string()]
         );
+    }
+
+    #[test]
+    fn length_order_round_trips() {
+        let passages = vec!["ccc".to_string(), "a".to_string(), "bb".to_string()];
+        let order = length_order(&passages);
+        assert_eq!(order, vec![1, 2, 0]);
+        let computed = order.iter().map(|&index| passages[index].len()).collect();
+        assert_eq!(unsort(&order, computed), vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn background_embedding_uses_half_the_cores() {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        assert_eq!(EmbedPriority::Foreground.threads(), cores);
+        assert_eq!(EmbedPriority::Background.threads(), (cores / 2).max(1));
+    }
+
+    /// The calling thread's scheduling priority as the OS reports it: its
+    /// nice value.
+    #[cfg(target_os = "linux")]
+    fn current_thread_priority() -> i32 {
+        // SAFETY: reads the calling thread's nice value.
+        unsafe {
+            let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+            libc::getpriority(libc::PRIO_PROCESS, tid)
+        }
+    }
+
+    /// The calling thread's scheduling priority as the OS reports it.
+    #[cfg(windows)]
+    fn current_thread_priority() -> i32 {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
+        // SAFETY: reads the calling thread's priority through its pseudo
+        // handle.
+        unsafe { GetThreadPriority(GetCurrentThread()) }
+    }
+
+    /// Not read on other systems.
+    #[cfg(not(any(target_os = "linux", windows)))]
+    fn current_thread_priority() -> i32 {
+        0
+    }
+
+    /// Fork: the helper lowers only the calling thread, on Windows too. It
+    /// is called directly: the background call sites skip it in tests.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn lowering_the_priority_changes_only_the_calling_thread() {
+        let before = current_thread_priority();
+        let lowered = std::thread::spawn(|| {
+            lower_current_thread_priority();
+            current_thread_priority()
+        })
+        .join()
+        .unwrap();
+        #[cfg(target_os = "linux")]
+        assert!(lowered >= 10, "nice {lowered}");
+        #[cfg(windows)]
+        assert_eq!(
+            lowered,
+            windows_sys::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL
+        );
+        assert_eq!(
+            current_thread_priority(),
+            before,
+            "this thread is unchanged"
+        );
+    }
+
+    #[test]
+    fn background_threads_keep_their_priority_in_tests() {
+        let (before, after) = std::thread::spawn(|| {
+            let before = current_thread_priority();
+            lower_background_thread_priority();
+            (before, current_thread_priority())
+        })
+        .join()
+        .unwrap();
+        assert_eq!(before, after);
     }
 
     #[test]

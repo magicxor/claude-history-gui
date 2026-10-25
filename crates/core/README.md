@@ -74,8 +74,9 @@ The `hermetic` feature turns the unit tests' guard rails (below) on in a
 normal build of the library, for other crates' tests (the GUI enables it in
 its `[dev-dependencies]`): `HistoryEnv::from_process_env` panics, the
 default embedders and `FastembedEmbedder::new_in` itself refuse to load the
-model, the update check panics and the terminal spawn functions return
-`Unsupported`. `tests/hermetic_guards.rs`
+model, the update check panics, the terminal spawn functions return
+`Unsupported` and the semantic worker and the reconcile pool keep their
+threads' scheduling priority. `tests/hermetic_guards.rs`
 checks that build. `examples/terminal_smoke.rs` opens a real terminal and is
 only run by CI smoke jobs.
 

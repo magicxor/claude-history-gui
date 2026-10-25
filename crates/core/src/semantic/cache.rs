@@ -1021,7 +1021,10 @@ mod tests {
         )
         .expect("embedding succeeds");
 
-        assert_eq!(embedder.calls, 10);
+        assert_eq!(
+            embedder.calls,
+            300usize.div_ceil(DEFAULT_EMBEDDING_BATCH_SIZE)
+        );
         assert_eq!(saved_entry_counts, vec![256, 300]);
     }
 
@@ -1033,7 +1036,7 @@ mod tests {
         let mut embedder = CancellingEmbedder {
             cancellation: cancellation.clone(),
         };
-        let chunks = (0..33)
+        let chunks = (0..=DEFAULT_EMBEDDING_BATCH_SIZE)
             .map(|index| chunk(&format!("session:{index}"), &format!("text {index}")))
             .collect();
         let mut saved_entry_counts = Vec::new();
@@ -1048,7 +1051,7 @@ mod tests {
         );
 
         assert!(matches!(result, Err(AppError::SemanticSearchCancelled)));
-        assert_eq!(saved_entry_counts, vec![32]);
+        assert_eq!(saved_entry_counts, vec![DEFAULT_EMBEDDING_BATCH_SIZE]);
     }
 
     #[test]

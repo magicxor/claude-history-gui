@@ -471,6 +471,7 @@ fn hermetic_guards_active() {
     let loader = claude_history_core::semantic::fastembed::FastembedEmbedder::new_in(
         model_dir.clone(),
         false,
+        claude_history_core::semantic::fastembed::EmbedPriority::Background,
     );
     assert!(loader.is_err(), "the shared embedder's loader refuses");
     assert!(!model_dir.exists(), "no model directory is created");
