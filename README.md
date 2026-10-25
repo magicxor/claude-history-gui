@@ -292,7 +292,7 @@ command palette.
 | PageDown / PageUp | Page down / up |
 | g / Home, Shift+G / End | Top / bottom |
 | Shift+J or `]`, Shift+K or `[` | Next / previous message |
-| `/` | Find in conversation; Enter commits, Esc cancels, Ctrl+U clears |
+| `/` | Find in conversation (words match like the list search); Enter commits, Esc cancels, Ctrl+U clears |
 | n / Shift+N, F3 / Shift+F3 (Cmd+G / Cmd+Shift+G on macOS) | Next / previous match |
 | t | Cycle tool display (Summary, Truncated, Full) |
 | Shift+T | Toggle thinking and subagents |

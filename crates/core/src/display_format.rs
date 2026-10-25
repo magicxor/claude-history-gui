@@ -24,7 +24,7 @@ use crate::search::literal::{Literal, match_literal_ranges};
 use crate::search::normalize_for_search;
 use crate::search::query::ParsedQuery;
 use crate::semantic::types::SemanticRationaleKind;
-use crate::text_match::{NormalizedText, is_word_separator};
+use crate::text_match::{NormalizedForm, NormalizedText, is_word_separator};
 use chrono::{DateTime, Local};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -841,6 +841,81 @@ fn merge_separated_ranges(text: &str, ranges: Vec<(usize, usize)>) -> Vec<(usize
         merged.push((start, end));
     }
     merged
+}
+
+/// [`merge_separated_ranges`] that keeps ranges on different lines apart, so
+/// each line of a multi-line text gets the ranges it would get on its own
+/// (fork addition, see [`ViewSearchQuery::match_ranges_in`]).
+fn merge_separated_ranges_in_lines(text: &str, ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut()
+            && (start <= last.1
+                || text[last.1..start]
+                    .chars()
+                    .all(|c| c != '\n' && is_word_separator(c)))
+        {
+            last.1 = last.1.max(end);
+            continue;
+        }
+        merged.push((start, end));
+    }
+    merged
+}
+
+// ---------------------------------------------------------------------------
+// Viewer search query
+// ---------------------------------------------------------------------------
+
+/// A viewer `/` search: query words match lines as they match conversations
+/// in the list, and quoted literals match exactly (upstream d2c0f07,
+/// `tui/ui.rs`).
+///
+/// A line matches when any query word matches it as keyword search matches
+/// conversations (normalized and case-folded, at word starts, anywhere when
+/// the query has CJK text) or a quoted or `_` literal matches it (word start,
+/// smart case), as [`HighlightQuery::has_match`].
+///
+/// Fork additions for viewers that search multi-line texts (the GUI's
+/// segments, [`crate::view::DocSearchIndex`]): [`Self::match_ranges`] and
+/// [`Self::match_ranges_in`] give each line the ranges
+/// [`HighlightQuery::match_ranges`] gives it on its own (separator-joined
+/// words merge into one range within a line, never across lines, as the TUI
+/// matched each rendered line), and [`Self::match_ranges_in`] reuses a
+/// [`NormalizedForm`] kept beside the text.
+#[derive(Clone, Debug, Default)]
+pub struct ViewSearchQuery(HighlightQuery);
+
+impl ViewSearchQuery {
+    pub fn parse(query: &str) -> Self {
+        Self(HighlightQuery::parse(query))
+    }
+
+    /// Whether the query has no words or literals (finds nothing).
+    pub fn is_empty(&self) -> bool {
+        self.0.unquoted.is_empty() && self.0.literals.is_empty()
+    }
+
+    /// Whether `text` has a match.
+    pub fn has_match(&self, text: &str) -> bool {
+        self.0.has_match(text)
+    }
+
+    /// Merged byte ranges of the matches in `text`, per line (see the type).
+    pub fn match_ranges(&self, text: &str) -> Vec<(usize, usize)> {
+        self.match_ranges_in(text, &NormalizedForm::new(text))
+    }
+
+    /// [`Self::match_ranges`] with `form`, the [`NormalizedForm`] of `text`.
+    pub fn match_ranges_in(&self, text: &str, form: &NormalizedForm) -> Vec<(usize, usize)> {
+        let mut ranges = if self.0.unquoted.is_empty() {
+            Vec::new()
+        } else {
+            merge_separated_ranges_in_lines(text, form.query_ranges(text, &self.0.unquoted))
+        };
+        ranges.extend(match_literal_ranges(text, &self.0.literals));
+        merge_match_ranges(ranges)
+    }
 }
 
 // ---------------------------------------------------------------------------

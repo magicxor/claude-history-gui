@@ -4,6 +4,10 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 ## Unreleased
 
+- Find in conversation (`/`) matches words the way the list search does: `istanbul` finds `İstanbul`, `strasse`
+  finds `Straße`, `needle token` finds `needle_token` (highlighted as one match), any word of the query can match,
+  quoted text matches exactly, and a word no longer matches inside a longer one (`ired` does not find `fired`).
+  Pressing Enter on a search with no matches says so.
 - Search ignores how letters are encoded and folds case fully: a decomposed `é` finds a composed one, `strasse`
   finds `straße`, `istanbul` finds `İstanbul` and `λογος` finds `ΛΟΓΟΣ`. Accents still count: `cafe` does not
   find `café`. The conversation index is rebuilt once.

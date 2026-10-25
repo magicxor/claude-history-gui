@@ -655,6 +655,53 @@ fn find_normalized_ranges_follow_keyword_search() {
 }
 
 #[test]
+fn view_search_ranges_are_the_highlight_ranges_of_each_line() {
+    let lines = [
+        "the hidden needle_token appears",
+        "late mention of İstanbul and STRAẞE",
+        "exact audio_generation, audio generation",
+        "the fired plan, 测试会话内容",
+        "",
+        "needle needle-token",
+    ];
+    let text = lines.join("\n");
+    for query in [
+        "needle token",
+        "istanbul strasse",
+        "\"audio_generation\"",
+        "audio_generation",
+        "ired",
+        "测试",
+        "needle \"fired\"",
+    ] {
+        let view = ViewSearchQuery::parse(query);
+        let highlight = HighlightQuery::parse(query);
+        let mut expected = Vec::new();
+        let mut at = 0;
+        for line in lines {
+            let ranges = highlight.match_ranges(line);
+            assert_eq!(view.match_ranges(line), ranges, "{line:?} {query}");
+            assert_eq!(view.has_match(line), !ranges.is_empty(), "{line:?} {query}");
+            expected.extend(ranges.iter().map(|&(start, end)| (at + start, at + end)));
+            at += line.len() + 1;
+        }
+        // The lines of one text keep their own ranges: the trailing
+        // "needle" of a line never merges with the next line's first word.
+        assert_eq!(view.match_ranges(&text), expected, "{query}");
+        let form = NormalizedForm::new(&text);
+        assert_eq!(view.match_ranges_in(&text, &form), expected, "{query}");
+    }
+    assert!(ViewSearchQuery::parse(" - / ").is_empty());
+    assert!(ViewSearchQuery::parse("\"\"").is_empty());
+    assert!(!ViewSearchQuery::parse("\"x\"").is_empty());
+    let text = "token\ntoken token";
+    assert_eq!(
+        ViewSearchQuery::parse("token").match_ranges(text),
+        [(0, 5), (6, 17)]
+    );
+}
+
+#[test]
 fn find_normalized_ranges_underscore() {
     let text = "set red_team flag";
     let ranges = find_normalized_match_ranges(text, "red team");

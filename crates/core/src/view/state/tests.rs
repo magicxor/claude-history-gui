@@ -262,7 +262,10 @@ fn ledger_search_matches_lines_case_insensitively_including_labels() {
     let bug = search_lines(&rendered.lines, "BUG");
     assert!(!bug.is_empty());
     for &line in &bug {
-        assert!(line_matches_query(&rendered.lines[line], "bug"));
+        assert!(line_matches_query(
+            &rendered.lines[line],
+            &ViewSearchQuery::parse("bug")
+        ));
     }
     // Upstream quirk: the label column is searchable too.
     let claude = search_lines(&rendered.lines, "claude");
@@ -274,6 +277,24 @@ fn ledger_search_matches_lines_case_insensitively_including_labels() {
     }));
     assert!(!claude.is_empty());
     assert!(search_lines(&rendered.lines, "").is_empty());
+    // A lone separator has no words to find.
+    assert!(search_lines(&rendered.lines, " - / ").is_empty());
+}
+
+/// Upstream d2c0f07 (`tui/app/view_state.rs`).
+#[test]
+fn view_search_matches_lines_like_the_list() {
+    let matches = |line: &str, query: &str| {
+        let line = RenderedLine::new(vec![(line.to_string(), Default::default())]);
+        line_matches_query(&line, &ViewSearchQuery::parse(query))
+    };
+    assert!(matches("the hidden needle_token appears", "needle token"));
+    assert!(matches("late mention of İstanbul", "istanbul"));
+    assert!(matches("tag v1.1.1", "1.1"));
+    assert!(matches("needle only", "needle token"));
+    assert!(!matches("the fired plan", "ired"));
+    assert!(matches("exact audio_generation", "\"audio_generation\""));
+    assert!(!matches("audio generation", "\"audio_generation\""));
 }
 
 #[test]
@@ -545,7 +566,7 @@ fn typing_updates_matches_and_jumps_to_the_first() {
 
     // n/N only work in an active search.
     assert_eq!(search.next_match(), None);
-    search.commit();
+    assert_eq!(search.commit(), None);
     assert_eq!(search.mode(), ViewSearchMode::Active);
     assert_eq!(search.match_counter().as_deref(), Some("1/2"));
     assert_eq!(search.next_match(), Some(2));
@@ -561,9 +582,18 @@ fn commit_without_matches_turns_search_off() {
     let mut search: ViewSearch<usize> = ViewSearch::new();
     search.start();
     search.set_query("zzz", &find);
-    search.commit();
+    // Upstream d2c0f07's status message for a committed search without hits.
+    assert_eq!(search.commit().as_deref(), Some("No matches for /zzz"));
     assert_eq!(search.mode(), ViewSearchMode::Off);
     assert_eq!(search.match_counter(), None);
+
+    // Nothing to report for a query without text.
+    for query in ["", "  "] {
+        search.start();
+        search.set_query(query, &find);
+        assert_eq!(search.commit(), None, "{query:?}");
+        assert_eq!(search.mode(), ViewSearchMode::Off);
+    }
 }
 
 #[test]
@@ -678,7 +708,17 @@ fn document_search_reports_block_byte_ranges() {
     let id = doc.messages[2].blocks[0].toggle_id().unwrap().clone();
     expanded.toggle_expanded(&id);
     let index = DocSearchIndex::new(&expanded.document());
-    assert_eq!(index.find("l5 BUG").len(), 1);
+    assert_eq!(index.find("\"l5 bug\"").len(), 1);
+    // Any query word matches, and words joined by separators on one line
+    // are one match: "bug", "BUG", then "l5 bug".
+    let text = index.text(2, 0, None).unwrap();
+    let found: Vec<&str> = index
+        .find("l5 BUG")
+        .into_iter()
+        .filter(|m| (m.message, m.block) == (2, 0))
+        .map(|m| &text[m.range])
+        .collect();
+    assert_eq!(found, ["bug", "BUG", "l5 bug"]);
 }
 
 #[test]
@@ -716,16 +756,19 @@ fn document_search_covers_expanded_summary_items() {
     );
 }
 
+/// A one-block index over `text`.
+fn text_index(text: &str) -> DocSearchIndex {
+    DocSearchIndex {
+        targets: vec![SearchTarget::new(0, 0, None, text.to_string())],
+    }
+}
+
 #[test]
 fn document_search_folds_greek_final_sigma_in_both_directions() {
     // Per-character lowercasing turns 'Σ' into 'σ' but leaves the
-    // lowercase word-final 'ς' alone, so "οδος" missed "ΟΔΟΣ" and back.
-    let target = SearchTarget::new(0, 0, None, "ΟΔΟΣ οδος".to_string());
-    // ς and σ have the same UTF-8 length: no byte map is needed.
-    assert!(target.origin.is_none());
-    let index = DocSearchIndex {
-        targets: vec![target],
-    };
+    // lowercase word-final 'ς' alone; case folding maps both to 'σ'. (A
+    // comma keeps the two words apart: separator-joined matches merge.)
+    let index = text_index("ΟΔΟΣ, οδος");
     let text = index.text(0, 0, None).unwrap();
     for query in ["οδος", "ΟΔΟΣ", "οδοσ", "Οδος"] {
         let found: Vec<&str> = index
@@ -738,32 +781,55 @@ fn document_search_folds_greek_final_sigma_in_both_directions() {
 }
 
 #[test]
-fn document_search_maps_case_folding_back_to_original_bytes() {
-    // 'İ' lowercases to two characters and the Kelvin sign to a 1-byte 'k'.
-    let target = SearchTarget::new(0, 0, None, "xİy \u{212A}elvin Straße".to_string());
-    assert!(target.origin.is_some());
-    let index = DocSearchIndex {
-        targets: vec![target],
-    };
+fn document_search_follows_keyword_rules_and_maps_back_to_original_bytes() {
+    // 'İ' folds to 'i', the Kelvin sign to a 1-byte 'k' and 'ß' to "ss";
+    // words match at word starts only (upstream d2c0f07).
+    let index = text_index("xİy İstanbul \u{212A}elvin Straße the fired plan");
     let text = index.text(0, 0, None).unwrap();
-    let found: Vec<&str> = ["i", "kelvin", "STRASSE", "straße", "y"]
-        .iter()
-        .flat_map(|query| index.find(query))
-        .map(|m| &text[m.range])
-        .collect();
-    // "i" matches the first half of 'İ' (the whole character is reported)
-    // and the 'i' of "Kelvin"; "STRASSE" does not fold to "straße".
-    assert_eq!(found, ["İ", "i", "\u{212A}elvin", "Straße", "y"]);
-
-    // Plain text (identity folding) needs no byte map.
-    let plain = SearchTarget::new(0, 0, None, "Приветствие ABC".to_string());
-    assert!(plain.origin.is_none());
-    let index = DocSearchIndex {
-        targets: vec![plain],
+    let found = |query: &str| -> Vec<&str> {
+        index
+            .find(query)
+            .into_iter()
+            .map(|m| &text[m.range])
+            .collect()
     };
+    assert_eq!(found("istanbul"), ["İstanbul"]);
+    assert_eq!(found("kelvin"), ["\u{212A}elvin"]);
+    assert_eq!(found("STRASSE"), ["Straße"]);
+    assert_eq!(found("straße"), ["Straße"]);
+    // Not at a word start: inside "xİy", "Kelvin" and "fired".
+    assert_eq!(found("i"), ["İ"]);
+    assert!(found("y").is_empty());
+    assert!(found("ired").is_empty());
+    // Any word matches; words on one line joined by separators are one match.
+    assert_eq!(found("fired plan"), ["fired plan"]);
+    assert_eq!(found("straße zzz"), ["Straße"]);
+    // Quoted and `_` literals match exactly (smart case).
+    assert_eq!(found("\"Straße\""), ["Straße"]);
+    assert!(found("\"STRASSE\"").is_empty());
+
+    let index = text_index("Приветствие ABC");
     let text = index.text(0, 0, None).unwrap();
     let m = &index.find("ПРИВЕТ")[0];
     assert_eq!(&text[m.range.clone()], "Привет");
+}
+
+#[test]
+fn document_search_keeps_matches_on_different_lines_apart() {
+    let index = text_index("needle\nneedle token\n  needle_token");
+    let text = index.text(0, 0, None).unwrap();
+    let found: Vec<&str> = index
+        .find("needle token")
+        .into_iter()
+        .map(|m| &text[m.range])
+        .collect();
+    assert_eq!(found, ["needle", "needle token", "needle_token"]);
+    let found: Vec<&str> = index
+        .find("needle_token")
+        .into_iter()
+        .map(|m| &text[m.range])
+        .collect();
+    assert_eq!(found, ["needle_token"]);
 }
 
 // --- K5: agent message ordinals ---

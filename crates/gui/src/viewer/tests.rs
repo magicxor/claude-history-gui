@@ -852,16 +852,43 @@ mod pure {
         assert!(index.find(&items, &doc, "").is_empty());
     }
 
+    /// V-073 (d2c0f07): the list's keyword rules, with ranges in the
+    /// segment text.
     #[test]
-    fn search_texts_fold_case_and_map_ranges() {
-        let text = "Straße ΟΔΟΣ";
-        let st = segments::search_text_of(text);
-        let ranges = st.find(&segments::fold_query("οδος"), text);
-        assert_eq!(ranges.len(), 1);
-        assert_eq!(&text[ranges[0].clone()], "ΟΔΟΣ");
-        let ascii = segments::search_text_of("Hello World");
-        assert!(ascii.origin.is_none());
-        assert_eq!(ascii.find("world", "Hello World"), vec![6..11]);
+    fn search_follows_the_list_keyword_rules() {
+        let lines = vec![
+            user("Straße ΟΔΟΣ in İstanbul"),
+            assistant("the hidden needle_token appears; the fired plan"),
+            user("exact audio_generation and audio generation"),
+        ];
+        let (_dir, model) = model_for(&lines, prefs(ToolDisplayMode::Truncated, false, false));
+        let doc = model.document();
+        let items = items_of(&model, 80);
+        let mut index = SearchIndex::build(&items);
+        let mut found = |query: &str| -> Vec<String> {
+            index
+                .find(&items, &doc, query)
+                .into_iter()
+                .map(|m| items[m.item_ix].segments[m.segment_ix].text[m.range].to_string())
+                .collect()
+        };
+        assert_eq!(found("οδος"), ["ΟΔΟΣ"]);
+        assert_eq!(found("STRASSE"), ["Straße"]);
+        assert_eq!(found("istanbul"), ["İstanbul"]);
+        // Separator-joined words are one match; any word matches.
+        assert_eq!(found("needle token"), ["needle_token"]);
+        assert_eq!(found("needle zzz"), ["needle"]);
+        // Words match at word starts only.
+        assert!(found("ired").is_empty());
+        assert!(found("oken").is_empty());
+        // Quoted and `_` literals match exactly.
+        assert_eq!(found("\"audio_generation\""), ["audio_generation"]);
+        assert_eq!(found("audio_generation"), ["audio_generation"]);
+        assert_eq!(
+            found("audio generation"),
+            ["audio_generation", "audio generation"]
+        );
+        assert!(found(" - / ").is_empty());
     }
 
     #[test]
@@ -2307,6 +2334,38 @@ mod gui {
         });
     }
 
+    /// V-073 (d2c0f07): Enter on a query without matches closes the find bar
+    /// and says so in a toast; matching follows the list's keyword rules.
+    #[gpui_kit::test]
+    fn v073_commit_without_matches_shows_a_toast(cx: &mut TestAppContext) {
+        let world = TestWorld::new();
+        let lines = vec![user("the fired plan"), assistant("a needle_token here")];
+        let (handle, viewer, _) = open_viewer(cx, &world, &lines, &[]);
+        keys(cx, handle, &viewer, "/");
+        cx.simulate_input(handle, "ired");
+        wait_viewer_ready(cx, handle, &viewer);
+        assert_eq!(
+            read(cx, &viewer, |v| v.view_search().count()),
+            0,
+            "no match inside a word"
+        );
+        keys(cx, handle, &viewer, "enter");
+        read(cx, &viewer, |v| {
+            assert_eq!(v.view_search().mode(), ViewSearchMode::Off);
+        });
+        assert_eq!(cx.read(last_toast).as_ref(), "No matches for /ired");
+
+        keys(cx, handle, &viewer, "/");
+        cx.simulate_input(handle, "needle token");
+        wait_viewer_ready(cx, handle, &viewer);
+        assert_eq!(read(cx, &viewer, |v| v.view_search().count()), 1);
+        keys(cx, handle, &viewer, "enter");
+        read(cx, &viewer, |v| {
+            assert_eq!(v.view_search().mode(), ViewSearchMode::Active);
+        });
+        assert_eq!(cx.read(last_toast).as_ref(), "No matches for /ired");
+    }
+
     /// V-074: n/N wrap; a visible match does not scroll.
     #[gpui_kit::test]
     fn v074_next_prev_wrap(cx: &mut TestAppContext) {
@@ -2406,7 +2465,8 @@ mod gui {
         ];
         let (handle, viewer, _) = open_viewer(cx, &world, &lines, &["--show-tools"]);
         keys(cx, handle, &viewer, "/");
-        cx.simulate_input(handle, "output line 2950");
+        // Quoted: unquoted, any word would match (every line has `output`).
+        cx.simulate_input(handle, "\"output line 2950\"");
         wait_viewer_ready(cx, handle, &viewer);
         draw(cx, handle);
         wait_viewer_ready(cx, handle, &viewer);

@@ -233,6 +233,146 @@ pub fn contains_cjk(text: &str) -> bool {
     text.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c))
 }
 
+// ---------------------------------------------------------------------------
+// Fork addition: an owned normalized form
+// ---------------------------------------------------------------------------
+
+/// The search-normalized form of a text, held without the text: what
+/// [`NormalizedText`] computes, owned so that a caller can keep it beside a
+/// text it already stores and match many queries against it without
+/// normalizing again (the GUI viewer's find runs every keystroke over the
+/// same segment texts). Not in upstream.
+///
+/// Offsets map back to the text through a sparse list of the chars whose
+/// normalized form is not one char of the same length (upstream 408cdd8
+/// later gives [`NormalizedText`] the same mapping).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NormalizedForm {
+    normalized: String,
+    raw_len: usize,
+    shifts: Vec<FormShift>,
+}
+
+/// A raw char and the bytes it normalized to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FormShift {
+    normalized: usize,
+    normalized_len: usize,
+    raw: usize,
+    raw_len: usize,
+}
+
+impl NormalizedForm {
+    /// The form of `raw`, which should be in NFC as for
+    /// [`NormalizedText::new`]; `normalized()` then equals
+    /// `normalize_for_search(raw)`.
+    pub fn new(raw: &str) -> Self {
+        let mut normalized = String::with_capacity(raw.len());
+        let mut shifts = Vec::new();
+        let mut rest = raw;
+        while !rest.is_empty() {
+            // ASCII runs normalize byte for byte, one char each.
+            let ascii = rest
+                .bytes()
+                .position(|byte| !byte.is_ascii())
+                .unwrap_or(rest.len());
+            normalized.extend(rest[..ascii].bytes().map(|byte| {
+                if is_word_separator(byte.into()) {
+                    ' '
+                } else {
+                    char::from(byte.to_ascii_lowercase())
+                }
+            }));
+            rest = &rest[ascii..];
+            let Some(ch) = rest.chars().next() else {
+                break;
+            };
+            let raw_at = raw.len() - rest.len();
+            let at = normalized.len();
+            push_normalized(&mut normalized, ch);
+            let added = &normalized[at..];
+            let same_shape = added.len() == ch.len_utf8()
+                && added.chars().next().map(char::len_utf8) == Some(added.len());
+            if !same_shape {
+                shifts.push(FormShift {
+                    normalized: at,
+                    normalized_len: added.len(),
+                    raw: raw_at,
+                    raw_len: ch.len_utf8(),
+                });
+            }
+            rest = &rest[ch.len_utf8()..];
+        }
+        Self {
+            normalized,
+            raw_len: raw.len(),
+            shifts,
+        }
+    }
+
+    pub fn normalized(&self) -> &str {
+        &self.normalized
+    }
+
+    /// Heap bytes held: the normalized text and the offset map.
+    pub fn heap_bytes(&self) -> usize {
+        self.normalized.capacity() + self.shifts.capacity() * std::mem::size_of::<FormShift>()
+    }
+
+    /// [`NormalizedText::query_ranges`] for `raw`, the text this form was
+    /// built from.
+    pub fn query_ranges(&self, raw: &str, query: &str) -> Vec<(usize, usize)> {
+        let anywhere = contains_cjk(query);
+        let mut ranges: Vec<(usize, usize)> = query
+            .split_whitespace()
+            .flat_map(|word| word_match_ranges(&self.normalized, word, anywhere))
+            .collect();
+        ranges.sort_unstable();
+        self.raw_ranges(raw, &ranges)
+    }
+
+    /// [`NormalizedText::raw_ranges`] for `raw`, the text this form was built
+    /// from.
+    pub fn raw_ranges(&self, raw: &str, ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+        debug_assert_eq!(raw.len(), self.raw_len, "a form of another text");
+        ranges
+            .iter()
+            .map(|&(start, end)| {
+                (
+                    self.raw_char_at(raw, start).0,
+                    self.raw_char_at(raw, end.max(start + 1) - 1).1,
+                )
+            })
+            .collect()
+    }
+
+    /// The byte range of the raw char that normalized byte `at` came from,
+    /// or an empty range at the end past the normalized text.
+    fn raw_char_at(&self, raw: &str, at: usize) -> (usize, usize) {
+        let len = raw.len();
+        let shift = self.shifts.partition_point(|shift| shift.normalized <= at);
+        let (normalized_end, raw_end) = match shift.checked_sub(1).map(|i| &self.shifts[i]) {
+            Some(shift) if at < shift.normalized + shift.normalized_len => {
+                return (shift.raw, shift.raw + shift.raw_len);
+            }
+            Some(shift) => (
+                shift.normalized + shift.normalized_len,
+                shift.raw + shift.raw_len,
+            ),
+            None => (0, 0),
+        };
+        let mut raw_at = raw_end + (at - normalized_end);
+        if raw_at >= len {
+            return (len, len);
+        }
+        while !raw.is_char_boundary(raw_at) {
+            raw_at -= 1;
+        }
+        let char_len = raw[raw_at..].chars().next().map_or(0, char::len_utf8);
+        (raw_at, raw_at + char_len)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,6 +450,42 @@ mod tests {
         assert_eq!(found("fi"), ["ﬁ"]);
         assert_eq!(found("strasse ok"), ["STRAẞE", "ok"]);
         assert_eq!(found("ss"), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn normalized_form_maps_every_range_like_normalized_text() {
+        let texts = [
+            "",
+            "plain ASCII_text-with/separators",
+            "İstanbul ﬁle STRAẞE i\u{307}stanbul ok",
+            "Café_ΛΟΓΟΣ-测试会话/Москва ǰ\u{301} \u{307}x Ꮳherokee",
+            "emoji🚀rocket 한국어 naïve—dash “quotes” ǅemal \u{212A}elvin",
+            "ß\u{307}İ\u{307}\u{307}ﬃ",
+        ];
+        for raw in texts {
+            let text = NormalizedText::new(raw);
+            let form = NormalizedForm::new(raw);
+            assert_eq!(form.normalized(), text.normalized(), "{raw:?}");
+            let normalized = form.normalized();
+            let boundaries: Vec<usize> = normalized.char_indices().map(|(at, _)| at).collect();
+            for (i, &start) in boundaries.iter().enumerate() {
+                for &end in boundaries[i + 1..].iter().chain([&normalized.len()]) {
+                    assert_eq!(
+                        form.raw_ranges(raw, &[(start, end)]),
+                        text.raw_ranges(&[(start, end)]),
+                        "{raw:?} {start}..{end}"
+                    );
+                }
+            }
+            for query in ["istanbul", "strasse ok", "fi", "москва", "测试", "x", "ss"] {
+                assert_eq!(
+                    form.query_ranges(raw, query),
+                    text.query_ranges(query),
+                    "{raw:?} {query}"
+                );
+            }
+        }
+        assert!(NormalizedForm::new("plain ascii").shifts.is_empty());
     }
 
     #[test]

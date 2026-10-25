@@ -1639,11 +1639,16 @@ impl ViewerPane {
         cx.notify();
     }
 
+    /// Enter in the find bar: the find bar closes, so a query with no matches
+    /// says so in a toast (`No matches for /<query>`, upstream's status line).
     fn commit_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.search.commit();
+        let no_matches = self.search.commit();
         self.find_open = false;
         self.update_match_map();
         self.focus(window, cx);
+        if let Some(message) = no_matches {
+            Toast::info(message).show(window, cx);
+        }
         cx.notify();
     }
 

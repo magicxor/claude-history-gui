@@ -27,10 +27,12 @@ use super::ledger::{
     MessageRange, RenderableEntry, RenderedConversation, RenderedLine, ToolDisplayMode,
     ToolOutputId, open_conversation, render_parsed_conversation, renderable_entries,
 };
+use crate::display_format::ViewSearchQuery;
 use crate::export::{ExportOptions, MESSAGE_NOT_FOUND};
 use crate::history::model::Transcript;
 use crate::history::service::HistoryService;
 use crate::history::view;
+use crate::text_match::NormalizedForm;
 
 // ---------------------------------------------------------------------
 // ViewerModel
@@ -249,27 +251,26 @@ fn agent_ordinals(transcript: &Transcript) -> Vec<(usize, usize)> {
 // Ledger (line-based) helpers, verbatim from upstream view_state.rs
 // ---------------------------------------------------------------------
 
-/// Whether a rendered ledger line contains `query_lower` (already
-/// lowercased): case-insensitive substring match over the concatenated span
-/// text, including the name column, separator and timestamp (upstream
-/// quirk).
-pub fn line_matches_query(line: &RenderedLine, query_lower: &str) -> bool {
+/// Whether `line` has a match for `query`, by the list's matching rules.
+/// The concatenated span text is searched, including the name column,
+/// separator and timestamp (upstream quirk).
+pub fn line_matches_query(line: &RenderedLine, query: &ViewSearchQuery) -> bool {
     let full_text: String = line.spans.iter().map(|(text, _)| text.as_str()).collect();
-    full_text.to_lowercase().contains(query_lower)
+    query.has_match(&full_text)
 }
 
 /// Indices of the ledger lines matching `query` (upstream
-/// `update_search_results`); empty for an empty query. Counts are lines, not
-/// occurrences.
+/// `update_search_results`, parsed as a [`ViewSearchQuery`]); empty for a
+/// query without words or literals. Counts are lines, not occurrences.
 pub fn search_lines(lines: &[RenderedLine], query: &str) -> Vec<usize> {
-    let query_lower = query.to_lowercase();
-    if query_lower.is_empty() {
+    let query = ViewSearchQuery::parse(query);
+    if query.is_empty() {
         return Vec::new();
     }
     lines
         .iter()
         .enumerate()
-        .filter(|(_, line)| line_matches_query(line, &query_lower))
+        .filter(|(_, line)| line_matches_query(line, &query))
         .map(|(i, _)| i)
         .collect()
 }
@@ -726,13 +727,16 @@ impl<M: Clone> ViewSearch<M> {
         self.update(find)
     }
 
-    /// Enter: keep the search active only when there are matches.
-    pub fn commit(&mut self) {
-        self.mode = if self.matches.is_empty() {
-            ViewSearchMode::Off
-        } else {
-            ViewSearchMode::Active
-        };
+    /// Enter: keep the search active only when there are matches. A query
+    /// with text but no matches returns upstream's status message
+    /// `No matches for /<query>` (d2c0f07).
+    pub fn commit(&mut self) -> Option<String> {
+        if !self.matches.is_empty() {
+            self.mode = ViewSearchMode::Active;
+            return None;
+        }
+        self.mode = ViewSearchMode::Off;
+        (!self.query.trim().is_empty()).then(|| format!("No matches for /{}", self.query))
     }
 
     /// `n` (active search only): the next match, wrapping around. The GUI
@@ -844,22 +848,20 @@ struct SearchTarget {
     block: usize,
     item: Option<usize>,
     text: String,
-    folded: String,
-    /// For each byte of `folded`, the start of the original character; only
-    /// when lowercasing changed byte lengths (identity otherwise).
-    origin: Option<Vec<usize>>,
+    form: NormalizedForm,
 }
 
 /// The searchable text of a document: every block's (or summary item's)
-/// plain text, lowercased once. Build it when the document changes and run
-/// [`DocSearchIndex::find`] on each keystroke.
+/// plain text, search-normalized once. Build it when the document changes
+/// and run [`DocSearchIndex::find`] on each keystroke.
 ///
-/// Matching is a case-insensitive substring search (Greek final sigma
-/// matches `σ`/`Σ`) over the text the block shows ([`super::DocBlock::plain_text`]): collapsed tool output, hidden
-/// thinking and other content that is not displayed is not searchable, as
-/// in the ledger. Unlike the ledger search, labels and timestamps are not
-/// part of the text, and every occurrence is a match (the ledger counts
-/// matching lines).
+/// Matching follows the list's keyword rules ([`ViewSearchQuery`], upstream
+/// d2c0f07) over the text the block shows
+/// ([`super::DocBlock::plain_text`]): collapsed tool output, hidden thinking
+/// and other content that is not displayed is not searchable, as in the
+/// ledger. Unlike the ledger search, labels and timestamps are not part of
+/// the text, and every match range is a match (the ledger counts matching
+/// lines); separator-joined words on one line are one range.
 #[derive(Clone, Debug, Default)]
 pub struct DocSearchIndex {
     targets: Vec<SearchTarget>,
@@ -902,21 +904,21 @@ impl DocSearchIndex {
             .map(|t| t.text.as_str())
     }
 
-    /// All non-overlapping occurrences of `query`, case-insensitively, in
-    /// document order. Empty for an empty query.
+    /// Every match of `query` ([`ViewSearchQuery::match_ranges_in`]) in
+    /// document order. Empty for a query without words or literals.
     pub fn find(&self, query: &str) -> Vec<SearchMatch> {
-        let query: String = query.chars().flat_map(fold_char).collect();
+        let query = ViewSearchQuery::parse(query);
         if query.is_empty() {
             return Vec::new();
         }
         let mut matches = Vec::new();
         for target in &self.targets {
-            for (start, found) in target.folded.match_indices(&query) {
+            for (start, end) in query.match_ranges_in(&target.text, &target.form) {
                 matches.push(SearchMatch {
                     message: target.message,
                     block: target.block,
                     item: target.item,
-                    range: target.original_range(start..start + found.len()),
+                    range: start..end,
                 });
             }
         }
@@ -924,52 +926,16 @@ impl DocSearchIndex {
     }
 }
 
-/// Lowercase one character for search. Final sigma folds to `σ` as well, so
-/// that "ΟΔΟΣ", "Οδος" and "οδος" match each other in either direction:
-/// per-character lowercasing never yields `ς`, while lowercase text spells
-/// the word-final sigma `ς` (the ledger's `str::to_lowercase` applies the
-/// final-sigma rule instead, which misses some of these pairs). `ς` and `σ`
-/// are both two bytes, so byte offsets are unchanged.
-fn fold_char(ch: char) -> impl Iterator<Item = char> {
-    ch.to_lowercase().map(|c| if c == 'ς' { 'σ' } else { c })
-}
-
 impl SearchTarget {
     fn new(message: usize, block: usize, item: Option<usize>, text: String) -> Self {
-        let mut folded = String::with_capacity(text.len());
-        let mut identity = true;
-        for ch in text.chars() {
-            let before = folded.len();
-            folded.extend(fold_char(ch));
-            identity &= folded.len() - before == ch.len_utf8();
-        }
-        let origin = (!identity).then(|| {
-            let mut origin = Vec::with_capacity(folded.len());
-            for (start, ch) in text.char_indices() {
-                let added: usize = fold_char(ch).map(char::len_utf8).sum();
-                origin.extend(std::iter::repeat_n(start, added));
-            }
-            origin
-        });
+        let form = NormalizedForm::new(&text);
         Self {
             message,
             block,
             item,
             text,
-            folded,
-            origin,
+            form,
         }
-    }
-
-    /// Map a non-empty byte range of `folded` to whole characters of `text`.
-    fn original_range(&self, folded: Range<usize>) -> Range<usize> {
-        let Some(origin) = &self.origin else {
-            return folded;
-        };
-        let start = origin[folded.start];
-        let last = origin[folded.end - 1];
-        let end = last + self.text[last..].chars().next().map_or(0, char::len_utf8);
-        start..end
     }
 }
 
