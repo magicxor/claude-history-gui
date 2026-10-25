@@ -1810,7 +1810,7 @@ impl ListPane {
     #[cfg(any(test, feature = "qa"))]
     pub fn debug_state(&self) -> String {
         format!(
-            "view={:?} mode={:?} query={:?} rows={} total={} in_flight={} progress={:?} indexing={:?} activity={:?} error={:?} status={:?} loader_running={} refreshing={}",
+            "view={:?} mode={:?} query={:?} rows={} total={} in_flight={} progress={:?} indexing={:?} busy={} activity={:?} error={:?} status={:?} loader_running={} refreshing={}",
             self.view,
             self.mode(),
             self.browser.query(),
@@ -1819,6 +1819,7 @@ impl ListPane {
             self.browser.has_search_work_in_flight(),
             self.browser.semantic_progress(),
             self.browser.semantic_indexing(),
+            self.browser.semantic_worker_busy(),
             self.browser.semantic_activity_status_text(),
             self.browser.semantic_error(),
             self.browser.search_status_text(),

@@ -360,7 +360,7 @@ impl ListFixture {
     pub fn wait_idle(&self, cx: &mut TestAppContext) {
         self.wait_until(cx, "the search workers to go idle", |list, _| {
             !list.browser().has_search_work_in_flight()
-                && list.browser().semantic_indexing().is_none()
+                && !list.browser().semantic_worker_busy()
                 && !list.loader().is_running()
         });
     }

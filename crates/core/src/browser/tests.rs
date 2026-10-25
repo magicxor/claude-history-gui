@@ -1509,7 +1509,7 @@ fn semantic_progress_messages_update_activity_status_text() {
 }
 
 /// Upstream c6d0421: background indexing has its own activity text, shown
-/// while no search has one, and ends with `Indexing(None)`.
+/// while no search has one, and ends with `Idle`.
 #[test]
 fn background_indexing_shows_its_activity_until_it_ends() {
     let sandbox = Sandbox::new();
@@ -1519,10 +1519,10 @@ fn background_indexing_shows_its_activity_until_it_ends() {
     app.semantic_search.prewarm_status = None;
 
     response_tx
-        .send(SemanticSearchMessage::Indexing(Some(SemanticIndexing {
+        .send(SemanticSearchMessage::Indexing(SemanticIndexing {
             completed: 3,
             total: 10,
-        })))
+        }))
         .unwrap();
     assert!(app.poll());
     assert_eq!(
@@ -1555,11 +1555,51 @@ fn background_indexing_shows_its_activity_until_it_ends() {
     app.list_search_mode = ListSearchMode::Semantic;
 
     response_tx
-        .send(SemanticSearchMessage::Indexing(None))
+        .send(SemanticSearchMessage::Idle { generation: 0 })
         .unwrap();
     assert!(app.poll());
     assert_eq!(app.semantic_indexing(), None);
     assert_eq!(app.semantic_activity_status_text(), None);
+}
+
+/// Upstream 4e9b8f6: the worker counts as busy from a search sent to it
+/// until an `Idle` covering it arrives, and the indexing progress shows
+/// when the search status has no text of its own (a ready cache).
+#[test]
+fn background_indexing_shows_its_progress_until_the_worker_is_idle() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(&sandbox, vec![visible()]);
+    let (_request_tx, _request_rx, response_tx) = connect_semantic_search_channels(&mut app);
+    app.semantic_search.prewarm_generation = None;
+    app.semantic_search.prewarm_status = None;
+    app.semantic_search.pending_status = Some(SemanticProgress::CacheReady);
+    app.semantic_search.busy_generation = Some(3);
+    assert!(app.semantic_worker_busy());
+
+    response_tx
+        .send(SemanticSearchMessage::Indexing(SemanticIndexing {
+            completed: 1,
+            total: 4,
+        }))
+        .unwrap();
+    assert!(app.poll());
+    assert_eq!(
+        app.semantic_activity_status_text().as_deref(),
+        Some("sem indexing 25%  1/4 chunks")
+    );
+
+    response_tx
+        .send(SemanticSearchMessage::Idle { generation: 2 })
+        .unwrap();
+    assert!(app.poll());
+    assert_eq!(app.semantic_activity_status_text(), None);
+    assert!(app.semantic_worker_busy(), "a newer search is outstanding");
+
+    response_tx
+        .send(SemanticSearchMessage::Idle { generation: 3 })
+        .unwrap();
+    assert!(app.poll());
+    assert!(!app.semantic_worker_busy());
 }
 
 /// Upstream c6d0421: a search that nothing embedded so far matches shows
@@ -1574,10 +1614,10 @@ fn a_search_waiting_for_indexing_follows_its_progress() {
     app.search_generation = 7;
     app.semantic_search.pending_generation = Some(7);
     response_tx
-        .send(SemanticSearchMessage::Indexing(Some(SemanticIndexing {
+        .send(SemanticSearchMessage::Indexing(SemanticIndexing {
             completed: 0,
             total: 10,
-        })))
+        }))
         .unwrap();
     send_semantic_progress_response(
         &response_tx,
@@ -1588,10 +1628,10 @@ fn a_search_waiting_for_indexing_follows_its_progress() {
         },
     );
     response_tx
-        .send(SemanticSearchMessage::Indexing(Some(SemanticIndexing {
+        .send(SemanticSearchMessage::Indexing(SemanticIndexing {
             completed: 4,
             total: 10,
-        })))
+        }))
         .unwrap();
 
     assert!(app.poll());

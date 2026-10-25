@@ -199,8 +199,13 @@ pub enum SemanticSearchMessage {
     },
     Complete(SemanticSearchResponse),
     /// Progress of embedding the passages the corpus has no embedding for,
-    /// which runs behind searches; `None` once there are none left.
-    Indexing(Option<SemanticIndexing>),
+    /// which runs behind searches.
+    Indexing(SemanticIndexing),
+    /// The worker has nothing left to do for the searches up to
+    /// `generation`: each is answered and indexing has finished.
+    Idle {
+        generation: u64,
+    },
 }
 
 /// Passages embedded since indexing started, of those it has found to embed.
@@ -360,8 +365,15 @@ fn run_semantic_worker(
     let mut save_cache = embedding_cache_writer(config.cache_path.clone());
     let mut embedder: Option<Box<dyn SemanticEmbedder>> = None;
     let mut indexing: Option<Indexing> = None;
+    let mut idle_reported = true;
 
     loop {
+        if indexing.is_none() && !idle_reported {
+            idle_reported = true;
+            outbox.post(SemanticSearchMessage::Idle {
+                generation: worker.last_search_generation,
+            });
+        }
         // Fork: the token of the next slice is taken before the channel is
         // looked at. Closing the channel and then cancelling (K6 suspend)
         // either closes it before the look or cancels the slice.
@@ -406,6 +418,7 @@ fn run_semantic_worker(
         let Some(request) = request else {
             continue;
         };
+        idle_reported = false;
         let Some(version_state) = worker.version_state_for(&request) else {
             continue;
         };
@@ -502,7 +515,7 @@ fn run_semantic_worker(
                         current.answered = !unanswered;
                     }
                     let progress = current.progress(missing);
-                    outbox.post(SemanticSearchMessage::Indexing(Some(progress)));
+                    outbox.post(SemanticSearchMessage::Indexing(progress));
                     if unanswered {
                         // Nothing embedded so far matches; the search is
                         // answered once something does.
@@ -562,7 +575,6 @@ fn index_slice(
     save_cache: &mut dyn FnMut(&EmbeddingCache),
 ) -> bool {
     let Some(model) = embedder.as_deref_mut() else {
-        outbox.post(SemanticSearchMessage::Indexing(None));
         return true;
     };
     let full_corpus = worker.full_corpus_candidates();
@@ -601,16 +613,15 @@ fn index_slice(
                     error.to_string(),
                 )));
             }
-            outbox.post(SemanticSearchMessage::Indexing(None));
             return true;
         }
     };
     indexing.completed += response.embedded_chunk_count;
     indexing.resize(response.embedded_chunk_count, started.elapsed());
     if response.missing_chunk_count > 0 {
-        outbox.post(SemanticSearchMessage::Indexing(Some(
+        outbox.post(SemanticSearchMessage::Indexing(
             indexing.progress(response.missing_chunk_count),
-        )));
+        ));
         if !indexing.answered
             && let Some(response) =
                 rank_current(worker, state, model, &indexing.request, cancellation)
@@ -626,7 +637,6 @@ fn index_slice(
     if let Some(response) = rank_current(worker, state, model, &indexing.request, cancellation) {
         outbox.post(SemanticSearchMessage::Complete(response));
     }
-    outbox.post(SemanticSearchMessage::Indexing(None));
     true
 }
 
@@ -679,6 +689,8 @@ struct SemanticWorkerState {
     texts: Option<Arc<SearchIndex>>,
     scope: Arc<Vec<usize>>,
     pending_search: Option<SemanticSearchRequest>,
+    /// Generation of the newest search received.
+    last_search_generation: u64,
 }
 
 enum VersionState {
@@ -728,6 +740,7 @@ impl SemanticWorkerState {
                 prewarm,
             } => {
                 cancellation.cancel();
+                self.last_search_generation = self.last_search_generation.max(generation);
                 Some(SemanticSearchRequest {
                     generation,
                     query,
@@ -1186,6 +1199,9 @@ mod tests {
             SemanticSearchMessage::Indexing(indexing) => {
                 panic!("unexpected indexing before empty response: {indexing:?}");
             }
+            SemanticSearchMessage::Idle { generation } => {
+                panic!("unexpected idle before empty response: {generation}");
+            }
         }
     }
 
@@ -1195,7 +1211,9 @@ mod tests {
                 .recv_timeout(WORKER_RESPONSE_TIMEOUT)
                 .expect("worker response")
             {
-                SemanticSearchMessage::Progress { .. } | SemanticSearchMessage::Indexing(_) => {
+                SemanticSearchMessage::Progress { .. }
+                | SemanticSearchMessage::Indexing(_)
+                | SemanticSearchMessage::Idle { .. } => {
                     continue;
                 }
                 SemanticSearchMessage::Complete(response) => return response,
@@ -1308,9 +1326,8 @@ mod tests {
         loop {
             match recv(rx) {
                 SemanticSearchMessage::Complete(response) => responses.push(response),
-                SemanticSearchMessage::Indexing(None) => return responses,
-                SemanticSearchMessage::Indexing(Some(_))
-                | SemanticSearchMessage::Progress { .. } => {}
+                SemanticSearchMessage::Idle { .. } => return responses,
+                SemanticSearchMessage::Indexing(_) | SemanticSearchMessage::Progress { .. } => {}
             }
         }
     }
@@ -1380,7 +1397,7 @@ mod tests {
             panic!("expected model initialization first");
         };
         assert_eq!(progress, SemanticProgress::InitializingModel);
-        let SemanticSearchMessage::Indexing(Some(indexing)) = recv(&rx) else {
+        let SemanticSearchMessage::Indexing(indexing) = recv(&rx) else {
             panic!("expected indexing to start");
         };
         assert_eq!(indexing.completed, 0);
@@ -1516,8 +1533,8 @@ mod tests {
                     first_answer_during = first_answer_during.or(indexing);
                     responses.push(response);
                 }
-                SemanticSearchMessage::Indexing(Some(progress)) => indexing = Some(progress),
-                SemanticSearchMessage::Indexing(None) => break,
+                SemanticSearchMessage::Indexing(progress) => indexing = Some(progress),
+                SemanticSearchMessage::Idle { .. } => break,
                 SemanticSearchMessage::Progress { .. } => {}
             }
         }
@@ -1555,7 +1572,7 @@ mod tests {
         let first = loop {
             match recv(&rx) {
                 SemanticSearchMessage::Complete(response) => break response,
-                SemanticSearchMessage::Indexing(None) => panic!("indexing ran while held"),
+                SemanticSearchMessage::Idle { .. } => panic!("indexing ran while held"),
                 _ => {}
             }
         };
@@ -1644,7 +1661,7 @@ mod tests {
         assert!(
             !messages
                 .iter()
-                .any(|message| matches!(message, SemanticSearchMessage::Indexing(None))),
+                .any(|message| matches!(message, SemanticSearchMessage::Idle { .. })),
             "indexing did not finish"
         );
     }
@@ -1677,6 +1694,9 @@ mod tests {
             }
             SemanticSearchMessage::Indexing(indexing) => {
                 panic!("unexpected indexing before literal response: {indexing:?}");
+            }
+            SemanticSearchMessage::Idle { generation } => {
+                panic!("unexpected idle before literal response: {generation}");
             }
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -1798,6 +1818,9 @@ mod tests {
             }
             SemanticSearchMessage::Indexing(indexing) => {
                 panic!("unexpected indexing before literal response: {indexing:?}");
+            }
+            SemanticSearchMessage::Idle { generation } => {
+                panic!("unexpected idle before literal response: {generation}");
             }
         }
     }
@@ -1973,6 +1996,7 @@ mod tests {
                     progress.push(step);
                 }
                 SemanticSearchMessage::Indexing(step) => indexing.push(step),
+                SemanticSearchMessage::Idle { .. } => panic!("idle before the answer"),
                 SemanticSearchMessage::Complete(response) => break response,
             }
         };
@@ -1988,20 +2012,20 @@ mod tests {
         );
         assert_eq!(
             indexing.first(),
-            Some(&Some(SemanticIndexing {
+            Some(&SemanticIndexing {
                 completed: 0,
                 total: 2
-            }))
+            })
         );
         assert_eq!(
             rx.recv_timeout(WORKER_RESPONSE_TIMEOUT)
                 .ok()
                 .and_then(|message| match message {
-                    SemanticSearchMessage::Indexing(indexing) => Some(indexing),
+                    SemanticSearchMessage::Idle { generation } => Some(generation),
                     _ => None,
                 }),
-            Some(None),
-            "indexing ends after the answer"
+            Some(3),
+            "idle follows the answer"
         );
         assert_eq!(response.error, None);
         assert_eq!(response.generation, 3);
@@ -2159,7 +2183,9 @@ mod tests {
         .unwrap();
         let response = loop {
             match rx.recv_timeout(Duration::from_secs(600)).unwrap() {
-                SemanticSearchMessage::Progress { .. } | SemanticSearchMessage::Indexing(_) => {
+                SemanticSearchMessage::Progress { .. }
+                | SemanticSearchMessage::Indexing(_)
+                | SemanticSearchMessage::Idle { .. } => {
                     continue;
                 }
                 SemanticSearchMessage::Complete(response) => break response,

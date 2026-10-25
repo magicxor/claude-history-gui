@@ -95,6 +95,9 @@ pub(super) struct SemanticSearchState {
     /// Progress of embedding the conversations the worker has no
     /// embeddings for, while it does.
     pub(super) indexing: Option<SemanticIndexing>,
+    /// Generation of the newest search sent to the worker until the worker
+    /// reports it has nothing left to do for it (upstream 4e9b8f6).
+    pub(super) busy_generation: Option<u64>,
     pub(super) last_status: SemanticProgress,
     pub(super) error: Option<String>,
     pub(super) results: HashMap<usize, SemanticResultMetadata>,
@@ -974,8 +977,10 @@ impl Browser {
         self.semantic_search.worker_thread = Some(worker.thread);
         self.semantic_sent_corpus_version = 0;
         self.semantic_sent_scope_signature = None;
-        // The replaced worker's indexing reports no longer arrive.
+        // The replaced worker's indexing reports no longer arrive, nor does
+        // its Idle.
         self.semantic_search.indexing = None;
+        self.semantic_search.busy_generation = None;
     }
 
     /// Stop the semantic worker for an exclusive semantic-cache operation
@@ -1009,6 +1014,7 @@ impl Browser {
         self.semantic_sent_corpus_version = 0;
         self.semantic_sent_scope_signature = None;
         self.semantic_search.indexing = None;
+        self.semantic_search.busy_generation = None;
         // No semantic answer will come; a lexical fallback that is still
         // running is applied when it arrives.
         if !self.search_in_flight {
@@ -1239,6 +1245,7 @@ impl Browser {
         if prewarm {
             self.semantic_search.results.clear();
         }
+        self.semantic_search.busy_generation = Some(self.search_generation);
         if let Some(cancellation) = &self.semantic_search.cancellation {
             cancellation.cancel();
         }
@@ -1249,6 +1256,7 @@ impl Browser {
                 let Some(versions) = self.send_semantic_state() else {
                     self.semantic_search.error = Some("semantic worker unavailable".to_string());
                     self.semantic_search.pending_status = Some(SemanticProgress::Failed);
+                    self.semantic_search.busy_generation = None;
                     return;
                 };
                 versions
@@ -1269,6 +1277,7 @@ impl Browser {
             let Some((corpus_version, scope_version)) = self.send_semantic_state() else {
                 self.semantic_search.error = Some("semantic worker unavailable".to_string());
                 self.semantic_search.pending_status = Some(SemanticProgress::Failed);
+                self.semantic_search.busy_generation = None;
                 return;
             };
             if !self.send_semantic_command(SemanticWorkerCommand::Search {
@@ -1280,6 +1289,7 @@ impl Browser {
             }) {
                 self.semantic_search.error = Some("semantic worker unavailable".to_string());
                 self.semantic_search.pending_status = Some(SemanticProgress::Failed);
+                self.semantic_search.busy_generation = None;
             }
         }
     }
@@ -1398,10 +1408,21 @@ impl Browser {
                             }
                         }
                     }
+                    SemanticSearchMessage::Idle { generation } => {
+                        self.semantic_search.indexing = None;
+                        if self
+                            .semantic_search
+                            .busy_generation
+                            .is_some_and(|busy| busy <= generation)
+                        {
+                            self.semantic_search.busy_generation = None;
+                        }
+                        applied = true;
+                    }
                     SemanticSearchMessage::Indexing(indexing) => {
                         // A search waiting for indexing shows its progress.
-                        if let (Some(SemanticProgress::Embedding { .. }), Some(indexing)) =
-                            (&self.semantic_search.pending_status, indexing)
+                        if let Some(SemanticProgress::Embedding { .. }) =
+                            &self.semantic_search.pending_status
                         {
                             self.semantic_search.pending_status =
                                 Some(SemanticProgress::Embedding {
@@ -1409,7 +1430,7 @@ impl Browser {
                                     total: indexing.total,
                                 });
                         }
-                        self.semantic_search.indexing = indexing;
+                        self.semantic_search.indexing = Some(indexing);
                         applied = true;
                     }
                     SemanticSearchMessage::Complete(response) => {
@@ -1483,6 +1504,13 @@ impl Browser {
     /// started it was answered, and is not search work in flight.
     pub fn semantic_indexing(&self) -> Option<SemanticIndexing> {
         self.semantic_search.indexing
+    }
+
+    /// Whether the semantic worker may still send messages for the searches
+    /// sent to it: from sending a search until an `Idle` covering it
+    /// arrives, or while indexing progress is shown (upstream 4e9b8f6).
+    pub fn semantic_worker_busy(&self) -> bool {
+        self.semantic_search.busy_generation.is_some() || self.semantic_search.indexing.is_some()
     }
 
     /// Whether a lexical search, a semantic search or a prewarm is running,
@@ -1606,14 +1634,7 @@ impl Browser {
             .as_ref()
             .or(self.semantic_search.pending_status.as_ref())
             .or(self.semantic_corpus_pending().then_some(&loading));
-        let Some(status) = status else {
-            let SemanticIndexing { completed, total } = self.semantic_search.indexing?;
-            return Some(SemanticActivity::Indexing {
-                completed: completed.min(total),
-                total,
-            });
-        };
-        match status {
+        let search = status.and_then(|status| match status {
             SemanticProgress::LoadingSessions => Some(SemanticActivity::Loading),
             SemanticProgress::InitializingModel => Some(SemanticActivity::Preparing),
             SemanticProgress::Embedding { completed, total } => Some(SemanticActivity::Embedding {
@@ -1621,7 +1642,16 @@ impl Browser {
                 total: *total,
             }),
             _ => None,
-        }
+        });
+        // A status with no text of its own (such as a ready cache) shows
+        // the indexing progress (upstream 4e9b8f6).
+        search.or_else(|| {
+            let SemanticIndexing { completed, total } = self.semantic_search.indexing?;
+            Some(SemanticActivity::Indexing {
+                completed: completed.min(total),
+                total,
+            })
+        })
     }
 
     /// The semantic error message, if the last semantic search failed

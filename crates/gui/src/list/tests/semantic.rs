@@ -258,7 +258,7 @@ fn a_search_waits_for_indexing_with_its_lexical_rows(cx: &mut TestAppContext) {
     batch.open();
     f.wait_until(cx, "the refreshed result", |list, _| {
         !list.browser().has_search_work_in_flight()
-            && list.browser().semantic_indexing().is_none()
+            && !list.browser().semantic_worker_busy()
             && list
                 .browser()
                 .semantic_result_metadata_for_selection()
