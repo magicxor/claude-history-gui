@@ -28,10 +28,9 @@ use super::generation::{
 };
 use super::legacy;
 use crate::history::adapter::{Completeness, FileId, Located};
-use crate::history::parser::{process_conversation_file, process_omp_conversation_file};
-use crate::history::path::decode_project_dir_name_to_path;
+use crate::history::index::index;
 use crate::history::sources::Registry;
-use crate::history::{Conversation, Source, format_short_name_from_path};
+use crate::history::{Conversation, Source};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -121,14 +120,9 @@ pub fn reconcile_cancellable(
             .cmp(&a.located.modified)
             .then_with(|| a.located.path.cmp(&b.located.path))
     });
-    let omp_owned = sources
-        .of_kind(Source::Omp)
-        .next()
-        .is_some_and(|adapter| crate::history::sources::pi::omp_owned(&adapter.instance().root));
-
     let mut first = true;
     loop {
-        let batch = take_batch(&mut pending, first, omp_owned, cancelled);
+        let batch = take_batch(&mut pending, first, sources, cancelled);
         // Files skipped once cancelled are never published.
         if cancelled() {
             return Err(generation::cancelled_build());
@@ -358,26 +352,26 @@ enum Parsed {
 fn take_batch(
     pending: &mut Vec<Found>,
     first: bool,
-    omp_owned: bool,
+    sources: &Registry,
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Vec<(Found, Parsed)> {
     if first {
         let files: Vec<Found> = pending.drain(..pending.len().min(FIRST_BATCH)).collect();
-        return parse_all(files, omp_owned, cancelled);
+        return parse_all(files, sources, cancelled);
     }
     let started = Instant::now();
     let chunk = rayon::current_num_threads().max(1) * 8;
     let mut batch = Vec::new();
     while !pending.is_empty() && started.elapsed() < BATCH_TIME && !cancelled() {
         let files: Vec<Found> = pending.drain(..pending.len().min(chunk)).collect();
-        batch.extend(parse_all(files, omp_owned, cancelled));
+        batch.extend(parse_all(files, sources, cancelled));
     }
     batch
 }
 
 fn parse_all(
     files: Vec<Found>,
-    omp_owned: bool,
+    sources: &Registry,
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Vec<(Found, Parsed)> {
     files
@@ -386,52 +380,39 @@ fn parse_all(
             let parsed = if cancelled() {
                 Parsed::Failed
             } else {
-                parse(&found, omp_owned)
+                parse(&found, sources)
             };
             (found, parsed)
         })
         .collect()
 }
 
-/// Parses `found` the way the history loader does for its source.
-fn parse(found: &Found, omp_owned: bool) -> Parsed {
-    let path = found.located.path.clone();
-    let modified = found.located.modified;
-    let result = match found.source() {
-        Source::Omp if omp_owned => process_omp_conversation_file(path, modified, None),
-        _ => process_conversation_file(path, modified, None),
+/// Decodes `found` through its instance's adapter and indexes it. A file
+/// that another source wrote is listed only when that source's root holds
+/// it too, except under a Claude root.
+fn parse(found: &Found, sources: &Registry) -> Parsed {
+    let Some(adapter) = sources.get(&found.located.key.instance) else {
+        return Parsed::Failed;
     };
-    let mut conversation = match result {
-        Ok(Some(conversation)) => conversation,
+    let transcript = match adapter.decode(&found.located) {
+        Ok(Some(transcript)) => transcript,
         Ok(None) => return Parsed::Ignored,
         Err(crate::error::AppError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
             return Parsed::Gone;
         }
         Err(_) => return Parsed::Failed,
     };
-    let project_path = match found.source() {
-        Source::Claude => conversation.cwd.clone().unwrap_or_else(|| {
-            found
-                .located
-                .path
-                .parent()
-                .and_then(Path::file_name)
-                .map(|dir| decode_project_dir_name_to_path(&dir.to_string_lossy()))
-                .unwrap_or_default()
-        }),
-        source => {
-            if conversation.source != source && !found.also.contains(&conversation.source) {
-                return Parsed::Ignored;
-            }
-            conversation
-                .cwd
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("unknown"))
-        }
-    };
-    conversation.project_name = Some(format_short_name_from_path(&project_path));
-    conversation.project_path = Some(project_path);
-    Parsed::Conversation(Box::new(conversation))
+    let source = found.source();
+    if source != Source::Claude
+        && transcript.source != source
+        && !found.also.contains(&transcript.source)
+    {
+        return Parsed::Ignored;
+    }
+    match index(&transcript) {
+        Ok(conversation) => Parsed::Conversation(Box::new(conversation)),
+        Err(_) => Parsed::Ignored,
+    }
 }
 
 /// The docs of the next generation: `keep` without the rows `batch`

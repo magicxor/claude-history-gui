@@ -114,7 +114,7 @@ pub struct ReadMessage {
     /// `mN` message number.
     pub ordinal: usize,
     pub role: AgentMessageRole,
-    pub timestamp: Option<String>,
+    pub timestamp: Option<chrono::DateTime<chrono::Utc>>,
     /// Line of the record in the JSONL file.
     pub jsonl_line: usize,
     /// Durable anchor of the message.
@@ -167,7 +167,7 @@ pub fn read_messages(
             conversation_full_ref: rendered.conversation.reference.full_ref(),
             ordinal: rendered.message.ordinal,
             role: rendered.message.role,
-            timestamp: rendered.message.timestamp.clone(),
+            timestamp: rendered.message.timestamp,
             jsonl_line: rendered.message.jsonl_line,
             anchor: rendered
                 .transcript

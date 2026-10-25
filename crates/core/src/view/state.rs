@@ -43,6 +43,10 @@ pub struct ViewerModel {
     pub entries: Arc<Vec<RenderableEntry>>,
     pub prefs: ViewPrefs,
     pub expanded: BTreeSet<ToolOutputId>,
+    /// `(entry_index, ordinal)` of every entry of `entries` placed as an
+    /// agent message ([`agent_ordinals`]), placed once when the model is
+    /// built (on the thread that parses it) rather than on each reveal.
+    agent_ordinals: Arc<[(usize, usize)]>,
 }
 
 impl ViewerModel {
@@ -74,11 +78,13 @@ impl ViewerModel {
         entries: Arc<Vec<RenderableEntry>>,
         prefs: ViewPrefs,
     ) -> Self {
+        let agent_ordinals = agent_ordinals(&entries).into();
         Self {
             path,
             entries,
             prefs,
             expanded: BTreeSet::new(),
+            agent_ordinals,
         }
     }
 
@@ -182,10 +188,10 @@ impl ViewerModel {
     /// cached entries. A streamed assistant message whose later records
     /// replace it maps to the first entry with that ordinal.
     pub fn entry_for_agent_ordinal(&self, ordinal: usize) -> Option<usize> {
-        self.agent_ordinals()
-            .into_iter()
+        self.agent_ordinals
+            .iter()
             .find(|(_, placed)| *placed == ordinal)
-            .map(|(entry_index, _)| entry_index)
+            .map(|&(entry_index, _)| entry_index)
     }
 
     /// The agent message ordinal (`mN`) of the entry `entry_index`, or
@@ -193,37 +199,41 @@ impl ViewerModel {
     /// Warmup exchange, `/clear`, an entry without content). Every record
     /// of a replaced streaming message has its ordinal.
     pub fn agent_ordinal_for_entry(&self, entry_index: usize) -> Option<usize> {
-        self.agent_ordinals()
-            .into_iter()
+        self.agent_ordinals
+            .iter()
             .find(|(placed_entry, _)| *placed_entry == entry_index)
-            .map(|(_, ordinal)| ordinal)
+            .map(|&(_, ordinal)| ordinal)
     }
+}
 
-    /// `(entry_index, ordinal)` of every entry placed as an agent message,
-    /// in entry order.
-    fn agent_ordinals(&self) -> Vec<(usize, usize)> {
-        use crate::claude::{LogEntry, parse_agent_progress};
-        use crate::history::{MessageOrdinals, Placement};
+/// `(entry_index, ordinal)` of every entry of `entries` placed as an agent
+/// message, in entry order.
+///
+/// Placement runs over events (upstream fd27225), so each entry is copied
+/// into the event the Claude adapter decodes it to
+/// (`history::sources::claude::Records`, which Pi and OMP projections go
+/// through too) and placed like the agent transcript reader places it.
+fn agent_ordinals(entries: &[RenderableEntry]) -> Vec<(usize, usize)> {
+    use crate::history::model::Origin;
+    use crate::history::sources::claude::Records;
+    use crate::history::{MessageOrdinals, Placement};
 
-        let mut ordinals = MessageOrdinals::new();
-        let mut placed = Vec::new();
-        for parsed in self.entries.iter() {
-            let placement = match parsed.entry() {
-                LogEntry::Progress { data, .. } => match parse_agent_progress(data) {
-                    Some(progress) => ordinals.place_subagent(&progress),
-                    None => Placement::Control,
-                },
-                entry => ordinals.place(entry),
-            };
-            match placement {
-                Placement::Message(ordinal) | Placement::Replaces(ordinal) => {
-                    placed.push((parsed.entry_index, ordinal));
-                }
-                Placement::Control => {}
+    let mut ordinals = MessageOrdinals::new();
+    let mut records = Records::default();
+    let mut placed = Vec::new();
+    for parsed in entries {
+        records.push(parsed.entry().clone(), Origin::default());
+        let Some(event) = records.events.pop() else {
+            continue;
+        };
+        match ordinals.place(&event) {
+            Placement::Message(ordinal) | Placement::Replaces(ordinal) => {
+                placed.push((parsed.entry_index, ordinal));
             }
+            Placement::Control => {}
         }
-        placed
     }
+    placed
 }
 
 // ---------------------------------------------------------------------

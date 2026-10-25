@@ -798,8 +798,9 @@ mod tests {
 
         let sources = Registry::from_env(&env);
         let claude = sources
-            .of_kind(crate::history::Source::Claude)
-            .next()
+            .adapters()
+            .iter()
+            .find(|adapter| adapter.instance().kind == crate::history::Source::Claude)
             .unwrap();
         assert_eq!(claude.instance().root, projects);
         let outcome = reconcile::reconcile(&root, &sources).unwrap();

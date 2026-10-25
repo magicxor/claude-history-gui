@@ -39,6 +39,9 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 - The per-project and Pi/OMP conversation caches of earlier versions are no longer used: the first index update of
   this version removes them from `~/.cache/claude-history-gui` (only files the app wrote there, never the
   claude-history CLI's cache), freeing their disk space.
+- Parse errors that follow a skipped user message (a Warmup message, the records `/clear` leaves behind) show their
+  own line number and surrounding lines in Tools > Debug log > Parse errors and in debug.log; they were reported one
+  line early, with the wrong context. Claude conversation files are also recognized and read with less work.
 
 ## v0.1.1
 
