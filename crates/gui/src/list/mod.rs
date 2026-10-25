@@ -314,13 +314,14 @@ impl ListPane {
         let focus = cx.focus_handle();
         let toolbar_focus = cx.focus_handle();
 
-        let (env, workspace, mode, local, launch_filter, show_last, excluded, recents) = {
+        let (env, workspace, mode, local, all_kinds, launch_filter, show_last, excluded, recents) = {
             let state = app_state(cx);
             (
                 state.env.clone(),
                 state.workspace.clone(),
                 state.list_mode,
                 state.launch.args.local,
+                state.launch.args.all_kinds,
                 state.launch.time_filter,
                 state.settings.show_last,
                 state.settings.exclude_projects.clone(),
@@ -342,6 +343,7 @@ impl ListPane {
             .with_exclude_projects(excluded.clone())
             .with_workspace(workspace.clone())
             .with_workspace_filter(local && workspace.is_some())
+            .with_all_kinds(all_kinds)
             .with_waker(waker.clone())
             .with_embedder_factory(warmed_factory(crate::embedder::browser_factory(cx)));
         let mut browser = Browser::new_loading(options);
@@ -663,6 +665,12 @@ impl ListPane {
         self.browser.workspace_filter()
     }
 
+    /// Whether automated (Codex exec) and subagent conversations are listed
+    /// (upstream cb990e6, `ToggleAllKinds`).
+    pub fn all_kinds(&self) -> bool {
+        self.browser.all_kinds()
+    }
+
     pub fn has_workspace(&self) -> bool {
         self.browser.has_project_context()
     }
@@ -831,6 +839,9 @@ impl ListPane {
         } else if any.is::<ToggleScope>() {
             let next = !self.scope_is_workspace();
             self.set_scope_workspace(next, cx);
+        } else if any.is::<ToggleAllKinds>() {
+            let next = !self.all_kinds();
+            self.set_all_kinds(next, cx);
         } else if any.is::<ShowSemanticDetails>() {
             self.show_semantic_details(window, cx);
         } else if any.is::<Refresh>() {
@@ -866,6 +877,20 @@ impl ListPane {
         };
         update_app_state(cx, |state, _| state.ui.search_mode = Some(remembered));
         crate::persist::schedule_save(cx);
+    }
+
+    /// List or hide automated (Codex exec) and subagent conversations,
+    /// keeping the query and the selected conversation (core
+    /// `Browser::set_all_kinds`; not remembered, as upstream).
+    pub fn set_all_kinds(&mut self, all_kinds: bool, cx: &mut Context<Self>) {
+        if self.all_kinds() == all_kinds {
+            return;
+        }
+        self.browser.set_all_kinds(all_kinds);
+        // The selected conversation stays selected but moves when rows come
+        // in above it (or go): keep it in view.
+        self.scroll_to_selection();
+        self.after_filter_change(cx);
     }
 
     fn set_scope_workspace(&mut self, workspace: bool, cx: &mut Context<Self>) {
@@ -1317,6 +1342,7 @@ impl ListPane {
                 "all"
             }
             .to_string(),
+            "list.all_kinds" => self.all_kinds().to_string(),
             "list.time" => self
                 .time_label
                 .as_ref()
@@ -1466,6 +1492,9 @@ impl Render for ListPane {
                 this.handle_forwarded(a, w, cx);
             }))
             .on_action(cx.listener(|this, a: &SetScopeWorkspace, w, cx| {
+                this.handle_forwarded(a, w, cx);
+            }))
+            .on_action(cx.listener(|this, a: &ToggleAllKinds, w, cx| {
                 this.handle_forwarded(a, w, cx);
             }))
             .on_action(cx.listener(|this, _: &ShowSemanticDetails, w, cx| {

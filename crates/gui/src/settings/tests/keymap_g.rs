@@ -373,8 +373,24 @@ fn rebind(cx: &mut TestAppContext, keys: KeyBindings) {
 
 fn chords(rename: &str, refresh: &str, fork: &str, resume: &str, delete: &str) -> KeyBindings {
     KeyBindings {
+        all_kinds: KeyBindings::default().all_kinds,
+        ..chords_with_all_kinds(rename, refresh, "ctrl+g", fork, resume, delete)
+    }
+}
+
+/// `chords` with the all-kinds key chosen too.
+fn chords_with_all_kinds(
+    rename: &str,
+    refresh: &str,
+    all_kinds: &str,
+    fork: &str,
+    resume: &str,
+    delete: &str,
+) -> KeyBindings {
+    KeyBindings {
         rename: parse_key_binding(rename).unwrap(),
         refresh: parse_key_binding(refresh).unwrap(),
+        all_kinds: parse_key_binding(all_kinds).unwrap(),
         fork: parse_key_binding(fork).unwrap(),
         resume: parse_key_binding(resume).unwrap(),
         delete: parse_key_binding(delete).unwrap(),
@@ -452,6 +468,36 @@ fn duplicate_bindings_resolve_by_the_tui_check_order(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let got = winner(cx, "ctrl-k", LIST);
         assert!(got.is_some_and(|got| got.partial_eq(&Refresh)));
+    });
+    // Refresh, all kinds and rename on one key → Refresh; all kinds and rename → ToggleAllKinds.
+    rebind(
+        cx,
+        chords_with_all_kinds("ctrl+k", "ctrl+k", "ctrl+k", "f7", "f8", "f9"),
+    );
+    cx.update(|cx| {
+        for declaration in [LIST, VIEWER] {
+            let got = winner(cx, "ctrl-k", declaration);
+            assert!(
+                got.as_ref().is_some_and(|got| got.partial_eq(&Refresh)),
+                "ctrl-k in [{declaration}]: {}",
+                name_of(&got)
+            );
+        }
+    });
+    rebind(
+        cx,
+        chords_with_all_kinds("ctrl+k", "f6", "ctrl+k", "f7", "f8", "f9"),
+    );
+    cx.update(|cx| {
+        for declaration in [LIST, VIEWER] {
+            let got = winner(cx, "ctrl-k", declaration);
+            assert!(
+                got.as_ref()
+                    .is_some_and(|got| got.partial_eq(&ToggleAllKinds)),
+                "ctrl-k in [{declaration}]: {}",
+                name_of(&got)
+            );
+        }
     });
 }
 

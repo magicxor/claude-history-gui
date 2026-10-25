@@ -34,10 +34,12 @@ All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-h
   after a rename or delete): the newest ones are shown at once and the full history is never loaded into memory
   for the list. The first run indexes the history in the background, newest first.
 * Codex threads (`~/.codex` or `CODEX_HOME`, archived and compressed sessions included, titles from Codex's state
-  database) are listed and searched too, marked `CX` (automated `codex exec` runs and subagent threads are indexed
-  but stay out of the list, list search and semantic search). They open in the viewer (a forked thread shows the
-  history it continues from, then a `Fork` marker where its own records begin), resume and fork through the Codex
-  CLI and delete through `codex delete`; they cannot be renamed, and a thread whose current rollout Codex no longer
+  database) are listed and searched too, marked `CX`. Automated `codex exec` runs and subagent threads stay out of
+  the list and of Deep search unless you ask for them: Ctrl+G (View > Show automated and subagent conversations,
+  `[keys] all_kinds`) or `--all-kinds` lists them, tagged `auto` or `sub`, and Deep search's **Include exec and
+  subagent runs** searches them. They are never embedded, so semantic search does not find them. They open in the viewer
+  (a forked thread shows the history it continues from, then a `Fork` marker where its own records begin), resume
+  and fork through the Codex CLI and delete through `codex delete`; they cannot be renamed, and a thread whose current rollout Codex no longer
   has is read-only.
 * Search as you type. **Lexical** search (with highlighted matches and a literal mode for quoted text) or
   **semantic** search (local embedding model, downloaded on first use; falls back to lexical while the cache is
@@ -81,7 +83,8 @@ log, show the projects directory, delete a conversation by session ID, check for
 **Settings and themes**
 * Themes: follow the system, Light or Dark (View > Theme, Settings, palette).
 * A Settings dialog (General, Display, Search, Keys, Resume, Agent) that edits `gui.toml` only; every field shows
-  where its value comes from. Resume, Fork, Rename, Delete and Refresh keys are rebindable.
+  where its value comes from. Resume, Fork, Rename, Delete, Refresh and Show automated and subagent
+  conversations keys are rebindable.
 * Window layout, workspace and view defaults are remembered between runs.
 
 The full parity checklist with one row per upstream behavior is in [`docs/FEATURES.md`](docs/FEATURES.md).
@@ -148,6 +151,7 @@ cancelled picker exits 0.
 | `[FILE]` | open a JSONL transcript in a viewer window |
 | `-w, --workspace <DIR>` | workspace folder (workspace filter, resume and fork) |
 | `-L, --local` | workspace is the current directory; start with the workspace filter on |
+| `--all-kinds` | also list automated (Codex exec) and subagent conversations |
 | `--since <WHEN>`, `--after <WHEN>` | only conversations this recent (`2d`, `1d6h`, `6mo`, `2026-07-20`) |
 | `--before <WHEN>` | only conversations older than this |
 | `--first` / `-l, --last` | preview first / last messages (default last) |
@@ -184,11 +188,13 @@ first when stdout is a terminal.
 
 | Command | Arguments | Options |
 |---|---|---|
-| `agent search` | `<QUERY>` | `--top`, `--budget`, `--no-budget`, `--flat`, `--hits-per-conv`, `--all-hits`, `--local`, `--all`, `--mode <lexical\|semantic\|exact\|hybrid>` (or `--lexical`, `--semantic`, `--exact`, `--hybrid`), `--since`, `--after`, `--before` |
+| `agent search` | `<QUERY>` | `--top`, `--budget`, `--no-budget`, `--flat`, `--hits-per-conv`, `--all-hits`, `--local`, `--all`, `--all-kinds`, `--mode <lexical\|semantic\|exact\|hybrid>` (or `--lexical`, `--semantic`, `--exact`, `--hybrid`), `--since`, `--after`, `--before` |
 | `agent within` | `<CONVERSATION> <QUERY>` | `--top`, `--budget`, `--no-budget`, mode options |
 | `agent read` | `<REFS>...` (`ch_` handle, UUID or filename, optionally `:mN..mM`) | `--anchor`, `--focus`, `--lines`, `--match`, `--context`, `--budget`, `--no-budget`, `--tools`, `--tool-results`, `--thinking`, `--subagents` |
 | `agent outline` | `<CONVERSATION>` | `--budget`, `--no-budget`, `--tools`, `--tool-results`, `--thinking`, `--subagents` |
 
+`agent search` leaves automated (Codex exec) and subagent conversations out unless `--all-kinds` is given;
+`agent read`, `outline` and `within` resolve their refs either way.
 `claude-history-gui agent <command> --help` lists the exact options. The companion Claude Code skill of the
 original project calls `claude-history agent ...`. **This repository installs nothing** and never writes to
 `.claude/skills`. To let that skill use the GUI binary, make `claude-history` resolve to it yourself:
@@ -262,6 +268,7 @@ command palette.
 | Ctrl+T | Toggle Lexical / Semantic |
 | Shift+F10, Menu | Row context menu |
 | Ctrl+R / Ctrl+F / F2 / Ctrl+X / Ctrl+L | Resume / Fork / Rename / Delete / Refresh (rebindable) |
+| Ctrl+G | Show / hide automated and subagent conversations (rebindable) |
 | Ctrl+E, Ctrl+B, Ctrl+F, Alt+B, Alt+F, Ctrl+K, Ctrl+U, Ctrl+W | Emacs-style editing in the search field (Ctrl+F moves right unless Fork is on Ctrl+F) |
 
 **Viewer**
@@ -302,8 +309,9 @@ command palette.
 | 1 - 4, j / k, Enter, Esc | Export menu: pick a format |
 | Ctrl+U | Clear the rename field |
 
-The five rebindable keys come from `[keys]` in `gui.toml` or `config.toml` (syntax such as `ctrl+r`,
-`f2`). Ctrl+C, Ctrl+V, Ctrl+A, Ctrl+Z, Ctrl+Y and Ctrl+W are rejected as reserved for clipboard and editing.
+The six rebindable keys come from `[keys]` in `gui.toml` or `config.toml` (`resume`, `fork`, `rename`,
+`delete`, `refresh`, `all_kinds`; syntax such as `ctrl+r`, `f2`). Ctrl+C, Ctrl+V, Ctrl+A, Ctrl+Z, Ctrl+Y and Ctrl+W are rejected as reserved for
+clipboard and editing.
 Ctrl+W deletes a word in text fields and never closes a window.
 
 ## Configuration and data

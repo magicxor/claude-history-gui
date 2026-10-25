@@ -200,6 +200,8 @@ pub struct KeysConfig {
     pub delete: Option<KeyBinding>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh: Option<KeyBinding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub all_kinds: Option<KeyBinding>,
 }
 
 // ---------------------------------------------------------------------------
@@ -424,6 +426,8 @@ pub struct KeyBindings {
     pub rename: KeyBinding,
     pub delete: KeyBinding,
     pub refresh: KeyBinding,
+    /// Lists or hides automated and child conversations
+    pub all_kinds: KeyBinding,
 }
 
 impl Default for KeyBindings {
@@ -434,6 +438,7 @@ impl Default for KeyBindings {
             rename: KeyChord::plain(Key::F(2)),
             delete: KeyChord::ctrl('x'),
             refresh: KeyChord::ctrl('l'),
+            all_kinds: KeyChord::ctrl('g'),
         }
     }
 }
@@ -449,12 +454,15 @@ impl KeyBindings {
                 rename: cfg.rename.unwrap_or(defaults.rename),
                 delete: cfg.delete.unwrap_or(defaults.delete),
                 refresh: cfg.refresh.unwrap_or(defaults.refresh),
+                all_kinds: cfg.all_kinds.unwrap_or(defaults.all_kinds),
             },
         }
     }
 
     /// Whether any action is bound to `Ctrl+T`. Upstream disables the
-    /// lexical/semantic toggle (Ctrl+T) in that case.
+    /// lexical/semantic toggle (Ctrl+T) in that case. `all_kinds` counts too
+    /// (fork: upstream's `semantic_toggle_available` does not list it, but
+    /// its key is checked before Ctrl+T, so the toggle never runs either).
     pub fn conflicts_with_ctrl_t(&self) -> bool {
         let ctrl_t = (Key::Char('t'), KeyMods::CTRL);
         [
@@ -463,6 +471,7 @@ impl KeyBindings {
             self.resume,
             self.fork,
             self.refresh,
+            self.all_kinds,
         ]
         .iter()
         .any(|binding| binding.matches(ctrl_t.0, ctrl_t.1))
@@ -688,6 +697,7 @@ impl ConfigFile {
                     rename: overlay(base.rename, &top.rename),
                     delete: overlay(base.delete, &top.delete),
                     refresh: overlay(base.refresh, &top.refresh),
+                    all_kinds: overlay(base.all_kinds, &top.all_kinds),
                 })
             }
         };
@@ -1331,6 +1341,18 @@ subagents = true
         }));
 
         assert!(keys.refresh.matches(Key::Char('u'), KeyMods::ALT));
+    }
+
+    #[test]
+    fn applies_all_kinds_key_config() {
+        // Upstream cb990e6: `[keys] all_kinds`, Ctrl+G by default.
+        assert_eq!(KeyBindings::default().all_kinds, KeyChord::ctrl('g'));
+        let config: ConfigFile = toml::from_str("[keys]\nall_kinds = \"alt+k\"\n").unwrap();
+        let keys = KeyBindings::from_config(config.keys);
+        assert!(keys.all_kinds.matches(Key::Char('k'), KeyMods::ALT));
+        assert_eq!(keys.refresh, KeyChord::ctrl('l'));
+        let config: ConfigFile = toml::from_str("[keys]\nall_kinds = \"ctrl+t\"\n").unwrap();
+        assert!(KeyBindings::from_config(config.keys).conflicts_with_ctrl_t());
     }
 
     // --- KeyChord parity with upstream config.rs:261-402 -------------------

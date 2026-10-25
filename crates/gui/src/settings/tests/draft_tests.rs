@@ -186,7 +186,7 @@ fn sample(field: Field) -> Value {
 /// Every field round-trips through the gui.toml model and Reset removes it.
 #[test]
 fn every_field_sets_gets_and_resets() {
-    assert_eq!(Field::ALL.len(), 32);
+    assert_eq!(Field::ALL.len(), 33);
     for field in Field::ALL {
         let mut gui = GuiConfigFile::default();
         assert!(get(field, &gui).is_unset(), "{field:?} starts unset");

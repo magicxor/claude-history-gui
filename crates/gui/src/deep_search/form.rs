@@ -29,6 +29,7 @@ pub mod help {
     pub const NO_BUDGET: &str = "Disable output budgeting";
     pub const LOCAL: &str = "Search only the current workspace";
     pub const ALL: &str = "Search all workspaces";
+    pub const ALL_KINDS: &str = "Also search automated (Codex exec) and subagent conversations";
     pub const MODE: &str =
         "Search mode for this invocation [possible values: lexical, semantic, exact, hybrid]";
     pub const HYBRID: &str =
@@ -60,6 +61,7 @@ pub mod help {
         ("no-budget", NO_BUDGET),
         ("local", LOCAL),
         ("all", ALL),
+        ("all-kinds", ALL_KINDS),
         ("mode", MODE),
         ("hybrid", HYBRID),
         ("since", SINCE),
@@ -285,6 +287,9 @@ impl TimeTexts {
 pub struct SearchForm {
     pub mode: ModeChoice,
     pub scope: ScopeChoice,
+    /// Also search automated (Codex exec) and subagent conversations
+    /// (`--all-kinds`, upstream cb990e6).
+    pub all_kinds: bool,
     pub time: TimeTexts,
     pub top: String,
     pub flat: bool,
@@ -308,6 +313,7 @@ impl SearchForm {
             all_hits: self.all_hits,
             local: self.scope == ScopeChoice::Workspace,
             all: self.scope == ScopeChoice::All,
+            all_kinds: self.all_kinds,
             search_mode: self.mode.modes(),
             time: self.time.to_args()?,
         };
@@ -558,11 +564,12 @@ mod tests {
             (args.top, args.budget, args.hits_per_conv),
             (None, None, None)
         );
-        assert!(!args.flat && !args.all_hits && !args.no_budget);
+        assert!(!args.flat && !args.all_hits && !args.no_budget && !args.all_kinds);
 
         let form = SearchForm {
             mode: ModeChoice::Hybrid,
             scope: ScopeChoice::Workspace,
+            all_kinds: true,
             time: TimeTexts {
                 since: "2d".into(),
                 before: String::new(),
@@ -575,7 +582,7 @@ mod tests {
             no_budget: false,
         };
         let args = form.to_args("q").unwrap();
-        assert!(args.local && !args.all);
+        assert!(args.local && !args.all && args.all_kinds);
         assert_eq!(args.mode_override(), Some(SearchMode::Hybrid));
         assert_eq!(args.top, Some(3));
         assert_eq!(args.hits_per_conv, Some(1));
@@ -699,6 +706,10 @@ mod tests {
             (
                 "all-hits",
                 "Disable duplicate suppression inside grouped conversation results",
+            ),
+            (
+                "all-kinds",
+                "Also search automated (Codex exec) and subagent conversations",
             ),
             (
                 "hybrid",

@@ -254,6 +254,10 @@ pub struct GuiLaunchArgs {
     pub file: Option<PathBuf>,
     /// `-L, --local`: start with the workspace filter on.
     pub local: bool,
+    /// `--all-kinds`: start listing automated (Codex exec) and subagent
+    /// conversations, which are hidden by default (upstream cb990e6; no
+    /// effect with `[FILE]`, as upstream).
+    pub all_kinds: bool,
     /// `-w, --workspace <DIR>`: the workspace folder, as typed (it may be
     /// relative or end with a separator). Turn it into a scope with
     /// [`GuiLaunchArgs::workspace_scope`].
@@ -561,6 +565,7 @@ Arguments:
 
 Options:
   -L, --local                   Start with the workspace filter on
+      --all-kinds               List automated (Codex exec) and subagent conversations too
   -w, --workspace <DIR>         Workspace folder (used for the workspace filter, resume and fork)
       --since <WHEN>            Only conversations this recent, as a duration or date (2d, 1d6h, 6mo, 2026-07-20)
       --after <WHEN>            Alias for --since
@@ -601,6 +606,7 @@ pub fn parse_process_args() -> std::result::Result<LaunchCommand, LaunchArgsErro
 fn long_option(name: &str) -> Option<(&'static str, bool)> {
     const OPTIONS: &[(&str, bool)] = &[
         ("local", false),
+        ("all-kinds", false),
         ("workspace", true),
         ("since", true),
         ("after", true),
@@ -961,6 +967,7 @@ where
                 }
                 match option {
                     "local" => parsed.local = true,
+                    "all-kinds" => parsed.all_kinds = true,
                     "first" => parsed.first = true,
                     "last" => parsed.last = true,
                     "show-tools" => parsed.show_tools = true,
@@ -1280,6 +1287,7 @@ mod tests {
     fn every_option_parses() {
         let parsed = run(&[
             "--local",
+            "--all-kinds",
             "--workspace",
             "C:\\code\\my project",
             "--since",
@@ -1295,6 +1303,7 @@ mod tests {
             "--semantic",
         ]);
         assert!(parsed.local);
+        assert!(parsed.all_kinds);
         assert_eq!(
             parsed.workspace,
             Some(PathBuf::from("C:\\code\\my project"))
@@ -1423,6 +1432,7 @@ mod tests {
         assert!(help.contains("Usage: claude-history-gui [OPTIONS] [FILE]"));
         for option in [
             "--local",
+            "--all-kinds",
             "--workspace",
             "--since",
             "--after",

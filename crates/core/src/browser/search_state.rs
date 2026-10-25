@@ -1521,6 +1521,27 @@ impl Browser {
         self.scope_changed();
     }
 
+    /// List or hide automated (Codex exec) and child (subagent)
+    /// conversations (upstream `toggle_all_kinds`, Ctrl+G), keeping the query
+    /// and the selected session. They are lexical only: indexing gives them
+    /// no semantic turns, so semantic search does not find them. No-op in
+    /// single-file mode.
+    pub fn toggle_all_kinds(&mut self) {
+        self.set_all_kinds(!self.all_kinds);
+    }
+
+    /// Turn [`Browser::toggle_all_kinds`] on or off (no-op when unchanged).
+    pub fn set_all_kinds(&mut self, all_kinds: bool) {
+        if self.single_file_mode || self.all_kinds == all_kinds {
+            return;
+        }
+        self.all_kinds = all_kinds;
+        if self.selection_anchor.is_none() {
+            self.selection_anchor = self.selected_path();
+        }
+        self.scope_changed();
+    }
+
     /// Re-run the current query after the scope or exclusions changed
     /// (upstream `toggle_workspace_filter`).
     fn scope_changed(&mut self) {

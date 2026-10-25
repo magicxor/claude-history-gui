@@ -437,7 +437,7 @@ impl AgentService {
             crate::store::Contents::Full,
             &|| cancellation.is_cancelled(),
             &|conversation| {
-                !conversation.provenance.hidden_by_default()
+                (args.all_kinds || !conversation.provenance.hidden_by_default())
                     && !project_is_excluded(&conversation.path, &agent_config.exclude_projects)
                     && time.matches(conversation.timestamp)
             },
@@ -484,8 +484,12 @@ impl AgentService {
             request.config_mode,
             request.tui_semantic_search,
         );
-        let (mut keys, mut base_warnings) =
-            discover_agent_keys(&self.env, workspace.as_ref(), Some(&conversations))?;
+        let (mut keys, mut base_warnings) = discover_agent_keys(
+            &self.env,
+            workspace.as_ref(),
+            Some(&conversations),
+            args.all_kinds,
+        )?;
         keys.retain(|key| !project_is_excluded(&key.path, &agent_config.exclude_projects));
         if time.is_active() {
             // Key discovery walks the projects directory independently, so
@@ -634,7 +638,7 @@ impl AgentService {
     fn run_within(&self, args: &AgentWithinArgs) -> Result<Served> {
         let search_config = self.config.search.clone().unwrap_or_default();
         let agent_config = self.agent_config();
-        let (keys, _) = discover_agent_keys(&self.env, None, None)?;
+        let (keys, _) = discover_agent_keys(&self.env, None, None, true)?;
         let resolved = resolve_agent_conversation_arg(&self.env, &args.conversation, Some(&keys))?;
         let transcript = self
             .load_transcript(&resolved.key.path)
@@ -727,10 +731,10 @@ impl AgentService {
 
 /// Discover every Claude/Pi/OMP transcript key (public so a GUI can turn the
 /// candidates of an ambiguous-ref error into durable full refs), and the keys
-/// of the listed Codex threads among `listed`, else among the store's cards.
-/// Codex keys need the thread's working directory, which only decoding
-/// reveals, so they come from the cards the store keeps (hidden exec and
-/// subagent threads get none). With `local`, only the workspace's Claude
+/// of the listed Codex threads among `listed`, else among the store's cards;
+/// automated and child threads only with `all_kinds`. Codex keys need the
+/// thread's working directory, which only decoding reveals, so they come from
+/// the cards the store keeps. With `local`, only the workspace's Claude
 /// project directories (worktree-aware) and the Pi/OMP sessions whose working
 /// directory is the workspace are returned; Codex keys are not narrowed
 /// (as upstream), search scopes its conversations itself.
@@ -738,6 +742,7 @@ pub fn discover_agent_keys(
     env: &HistoryEnv,
     local: Option<&WorkspaceScope>,
     listed: Option<&[history::Conversation]>,
+    all_kinds: bool,
 ) -> Result<(Vec<agent::refs::AgentConversationKey>, Vec<AgentWarning>)> {
     let project_filter = local.map(WorkspaceScope::project_dir_name);
     // Upstream compared against the canonicalized process cwd.
@@ -926,7 +931,7 @@ pub fn discover_agent_keys(
             .iter()
             .filter(|conversation| {
                 conversation.source == history::model::SourceKind::Codex
-                    && !conversation.provenance.hidden_by_default()
+                    && (all_kinds || !conversation.provenance.hidden_by_default())
             })
             .filter_map(|conversation| {
                 agent::refs::AgentConversationKey::from_conversation_in(conversation, &registry)
@@ -1699,7 +1704,7 @@ impl AgentService {
         let keys = match keys {
             Some(keys) => keys,
             None => {
-                discovered = discover_agent_keys(&self.env, None, None)?.0;
+                discovered = discover_agent_keys(&self.env, None, None, true)?.0;
                 &discovered
             }
         };
@@ -1826,7 +1831,7 @@ impl AgentService {
         let keys = match keys {
             Some(keys) => keys,
             None => {
-                discovered = discover_agent_keys(&self.env, None, None)?.0;
+                discovered = discover_agent_keys(&self.env, None, None, true)?.0;
                 &discovered
             }
         };
@@ -2254,7 +2259,7 @@ mode = "hybrid"
         // The flat session directory feeds both the Pi and the OMP discovery
         // (upstream behavior), so the same file may yield one key per source.
         let (local, _) =
-            discover_agent_keys(&env, env.workspace().unwrap().as_ref(), None).unwrap();
+            discover_agent_keys(&env, env.workspace().unwrap().as_ref(), None, false).unwrap();
         assert!(
             local
                 .iter()
@@ -2264,10 +2269,10 @@ mode = "hybrid"
         );
 
         let other = WorkspaceScope::new(&elsewhere).unwrap();
-        let (keys, _) = discover_agent_keys(&env, Some(&other), None).unwrap();
+        let (keys, _) = discover_agent_keys(&env, Some(&other), None, false).unwrap();
         assert!(keys.is_empty(), "{keys:?}");
 
-        let (global, _) = discover_agent_keys(&env, None, None).unwrap();
+        let (global, _) = discover_agent_keys(&env, None, None, false).unwrap();
         assert_eq!(global, local);
     }
 

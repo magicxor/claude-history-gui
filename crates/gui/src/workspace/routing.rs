@@ -196,6 +196,7 @@ macro_rules! on_fallback_actions {
                 $crate::actions::SetScopeWorkspace,
                 $crate::actions::ToggleScope,
                 $crate::actions::ToggleSearchMode,
+                $crate::actions::ToggleAllKinds,
                 $crate::actions::ShowSemanticDetails,
                 $crate::actions::Refresh,
                 // viewer
@@ -244,6 +245,7 @@ pub fn is_list_action(action: &dyn Action) -> bool {
         || a.is::<SetScopeWorkspace>()
         || a.is::<ToggleScope>()
         || a.is::<ToggleSearchMode>()
+        || a.is::<ToggleAllKinds>()
         || a.is::<ShowSemanticDetails>()
         || a.is::<Refresh>()
 }

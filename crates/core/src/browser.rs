@@ -100,6 +100,9 @@
 //!   also forced lexical mode).
 //! * **Failed initial load.** [`LoadEvent::LoadFailed`] leaves the browser
 //!   ready, so [`HistoryLoader::start_refresh`] can retry (upstream exited).
+//! * **All kinds (upstream cb990e6).** [`Browser::set_all_kinds`] also
+//!   applies while loading (to the loaded rows, or the first cards of a
+//!   generation); upstream's Ctrl+G was ignored until the rows were listed.
 //! * **Generation mode.** The cards' workspace test is [`WorkspaceScope`]'s
 //!   (D2, W1), not the process cwd. Every card is materialized and the index
 //!   opened off the UI thread, and a swap keeps a query's rows until it
@@ -187,6 +190,10 @@ pub struct BrowserOptions {
     pub workspace: Option<WorkspaceScope>,
     /// Start with the workspace scope on (upstream `--local`).
     pub workspace_filter: bool,
+    /// Start listing automated (Codex exec) and child (subagent)
+    /// conversations, which are hidden by default (upstream `--all-kinds`,
+    /// `TuiSearchOptions::all_kinds`). Ignored in single-file mode.
+    pub all_kinds: bool,
     /// Whether semantic search can be used (forced off in single-file mode).
     /// When false the browser starts in lexical mode whatever
     /// [`BrowserOptions::default_mode`] says, and never starts the semantic
@@ -211,6 +218,7 @@ impl BrowserOptions {
             exclude_projects: Vec::new(),
             workspace,
             workspace_filter: false,
+            all_kinds: false,
             semantic_available: true,
             waker: None,
             embedder_factory: None,
@@ -242,6 +250,11 @@ impl BrowserOptions {
         self
     }
 
+    pub fn with_all_kinds(mut self, all_kinds: bool) -> Self {
+        self.all_kinds = all_kinds;
+        self
+    }
+
     pub fn with_semantic_available(mut self, available: bool) -> Self {
         self.semantic_available = available;
         self
@@ -267,6 +280,7 @@ impl std::fmt::Debug for BrowserOptions {
             .field("exclude_projects", &self.exclude_projects)
             .field("workspace", &self.workspace)
             .field("workspace_filter", &self.workspace_filter)
+            .field("all_kinds", &self.all_kinds)
             .field("semantic_available", &self.semantic_available)
             .field("waker", &self.waker.is_some())
             .field("embedder_factory", &self.embedder_factory.is_some())
@@ -332,6 +346,8 @@ pub struct Browser {
     single_file_error: Option<String>,
     /// Whether the workspace scope is active
     workspace_filter: bool,
+    /// Whether automated and child conversations are listed
+    all_kinds: bool,
     /// The workspace for the scope filter (upstream: the process cwd)
     workspace: Option<WorkspaceScope>,
     /// Exact project names hidden from list-mode display
@@ -415,12 +431,14 @@ impl Browser {
         } else {
             ListSearchMode::Lexical
         };
-        let (workspace, workspace_filter, excluded_projects) = if parts.single_file_mode {
-            (None, false, HashSet::new())
+        let (workspace, workspace_filter, all_kinds, excluded_projects) = if parts.single_file_mode
+        {
+            (None, false, false, HashSet::new())
         } else {
             (
                 opts.workspace,
                 opts.workspace_filter,
+                opts.all_kinds,
                 opts.exclude_projects.into_iter().collect(),
             )
         };
@@ -431,6 +449,7 @@ impl Browser {
             Some(ScopeSettings {
                 excluded: excluded_projects.clone(),
                 workspace: workspace.clone().filter(|_| workspace_filter),
+                all_kinds,
             }),
         );
         let searchable: SearchSnapshot =
@@ -462,6 +481,7 @@ impl Browser {
             single_file_mode: parts.single_file_mode,
             single_file_error: parts.single_file_error,
             workspace_filter,
+            all_kinds,
             workspace,
             excluded_projects,
             search_tx: parts.search_tx,
@@ -692,6 +712,12 @@ impl Browser {
         self.workspace_filter
     }
 
+    /// Whether automated (Codex exec) and child (subagent) conversations are
+    /// listed ([`Browser::toggle_all_kinds`]).
+    pub fn all_kinds(&self) -> bool {
+        self.all_kinds
+    }
+
     /// The workspace used by the project scope.
     pub fn workspace(&self) -> Option<&WorkspaceScope> {
         self.workspace.as_ref()
@@ -778,6 +804,7 @@ impl Browser {
             query,
             width,
             show_source_label: self.has_multiple_sources(),
+            show_kind_label: true,
             semantic_mode: self.list_search_mode == ListSearchMode::Semantic,
             semantic_metadata: self.semantic_result_metadata(conversation_index),
             now,

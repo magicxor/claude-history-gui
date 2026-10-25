@@ -28,6 +28,9 @@ use crate::viewer::ViewerPane;
 pub const MENU_NAMES: [&str; 6] = ["File", "Edit", "View", "Session", "Tools", "Help"];
 /// The macOS application menu name.
 pub const APP_MENU_NAME: &str = "Claude History";
+/// View → the toggle of automated and subagent conversations (upstream
+/// cb990e6; also the shortcuts dialog's label).
+pub const ALL_KINDS_LABEL: &str = "Show automated and subagent conversations";
 
 const MAC: bool = cfg!(target_os = "macos");
 
@@ -42,6 +45,9 @@ pub struct MenuChecks {
     pub show_timing: bool,
     pub semantic_mode: bool,
     pub workspace_scope: bool,
+    /// The list shows automated and subagent conversations (upstream
+    /// cb990e6).
+    pub all_kinds: bool,
     pub picker: bool,
     /// The active conversation's header session ID differs from its file
     /// stem (Pi/OMP): Session → Copy header session ID is listed (A-042;
@@ -76,6 +82,7 @@ pub fn current_checks(cx: &App) -> MenuChecks {
         let list = list.read(cx);
         checks.semantic_mode = list.mode() == ListSearchMode::Semantic;
         checks.workspace_scope = list.scope_is_workspace();
+        checks.all_kinds = list.all_kinds();
     }
     checks
 }
@@ -320,6 +327,7 @@ pub fn build_tree_with(checks: &MenuChecks, app_menu_items: bool) -> Vec<Menu> {
             item("All", SetScopeAll).checked(!checks.workspace_scope),
             item("Workspace", SetScopeWorkspace).checked(checks.workspace_scope),
         ])),
+        item(ALL_KINDS_LABEL, ToggleAllKinds).checked(checks.all_kinds),
         MenuItem::separator(),
         MenuItem::submenu(Menu::new("Theme").items([
             item("System", SetThemeSystem).checked(checks.theme == ThemePreference::System),
@@ -644,6 +652,31 @@ mod tests {
         assert!(!listed(&MenuChecks::default()));
         assert!(listed(&MenuChecks {
             header_session_id: true,
+            ..MenuChecks::default()
+        }));
+    }
+
+    /// L-104: View lists the all-kinds toggle, checked while it is on.
+    #[test]
+    fn the_view_menu_checks_the_all_kinds_toggle() {
+        let checked = |checks: &MenuChecks| {
+            build_tree(checks)
+                .iter()
+                .find(|menu| menu.name.as_ref() == "View")
+                .unwrap()
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    MenuItem::Action { name, checked, .. } if name.as_ref() == ALL_KINDS_LABEL => {
+                        Some(*checked)
+                    }
+                    _ => None,
+                })
+                .expect("listed")
+        };
+        assert!(!checked(&MenuChecks::default()));
+        assert!(checked(&MenuChecks {
+            all_kinds: true,
             ..MenuChecks::default()
         }));
     }

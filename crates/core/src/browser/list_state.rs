@@ -28,6 +28,7 @@ impl Browser {
             indices,
             &self.conversations,
             &self.excluded_projects,
+            self.all_kinds,
             self.workspace_filter,
             self.workspace.as_ref(),
         )
@@ -44,6 +45,7 @@ impl Browser {
         ScopeSettings {
             excluded: self.excluded_projects.clone(),
             workspace: self.effective_workspace().cloned(),
+            all_kinds: self.all_kinds,
         }
     }
 
@@ -52,6 +54,7 @@ impl Browser {
         self.index.scope.is_current(
             &self.excluded_projects,
             self.effective_workspace(),
+            self.all_kinds,
             self.conversations.len(),
         )
     }
@@ -242,19 +245,25 @@ impl Browser {
     }
 }
 
-/// Exclusions first, then the workspace scope (upstream
-/// `filter_conversation_indices`); see [`ScopeFilter`] for the rules.
+/// Hidden kinds (unless `all_kinds`), exclusions, then the workspace scope
+/// (upstream `filter_conversation_indices`); see [`ScopeFilter`] for the
+/// rules.
 pub(super) fn filter_conversation_indices<I>(
     indices: I,
     conversations: &[Arc<Conversation>],
     excluded_projects: &HashSet<String>,
+    all_kinds: bool,
     workspace_filter: bool,
     workspace: Option<&WorkspaceScope>,
 ) -> Vec<usize>
 where
     I: IntoIterator<Item = usize>,
 {
-    let mut filter = ScopeFilter::new(excluded_projects, workspace.filter(|_| workspace_filter));
+    let mut filter = ScopeFilter::new(
+        excluded_projects,
+        workspace.filter(|_| workspace_filter),
+        all_kinds,
+    );
     indices
         .into_iter()
         .filter(|&idx| filter.passes(&conversations[idx]))

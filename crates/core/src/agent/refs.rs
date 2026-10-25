@@ -571,10 +571,11 @@ pub fn full_ref_for_candidate(
 
 /// The agent key of the transcript at `path` (K8): among every Claude, Pi,
 /// OMP and Codex transcript the agent commands discover for `env` (all roots,
-/// no workspace scope), the one whose canonical path equals `path`'s. A Codex
-/// rollout inside the env's Codex home maps by thread id instead, so an older
-/// or archived rollout resolves to its thread's key. `None`
-/// for a file outside the session roots (an export, an attachment, a copy)
+/// no workspace scope, automated and child Codex threads included, as `agent
+/// read`/`outline`/`within` resolve them), the one whose canonical path equals
+/// `path`'s. A Codex rollout inside the env's Codex home maps by thread id
+/// instead, so an older or archived rollout resolves to its thread's key.
+/// `None` for a file outside the session roots (an export, an attachment, a copy)
 /// or one that does not exist: a file with the same name elsewhere never
 /// resolves to another transcript. Use [`AgentConversationKey::conversation_ref`]
 /// `.full_ref()` to address it in `agent read` / `outline` / `within`.
@@ -606,10 +607,13 @@ pub fn conversation_key_for_path(
     let rollout =
         crate::history::sources::codex::discover::rollout_of(path, false).filter(|_| in_codex_home);
     let no_cards: &[Conversation] = &[];
+    // Hidden (automated and child) threads resolve too: a lookup by identity
+    // (upstream cb990e6: read, outline and within).
     let (keys, _) = crate::agent::service::discover_agent_keys(
         env,
         None,
         rollout.is_none().then_some(no_cards),
+        true,
     )?;
     if let Some(rollout) = rollout
         && let Some(key) = keys.iter().find(|key| {
@@ -810,6 +814,35 @@ mod tests {
     }
 
     #[test]
+    fn conversation_key_for_path_resolves_hidden_codex_threads() {
+        // An exec run is hidden from the list, yet the viewer's agent panel and
+        // Deep search's ref expansion still find it (cb990e6).
+        let home = tempfile::tempdir().unwrap();
+        let codex = crate::history::sources::codex::tests::home_copy(home.path());
+        let env = crate::env::HistoryEnv::sandbox(home.path()).with_codex_home(&codex);
+        let config = crate::config::ConfigFile::default();
+        const EXEC: &str = "01a00000-0000-7000-8000-000000000006";
+        let rollout = crate::history::sources::codex::discover::list(&codex)
+            .unwrap()
+            .into_iter()
+            .find(|rollout| rollout.thread_id == EXEC)
+            .expect("exec rollout");
+        let key = conversation_key_for_path(&env, &config, &rollout.path)
+            .unwrap()
+            .expect("a hidden Codex thread has a key");
+        assert_eq!(key.source, SourceKind::Codex);
+        assert_eq!(key.session_id, EXEC);
+        let (keys, _) = crate::agent::service::discover_agent_keys(&env, None, None, true).unwrap();
+        let full_ref = key.conversation_ref().full_ref();
+        let resolved = resolve_conversation_ref(&keys, &full_ref).unwrap();
+        assert_eq!(resolved.key.session_id, EXEC);
+        assert_eq!(
+            resolved.key.path.canonicalize().unwrap(),
+            rollout.path.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
     fn claude_keys_agree_between_discovery_and_the_registry() {
         // Windows: `AgentConversationKey::new` and `Registry::key_of` must
         // build the same native id (same separator), or a warning's ref
@@ -833,7 +866,7 @@ mod tests {
         )
         .unwrap();
 
-        let discovered = crate::agent::service::discover_agent_keys(&env, None, None)
+        let discovered = crate::agent::service::discover_agent_keys(&env, None, None, true)
             .unwrap()
             .0
             .into_iter()
@@ -886,7 +919,7 @@ mod tests {
             fork_key.conversation_ref().full_ref()
         );
         // The full ref addresses exactly this transcript.
-        let keys = crate::agent::service::discover_agent_keys(&env, None, None)
+        let keys = crate::agent::service::discover_agent_keys(&env, None, None, true)
             .unwrap()
             .0;
         let resolved = resolve_conversation_ref(&keys, &key.conversation_ref().full_ref()).unwrap();

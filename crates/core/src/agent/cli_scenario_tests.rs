@@ -66,6 +66,7 @@ fn parse(args: &[&str]) -> AgentRequest {
                 match (flag, value) {
                     ("lexical", None) => search.search_mode.lexical = true,
                     ("exact", None) => search.search_mode.exact = true,
+                    ("all-kinds", None) => search.all_kinds = true,
                     ("mode", Some(mode)) => {
                         search.search_mode.mode = Some(mode.parse::<SearchMode>().unwrap())
                     }
@@ -317,6 +318,32 @@ fn codex_threads_support_agent_search_read_and_outline() {
     let hidden = run_env(&env, &["agent", "search", "--lexical", "iguana report"]);
     assert!(hidden.success, "{}", hidden.stderr);
     assert!(!hidden.stdout.contains(EXEC), "{}", hidden.stdout);
+
+    // --all-kinds searches them, and their refs resolve without it.
+    let all = run_env(
+        &env,
+        &[
+            "agent",
+            "search",
+            "--lexical",
+            "--all-kinds",
+            "iguana report",
+        ],
+    );
+    assert!(all.success, "{}", all.stderr);
+    assert!(
+        all.stdout.contains(&format!("uuid={EXEC}")),
+        "{}",
+        all.stdout
+    );
+    let exec_ref = first_ref(&all.stdout);
+    let exec_outline = run_env(&env, &["agent", "outline", &exec_ref]);
+    assert!(exec_outline.success, "{}", exec_outline.stderr);
+    assert!(
+        exec_outline.stdout.contains(&format!("uuid={EXEC}")),
+        "{}",
+        exec_outline.stdout
+    );
 }
 
 #[test]

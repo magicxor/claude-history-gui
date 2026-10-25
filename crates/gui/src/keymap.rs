@@ -4,9 +4,10 @@
 //! 1. the static table (§8.3) in table order, incl. the `ConversationList > Input`
 //!    and `Workspace > Input` duplicates that beat the focused Input;
 //! 2. the input-editing bindings (§8.4);
-//! 3. the user-configurable bindings (§8.5) in the order rename, refresh,
-//!    fork, resume, delete — later wins at equal depth, which reproduces the
-//!    TUI check order delete > resume > fork > refresh > rename (C-028).
+//! 3. the user-configurable bindings (§8.5) in the order rename, all kinds,
+//!    refresh, fork, resume, delete — later wins at equal depth, which
+//!    reproduces the TUI check order delete > resume > fork > refresh > all
+//!    kinds > rename (C-028).
 //!    They are validated first, at startup too: a rejected binding (reserved
 //!    clipboard/editing keys, §8.5) keeps the default and is reported in the
 //!    debug log, like every warning.
@@ -374,17 +375,19 @@ fn user_binding_rows(chord: &KeyChord, action: Box<dyn Action>) -> Result<Vec<Ke
         .collect()
 }
 
-/// The user-configurable bindings (§8.5) in registration order rename,
-/// refresh, fork, resume, delete. Does not validate (see [`sanitize_keys`]).
+/// The user-configurable bindings (§8.5) in registration order rename, all
+/// kinds, refresh, fork, resume, delete. Does not validate (see
+/// [`sanitize_keys`]).
 pub fn user_bindings(keys: &KeyBindings) -> Result<Vec<KeyBinding>, String> {
-    let ordered: [(&KeyChord, Box<dyn Action>); 5] = [
+    let ordered: [(&KeyChord, Box<dyn Action>); 6] = [
         (&keys.rename, Box::new(Rename)),
+        (&keys.all_kinds, Box::new(ToggleAllKinds)),
         (&keys.refresh, Box::new(Refresh)),
         (&keys.fork, Box::new(Fork)),
         (&keys.resume, Box::new(Resume)),
         (&keys.delete, Box::new(Delete)),
     ];
-    let mut out = Vec::with_capacity(15);
+    let mut out = Vec::with_capacity(18);
     for (chord, action) in ordered {
         out.extend(user_binding_rows(chord, action)?);
     }
@@ -422,6 +425,7 @@ pub fn sanitize_keys(keys: &KeyBindings) -> (KeyBindings, KeyValidation) {
             KeyAction::Rename => effective.rename = default,
             KeyAction::Delete => effective.delete = default,
             KeyAction::Refresh => effective.refresh = default,
+            KeyAction::AllKinds => effective.all_kinds = default,
         }
     }
     (effective, validation)
@@ -476,7 +480,7 @@ fn report_validation(configured: &KeyBindings, validation: &KeyValidation, cx: &
     }
 }
 
-/// Rebind the five configurable actions live (Settings → Keys). Validates
+/// Rebind the six configurable actions live (Settings → Keys). Validates
 /// first: a rejected binding (reserved key, unparseable key) is an error
 /// and changes nothing. The keymap update runs deferred.
 pub fn install_user_bindings(cx: &mut App, keys: &KeyBindings) -> Result<(), String> {
@@ -819,6 +823,16 @@ static HELP_ROWS: &[HelpRow] = &[
     help!(List, [key!(Rename)], L, "Rename", ""),
     help!(List, [key!(Delete)], L, "Delete", ""),
     help!(List, [key!(Refresh)], L, "Refresh conversations", ""),
+    help!(
+        List,
+        [key!(ToggleAllKinds)],
+        L,
+        crate::menus::ALL_KINDS_LABEL,
+        "",
+        HelpWhen::Always,
+        HelpWindows::MainOnly,
+        None
+    ),
     help!(List, [key!(ClearQuery, "escape")], L, "Clear search", "Esc"),
     help!(List, [key!(MoveEnd, "ctrl-e")], LI, "End of line", "Ctrl+E"),
     help!(
@@ -1557,6 +1571,7 @@ pub fn chord_of(keys: &KeyBindings, action: KeyAction) -> KeyChord {
         KeyAction::Rename => keys.rename,
         KeyAction::Delete => keys.delete,
         KeyAction::Refresh => keys.refresh,
+        KeyAction::AllKinds => keys.all_kinds,
     }
 }
 
@@ -1568,9 +1583,11 @@ mod tests {
     #[test]
     fn user_bindings_cover_every_context_in_registration_order() {
         let bindings = user_bindings(&KeyBindings::default()).unwrap();
-        assert_eq!(bindings.len(), 15);
+        assert_eq!(bindings.len(), 18);
         assert!(bindings[0].action().as_any().is::<Rename>());
-        assert!(bindings[14].action().as_any().is::<Delete>());
+        assert!(bindings[3].action().as_any().is::<ToggleAllKinds>());
+        assert!(bindings[6].action().as_any().is::<Refresh>());
+        assert!(bindings[17].action().as_any().is::<Delete>());
     }
 
     #[test]
@@ -1597,6 +1614,7 @@ mod tests {
             rename: Some(parse_key_binding("f2").unwrap()),
             delete: Some(parse_key_binding("f2").unwrap()),
             refresh: None,
+            all_kinds: None,
         };
         let validation = validate_keys(&keys);
         assert_eq!(

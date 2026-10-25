@@ -325,6 +325,87 @@ fn automated_and_child_conversations_are_not_listed_or_searchable() {
 }
 
 #[test]
+fn all_kinds_toggles_hidden_conversations_keeping_query_and_selection() {
+    // Upstream cb990e6 (Ctrl+G), in memory: automated and child
+    // conversations come into the list and its search and go again; the
+    // query and the selected session stay.
+    let sandbox = Sandbox::new();
+    let mut automated = conversation(
+        Some("Auto"),
+        "-tmp-auto",
+        "11111111-1111-4111-8111-111111111111",
+        "shared needle",
+    );
+    automated.provenance.automated = true;
+    let mut child = conversation(
+        Some("Child"),
+        "-tmp-child",
+        "22222222-2222-4222-8222-222222222222",
+        "other words",
+    );
+    child.provenance.child = true;
+    let plain = conversation(
+        Some("Plain"),
+        "-tmp-plain",
+        "33333333-3333-4333-8333-333333333333",
+        "shared needle",
+    );
+    let other = conversation(
+        Some("Other"),
+        "-tmp-other",
+        "44444444-4444-4444-8444-444444444444",
+        "unrelated",
+    );
+    let mut app = app(&sandbox, vec![automated, child, plain, other], vec![]);
+    assert!(!app.all_kinds());
+    assert_eq!(filtered_projects(&app), vec![Some("Plain"), Some("Other")]);
+    app.select(1);
+
+    app.toggle_all_kinds();
+    assert!(app.all_kinds());
+    assert_eq!(
+        filtered_projects(&app),
+        vec![Some("Auto"), Some("Child"), Some("Plain"), Some("Other")]
+    );
+    assert_eq!(
+        app.selected_conversation()
+            .and_then(|c| c.project_name.as_deref()),
+        Some("Other"),
+        "the selected session stays selected"
+    );
+
+    app.toggle_all_kinds();
+    app.set_query("needle");
+    wait_for_search(&mut app);
+    assert!(!app.all_kinds());
+    assert_eq!(filtered_projects(&app), vec![Some("Plain")]);
+    let plain = app.selected_path();
+
+    // The search runs again with them in, keeping the query and the
+    // selected session whatever row it lands on.
+    app.toggle_all_kinds();
+    wait_for_search(&mut app);
+    assert_eq!(app.query(), "needle");
+    let mut found = filtered_projects(&app);
+    found.sort();
+    assert_eq!(found, vec![Some("Auto"), Some("Plain")]);
+    assert_eq!(app.selected_path(), plain);
+
+    app.toggle_all_kinds();
+    wait_for_search(&mut app);
+    assert!(!app.all_kinds());
+    assert_eq!(filtered_projects(&app), vec![Some("Plain")]);
+
+    app.escape();
+    assert_eq!(filtered_projects(&app), vec![Some("Plain"), Some("Other")]);
+    // Unchanged state is a no-op; the start state comes from the options.
+    app.set_all_kinds(false);
+    assert!(!app.all_kinds());
+    let started = Browser::new(Vec::new(), sandbox.options().with_all_kinds(true));
+    assert!(started.all_kinds());
+}
+
+#[test]
 fn exclude_projects_filters_search_results() {
     let sandbox = Sandbox::new();
     let mut app = app(

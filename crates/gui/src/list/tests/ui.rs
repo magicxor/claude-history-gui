@@ -370,6 +370,140 @@ fn recorded_agent_cwds_skip_hidden_codex_threads(cx: &mut TestAppContext) {
     assert!(cwds.is_empty(), "{cwds:?}");
 }
 
+/// The listed Codex thread 002 and the hidden exec (006) and subagent (007)
+/// threads of core's Codex fixtures.
+fn codex_kinds_world() -> TestWorld {
+    let world = TestWorld::new();
+    for (day, name, bytes) in [
+        (
+            "01",
+            "rollout-2026-09-01T10-00-00-01a00000-0000-7000-8000-000000000002.jsonl",
+            &include_bytes!(
+                "../../../../core/tests/fixtures/codex/sessions/2026/09/01/rollout-2026-09-01T10-00-00-01a00000-0000-7000-8000-000000000002.jsonl"
+            )[..],
+        ),
+        (
+            "02",
+            "rollout-2026-09-02T11-00-00-01a00000-0000-7000-8000-000000000006.jsonl",
+            &include_bytes!(
+                "../../../../core/tests/fixtures/codex/sessions/2026/09/02/rollout-2026-09-02T11-00-00-01a00000-0000-7000-8000-000000000006.jsonl"
+            )[..],
+        ),
+        (
+            "02",
+            "rollout-2026-09-02T12-00-00-01a00000-0000-7000-8000-000000000007.jsonl",
+            &include_bytes!(
+                "../../../../core/tests/fixtures/codex/sessions/2026/09/02/rollout-2026-09-02T12-00-00-01a00000-0000-7000-8000-000000000007.jsonl"
+            )[..],
+        ),
+    ] {
+        world.add_fixture(&format!(".codex/sessions/2026/09/{day}/{name}"), bytes);
+    }
+    world
+}
+
+/// The thread number (last UUID digits) of each listed row and its kind tag.
+fn codex_rows(f: &ListFixture, cx: &TestAppContext) -> Vec<(String, Option<&'static str>)> {
+    f.read(cx, |list, _| {
+        let rows = list.filtered_paths().len();
+        list.row_models(0..rows, 480.0)
+            .into_iter()
+            .map(|row| {
+                let stem = row.stem.clone();
+                (stem[stem.len() - 3..].to_string(), row.kind_label)
+            })
+            .collect()
+    })
+}
+
+/// L-104 (upstream cb990e6): Ctrl+G lists the automated (exec) and subagent
+/// Codex threads, tagged `auto` / `sub` on line 2, keeping the query and the
+/// selected conversation; again Ctrl+G hides them. The View menu item and the
+/// footer's `all kinds` chip follow the toggle.
+#[gpui_kit::test]
+fn ctrl_g_lists_automated_and_subagent_threads(cx: &mut TestAppContext) {
+    let world = codex_kinds_world();
+    let f = ListFixture::open_loaded(cx, &world, &[]);
+    assert_eq!(codex_rows(&f, cx), [("002".to_string(), None)]);
+    let probe = |cx: &TestAppContext| f.read(cx, |list, cx| list.qa_probe("list.all_kinds", cx));
+    assert_eq!(probe(cx).as_deref(), Some("false"));
+    assert!(!cx.read(|cx| crate::menus::current_checks(cx).all_kinds));
+    let wide_footer = |cx: &mut TestAppContext| {
+        cx.update_window(f.handle, |_, window, cx| {
+            window.render_frame(cx);
+            f.list.read(cx).footer_model_for_width(120.0, window, cx)
+        })
+        .unwrap()
+    };
+    assert_eq!(chip(&wide_footer(cx), ChipKind::AllKinds), None);
+    let selected = f.selected_path(cx);
+    assert!(selected.is_some());
+
+    f.press(cx, "ctrl-g");
+    f.wait_idle(cx);
+    assert_eq!(probe(cx).as_deref(), Some("true"));
+    // Newest first; the listed thread moves down and stays selected.
+    assert_eq!(
+        codex_rows(&f, cx),
+        [
+            ("007".to_string(), Some("sub")),
+            ("006".to_string(), Some("auto")),
+            ("002".to_string(), None),
+        ]
+    );
+    assert_eq!(f.selected_path(cx), selected, "the selection is kept");
+    assert!(cx.read(|cx| crate::menus::current_checks(cx).all_kinds));
+    assert_eq!(
+        chip(&wide_footer(cx), ChipKind::AllKinds),
+        Some(format!("{} all kinds", kbd("ctrl-g")))
+    );
+    let tagged = f.read(cx, |list, _| {
+        let rows = list.filtered_paths().len();
+        list.row_models(0..rows, 480.0)
+            .into_iter()
+            .find(|row| row.kind_label.is_some())
+            .map(|row| (row.meta_text(), row.tooltip.clone()))
+            .unwrap()
+    });
+    assert!(tagged.0.starts_with("sub · "), "{}", tagged.0);
+    assert!(tagged.1.starts_with("sub · "), "{}", tagged.1);
+
+    // "iguana" is only in the exec thread: the query stays across toggles.
+    f.type_text(cx, "iguana");
+    f.wait_idle(cx);
+    assert_eq!(codex_rows(&f, cx), [("006".to_string(), Some("auto"))]);
+    f.press(cx, "ctrl-g");
+    f.wait_idle(cx);
+    assert_eq!(probe(cx).as_deref(), Some("false"));
+    assert!(codex_rows(&f, cx).is_empty());
+    assert_eq!(f.read(cx, |list, cx| list.query(cx).to_string()), "iguana");
+    f.press(cx, "ctrl-g");
+    f.wait_idle(cx);
+    assert_eq!(codex_rows(&f, cx), [("006".to_string(), Some("auto"))]);
+
+    f.press(cx, "escape");
+    f.press(cx, "ctrl-g");
+    f.wait_idle(cx);
+    assert_eq!(codex_rows(&f, cx), [("002".to_string(), None)]);
+    assert!(!cx.read(|cx| crate::menus::current_checks(cx).all_kinds));
+}
+
+/// C-068: `--all-kinds` starts with the hidden kinds listed; `[keys]
+/// all_kinds` rebinds the toggle.
+#[gpui_kit::test]
+fn the_all_kinds_flag_and_key_binding(cx: &mut TestAppContext) {
+    let world = codex_kinds_world();
+    world.write_config(Some("[keys]\nall_kinds = \"alt+k\"\n"), None);
+    let f = ListFixture::open_loaded(cx, &world, &["--all-kinds"]);
+    assert_eq!(codex_rows(&f, cx).len(), 3);
+    f.press(cx, "ctrl-g");
+    f.wait_idle(cx);
+    assert_eq!(codex_rows(&f, cx).len(), 3, "ctrl-g is no longer bound");
+    f.press(cx, "alt-k");
+    f.wait_idle(cx);
+    assert_eq!(codex_rows(&f, cx), [("002".to_string(), None)]);
+}
+
 #[gpui_kit::test]
 fn recorded_agent_cwds_keep_listed_codex_threads(cx: &mut TestAppContext) {
     let listed = TestWorld::new();

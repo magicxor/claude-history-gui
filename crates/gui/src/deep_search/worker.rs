@@ -391,7 +391,9 @@ fn full_ref_candidates(response: &mut AgentResponse, env: &HistoryEnv, cancelled
             // Cards are only needed for Codex keys.
             let no_cards: &[claude_history_core::history::Conversation] = &[];
             let listed = (!error.detail.contains(" source=codex ")).then_some(no_cards);
-            claude_history_core::agent::service::discover_agent_keys(env, None, listed)
+            // Hidden (exec and subagent) threads too: refs resolve them by
+            // identity (upstream cb990e6).
+            claude_history_core::agent::service::discover_agent_keys(env, None, listed, true)
                 .map(|(keys, _)| keys)
                 .unwrap_or_default()
         } else {

@@ -104,6 +104,7 @@ fn assert_index_consistent(browser: &Browser) {
             0..conversations.len(),
             conversations,
             &browser.excluded_projects,
+            browser.all_kinds,
             browser.workspace_filter,
             browser.workspace.as_ref(),
         );

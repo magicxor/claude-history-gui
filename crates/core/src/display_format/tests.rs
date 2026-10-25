@@ -124,6 +124,7 @@ fn row_header(
         query: &query,
         width,
         show_source_label: false,
+        show_kind_label: true,
         semantic_mode,
         semantic_metadata: metadata,
         now: Local::now(),
@@ -1085,6 +1086,7 @@ fn row_header_shows_source_labels_duration_and_highlights() {
         query: &query,
         width: 160,
         show_source_label: true,
+        show_kind_label: true,
         semantic_mode: false,
         semantic_metadata: None,
         now: Local::now(),
@@ -1107,6 +1109,7 @@ fn row_header_shows_source_labels_duration_and_highlights() {
         query: &query,
         width: 160,
         show_source_label: true,
+        show_kind_label: true,
         semantic_mode: false,
         semantic_metadata: None,
         now: Local::now(),
@@ -1116,6 +1119,41 @@ fn row_header_shows_source_labels_duration_and_highlights() {
     conversation.project_name = None;
     let header = row_header(&conversation, 160, false, None);
     assert_eq!(header.project.text, "");
+}
+
+#[test]
+fn row_header_tags_automated_and_child_conversations_after_the_source() {
+    // Upstream cb990e6: listed hidden kinds are tagged `auto` / `sub`.
+    let mut conversation = test_conversation();
+    conversation.source = crate::history::model::SourceKind::Codex;
+    conversation.provenance.automated = true;
+    fn project(conversation: &Conversation, show_kind_label: bool) -> String {
+        let query = HighlightQuery::parse("");
+        build_row_header(&RowHeaderInput {
+            conversation,
+            query: &query,
+            width: 160,
+            show_source_label: true,
+            show_kind_label,
+            semantic_mode: false,
+            semantic_metadata: None,
+            now: Local::now(),
+        })
+        .project
+        .text
+    }
+    assert_eq!(
+        project(&conversation, true),
+        "CX  · auto · project sentinel"
+    );
+    // A subagent run of an exec run is tagged as the child it is.
+    conversation.provenance.child = true;
+    assert_eq!(project(&conversation, true), "CX  · sub · project sentinel");
+    assert_eq!(project(&conversation, false), "CX  · project sentinel");
+    conversation.provenance = Default::default();
+    conversation.provenance.orphaned = true;
+    let header = row_header(&conversation, 160, false, None);
+    assert_eq!(header.project.text, "project sentinel");
 }
 
 // --- row preview (upstream render_list tests) ---

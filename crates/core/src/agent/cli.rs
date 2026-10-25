@@ -158,6 +158,10 @@ const SEARCH_OPTIONS: &[OptionSpec] = &[
     ),
     flag("local", "Search only the current workspace"),
     flag("all", "Search all workspaces"),
+    flag(
+        "all-kinds",
+        "Also search automated (Codex exec) and subagent conversations",
+    ),
     MODE_OPTIONS[0],
     MODE_OPTIONS[1],
     MODE_OPTIONS[2],
@@ -553,6 +557,7 @@ fn search_args(matches: &Matches) -> Result<AgentSearchArgs, LaunchArgsError> {
         all_hits: matches.flag("all-hits"),
         local: matches.flag("local"),
         all: matches.flag("all"),
+        all_kinds: matches.flag("all-kinds"),
         search_mode: search_mode(matches)?,
         time: TimeRangeArgs {
             since: time_point(matches, "since")?,
@@ -731,7 +736,23 @@ mod tests {
         assert!(search.flat);
         assert_eq!(search.hits_per_conv, Some(5));
         assert!(search.all_hits);
+        assert!(!search.all_kinds);
         assert!(fail(&["search", "cache", "--local", "--all"]).contains("cannot be used with"));
+    }
+
+    #[test]
+    fn agent_search_all_kinds_includes_hidden_conversations() {
+        // Upstream cb990e6: `--all-kinds` also searches automated (Codex exec)
+        // and subagent conversations; it combines with either scope.
+        let AgentRequest::Search(search) = request(&["search", "cache", "--all-kinds", "--local"])
+        else {
+            panic!("search expected");
+        };
+        assert!(search.all_kinds);
+        assert!(search.local);
+        let text = help(&["search", "--help"]);
+        assert!(text.contains("--all-kinds"));
+        assert!(text.contains("Also search automated (Codex exec) and subagent conversations"));
     }
 
     #[test]

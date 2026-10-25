@@ -1299,6 +1299,12 @@ pub struct RowHeaderInput<'a> {
     /// Prefix the project with the source label
     /// ([`crate::browser::Browser::has_multiple_sources`]).
     pub show_source_label: bool,
+    /// Prefix the project with the kind tag of an automated (`auto`) or
+    /// child (`sub`) conversation, after the source label
+    /// ([`crate::history::Provenance::list_label`], upstream cb990e6). Such
+    /// rows are listed only while [`crate::browser::Browser::all_kinds`] is
+    /// on.
+    pub show_kind_label: bool,
     /// Whether the list is in semantic mode.
     pub semantic_mode: bool,
     /// [`crate::browser::Browser::semantic_result_metadata`] of the row.
@@ -1310,8 +1316,10 @@ pub struct RowHeaderInput<'a> {
 /// The parts of a list row's header line, already fitted to the width.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RowHeader {
-    /// `project_name`, prefixed with `"CC  · "`, `"Pi  · "` or `"OMP · "`
-    /// for mixed sources; truncated with `…`. Empty without a project name.
+    /// `project_name`, prefixed with `"auto · "` or `"sub · "` for an
+    /// automated or child conversation, and with `"CC  · "`, `"Pi  · "`,
+    /// `"OMP · "` or `"CX  · "` for mixed sources; truncated with `…`. Empty
+    /// without a project name.
     pub project: HighlightedText,
     /// Custom title (shown after `" · "`), when there is room for it.
     pub custom_title: Option<HighlightedText>,
@@ -1369,10 +1377,18 @@ pub fn build_row_header(input: &RowHeaderInput<'_>) -> RowHeader {
         .project_name
         .as_ref()
         .map(|name| {
+            let name = match conv
+                .provenance
+                .list_label()
+                .filter(|_| input.show_kind_label)
+            {
+                Some(kind) => format!("{kind} · {name}"),
+                None => name.to_string(),
+            };
             if input.show_source_label {
                 format!("{:<3} · {name}", conv.source.list_label())
             } else {
-                name.to_string()
+                name
             }
         })
         .unwrap_or_default();

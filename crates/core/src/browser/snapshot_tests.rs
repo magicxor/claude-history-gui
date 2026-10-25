@@ -1672,3 +1672,65 @@ fn a_cancel_wakes_a_wait_for_the_lock() {
     assert!(waited < Duration::from_secs(60), "{waited:?}");
     assert!(cancel.sleep(Duration::from_secs(60)), "set stays set");
 }
+
+#[test]
+fn hidden_kinds_toggle_in_and_out_of_the_list_and_its_search() {
+    let sandbox = Sandbox::new();
+    let mut corpus = corpus();
+    corpus[0].full_text = "needle".into();
+    let mut exec = conversation("/p/-tmp-alpha/exec.jsonl", 4 * HOUR_MS);
+    exec.provenance.automated = true;
+    exec.full_text = "needle".into();
+    let mut child = conversation("/p/-tmp-beta/child.jsonl", 5 * HOUR_MS);
+    child.provenance.child = true;
+    corpus.extend([exec, child]);
+    let root = publish(&corpus);
+    let mut app = loading_app(&sandbox, None, vec![]);
+    show(&mut app, &root, TimeFilter::default());
+    let shown = [
+        "/p/-tmp-alpha/c.jsonl",
+        "/p/-tmp-beta/b.jsonl",
+        "/p/-tmp-alpha/a.jsonl",
+    ];
+    let all = [
+        "/p/-tmp-beta/child.jsonl",
+        "/p/-tmp-alpha/exec.jsonl",
+        "/p/-tmp-alpha/c.jsonl",
+        "/p/-tmp-beta/b.jsonl",
+        "/p/-tmp-alpha/a.jsonl",
+    ];
+    // Fork: the first cards follow the toggle too, before the index opens.
+    assert_eq!(listed_paths(&app), shown);
+    app.toggle_all_kinds();
+    assert_eq!(listed_paths(&app), all);
+    app.toggle_all_kinds();
+    assert_eq!(listed_paths(&app), shown);
+
+    assert!(app.open_search_index());
+    assert_eq!(listed_paths(&app), shown);
+    app.select_next();
+
+    app.toggle_all_kinds();
+    assert!(app.all_kinds());
+    assert_eq!(listed_paths(&app), all);
+    // Fork: the selected session stays selected (upstream's anchor).
+    assert_eq!(
+        app.selected_path(),
+        Some(PathBuf::from("/p/-tmp-beta/b.jsonl"))
+    );
+
+    type_query(&mut app, "needle");
+    wait_for_search(&mut app);
+    assert_eq!(
+        listed_paths(&app),
+        ["/p/-tmp-alpha/exec.jsonl", "/p/-tmp-alpha/a.jsonl"]
+    );
+
+    app.toggle_all_kinds();
+    wait_for_search(&mut app);
+    assert!(!app.all_kinds());
+    assert_eq!(listed_paths(&app), ["/p/-tmp-alpha/a.jsonl"]);
+
+    app.escape();
+    assert_eq!(listed_paths(&app), shown);
+}

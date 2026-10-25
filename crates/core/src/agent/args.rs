@@ -127,6 +127,8 @@ pub struct AgentSearchArgs {
     pub local: bool,
     /// Search all workspaces
     pub all: bool,
+    /// Also search automated (Codex exec) and subagent conversations
+    pub all_kinds: bool,
     pub search_mode: AgentSearchModeArgs,
     pub time: TimeRangeArgs,
 }

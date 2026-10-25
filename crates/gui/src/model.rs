@@ -455,7 +455,7 @@ impl SettingsPage {
     }
 }
 
-/// The five user-configurable key actions (`[keys]`, §8.5).
+/// The six user-configurable key actions (`[keys]`, §8.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum KeyAction {
     Resume,
@@ -463,25 +463,31 @@ pub enum KeyAction {
     Rename,
     Delete,
     Refresh,
+    /// List or hide automated and subagent conversations (upstream
+    /// cb990e6, `ToggleAllKinds`).
+    AllKinds,
 }
 
 impl KeyAction {
     /// Display order (Settings → Keys).
-    pub const ALL: [KeyAction; 5] = [
+    pub const ALL: [KeyAction; 6] = [
         KeyAction::Resume,
         KeyAction::Fork,
         KeyAction::Rename,
         KeyAction::Delete,
         KeyAction::Refresh,
+        KeyAction::AllKinds,
     ];
 
-    /// The TUI's check order, highest priority first: delete > resume > fork
-    /// > refresh > rename (C-028). With equal keys the earlier one wins.
-    pub const PRIORITY: [KeyAction; 5] = [
+    /// The TUI's check order, highest priority first: delete, resume, fork,
+    /// refresh, all kinds, rename (C-028). With equal keys the earlier one
+    /// wins.
+    pub const PRIORITY: [KeyAction; 6] = [
         KeyAction::Delete,
         KeyAction::Resume,
         KeyAction::Fork,
         KeyAction::Refresh,
+        KeyAction::AllKinds,
         KeyAction::Rename,
     ];
 
@@ -492,6 +498,7 @@ impl KeyAction {
             KeyAction::Rename => "Rename",
             KeyAction::Delete => "Delete",
             KeyAction::Refresh => "Refresh",
+            KeyAction::AllKinds => crate::menus::ALL_KINDS_LABEL,
         }
     }
 
@@ -503,6 +510,7 @@ impl KeyAction {
             KeyAction::Rename => "rename",
             KeyAction::Delete => "delete",
             KeyAction::Refresh => "refresh",
+            KeyAction::AllKinds => "all_kinds",
         }
     }
 
@@ -804,7 +812,9 @@ mod tests {
     #[test]
     fn key_action_priority_follows_the_tui_check_order() {
         assert_eq!(KeyAction::Delete.priority(), 0);
-        assert_eq!(KeyAction::Rename.priority(), 4);
+        assert_eq!(KeyAction::Rename.priority(), 5);
         assert!(KeyAction::Resume.priority() < KeyAction::Fork.priority());
+        assert!(KeyAction::Refresh.priority() < KeyAction::AllKinds.priority());
+        assert!(KeyAction::AllKinds.priority() < KeyAction::Rename.priority());
     }
 }

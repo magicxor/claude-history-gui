@@ -7,7 +7,8 @@
 //! displayed. While the initial load runs (AD6) the rename and delete chips
 //! are dimmed, and open, resume and fork until the rows are listed newest
 //! first (snapshot cards, upstream 3708bb6). Refresh is never advertised
-//! (L-041).
+//! (L-041). While automated and subagent conversations are listed, an
+//! active `all kinds` chip says so (upstream cb990e6's `^G·all kinds`).
 
 use claude_history_core::browser::{ListSearchMode, SemanticProgress};
 use gpui_kit::component::kbd::Kbd;
@@ -23,8 +24,8 @@ use gpui_kit::{
 };
 
 use crate::actions::{
-    ClearQuery, Delete, Fork, OpenConversation, Rename, Resume, ShowShortcuts, ToggleScope,
-    ToggleSearchMode,
+    ClearQuery, Delete, Fork, OpenConversation, Rename, Resume, ShowShortcuts, ToggleAllKinds,
+    ToggleScope, ToggleSearchMode,
 };
 use crate::keymap::{CTX_LIST, CTX_WORKSPACE, binding_labels};
 use crate::theme_tokens::roles;
@@ -114,6 +115,8 @@ pub enum ChipKind {
     Rename,
     Delete,
     Scope,
+    /// Shown only while automated and subagent conversations are listed.
+    AllKinds,
     Mode,
     Help,
 }
@@ -235,6 +238,7 @@ impl ListPane {
                     dimmed: spec.dimmed,
                     active: match spec.kind {
                         ChipKind::Scope => self.scope_is_workspace(),
+                        ChipKind::AllKinds => true,
                         ChipKind::Mode => self.mode() == ListSearchMode::Semantic,
                         _ => false,
                     },
@@ -334,6 +338,16 @@ impl ListPane {
                 false,
             ));
         }
+        if self.all_kinds() {
+            specs.extend(spec(
+                ChipKind::AllKinds,
+                Box::new(ToggleAllKinds),
+                CTX_LIST,
+                HINT_STACK,
+                "all kinds",
+                false,
+            ));
+        }
         let mode = match self.mode() {
             ListSearchMode::Lexical => "lex",
             ListSearchMode::Semantic => "sem",
@@ -363,11 +377,25 @@ impl ListPane {
 fn fit_chips(specs: &[ChipSpec], count: &str, pane_rem: f32) -> Vec<bool> {
     let count_rem = count.chars().count() as f32 * CHAR_REM + 1.0;
     let available = pane_rem - FOOTER_PADDING_REM - count_rem;
+    let width_of =
+        |spec: &ChipSpec| chip_width_rem(spec.key.chars().count(), spec.label.chars().count());
+    // `Ctrl+G all kinds` is the only sign of the toggle's state: it is never dropped.
+    let pinned = specs
+        .iter()
+        .position(|spec| spec.kind == ChipKind::AllKinds);
+    let Some(pinned) = pinned else {
+        let widths: Vec<f32> = specs.iter().map(width_of).collect();
+        return trim_chips(&widths, available);
+    };
     let widths: Vec<f32> = specs
         .iter()
-        .map(|spec| chip_width_rem(spec.key.chars().count(), spec.label.chars().count()))
+        .enumerate()
+        .filter(|(ix, _)| *ix != pinned)
+        .map(|(_, spec)| width_of(spec))
         .collect();
-    trim_chips(&widths, available)
+    let mut kept = trim_chips(&widths, available - width_of(&specs[pinned]) - CHIP_GAP_REM);
+    kept.insert(pinned, true);
+    kept
 }
 
 /// The estimated width of a chip (rem).

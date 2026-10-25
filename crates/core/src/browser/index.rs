@@ -236,12 +236,14 @@ impl SourceCounts {
     }
 }
 
-/// What decides whether a row is in scope: the excluded project names and,
-/// when the workspace scope is on, the workspace.
+/// What decides whether a row is in scope: the excluded project names, when
+/// the workspace scope is on, the workspace, and whether automated and child
+/// conversations are listed.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct ScopeSettings {
     pub(super) excluded: HashSet<String>,
     pub(super) workspace: Option<WorkspaceScope>,
+    pub(super) all_kinds: bool,
 }
 
 /// The scope test of one conversation (upstream
@@ -250,7 +252,8 @@ pub(super) struct ScopeSettings {
 /// * A conversation is excluded when its project name is in the excluded
 ///   names, or is a worktree `parent/branch` whose parent is. Conversations
 ///   without a project name are never excluded.
-/// * Automated and child conversations are never listed (upstream 8f60c5f).
+/// * Automated and child conversations are listed only with `all_kinds`
+///   (upstream 8f60c5f, cb990e6).
 /// * With a workspace, Claude conversations are kept when their project
 ///   directory is the same project as the workspace (worktree aware);
 ///   Pi/OMP conversations when their project path (or cwd) is the workspace
@@ -258,6 +261,7 @@ pub(super) struct ScopeSettings {
 pub(super) struct ScopeFilter<'a> {
     excluded: &'a HashSet<String>,
     workspace: Option<&'a WorkspaceScope>,
+    all_kinds: bool,
     /// The workspace canonicalized once (upstream: once per row).
     workspace_dir: Option<PathBuf>,
 }
@@ -266,16 +270,27 @@ impl<'a> ScopeFilter<'a> {
     pub(super) fn new(
         excluded: &'a HashSet<String>,
         workspace: Option<&'a WorkspaceScope>,
+        all_kinds: bool,
     ) -> Self {
         Self {
             excluded,
             workspace,
+            all_kinds,
             workspace_dir: None,
         }
     }
 
+    /// The filter of `settings`.
+    pub(super) fn of(settings: &'a ScopeSettings) -> Self {
+        Self::new(
+            &settings.excluded,
+            settings.workspace.as_ref(),
+            settings.all_kinds,
+        )
+    }
+
     pub(super) fn passes(&mut self, conversation: &Conversation) -> bool {
-        if conversation.provenance.hidden_by_default() {
+        if !self.all_kinds && conversation.provenance.hidden_by_default() {
             return false;
         }
         if conversation
@@ -397,7 +412,7 @@ pub(super) struct ScopeIndex {
 impl ScopeIndex {
     /// Evaluate every conversation (O(n); off the UI thread for loads).
     pub(super) fn compute(conversations: &[Arc<Conversation>], settings: ScopeSettings) -> Self {
-        let mut filter = ScopeFilter::new(&settings.excluded, settings.workspace.as_ref());
+        let mut filter = ScopeFilter::of(&settings);
         let member = conversations
             .iter()
             .map(|conversation| filter.passes(conversation))
@@ -444,10 +459,12 @@ impl ScopeIndex {
         &self,
         excluded: &HashSet<String>,
         workspace: Option<&WorkspaceScope>,
+        all_kinds: bool,
         len: usize,
     ) -> bool {
         self.valid
             && self.member.len() == len
+            && self.settings.all_kinds == all_kinds
             && self.settings.workspace.as_ref() == workspace
             && self.settings.excluded == *excluded
     }
@@ -474,8 +491,7 @@ impl ScopeIndex {
             self.invalidate();
             return;
         }
-        let mut filter =
-            ScopeFilter::new(&self.settings.excluded, self.settings.workspace.as_ref());
+        let mut filter = ScopeFilter::of(&self.settings);
         let added = conversations[start..]
             .iter()
             .map(|conversation| filter.passes(conversation))
@@ -507,8 +523,7 @@ impl ScopeIndex {
             self.invalidate();
             return;
         }
-        let mut filter =
-            ScopeFilter::new(&self.settings.excluded, self.settings.workspace.as_ref());
+        let mut filter = ScopeFilter::of(&self.settings);
         let member = filter.passes(&conversations[position]);
         if self.member[position] == member {
             return;

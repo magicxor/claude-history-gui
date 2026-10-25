@@ -4,6 +4,11 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 ## Unreleased
 
+- Codex exec runs and subagent threads can be listed on request: Ctrl+G (View > Show automated and subagent
+  conversations, rebindable as `[keys] all_kinds`) or `--all-kinds` brings them into the list and its keyword search,
+  tagged `auto` or `sub`, keeping the query and the selection. Deep Search's "Include exec and subagent runs" (`agent
+  search --all-kinds`) searches them too, and their refs open in the agent panel either way. Semantic search never
+  finds them.
 - Conversation refs and message anchors in Deep Search and the agent panel change once: a Codex thread keeps its ref
   across reverts and archiving, and a Pi or OMP ref no longer depends on its working directory still existing. Old
   refs and anchors still resolve; an anchor whose message was edited or dropped is reported as `stale-anchor`.

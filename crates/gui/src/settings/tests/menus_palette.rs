@@ -197,6 +197,7 @@ fn the_tree_marks_each_state() {
         show_timing: true,
         semantic_mode: true,
         workspace_scope: true,
+        all_kinds: true,
         picker: false,
         header_session_id: false,
     });
@@ -209,6 +210,7 @@ fn the_tree_marks_each_state() {
         ("View", "Show timestamps"),
         ("View › Search mode", "Semantic"),
         ("View › Scope", "Workspace"),
+        ("View", menus::ALL_KINDS_LABEL),
     ] {
         assert!(checked(&leaves, path, name), "{path} / {name}");
     }
