@@ -35,6 +35,7 @@ fn conversation(project: Option<&str>, project_dir: &str, uuid: &str, text: &str
         model: None,
         total_tokens: 0,
         duration_minutes: None,
+        provenance: Default::default(),
     }
 }
 
@@ -288,6 +289,39 @@ fn exclude_projects_filters_worktrees_by_parent_project() {
         filtered_projects(&app),
         vec![Some("other/exclude-projects")]
     );
+}
+
+#[test]
+fn automated_and_child_conversations_are_not_listed_or_searchable() {
+    let sandbox = Sandbox::new();
+    let mut automated = conversation(
+        Some("Auto"),
+        "-tmp-auto",
+        "11111111-1111-4111-8111-111111111111",
+        "shared needle",
+    );
+    automated.provenance.automated = true;
+    let mut child = conversation(
+        Some("Child"),
+        "-tmp-child",
+        "22222222-2222-4222-8222-222222222222",
+        "shared needle",
+    );
+    child.provenance.child = true;
+    let mut orphaned = conversation(
+        Some("Orphan"),
+        "-tmp-orphan",
+        "33333333-3333-4333-8333-333333333333",
+        "shared needle",
+    );
+    orphaned.provenance.orphaned = true;
+    let mut app = app(&sandbox, vec![automated, child, orphaned], vec![]);
+
+    assert_eq!(filtered_projects(&app), vec![Some("Orphan")]);
+    app.query = "needle".to_string();
+    app.update_filter();
+    wait_for_search(&mut app);
+    assert_eq!(filtered_projects(&app), vec![Some("Orphan")]);
 }
 
 #[test]

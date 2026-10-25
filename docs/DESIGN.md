@@ -134,7 +134,7 @@ Resolution at startup, first match wins:
 3. the launch cwd if it is *meaningful*: it is not a filesystem root, not the home directory, not the directory of
    the executable (or of the `.app` bundle), and (a) maps to an existing Claude projects dir
    (`env.claude_projects_dir_for(cwd).is_dir()`), or (b) has a `.git` entry (dir or file), or (c) is the recorded
-   cwd of at least one Pi, OMP or Codex session (any non-Claude source; 7f5c443) (checked after the first load batch; if it matches and no workspace was
+   cwd of at least one listed (not automated or child) Pi, OMP or Codex session (any non-Claude source; 7f5c443, 8f60c5f) (checked after the first load batch; if it matches and no workspace was
    chosen yet, the workspace is set then and a refresh is not needed because Pi/OMP/Codex roots do not depend on it);
 4. `[gui] default_workspace` from gui.toml if it exists **[FLAG: added; an explicit config value beats remembered
    state]**;
@@ -3782,7 +3782,7 @@ changes below (commits `integrator: …` on master). Contract changes a Phase-B 
   reconcile pass, `ListPane::is_reconciling()` false: a fresh store first lists only its newest delta generation) the
   main window calls
   `startup::apply_recorded_cwd_workspace(cx, ListPane::recorded_agent_cwds())` once (new `ListPane` method: the
-  distinct cwds of the loaded Pi/OMP/Codex conversations, i.e. every non-Claude source); on a match `AppState.workspace` is set and the list re-scopes
+  distinct cwds of the listed Pi/OMP/Codex conversations, i.e. every non-Claude source except automated and child ones); on a match `AppState.workspace` is set and the list re-scopes
   through `ListPane::set_workspace` (a background reload).
 * **Keymap (WP6)**: `keymap::install_all` also binds `help::shortcuts::bindings()` (context `ShortcutsDialog`); code
   that clears and rebuilds the keymap keeps them (`install_user_bindings` does). Status-bar hints look bindings up with

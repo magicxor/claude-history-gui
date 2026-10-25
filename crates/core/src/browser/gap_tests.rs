@@ -45,6 +45,7 @@ fn conversation(path: PathBuf, text: &str) -> Conversation {
         model: None,
         total_tokens: 0,
         duration_minutes: None,
+        provenance: Default::default(),
     }
 }
 

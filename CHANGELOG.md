@@ -45,6 +45,9 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 - Codex threads are listed and searchable next to Claude Code, Pi and OMP conversations (marked `CX`), read from
   `~/.codex` or `CODEX_HOME`, including archived and compressed sessions, with the titles Codex keeps in its state
   database (only ever read). Opening, resuming, forking, renaming and deleting them is not available yet.
+- Automated runs (such as `codex exec`) and subagent threads no longer appear in the list, list search or semantic
+  search (Deep search still finds them); Codex subagent threads whose task came from their parent are no longer
+  skipped as empty.
 
 ## v0.1.1
 

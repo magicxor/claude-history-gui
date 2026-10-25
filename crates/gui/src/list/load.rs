@@ -546,6 +546,9 @@ impl ListPane {
                             let Some(path) = &conversation.project_path else {
                                 continue;
                             };
+                            if conversation.provenance.hidden_by_default() {
+                                continue;
+                            }
                             if !seen.insert(path.clone()) {
                                 continue;
                             }

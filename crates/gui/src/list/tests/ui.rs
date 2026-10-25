@@ -337,6 +337,53 @@ fn the_row_menu_disables_modifying_items_while_loading(cx: &mut TestAppContext) 
     );
 }
 
+/// PD3 rule 3 (c): a directory recorded only by automated or child Codex
+/// threads (hidden from the list) is no recorded cwd; a listed thread's is.
+#[gpui_kit::test]
+fn recorded_agent_cwds_skip_hidden_codex_threads(cx: &mut TestAppContext) {
+    let hidden = TestWorld::new();
+    for (name, bytes) in [
+        (
+            "rollout-2026-09-02T11-00-00-01a00000-0000-7000-8000-000000000006.jsonl",
+            &include_bytes!(
+                "../../../../core/tests/fixtures/codex/sessions/2026/09/02/rollout-2026-09-02T11-00-00-01a00000-0000-7000-8000-000000000006.jsonl"
+            )[..],
+        ),
+        (
+            "rollout-2026-09-02T12-00-00-01a00000-0000-7000-8000-000000000007.jsonl",
+            &include_bytes!(
+                "../../../../core/tests/fixtures/codex/sessions/2026/09/02/rollout-2026-09-02T12-00-00-01a00000-0000-7000-8000-000000000007.jsonl"
+            )[..],
+        ),
+    ] {
+        hidden.add_fixture(&format!(".codex/sessions/2026/09/02/{name}"), bytes);
+    }
+    let f = ListFixture::open_loaded(cx, &hidden, &[]);
+    let (total, cwds) = cx.read(|cx| {
+        let list = f.list.read(cx);
+        (
+            list.browser().conversations().len(),
+            list.recorded_agent_cwds(),
+        )
+    });
+    assert_eq!(total, 2, "both hidden threads are in the corpus");
+    assert!(cwds.is_empty(), "{cwds:?}");
+}
+
+#[gpui_kit::test]
+fn recorded_agent_cwds_keep_listed_codex_threads(cx: &mut TestAppContext) {
+    let listed = TestWorld::new();
+    listed.add_fixture(
+        ".codex/sessions/2026/09/01/rollout-2026-09-01T10-00-00-01a00000-0000-7000-8000-000000000002.jsonl",
+        include_bytes!(
+            "../../../../core/tests/fixtures/codex/sessions/2026/09/01/rollout-2026-09-01T10-00-00-01a00000-0000-7000-8000-000000000002.jsonl"
+        ),
+    );
+    let f = ListFixture::open_loaded(cx, &listed, &[]);
+    let cwds = cx.read(|cx| f.list.read(cx).recorded_agent_cwds());
+    assert_eq!(cwds, vec![std::path::PathBuf::from("/work/demo")]);
+}
+
 /// L-081: the workspace picker shows Recent and Projects from cached data,
 /// makes no file-system call when built, and Choose folder… switches.
 #[gpui_kit::test]

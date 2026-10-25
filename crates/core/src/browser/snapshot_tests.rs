@@ -296,6 +296,67 @@ fn index_answers_queries_with_evidence_from_frames() {
 }
 
 #[test]
+fn automated_and_child_threads_are_hidden_in_generation_mode() {
+    use crate::history::sources::Registry;
+    const EXEC: &str = "01a00000-0000-7000-8000-000000000006";
+    const SUB: &str = "01a00000-0000-7000-8000-000000000007";
+    fn settle(dir: &Path) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                settle(&path);
+            } else {
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(SystemTime::now() - Duration::from_secs(3600))
+                    .unwrap();
+            }
+        }
+    }
+
+    let sandbox = Sandbox::new();
+    let work = tempfile::tempdir().unwrap();
+    let home = crate::history::sources::codex::tests::home_copy(work.path());
+    settle(&home);
+    let root = work.path().join("store");
+    let registry = Registry::with_roots(None, None, None).with_codex(Some(home));
+    crate::store::reconcile::reconcile(&root, &registry).unwrap();
+
+    let mut app = loading_app(&sandbox, None, vec![]);
+    let snapshot = crate::store::Snapshot::open(&root, true, TimeFilter::default()).unwrap();
+    app.show_snapshot(snapshot);
+    assert!(app.open_search_index());
+
+    let ids = |app: &Browser| -> Vec<String> {
+        app.filtered()
+            .iter()
+            .map(|&index| app.conversations()[index].session_id.to_string())
+            .collect()
+    };
+    let listed = ids(&app);
+    assert!(!listed.is_empty());
+    assert!(!listed.iter().any(|id| id == EXEC || id == SUB));
+
+    for (query, hidden) in [("iguana", EXEC), ("armadillo", SUB)] {
+        app.set_query(query);
+        wait_for_search(&mut app);
+        assert!(!ids(&app).iter().any(|id| id == hidden), "{query}");
+    }
+    app.set_query("walrus");
+    wait_for_search(&mut app);
+    assert!(!ids(&app).is_empty());
+
+    // Upstream parity: the session id still finds a hidden thread.
+    for hidden in [EXEC, SUB] {
+        app.set_query(hidden);
+        wait_for_search(&mut app);
+        assert!(ids(&app).iter().any(|id| id == hidden), "{hidden}");
+    }
+}
+
+#[test]
 fn index_results_match_in_memory_search() {
     let sandbox = Sandbox::new();
     let corpus = needle_corpus();

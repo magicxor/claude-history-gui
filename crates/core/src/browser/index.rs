@@ -249,6 +249,7 @@ pub(super) struct ScopeSettings {
 /// * A conversation is excluded when its project name is in the excluded
 ///   names, or is a worktree `parent/branch` whose parent is. Conversations
 ///   without a project name are never excluded.
+/// * Automated and child conversations are never listed (upstream 8f60c5f).
 /// * With a workspace, Claude conversations are kept when their project
 ///   directory is the same project as the workspace (worktree aware);
 ///   Pi/OMP conversations when their project path (or cwd) is the workspace
@@ -273,6 +274,9 @@ impl<'a> ScopeFilter<'a> {
     }
 
     pub(super) fn passes(&mut self, conversation: &Conversation) -> bool {
+        if conversation.provenance.hidden_by_default() {
+            return false;
+        }
         if conversation
             .project_name
             .as_deref()

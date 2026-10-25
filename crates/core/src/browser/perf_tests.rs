@@ -78,6 +78,7 @@ fn synthetic(root: &Path, index: usize) -> Conversation {
         model: Some("claude-opus-4-5-20251101".to_string()),
         total_tokens: 1234,
         duration_minutes: Some(3),
+        provenance: Default::default(),
     }
 }
 

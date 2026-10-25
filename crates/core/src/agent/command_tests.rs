@@ -382,6 +382,7 @@ fn stubbed_conversation(path: PathBuf, message_count: usize) -> history::Convers
         model: None,
         total_tokens: 0,
         duration_minutes: None,
+        provenance: Default::default(),
     }
 }
 
@@ -958,6 +959,7 @@ fn agent_semantic_candidates_require_canonical_transcript_projection() {
         model: None,
         total_tokens: 0,
         duration_minutes: None,
+        provenance: Default::default(),
     };
     let input = agent::search::AgentConversationInput {
         conversation: &conversation,

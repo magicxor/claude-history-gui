@@ -588,12 +588,14 @@ impl ListPane {
     }
 
     /// The distinct working directories recorded by the loaded Pi/OMP
-    /// conversations (every non-Claude source; PD3 rule 3 (c), L-082: the main window passes them to
+    /// conversations (every listed, i.e. not automated or child, non-Claude source; PD3 rule 3 (c), L-082: the main window passes them to
     /// `startup::apply_recorded_cwd_workspace` after the first load).
     pub fn recorded_agent_cwds(&self) -> Vec<PathBuf> {
         let mut cwds: Vec<PathBuf> = Vec::new();
         for conversation in self.browser.conversations() {
-            if conversation.source == claude_history_core::history::Source::Claude {
+            if conversation.source == claude_history_core::history::Source::Claude
+                || conversation.provenance.hidden_by_default()
+            {
                 continue;
             }
             if let Some(cwd) = &conversation.cwd

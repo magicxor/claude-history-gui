@@ -34,7 +34,7 @@ All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-h
   after a rename or delete): the newest ones are shown at once and the full history is never loaded into memory
   for the list. The first run indexes the history in the background, newest first.
 * Codex threads (`~/.codex` or `CODEX_HOME`, archived and compressed sessions included, titles from Codex's state
-  database) are listed and searched too, marked `CX`; they cannot be opened, resumed, renamed or deleted from the
+  database) are listed and searched too, marked `CX` (automated `codex exec` runs and subagent threads are indexed but stay out of the list, list search and semantic search); they cannot be opened, resumed, renamed or deleted from the
   app yet.
 * Search as you type. **Lexical** search (with highlighted matches and a literal mode for quoted text) or
   **semantic** search (local embedding model, downloaded on first use; falls back to lexical while the cache is
