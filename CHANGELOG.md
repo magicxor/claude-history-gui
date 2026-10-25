@@ -4,6 +4,10 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 ## Unreleased
 
+- Searching only your own messages, and list previews, keep text after an unclosed tag or an `[Image...` lookalike:
+  `[Image upload fails` and a typed `<system-reminder>` stay as typed text (only `[Image]`, `[Image #N]` and
+  `[Image: description]` are placeholders), and previews drop a tag only when its opening and closing tag both
+  occur, so `a < b` and `Vec<T>` stay. The conversation index is rebuilt once.
 - Search only your own messages: the list's new **You only** toggle (Alt+U, View > Search only your own messages,
   rebindable as `[keys] user_only`) makes lexical search match only what you typed, leaving out assistant replies,
   tool output, injected context, subagent prompts and titles; snippets come from your messages too. The query and

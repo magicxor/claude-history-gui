@@ -369,8 +369,28 @@ fn sanitize_preview_strips_tags_and_collapses_whitespace() {
         sanitize_preview("  <tag attr=\"x\">hello</tag>\n\n\tworld   again  "),
         "hello world again"
     );
-    assert_eq!(sanitize_preview("a < b > c"), "a c");
+    assert_eq!(sanitize_preview("a < b > c"), "a < b > c");
     assert_eq!(sanitize_preview(""), "");
+}
+
+#[test]
+fn sanitize_preview_strips_paired_tags_and_keeps_other_angle_brackets() {
+    assert_eq!(
+        sanitize_preview("<command-message>run</command-message>\n  <bash-input>ls</bash-input>"),
+        "run ls"
+    );
+    assert_eq!(
+        sanitize_preview("[Y3] explain the <system-reminder> tag handling for axolotl"),
+        "[Y3] explain the <system-reminder> tag handling for axolotl"
+    );
+    assert_eq!(
+        sanitize_preview("if a < b and Vec<T> or x>y then <br/>"),
+        "if a < b and Vec<T> or x>y then <br/>"
+    );
+    assert_eq!(
+        sanitize_preview("a <task id=\"1\">done</task> b"),
+        "a done b"
+    );
 }
 
 #[test]
