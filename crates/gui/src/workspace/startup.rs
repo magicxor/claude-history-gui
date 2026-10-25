@@ -296,6 +296,22 @@ pub fn dispatch(
             return Flow::Exit(EXIT_ERROR);
         }
     };
+    if let Some(path) = args.dump_semantic_turns.clone() {
+        let env = match prepare_env() {
+            Ok(env) => env,
+            Err(message) => return refused(out, &message),
+        };
+        // Querying the stream kind attaches to the parent console on Windows,
+        // which the stderr line needs.
+        let _ = out.stdout_kind();
+        return Flow::Exit(run_dump_semantic_turns(
+            &env,
+            &args,
+            &path,
+            launch_cwd.as_deref(),
+            out,
+        ));
+    }
     // Only the headless paths need the stream kind: querying it attaches to the
     // parent console on Windows, which a plain GUI launch must not do (§14.3).
     let stdout = if args.show_dir || args.render.is_some() {
@@ -394,6 +410,45 @@ pub fn run_show_dir(
                 EXIT_ERROR
             }
         },
+        Err(error) => {
+            out.write_stderr(&format!("Error: {error}\n"));
+            EXIT_ERROR
+        }
+    }
+}
+
+/// `--dump-semantic-turns PATH` (hidden): the whole corpus from the store with
+/// full contents, newest first, written as JSON lines to PATH
+/// (`semantic_ops::dump_turns`); the summary line goes to stderr. No window.
+pub fn run_dump_semantic_turns(
+    env: &HistoryEnv,
+    args: &GuiLaunchArgs,
+    path: &Path,
+    launch_cwd: Option<&Path>,
+    out: &dyn PlatformServices,
+) -> i32 {
+    let (config, errors) = load_config(env);
+    if let Some(error) = errors.cli.or(errors.gui) {
+        out.write_stderr(&format!("Error: {error}\n"));
+        return EXIT_ERROR;
+    }
+    let path = match launch_cwd {
+        Some(cwd) if path.is_relative() => cwd.join(path),
+        _ => path.to_path_buf(),
+    };
+    let show_last = args.settings(&config.effective).show_last;
+    let result = claude_history_core::maintenance::load_sorted_conversations(
+        env,
+        show_last,
+        None,
+        &TimeFilter::default(),
+    )
+    .and_then(|conversations| claude_history_core::semantic_ops::dump_turns(&conversations, &path));
+    match result {
+        Ok(line) => {
+            out.write_stderr(&format!("{line}\n"));
+            EXIT_OK
+        }
         Err(error) => {
             out.write_stderr(&format!("Error: {error}\n"));
             EXIT_ERROR

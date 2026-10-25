@@ -319,6 +319,9 @@ pub struct GuiLaunchArgs {
     pub generate_semantic_cache: bool,
     /// `--clear-semantic-cache` (hidden)
     pub clear_semantic_cache: bool,
+    /// `--dump-semantic-turns <PATH>` (hidden): write every conversation's
+    /// semantic turns as JSON lines and exit, for embedding benchmarks
+    pub dump_semantic_turns: Option<PathBuf>,
     /// `-g, --global` (hidden, deprecated: global is the default; no effect)
     pub global: bool,
     /// `--pager` (accepted; the GUI has no pager)
@@ -464,6 +467,10 @@ impl GuiLaunchArgs {
             (self.semantic_search.is_some(), "--semantic-search <QUERY>"),
             (self.generate_semantic_cache, "--generate-semantic-cache"),
             (self.clear_semantic_cache, "--clear-semantic-cache"),
+            (
+                self.dump_semantic_turns.is_some(),
+                "--dump-semantic-turns <PATH>",
+            ),
             (self.render.is_some(), "--render <FILE>"),
             (self.file.is_some(), "[FILE]"),
         ]
@@ -519,6 +526,10 @@ impl GuiLaunchArgs {
             (self.semantic_search.is_some(), "--semantic-search <QUERY>"),
             (self.generate_semantic_cache, "--generate-semantic-cache"),
             (self.clear_semantic_cache, "--clear-semantic-cache"),
+            (
+                self.dump_semantic_turns.is_some(),
+                "--dump-semantic-turns <PATH>",
+            ),
             (self.file.is_some(), "[FILE]"),
         ];
         let selection = [
@@ -551,7 +562,8 @@ impl GuiLaunchArgs {
 
 /// The usage text for `--help`. The hidden upstream flags (`--global`,
 /// `--semantic-search`, `--semantic-top`, `--debug-semantic-search`,
-/// `--generate-semantic-cache`, `--clear-semantic-cache`) are accepted but
+/// `--generate-semantic-cache`, `--clear-semantic-cache`,
+/// `--dump-semantic-turns`) are accepted but
 /// not listed, as upstream.
 pub fn help_text(program: &str) -> String {
     format!(
@@ -644,6 +656,7 @@ fn long_option(name: &str) -> Option<(&'static str, bool)> {
         ("debug-semantic-search", true),
         ("generate-semantic-cache", false),
         ("clear-semantic-cache", false),
+        ("dump-semantic-turns", true),
         ("global", false),
         ("pager", false),
         ("no-pager", false),
@@ -676,6 +689,7 @@ fn value_name(option: &str) -> &'static str {
     match option {
         "workspace" => "<DIR>",
         "render" => "<FILE>",
+        "dump-semantic-turns" => "<PATH>",
         "delete" => "<SESSION_ID>",
         "debug-search" | "semantic-search" | "debug-semantic-search" => "<QUERY>",
         "semantic-top" => "<SEMANTIC_TOP>",
@@ -1030,6 +1044,7 @@ where
                     }
                 }
                 "render" => parsed.render = Some(PathBuf::from(value)),
+                "dump-semantic-turns" => parsed.dump_semantic_turns = Some(PathBuf::from(value)),
                 "delete" => parsed.delete = Some(utf8_value(value)?),
                 "debug-search" => parsed.debug_search = Some(utf8_value(value)?),
                 "semantic-search" => {
@@ -1624,6 +1639,10 @@ mod tests {
         );
         assert!(run(&["--generate-semantic-cache"]).generate_semantic_cache);
         assert!(run(&["--clear-semantic-cache"]).clear_semantic_cache);
+        assert_eq!(
+            run(&["--dump-semantic-turns", "turns.jsonl"]).dump_semantic_turns,
+            Some(PathBuf::from("turns.jsonl"))
+        );
         // The compatibility flags change nothing else.
         let mut plain = run(&["--pager", "--no-color", "--global"]);
         plain.pager = false;
@@ -1642,6 +1661,7 @@ mod tests {
             &["--semantic-search", "q"],
             &["--generate-semantic-cache"],
             &["--clear-semantic-cache"],
+            &["--dump-semantic-turns", "t.jsonl"],
             &["--render", "r.jsonl"],
             &["f.jsonl"],
         ];
@@ -1805,6 +1825,7 @@ mod tests {
             "--debug-semantic-search",
             "--generate-semantic-cache",
             "--clear-semantic-cache",
+            "--dump-semantic-turns",
         ] {
             assert!(!help.contains(hidden), "{hidden}");
         }

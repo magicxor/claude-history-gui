@@ -501,6 +501,34 @@ fn a_cancelled_picker_exits_zero_with_empty_stdout(cx: &mut TestAppContext) {
     assert_eq!(recording(cx).stdout(), "");
 }
 
+/// `--dump-semantic-turns PATH` (hidden) writes the corpus' turns as JSON lines
+/// headless and reports on stderr, whatever the stdout kind.
+#[test]
+fn dump_semantic_turns_writes_json_lines_headless() {
+    let world = TestWorld::new();
+    let corpus = world.standard_corpus();
+    let out = world.home().join("turns.jsonl");
+    let result = run(
+        &world,
+        &["--dump-semantic-turns", "turns.jsonl"],
+        StdoutKind::None,
+        Some(world.home()),
+    );
+    assert_eq!(result.code(), 0, "{}", result.rec.stderr());
+    assert!(
+        result.rec.stderr().starts_with("Wrote semantic turns of "),
+        "{}",
+        result.rec.stderr()
+    );
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.lines().count() >= corpus.len() - 1, "{text}");
+    for line in text.lines() {
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(value["turns"].is_array());
+        assert!(value["path"].is_string());
+    }
+}
+
 /// C-011: `--render FILE` prints the Ledger headless when stdout is redirected.
 #[test]
 fn render_prints_the_ledger_to_a_redirected_stdout() {

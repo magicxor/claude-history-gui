@@ -2766,6 +2766,12 @@ after a failed pass re-scopes the cards at once.
   `generate_export(Ledger, settings options)` (no ANSI, `[dev]` vs
   upstream's ANSI ledger) → stdout, exit 0; errors → stderr, exit 1. Otherwise the single-file window (C-011).
 
+* `--dump-semantic-turns PATH` (hidden, upstream f222b3c): the corpus of §11.24 (`load_sorted_conversations`, no time
+  filter), written by `semantic_ops::dump_turns` as one JSON object per line (`path`, `timestamp` RFC 3339,
+  `project`, `title`, `summary`, `preview`, `message_count`, `turns`), newest first; stderr `Wrote semantic turns of N
+  conversation(s) to PATH`, exit 0; errors → stderr `Error: <e>`, exit 1. A relative PATH is resolved against the
+  launch directory. No window, whatever stdout is.
+
 ### 11.24 One-shot tool corpora (P11)
 Debug search, Semantic search report, Semantic debug dump and Generate cache work on a **fresh load** in the
 background, never the list corpus: `maintenance::load_sorted_conversations(env, show_last, debug, &tf)` with `tf` =
@@ -2900,6 +2906,7 @@ Usage lines: `claude-history-gui [OPTIONS] [FILE]` / `claude-history-gui delete-
 | `--debug-semantic-search QUERY` | | hidden | same dialog, debug-dump mode | C-015 |
 | `--generate-semantic-cache` | | hidden | Generate semantic cache dialog (not auto-started; scope from `-L`) | C-015 |
 | `--clear-semantic-cache` | | hidden | Clear semantic cache confirmation | C-015 |
+| `--dump-semantic-turns PATH` | | hidden | headless: every conversation's semantic turns as JSON lines to PATH (`semantic_ops::dump_turns`, §11.23), summary on stderr, exit | C-015 |
 | `-h/--help`, `-V/--version` | | | print `help_text` / `claude-history-gui <version>`; exit 0 | C-017 |
 | `help [COMMAND]`, `<subcommand> -h/--help` | | subcommand | `help` = `--help`; `help update\|delete-empty\|help` and `update --help`, `delete-empty -h` → `LaunchCommand::SubcommandHelp(text)`: print `text`, exit 0; `help agent [cmd]` → the agent help (K14/K15 as built) | C-017 |
 | `delete-empty [--local\|--all] [--yes]` | | subcommand | Delete empty transcripts dialog with the scope; `--yes` ignored (confirmation in the UI) | C-018 |
@@ -2909,7 +2916,7 @@ Usage lines: `claude-history-gui [OPTIONS] [FILE]` / `claude-history-gui delete-
 
 Conflict groups (core K14; message `error: the argument '<a>' cannot be used with '<b>'`, exit 2): `one_shot_action`
 (at most one of `--show-dir`, `--delete`, `--debug-search`, `--debug-semantic-search`, `--semantic-search`,
-`--generate-semantic-cache`, `--clear-semantic-cache`, `--render`, `FILE`); `selection_conflicting_action` (those
+`--generate-semantic-cache`, `--clear-semantic-cache`, `--dump-semantic-turns`, `--render`, `FILE`); `selection_conflicting_action` (those
 except `--show-dir`, conflicting also with `--resume`, `--show-path`, `--show-id`, `--plain`); picker kinds mutually
 exclusive; `--delete` × `--global`; `FILE` × `--local`/`--global`/picker flags; `--semantic-top` requires
 `--semantic-search` (`value must be greater than zero`; non-number → `invalid positive integer: <v>`); invalid

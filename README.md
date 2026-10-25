@@ -209,7 +209,8 @@ first when stdout is a terminal.
 `--render` opens a viewer window and `--show-dir` shows a toast). `delete-empty` and `update` open their dialogs;
 `--yes` is ignored because every deletion is confirmed in the UI. Some hidden upstream flags
 (`--semantic-search`, `--debug-semantic-search`, `--generate-semantic-cache`, `--clear-semantic-cache`,
-`--global`) are accepted too.
+`--global`) are accepted too. `--dump-semantic-turns PATH` (hidden, for embedding benchmarks) writes every
+conversation's semantic turns as JSON lines to PATH without opening a window.
 
 ### Agent subcommand (headless)
 

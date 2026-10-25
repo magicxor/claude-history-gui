@@ -12,6 +12,8 @@
 //! * [`semantic_search_report`] (`--semantic-search`)
 //! * [`semantic_debug_report`] (`--debug-semantic-search`)
 //! * [`semantic_status`]: cache file, model and corpus coverage statistics
+//! * [`dump_turns`] (`--dump-semantic-turns`, hidden): the semantic turns
+//!   chunking reads, as JSON lines, for embedding benchmarks
 //!
 //! The embedder is created lazily through an [`EmbedderFactory`]
 //! ([`fastembed_factory`] in production, which never draws hf-hub's stderr
@@ -174,6 +176,38 @@ impl Stderr {
 // ---------------------------------------------------------------------------
 // generate
 // ---------------------------------------------------------------------------
+
+/// Writes one JSON object per conversation (`path`, `timestamp`, `project`,
+/// `title`, `summary`, `preview`, `message_count`, `turns`) to `path`, the
+/// semantic turns that chunking reads, so embedding can be benchmarked
+/// outside the app (upstream f222b3c, `--dump-semantic-turns`). Returns
+/// upstream's stderr line; the caller prints it.
+pub fn dump_turns(conversations: &[Conversation], path: &Path) -> Result<String> {
+    use std::io::Write;
+
+    let file = std::fs::File::create(path).map_err(AppError::Io)?;
+    let mut out = std::io::BufWriter::new(file);
+    for conversation in conversations {
+        let line = serde_json::json!({
+            "path": conversation.path,
+            "timestamp": conversation.timestamp.to_rfc3339(),
+            "project": conversation.project_name,
+            "title": conversation.custom_title,
+            "summary": conversation.summary,
+            "preview": &*conversation.preview,
+            "message_count": conversation.message_count,
+            "turns": &*conversation.semantic_turns,
+        });
+        serde_json::to_writer(&mut out, &line).map_err(|error| AppError::Io(error.into()))?;
+        out.write_all(b"\n").map_err(AppError::Io)?;
+    }
+    out.flush().map_err(AppError::Io)?;
+    Ok(format!(
+        "Wrote semantic turns of {} conversation(s) to {}",
+        conversations.len(),
+        path.display()
+    ))
+}
 
 /// Progress of [`generate_semantic_cache`]. Its `Display` text is
 /// upstream's stderr line.
@@ -1355,6 +1389,30 @@ mod tests {
             .with_cwd(None)
             .with_summary(None)
             .build()
+    }
+
+    #[test]
+    fn dump_turns_writes_one_json_line_per_conversation() {
+        let (root, _env) = sandbox();
+        let conversations = vec![
+            test_conversation("/p/a.jsonl", "first", vec!["alpha".into(), "beta".into()]),
+            test_conversation("/p/b.jsonl", "second", Vec::new()),
+        ];
+        let out = root.path().join("turns.jsonl");
+        let message = dump_turns(&conversations, &out).unwrap();
+        assert!(message.starts_with("Wrote semantic turns of 2 conversation(s) to "));
+        let text = std::fs::read_to_string(&out).unwrap();
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["title"], "first");
+        assert_eq!(lines[0]["project"], "project-a");
+        assert_eq!(lines[0]["turns"], serde_json::json!(["alpha", "beta"]));
+        assert_eq!(lines[1]["turns"], serde_json::json!([]));
+        assert!(lines[0]["timestamp"].is_string());
+        assert!(lines[0]["message_count"].is_number());
     }
 
     fn corpus() -> Vec<Conversation> {
