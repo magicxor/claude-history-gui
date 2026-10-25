@@ -134,8 +134,8 @@ Resolution at startup, first match wins:
 3. the launch cwd if it is *meaningful*: it is not a filesystem root, not the home directory, not the directory of
    the executable (or of the `.app` bundle), and (a) maps to an existing Claude projects dir
    (`env.claude_projects_dir_for(cwd).is_dir()`), or (b) has a `.git` entry (dir or file), or (c) is the recorded
-   cwd of at least one Pi/OMP session (checked after the first load batch; if it matches and no workspace was
-   chosen yet, the workspace is set then and a refresh is not needed because Pi/OMP roots do not depend on it);
+   cwd of at least one Pi, OMP or Codex session (any non-Claude source; 7f5c443) (checked after the first load batch; if it matches and no workspace was
+   chosen yet, the workspace is set then and a refresh is not needed because Pi/OMP/Codex roots do not depend on it);
 4. `[gui] default_workspace` from gui.toml if it exists **[FLAG: added; an explicit config value beats remembered
    state]**;
 5. the last used workspace from `state.json` if `[gui] restore_session` (default true) and it exists;
@@ -143,8 +143,8 @@ Resolution at startup, first match wins:
 
 The workspace sets `HistoryEnv::workspace_dir` (core uses it for the Workspace scope filter, Pi's
 `<workspace>/.pi/settings.json`, delete-empty Local scope, show-dir, resume/fork launch dir, agent Local scope).
-**Relative paths inside `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`, `XDG_DATA_HOME`
-resolve against the launch cwd** (`HistoryEnv::env_path_base`, core gap K16), never against a workspace chosen
+**Relative paths inside `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`, `XDG_DATA_HOME`,
+`CODEX_HOME`, `CODEX_SQLITE_HOME` resolve against the launch cwd** (`HistoryEnv::env_path_base`, core gap K16), never against a workspace chosen
 later, so a variable set by the launching shell keeps its meaning. Changing the workspace at runtime triggers a
 background reload (§11.20) and re-filters.
 
@@ -447,7 +447,7 @@ truth.
 
 | Module | Items the GUI uses |
 |---|---|
-| `env` | `HistoryEnv { home_dir, claude_config_dir, pi_coding_agent_dir, pi_coding_agent_session_dir, pi_config_dir, omp_profile, pi_profile, xdg_data_home, path_var, pathext, workspace_dir, cache_root, config_file, gui_config_file, debug_log_file }` (+ `env_path_base`, K16: `with_env_path_base`, `launch_base_dir()`, `env_value_base_dir()`; `main` sets it to the launch cwd), `from_process_env()` (main only), `sandbox(root)`, `with_workspace`, `claude_dir()`, `claude_projects_root()`, `claude_projects_dir_for(dir)`, `cache_root()`, `cache_base_dir()` (`cache_root` or its `config-<hash>`, upstream `store::cache_base_dir`), `cli_cache_root()` + `is_in_cli_cache(path)` (the installed CLI's cache root, never deleted from), `semantic_cache_dir()`, `embedding_cache_file()`, `semantic_model_dir()`, `config_file()`, `gui_config_file()`, `debug_log_file()`, `workspace()`, `resolve_program(name, override)`; `WorkspaceScope { dir, project_dir_name }`, `WorkspaceScope::new`, `canonical_dir()`; `STATE_DIR_NAME`, `CACHE_DIR_NAME`, `CLI_CACHE_DIR_NAME`, `is_within(path, dir)` |
+| `env` | `HistoryEnv { home_dir, claude_config_dir, pi_coding_agent_dir, pi_coding_agent_session_dir, pi_config_dir, omp_profile, pi_profile, codex_home, codex_sqlite_home, xdg_data_home, path_var, pathext, workspace_dir, cache_root, config_file, gui_config_file, debug_log_file }` (+ `env_path_base`, K16: `with_env_path_base`, `launch_base_dir()`, `env_value_base_dir()`; `main` sets it to the launch cwd), `from_process_env()` (main only), `sandbox(root)`, `with_workspace`, `claude_dir()`, `claude_projects_root()`, `claude_projects_dir_for(dir)`, `codex_home()` (`CODEX_HOME`, else `<home>/.codex`) + `codex_sqlite_home()` + `with_codex_home` (upstream 7f5c443), `cache_root()`, `cache_base_dir()` (`cache_root` or its `config-<hash>`, upstream `store::cache_base_dir`), `cli_cache_root()` + `is_in_cli_cache(path)` (the installed CLI's cache root, never deleted from), `semantic_cache_dir()`, `embedding_cache_file()`, `semantic_model_dir()`, `config_file()`, `gui_config_file()`, `debug_log_file()`, `workspace()`, `resolve_program(name, override)`; `WorkspaceScope { dir, project_dir_name }`, `WorkspaceScope::new`, `canonical_dir()`; `STATE_DIR_NAME`, `CACHE_DIR_NAME`, `CLI_CACHE_DIR_NAME`, `is_within(path, dir)` |
 | `config` | `ConfigFile`, `GuiConfigFile`, `GuiSettings { theme, terminal, claude_path, pi_path, omp_path, default_workspace, restore_session }`, `LayeredConfig { cli, gui_file, effective, gui }`, `load_config_from(path)`, `load_gui_config_from(path)` (loaded **independently**, §11.1), `ConfigFile::overlaid_with(&GuiConfigFile)`, `save_gui_config_changes` (K12), `KeyChord::{short_label, help_label, gpui_keystroke, config_string}`, `parse_key_binding`, `KeyBindings { resume, fork, rename, delete, refresh }` + `from_config`, `conflicts_with_ctrl_t`, `AgentScopeConfig`, `AgentConfig` |
 | `settings` | `parse_launch_args(args) -> Result<LaunchCommand, LaunchArgsError>` (`LaunchCommand::{Run(GuiLaunchArgs), Help, Version, DeleteEmpty { local, all, yes }, Update, Agent(AgentCli), SubcommandHelp(String)}`; K14/K15, `SubcommandHelp` added by WP-C: `update --help`, `delete-empty -h`, `help <subcommand>` → print the text, exit 0), `GuiLaunchArgs` (+`display_flags`, `search_mode_override`, `picker`, `time_filter`, `settings`, `validate`), `help_text(program)`, `effective_settings(config, flags, mode_override) -> EffectiveSettings { show_last, show_tools, tool_display, show_thinking, search_mode, list_search_mode, exclude_projects, keys, semantic_toggle_enabled, resume_default_args }`, `EffectiveSettings::initial_view_prefs()`, `initial_tool_display`, `PickerAction::{ShowPath, ShowId, Resume{fork}}`, `picker_output(action, conv)`, `session_id_from_path(path)` |
 | `browser` | `Browser` (`new_loading`, `append_conversations`, `set_query`, `escape -> EscapeOutcome`, `toggle_workspace_filter`, `set_workspace_filter`, `set_workspace`, `set_excluded_projects`, `toggle_list_search_mode`, `set_list_search_mode`, `poll`, `has_search_work_in_flight`, `filtered`, `row`, `selected`, `select*`, `select_half_page_down(viewport_rows)`, `selected_path`, `selected_conversation`, `has_multiple_sources`, `conversation_by_path`, `count_text`, `search_status_text`, `semantic_status_text`, `semantic_activity_status_text`, `semantic_error`, `semantic_progress`, `semantic_result_metadata[_for_selection]`, `lexical_evidence`, `row_preview_input`, `row_header_input`, `uuid_lookup`, `rename_prefill`, `workspace`, `has_project_context`, `list_search_mode`, `is_loading` (`!readiness.list`, 358becb), `readiness() -> Readiness { list, lexical, reconcile: ReconcileState::{Running, Done}, semantic }`; generation mode (358becb): `show_snapshot(store::Snapshot)` (the first `SNAPSHOT_ROWS` cards), `shows_snapshot`, `generation_open`, `generation_len`, `generation_name`, `generation_is_empty`, `history_is_empty`, `is_hidden(index)`, `time_filter`, `set_time_filter(TimeFilter)`, `open_search_index` and `swap_generation(store::Snapshot)` (synchronous; the loader installs a generation opened off the UI thread), `search_index_generation`, `take_reconcile_request`, `set_reconciling`, `fill_visible_evidence(Range)`, `conversation_at`; upstream 3708bb6 replaced `loading_state`), `SNAPSHOT_ROWS`, `BrowserOptions` (+ builders, `embedder_factory`, `waker`, `semantic_available`), `HistoryLoader` (`new`, `reconfigure` (store mode: moves to the store root of the new env), `start_initial_load` (store mode: a reconcile pass), `start_refresh` (store mode: a pass, then `Refreshed` from the generation sizes), `set_time_filter` (store mode: re-scopes the cards at the next poll), `is_running`, `is_refreshing`, `uses_store`, `open_snapshot` (`&mut self`: enters store mode; every card and the index are opened on `generation-open` and installed by a later `poll`), `finish_snapshot_write` (waits for the running pass and the ones asked for after it, returns the last `store::generation::Publish`, e905169), `poll(&mut Browser) -> LoaderPoll` incl. `pending`, `swapped`; `BUSY_RETRY`, `GENERATION_POLL`), `LoaderOptions` (incl. `drain_budget`, default `DEFAULT_DRAIN_BUDGET` = 8 ms, upstream 93e17a5; `snapshot` = store mode, default off, 3708bb6, 358becb), `LoadEvent::{Loaded, NoHistory, LoadFailed, Refreshed, RefreshIncomplete, RefreshFailed, RefreshInterrupted}` (+`status_message`), `ListSearchMode`, `SemanticProgress`, `SemanticResultMetadata`, `UuidLookup`, `PreparedSession` (`Send`; `PreparedSession::new(Conversation)` normalizes the lexical body of a re-parsed session, the O(text) step for a background task; consumed by `Browser::apply_renamed_session` and `Browser::resolve_uuid_lookup_session`, 503fe42), `RenameError`, `DeleteError` (both with `Unsupported(Source)`: the source's adapter cannot rename or delete, 9799550), `Waker`, `SemanticEmbedderFactory`, `query_has_literals`; K1–K4, K6, K18 additions |
@@ -459,7 +459,7 @@ truth.
 | `semantic_ops` | `generate_semantic_cache(env, convs, workspace, &time_filter, embedder, progress, &cancel) -> GenerateReport`, `GenerateProgress`, `GenerateOutcome`, `clear_semantic_cache(env) -> ClearReport` (K6 as built: empties `<cache root>/semantic` but keeps the directory and its `embeddings.lock`), `semantic_search_report(env, query, convs, top, workspace, embedder)`, `semantic_debug_report(env, query, convs, workspace, embedder)`, `semantic_status(env, convs, workspace)` (`CacheFileState::{Missing, Unreadable, Incompatible, Ready, Legacy}`: 8919a76 made `Incompatible` field-less, the matrix keeps only a model hash, and added `Legacy` for an unconverted `embeddings-v1.bin`), `clear_embedding_cache(env)` (the matrix and an unconverted v1 file), `EmbedderFactory<'a>`, `fastembed_factory(env)`, `no_conversations_message` |
 | `agent` | `AgentRequest::{Search, Within, Read, Outline}`, `args::{AgentSearchArgs, AgentWithinArgs, AgentReadArgs, AgentOutlineArgs, AgentOutputFlags, AgentSearchModeArgs, TimeRangeArgs, DEFAULT_READ_CONTEXT}` (+`validate`), `AgentService::{new, with_embedder_factory, with_notice_sink, with_cancellation, respond}`, `agent::execute(env, config, request) -> AgentResponse` (headless `agent …`), `cli::{AgentCli::{Request, Help}, parse_agent_args}`, `AgentResponse { stdout, stderr, exit_code, result, warnings, error, notices }` (+`text`, `error_text`, `is_success`), `AgentResult::{Search, Within, Read, Outline}`, `AgentSearchResult { output, conversations }` (+`hits`, `conversation(ref)`), `AgentReadResult`, `AgentOutlineResult`, `AgentConversationInfo { reference, full_ref, uuid, project_id, source, session_id, session_filename, path }`, `AgentNotice::{SemanticProgress, UncachedPassages}`, `agent::service::{EmbedderFactory, discover_agent_keys}`, `refs::{AgentConversationKey::from_conversation, conversation_ref, full_ref, full_ref_for_candidate}`, `diagnostic::{AgentError, AgentWarning}`, `protocol::{ReadMessage, OutlineItem, ProtocolOptions, MessageLineRange}`; K5, K7, K8, K15 |
 | `update` | `check_latest_release(current) -> UpdateStatus` (services only), `update_status_from_response`, `UpdateStatus::{UpToDate, Available, Newer, NoRelease}`, `ReleaseInfo { tag, version, name, url, notes, … }` (+`asset_for(os, arch)`), `RELEASES_PAGE_URL`, `REPOSITORY` |
-| `history` | `Conversation`, `Source` (= `model::SourceKind`; +`label`, `list_label`), `model` (normalized transcript model: `Transcript`, `Event`, `Revision`, `ConversationKey`), `adapter` (`Adapter`, `Stamp`, `Located`, `Completeness`, `Discovery`; an adapter also declares the actions its tool supports, `capabilities`, and resumes, deletes and renames its conversations, 9799550), `actions` (`Capabilities`, `Target`, `refusal`) and `sources::Registry::from_env(env)` (+`for_source(kind)`: the adapter that acts on a source's conversations, 9799550) (one adapter per configured root; the store's reconcile pass discovers through it, 8daac4c, and decodes each changed file through `Adapter::decode_into` (`decode` collects the events into a `Transcript`), feeding the events into `index::Indexer` (`push` per event, `finish` with the transcript metadata) to build the card's `Conversation`, fd27225, 350314d), `detect_source(path)`, `process_conversation_file(path, mtime, debug)` (`sources::decode_path_into` feeding `index::Indexer`, 350314d; fork: the list loaders stream through `decode_path_into` too), `service::HistoryService` (`open(key)`, `open_path(path)`; reuses the decoded `Arc<Transcript>` while the stamp is unchanged; the agent commands load transcripts through it, 59b9565), `DeleteEmptyScope::{All, Local(WorkspaceScope)}`, `pi_loader::session_root`, `omp_loader::session_root`; K2 |
+| `history` | `Conversation`, `Source` (= `model::SourceKind`: `Claude`, `Pi`, `Omp`, `Codex` (list label `CX`, 7f5c443); +`label`, `list_label`), `model` (normalized transcript model: `Transcript`, `Event`, `Revision`, `ConversationKey`), `adapter` (`Adapter`, `Stamp`, `Located` (+`native`: the adapter's own resolution), `Completeness`, `Discovery`, `Adapter::native_id_of`; an adapter also declares the actions its tool supports, `capabilities`, and resumes, deletes and renames its conversations, 9799550), `actions` (`Capabilities`, `Target`, `refusal`) and `sources::Registry::from_env(env)` (+`for_source(kind)`: the adapter that acts on a source's conversations, 9799550) (one adapter per configured root, the Codex home included: `sources::codex::CodexAdapter::from_env(env)` lists the rollouts of `<codex home>/sessions` and `archived_sessions`, picks each thread's head with Codex's read-only state database and decodes its rollout chain, 7f5c443; its capabilities are none until Codex resume, fork and delete are ported; the store's reconcile pass discovers through it, 8daac4c, and decodes each changed file through `Adapter::decode_into` (`decode` collects the events into a `Transcript`), feeding the events into `index::Indexer` (`push` per event, `finish` with the transcript metadata) to build the card's `Conversation`, fd27225, 350314d), `detect_source(path)`, `process_conversation_file(path, mtime, debug)` (`sources::decode_path_into` feeding `index::Indexer`, 350314d; fork: the list loaders stream through `decode_path_into` too), `service::HistoryService` (`open(key)`, `open_path(path)`; reuses the decoded `Arc<Transcript>` while the stamp is unchanged; the agent commands load transcripts through it, 59b9565), `DeleteEmptyScope::{All, Local(WorkspaceScope)}`, `pi_loader::session_root`, `omp_loader::session_root`; K2 |
 | `theme`, `syntax`, `bench`, `debug`, `debug_log`, `markdown`, `time_filter`, `error` | `theme::{set_theme, kind, current, theme_for, ThemeKind, ThemePreference (+resolve), Theme, Rgb}`; `syntax::highlight_code(code, lang)`; `bench::{start(sink), enabled, mark, mark_peak_rss}` (upstream 40fa627 timing marks; explicit sink, no env read, no `--bench-startup`); `debug::{set_sink, reset_sink, DebugLevel (+tag), log, info, warn, error, should_log}`; `debug_log::{log_debug, log_display_error}`; `markdown::expand_tabs` (K10); `time_filter::{TimePoint, TimeFilter (+resolve, matches, is_active), TimeFilterError}`; `AppError`, `Result` |
 
 Duplicates the GUI must **not** write (each was planned in revision 1): its own loader bridge and refresh buffer
@@ -2153,7 +2153,7 @@ row), taken from the handle LRU (§9.7).
 ```rust
 pub struct RowModel {                 // built per visible row each frame (cheap; no Vec clones)
     pub id: SharedString,             // path string (domain id; QA id "row:<file stem>")
-    pub source_label: Option<&'static str>,      // "CC" | "Pi" | "OMP" when Browser::has_multiple_sources()
+    pub source_label: Option<&'static str>,      // "CC" | "Pi" | "OMP" | "CX" when Browser::has_multiple_sources()
     pub header: RowHeader,                       // core display_format::build_row_header(width = usize::MAX / 4)
     pub preview: RowPreview,                     // core display_format::build_row_preview(max_width = preview chars)
 }
@@ -2272,7 +2272,7 @@ recorded each frame (for the keyboard context menu position).
      (an older generation) every card is listed and queries browse until a generation has them.
    * **Reconcile passes (upstream e905169, 358becb).** `start_initial_load` starts a reconcile pass on a
      `store-reconcile` thread (upstream ran a detached `--reconcile` process at launch). The pass takes `LOCK`
-     without waiting, stats every Claude, Pi and OMP session file of the env's sources and compares size and mtime
+     without waiting, stats every Claude, Pi, OMP and Codex session file (Codex rollouts, with the read-only state database for thread metadata) of the env's sources and compares size and mtime
      with the fingerprints in `CURRENT`; only new or changed files are parsed (as the history loader parses them) and
      published as delta generations (newest 200 files first, then every 2 s of parsing; unchanged text, semantic and index
      segments hard-linked from the previous generation, deltas merged past the thresholds); files that hold no
@@ -2886,7 +2886,7 @@ line).
 
 Absolute rules:
 * No OS input injection (no SendKeys, no synthetic OS mouse) and no real-desktop automation.
-* No test, QA run or agent dev run reads or writes the real `~/.claude`, `~/.pi`, `~/.omp`,
+* No test, QA run or agent dev run reads or writes the real `~/.claude`, `~/.pi`, `~/.omp`, `~/.codex`,
   `~/.config/claude-history`, `~/.cache/claude-history*`, `~/.local/state/claude-history*`, the real clipboard, or
   launches `claude`/`pi`/`omp`, URLs, file managers or native file dialogs. This is **enforced**, not only stated:
   core `hermetic` guards in every GUI test build (K13), the env redirect in the test binary, `PlatformServices` for
@@ -2910,8 +2910,8 @@ Absolute rules:
   spawning returns an error — even if GUI code bypasses a seam by mistake.
 * A `#[ctor::ctor]` in `test_support` runs before any test: it creates a per-process temp root and sets (unsafe
   `set_var`, before threads exist) `HOME`, `USERPROFILE`, `CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR`,
-  `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`,
-  `XDG_STATE_HOME` inside it and removes `OMP_PROFILE`, `PI_PROFILE`, `TERMINAL`, `CLAUDE_HISTORY_CLIPBOARD`.
+  `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`, `CODEX_HOME`, `CODEX_SQLITE_HOME`, `XDG_DATA_HOME`,
+  `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` inside it and removes `OMP_PROFILE`, `PI_PROFILE`, `TERMINAL`, `CLAUDE_HISTORY_CLIPBOARD`.
 * `app::init_for_test` installs `RecordingServices`, a refusing embedder (`embedder::install_fake` to opt in),
   disables state.json writes, and uses an empty config unless the test writes one into its `TestWorld`. The list's
   store is on (`ListSnapshots(true)`, store mode as in the app, upstream 358becb; `use_memory_list(cx, world, args)`
@@ -3029,11 +3029,12 @@ quit 0
   unless all hold: (1) the resolved home (`home::home_dir()`) contains a `.qa-sandbox` file; (2) the home is not the
   OS profile directory of the current user, obtained from the OS, not from variables (Windows
   `SHGetKnownFolderPath(FOLDERID_Profile)`, Unix `getpwuid_r(getuid())` → `pw_dir`); (3) each of
-  `CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`, `XDG_DATA_HOME`,
-  `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` is unset or (canonically) inside the home; (4) `OMP_PROFILE`
+  `CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`, `CODEX_HOME`,
+  `CODEX_SQLITE_HOME`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` is unset or
+  (canonically) inside the home; (4) `OMP_PROFILE`
   and `PI_PROFILE` are unset or plain names. As built (WP0): when the OS cannot tell the profile directory the gate
   refuses (fails closed), and the default data locations used while the variables are unset (`<home>/.claude`,
-  `.claude.json`, `.pi`, `.omp`, `.config`, `.cache`, `.local` and their data subfolders,
+  `.claude.json`, `.pi`, `.omp`, `.codex`, `.config`, `.cache`, `.local` and their data subfolders,
   `qa::gate::DEFAULT_DATA_PATHS`) must canonically stay inside the home when they exist — a junction or symlink to
   real data is refused. Debug builds skip the gate only with `CHG_ALLOW_REAL_HOME=1` (the user's
   own choice); `--features qa` builds never skip it.
@@ -3046,8 +3047,8 @@ quit 0
      recorder script in the sandbox.
   2. `tools/qa/run-gui.ps1 -Sandbox <dest> -Exe <path> [-Scenario x.qa -Out <dir>] [-Shots]` sets, for the child
      process only: `USERPROFILE`, `HOME` = `<dest>`; `CLAUDE_CONFIG_DIR` = `<dest>\.claude`; `PI_CODING_AGENT_DIR` =
-     `<dest>\.pi\agent`; `XDG_*` under `<dest>`; removes `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`,
-     `OMP_PROFILE`, `PI_PROFILE`; starts the watcher when `-Shots`; waits; prints the report.
+     `<dest>\.pi\agent`; `CODEX_HOME` = `<dest>\.codex`; `XDG_*` under `<dest>`; removes
+     `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`, `CODEX_SQLITE_HOME`, `OMP_PROFILE`, `PI_PROFILE`; starts the watcher when `-Shots`; waits; prints the report.
   3. Semantic QA: the model downloads into the sandbox cache on first use unless `--qa-model-dir
      <scratchpad>\qa-model-cache` points at a pre-downloaded copy (feature `qa` only).
   4. Plain dev runs use the same script without `-Scenario`.
@@ -3781,7 +3782,7 @@ changes below (commits `integrator: …` on master). Contract changes a Phase-B 
   reconcile pass, `ListPane::is_reconciling()` false: a fresh store first lists only its newest delta generation) the
   main window calls
   `startup::apply_recorded_cwd_workspace(cx, ListPane::recorded_agent_cwds())` once (new `ListPane` method: the
-  distinct cwds of the loaded Pi/OMP conversations); on a match `AppState.workspace` is set and the list re-scopes
+  distinct cwds of the loaded Pi/OMP/Codex conversations, i.e. every non-Claude source); on a match `AppState.workspace` is set and the list re-scopes
   through `ListPane::set_workspace` (a background reload).
 * **Keymap (WP6)**: `keymap::install_all` also binds `help::shortcuts::bindings()` (context `ShortcutsDialog`); code
   that clears and rebuilds the keymap keeps them (`install_user_bindings` does). Status-bar hints look bindings up with

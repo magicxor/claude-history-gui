@@ -54,13 +54,15 @@ use crate::workspace::Workspace;
 static REDIRECT_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 /// Variables the redirect points into the temp root (relative to its `home`).
-pub const REDIRECTED_VARS: [(&str, &str); 10] = [
+pub const REDIRECTED_VARS: [(&str, &str); 12] = [
     ("HOME", ""),
     ("USERPROFILE", ""),
     ("CLAUDE_CONFIG_DIR", ".claude"),
     ("PI_CODING_AGENT_DIR", ".pi/agent"),
     ("PI_CODING_AGENT_SESSION_DIR", ".pi/sessions"),
     ("PI_CONFIG_DIR", ".omp"),
+    ("CODEX_HOME", ".codex"),
+    ("CODEX_SQLITE_HOME", ".codex"),
     ("XDG_DATA_HOME", ".local/share"),
     ("XDG_CONFIG_HOME", ".config"),
     ("XDG_CACHE_HOME", ".cache"),

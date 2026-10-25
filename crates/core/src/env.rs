@@ -2,7 +2,8 @@
 //! environment (refactor R1).
 //!
 //! Upstream `claude-history` read `HOME`/`USERPROFILE`, `CLAUDE_CONFIG_DIR`,
-//! the Pi/OMP variables and the process working directory from many places.
+//! the Pi/OMP and Codex variables and the process working directory from
+//! many places.
 //! In core every such read goes through a [`HistoryEnv`] value instead:
 //!
 //! * the GUI builds one with [`HistoryEnv::from_process_env`] in `main` and
@@ -10,7 +11,8 @@
 //!   GUI has no meaningful process cwd, so core never calls
 //!   `std::env::current_dir()`);
 //! * tests build one with [`HistoryEnv::sandbox`], which keeps every path
-//!   (Claude data, Pi/OMP sessions, caches, config, logs) under a temporary
+//!   (Claude data, Pi/OMP sessions, the Codex home, caches, config, logs)
+//!   under a temporary
 //!   directory. `from_process_env` panics under `cfg(test)` so a test can
 //!   never reach the real home directory by accident.
 //!
@@ -20,6 +22,7 @@
 //! | What | Default |
 //! |---|---|
 //! | Claude data | `$CLAUDE_CONFIG_DIR` (absolute only) or `~/.claude` |
+//! | Codex home (read-only) | `$CODEX_HOME` or `~/.codex`; its state database in `config.toml`'s `sqlite_home`, else `$CODEX_SQLITE_HOME`, else the home |
 //! | caches (the list's store, semantic embeddings, fastembed model) | `~/.cache/claude-history-gui` |
 //! | CLI config (read-only, shared settings) | `~/.config/claude-history/config.toml` |
 //! | GUI config (GUI settings and overrides) | `~/.config/claude-history/gui.toml` |
@@ -75,6 +78,12 @@ pub struct HistoryEnv {
     pub omp_profile: Option<OsString>,
     /// `PI_PROFILE`
     pub pi_profile: Option<OsString>,
+    /// `CODEX_HOME`: the Codex home ([`HistoryEnv::codex_home`]). A relative
+    /// value resolves like the `PI_*` paths.
+    pub codex_home: Option<PathBuf>,
+    /// `CODEX_SQLITE_HOME`: the directory of Codex's state database when the
+    /// home's `config.toml` names none ([`HistoryEnv::codex_sqlite_home`]).
+    pub codex_sqlite_home: Option<PathBuf>,
     /// `XDG_DATA_HOME` (OMP only). A relative value resolves like the
     /// `PI_*` paths ([`HistoryEnv::env_value_base_dir`]: the launch
     /// directory, as upstream resolved it against its cwd, else the
@@ -131,6 +140,13 @@ impl HistoryEnv {
             pi_config_dir: std::env::var_os("PI_CONFIG_DIR").map(PathBuf::from),
             omp_profile: std::env::var_os("OMP_PROFILE"),
             pi_profile: std::env::var_os("PI_PROFILE"),
+            // Upstream treats an empty value as unset.
+            codex_home: std::env::var_os("CODEX_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+            codex_sqlite_home: std::env::var_os("CODEX_SQLITE_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
             xdg_data_home: std::env::var_os("XDG_DATA_HOME")
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from),
@@ -156,7 +172,8 @@ impl HistoryEnv {
     /// An environment rooted entirely inside `root` (for tests and demos).
     ///
     /// `root` acts as the home directory, so Claude data lives in
-    /// `root/.claude`, Pi in `root/.pi`, OMP in `root/.omp`, caches in
+    /// `root/.claude`, Pi in `root/.pi`, OMP in `root/.omp`, Codex in
+    /// `root/.codex`, caches in
     /// `root/.cache/claude-history-gui`, config in `root/.config/...` and the
     /// debug log in `root/.local/state/...`. No process environment variable
     /// is consulted. Override individual fields (or use the `with_*`
@@ -196,6 +213,41 @@ impl HistoryEnv {
     pub fn with_cache_root(mut self, dir: impl Into<PathBuf>) -> Self {
         self.cache_root = Some(dir.into());
         self
+    }
+
+    /// Set `CODEX_HOME`.
+    pub fn with_codex_home(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.codex_home = Some(dir.into());
+        self
+    }
+
+    /// The Codex home (upstream `codex::home_from_env`): `CODEX_HOME`, else
+    /// `<home>/.codex`. A relative `CODEX_HOME` resolves against
+    /// [`HistoryEnv::env_value_base_dir`] (upstream: the process cwd), and
+    /// without one the default is used, as upstream does when it has no cwd.
+    /// An empty value counts as unset.
+    pub fn codex_home(&self) -> Option<PathBuf> {
+        self.env_value_path(self.codex_home.as_deref())
+            .or_else(|| self.home_dir.as_ref().map(|home| home.join(".codex")))
+    }
+
+    /// `CODEX_SQLITE_HOME`, resolved like [`HistoryEnv::codex_home`]: where
+    /// Codex keeps its state database when the home's `config.toml` names
+    /// no `sqlite_home` (`None`: in the home).
+    pub fn codex_sqlite_home(&self) -> Option<PathBuf> {
+        self.env_value_path(self.codex_sqlite_home.as_deref())
+    }
+
+    /// An environment-variable path: as is when absolute, else against
+    /// [`HistoryEnv::env_value_base_dir`] (`None` without one, or when the
+    /// value is empty).
+    fn env_value_path(&self, value: Option<&Path>) -> Option<PathBuf> {
+        let path = value.filter(|path| !path.as_os_str().is_empty())?;
+        if path.is_absolute() {
+            Some(path.to_path_buf())
+        } else {
+            self.env_value_base_dir().map(|base| base.join(path))
+        }
     }
 
     fn missing_home() -> AppError {
@@ -607,7 +659,9 @@ mod tests {
             env.config_file().unwrap(),
             env.gui_config_file().unwrap(),
             env.debug_log_file().unwrap(),
+            env.codex_home().unwrap(),
         ];
+        assert_eq!(env.codex_sqlite_home(), None);
         for path in paths {
             assert!(
                 path.starts_with(root.path()),
@@ -831,6 +885,42 @@ mod tests {
         );
         // The workspace scope is unaffected by the launch directory.
         assert_eq!(env.workspace_base_dir(), Some(PathBuf::from(workspace)));
+    }
+
+    #[test]
+    fn codex_paths_default_to_the_home_and_resolve_like_pi_paths() {
+        let (home, launch, codex) = if cfg!(windows) {
+            (r"C:\home", r"C:\launch", r"D:\codex")
+        } else {
+            ("/home", "/launch", "/codex")
+        };
+        let env = HistoryEnv {
+            home_dir: Some(PathBuf::from(home)),
+            ..HistoryEnv::default()
+        };
+        assert_eq!(env.codex_home(), Some(Path::new(home).join(".codex")));
+        assert_eq!(env.codex_sqlite_home(), None);
+        let absolute = env.clone().with_codex_home(codex);
+        assert_eq!(absolute.codex_home(), Some(PathBuf::from(codex)));
+        // An empty value is unset; a relative one needs a base, else the
+        // default home is used (as upstream does without a cwd).
+        assert_eq!(
+            env.clone().with_codex_home("").codex_home(),
+            Some(Path::new(home).join(".codex"))
+        );
+        let relative = HistoryEnv {
+            codex_sqlite_home: Some(PathBuf::from("db")),
+            ..env.clone().with_codex_home("rel")
+        };
+        assert_eq!(relative.codex_home(), Some(Path::new(home).join(".codex")));
+        assert_eq!(relative.codex_sqlite_home(), None);
+        let launched = relative.with_env_path_base(launch);
+        assert_eq!(launched.codex_home(), Some(Path::new(launch).join("rel")));
+        assert_eq!(
+            launched.codex_sqlite_home(),
+            Some(Path::new(launch).join("db"))
+        );
+        assert_eq!(HistoryEnv::default().codex_home(), None);
     }
 
     #[test]

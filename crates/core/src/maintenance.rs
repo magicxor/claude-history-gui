@@ -494,7 +494,8 @@ impl From<Box<SessionDeleteFailure>> for AppError {
 ///   upstream `--delete`;
 /// * Pi: `path`, if it is a `.jsonl` Pi session, else `SessionNotFound`;
 /// * OMP: `path`, if it is a `.jsonl` OMP session, plus its artifact
-///   directory when it exists.
+///   directory when it exists;
+/// * Codex: refused, until `codex delete` is ported (upstream eea6d37).
 ///
 /// A source whose adapter cannot delete (`Adapter::capabilities`, upstream
 /// 9799550) is refused with [`AppError::Unsupported`]. Nothing is removed.
@@ -558,6 +559,11 @@ pub fn plan_session_delete(env: &HistoryEnv, path: &Path, source: Source) -> Res
                     .collect(),
             })
         }
+        // The Codex adapter cannot delete yet, so the check above refuses
+        // first (`history::sources::codex`).
+        Source::Codex => Err(AppError::Unsupported(history::actions::refusal(
+            source, "Deleting",
+        ))),
     }
 }
 
@@ -685,6 +691,8 @@ fn validate_delete_plan(env: &HistoryEnv, plan: &DeletePlan) -> Result<()> {
                 return refuse();
             }
         }
+        // Nothing plans a Codex deletion yet.
+        Source::Codex => return refuse(),
     }
     Ok(())
 }

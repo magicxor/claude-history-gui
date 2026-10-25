@@ -33,6 +33,9 @@ All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-h
   kept up to date in the background (reading only the conversation files that changed, at start, on refresh and
   after a rename or delete): the newest ones are shown at once and the full history is never loaded into memory
   for the list. The first run indexes the history in the background, newest first.
+* Codex threads (`~/.codex` or `CODEX_HOME`, archived and compressed sessions included, titles from Codex's state
+  database) are listed and searched too, marked `CX`; they cannot be opened, resumed, renamed or deleted from the
+  app yet.
 * Search as you type. **Lexical** search (with highlighted matches and a literal mode for quoted text) or
   **semantic** search (local embedding model, downloaded on first use; falls back to lexical while the cache is
   not ready). Ctrl+T toggles the mode.
@@ -316,14 +319,16 @@ is not remembered. An invalid file shows a dialog naming it (Quit / Continue wit
 * `CLAUDE_CONFIG_DIR`: Claude data directory (must be absolute; default `~/.claude`).
 * `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`, `PI_PROFILE`: Pi session locations.
 * `OMP_PROFILE`: OMP profile; `XDG_DATA_HOME` is honored for Pi/OMP data.
-  Relative values resolve against the directory the app was started in.
+* `CODEX_HOME`: the Codex home (default `~/.codex`); `CODEX_SQLITE_HOME`: where Codex keeps its state database
+  when the home's `config.toml` sets no `sqlite_home` (default: the home).
+  Relative values of the Pi, OMP and Codex variables resolve against the directory the app was started in.
 * `TERMINAL`: preferred terminal emulator on Linux. `PATH`/`PATHEXT` locate `claude`, `pi` and `omp`.
 * Development only: `CHG_ALLOW_REAL_HOME`, `CHG_ALLOW_REAL_LAUNCH` (see below).
 
 ## Safety
 
-The app reads your Claude Code, Pi and OMP history and writes to it only through these actions, each of which
-names the conversation and asks for confirmation:
+The app reads your Claude Code, Pi, OMP and Codex history (Codex's state database is opened read-only) and writes
+to it only through these actions, each of which names the conversation and asks for confirmation:
 
 * **Rename**: writes the custom title into the conversation.
 * **Delete**: removes the session's files from disk (every copy across projects, and the Pi/OMP artifacts

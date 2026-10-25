@@ -139,11 +139,16 @@ fn run_env(env: &HistoryEnv, args: &[&str]) -> Output {
 }
 
 /// A sandbox whose home is `home`, with upstream's `CLAUDE_CONFIG_DIR` and
-/// `PI_CODING_AGENT_SESSION_DIR` overrides.
+/// `PI_CODING_AGENT_SESSION_DIR` overrides. Its caches and the Codex home it
+/// reads stay out of the user's (upstream removes `CODEX_HOME` and
+/// `CODEX_SQLITE_HOME` from the binary's environment).
 fn sandbox(home: &Path, config: &Path, sessions: &Path) -> HistoryEnv {
-    HistoryEnv::sandbox(home)
+    let env = HistoryEnv::sandbox(home)
         .with_claude_config_dir(config)
-        .with_pi_session_dir(sessions)
+        .with_pi_session_dir(sessions);
+    assert_eq!(env.codex_home(), Some(home.join(".codex")));
+    assert_eq!(env.codex_sqlite_home(), None);
+    env
 }
 
 /// Upstream `run(config, args)`.

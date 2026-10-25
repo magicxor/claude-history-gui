@@ -15,6 +15,9 @@
 //! * **[`refusal`]** formats this commit's refusal texts (the TUI's status
 //!   messages) for the core errors that carry them; upstream adds the same
 //!   function, with a provenance parameter, in a later commit.
+//! * **Codex threads cannot be acted on yet.** Upstream's Codex adapter
+//!   supports everything but rename; the fork's reports no capability until
+//!   its resume plan and delete are ported (`history::sources::codex`).
 
 use crate::history::model::SourceKind;
 use std::path::Path;
@@ -64,10 +67,18 @@ mod tests {
     #[test]
     fn every_source_has_an_acting_adapter() {
         let registry = Registry::with_roots(None, None, None);
-        for source in [Source::Claude, Source::Pi, Source::Omp] {
+        for source in [Source::Claude, Source::Pi, Source::Omp, Source::Codex] {
             let adapter = registry.for_source(source);
             assert_eq!(adapter.instance().kind, source);
-            assert_eq!(adapter.capabilities(), Capabilities::ALL);
+            let capabilities = adapter.capabilities();
+            assert_eq!(capabilities.rename, source != Source::Codex);
+            // Fork: Codex resume, fork and delete come with upstream eea6d37
+            // (`history::sources::codex` module docs).
+            let acts = source != Source::Codex;
+            assert_eq!(
+                (capabilities.resume, capabilities.fork, capabilities.delete),
+                (acts, acts, acts)
+            );
         }
     }
 

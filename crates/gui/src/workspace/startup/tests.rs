@@ -941,7 +941,7 @@ fn recorded_cwd_entry_updates_the_app_workspace(cx: &mut TestAppContext) {
     });
 }
 
-/// L-082: the cwd recorded by a Pi/OMP session is meaningful once the first batch is loaded.
+/// L-082: the cwd recorded by a Pi, OMP or Codex session is meaningful once the first batch is loaded.
 #[test]
 fn pi_omp_recorded_cwd_selects_the_workspace() {
     let t = Table::new();
@@ -958,6 +958,12 @@ fn pi_omp_recorded_cwd_selects_the_workspace() {
     assert_eq!(
         found.map(|scope| scope.dir().to_path_buf()),
         Some(canon(&cwd))
+    );
+    // A Codex thread's cwd arrives the same way (every non-Claude source records one).
+    let codex = t.dir("codex-project");
+    assert!(
+        workspace_from_recorded_cwd_with(Some(&codex), None, env, [codex.as_path()], None)
+            .is_some()
     );
     // No match, an already chosen workspace, the home directory and the exe directory do not.
     assert!(

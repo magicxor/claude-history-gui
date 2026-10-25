@@ -5,7 +5,9 @@
 //!
 //! * **Roots from a [`HistoryEnv`].** [`Registry::from_env`] takes the env
 //!   (the Claude projects root and the Pi/OMP session roots the history
-//!   loader reads; the Pi root follows the workspace's `.pi/settings.json`)
+//!   loader reads; the Pi root follows the workspace's `.pi/settings.json`;
+//!   the Codex home and state database directory,
+//!   [`HistoryEnv::codex_home`] and [`HistoryEnv::codex_sqlite_home`])
 //!   instead of reading the process environment. Like upstream's, a registry
 //!   is built for each pass, so it follows a workspace change.
 //! * **The CLI's cache dir.** A registry built from an env also carries the
@@ -15,6 +17,7 @@
 //!   [`Registry::with_roots`] leaves it unset.
 
 pub mod claude;
+pub mod codex;
 pub mod pi;
 
 use super::adapter::{Adapter, FileId, Located, Stamp};
@@ -31,7 +34,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 /// The adapters of every configured history root, in a fixed order: Claude,
-/// Pi, OMP.
+/// Pi, OMP, Codex.
 #[derive(Clone, Default)]
 pub struct Registry {
     adapters: Vec<Arc<dyn Adapter>>,
@@ -41,15 +44,20 @@ pub struct Registry {
 
 impl Registry {
     /// The roots `env` selects (`CLAUDE_CONFIG_DIR`, the Pi and OMP
-    /// settings), whether or not they exist (fork: from the [`HistoryEnv`],
-    /// not the process environment), and the CLI's cache root.
+    /// settings, `CODEX_HOME`), whether or not they exist (fork: from the
+    /// [`HistoryEnv`], not the process environment), and the CLI's cache
+    /// root.
     pub fn from_env(env: &HistoryEnv) -> Self {
-        Self::with_roots(
+        let mut registry = Self::with_roots(
             env.claude_projects_root().ok(),
             pi_loader::session_root(env).ok(),
             omp_loader::session_root(env).ok(),
         )
-        .with_cli_cache(env.cli_cache_root())
+        .with_cli_cache(env.cli_cache_root());
+        if let Some(codex) = codex::CodexAdapter::from_env(env) {
+            registry.adapters.push(Arc::new(codex));
+        }
+        registry
     }
 
     /// Adapters for a Claude `projects` directory and Pi and OMP session
@@ -89,6 +97,15 @@ impl Registry {
         self.cli_cache.as_deref()
     }
 
+    /// Adds the adapter of a Codex home (fork: without a `CODEX_SQLITE_HOME`;
+    /// [`Self::from_env`] adds the env's through `CodexAdapter::from_env`).
+    pub fn with_codex(mut self, home: Option<PathBuf>) -> Self {
+        if let Some(home) = home {
+            self.adapters.push(Arc::new(codex::CodexAdapter::new(home)));
+        }
+        self
+    }
+
     pub fn adapters(&self) -> &[Arc<dyn Adapter>] {
         &self.adapters
     }
@@ -98,9 +115,12 @@ impl Registry {
     pub fn key_of(&self, path: &Path) -> Option<ConversationKey> {
         self.adapters.iter().find_map(|adapter| {
             let instance = adapter.instance();
-            path.starts_with(&instance.root).then(|| ConversationKey {
+            if !path.starts_with(&instance.root) {
+                return None;
+            }
+            Some(ConversationKey {
                 instance: instance.clone(),
-                native_id: native_id(&instance.root, path),
+                native_id: adapter.native_id_of(path)?,
             })
         })
     }
@@ -125,6 +145,10 @@ impl Registry {
                 path: PathBuf::new(),
                 flat: false,
             })),
+            SourceKind::Codex => Arc::new(codex::CodexAdapter::with_sqlite_home(
+                PathBuf::new(),
+                PathBuf::new(),
+            )),
         }
     }
 
@@ -188,6 +212,7 @@ fn located(
         path,
         size,
         modified,
+        native: None,
     }
 }
 
@@ -234,6 +259,7 @@ pub(crate) fn decode_path_into(
         modified,
         file_id: None,
         stamp: Stamp::default(),
+        native: None,
     };
     Ok(decode_file(&located, omp, events)?
         .expect("a file that is not a Pi session decodes as a Claude session"))

@@ -10,11 +10,12 @@
 //!    Unix `getpwuid_r(getuid())`); when the OS cannot tell, the gate refuses
 //!    (it fails closed);
 //! 3. each of `CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR`,
-//!    `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`, `XDG_DATA_HOME`,
-//!    `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` is unset or
-//!    (canonically) inside the home, and the default data locations used
-//!    while they are unset (`<home>/.claude`, `.claude.json`, `.pi`, `.omp`,
-//!    `.config`, `.cache`, `.local` and their data subfolders) canonically
+//!    `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`, `CODEX_HOME`,
+//!    `CODEX_SQLITE_HOME`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`,
+//!    `XDG_CACHE_HOME`, `XDG_STATE_HOME` is unset or (canonically) inside the
+//!    home, and the default data locations used while they are unset
+//!    (`<home>/.claude`, `.claude.json`, `.pi`, `.omp`, `.codex`, `.config`,
+//!    `.cache`, `.local` and their data subfolders) canonically
 //!    stay inside the home when they exist — a junction or symlink to real
 //!    data is refused;
 //! 4. `OMP_PROFILE` and `PI_PROFILE` are unset or plain names.
@@ -32,11 +33,13 @@ pub const SANDBOX_MARKER: &str = ".qa-sandbox";
 /// The variable that lets a debug build use the real home.
 pub const ALLOW_REAL_HOME_VAR: &str = "CHG_ALLOW_REAL_HOME";
 /// Path variables that must stay inside the sandbox home.
-pub const PATH_VARS: [&str; 8] = [
+pub const PATH_VARS: [&str; 10] = [
     "CLAUDE_CONFIG_DIR",
     "PI_CODING_AGENT_DIR",
     "PI_CODING_AGENT_SESSION_DIR",
     "PI_CONFIG_DIR",
+    "CODEX_HOME",
+    "CODEX_SQLITE_HOME",
     "XDG_DATA_HOME",
     "XDG_CONFIG_HOME",
     "XDG_CACHE_HOME",
@@ -46,7 +49,7 @@ pub const PATH_VARS: [&str; 8] = [
 pub const NAME_VARS: [&str; 2] = ["OMP_PROFILE", "PI_PROFILE"];
 /// Default data locations under the home (relative), checked when present:
 /// each must canonically stay inside the home.
-pub const DEFAULT_DATA_PATHS: [&str; 16] = [
+pub const DEFAULT_DATA_PATHS: [&str; 19] = [
     ".claude",
     ".claude/projects",
     ".claude.json",
@@ -54,6 +57,9 @@ pub const DEFAULT_DATA_PATHS: [&str; 16] = [
     ".pi/agent",
     ".omp",
     ".omp/agent",
+    ".codex",
+    ".codex/sessions",
+    ".codex/archived_sessions",
     ".config",
     ".config/claude-history",
     ".cache",
@@ -354,6 +360,12 @@ mod tests {
             Some(outside.path().join(".claude").into_os_string()),
         )];
         assert!(check(&gate).unwrap_err().contains("CLAUDE_CONFIG_DIR"));
+        // The Codex home and its state database directory are checked too.
+        for name in ["CODEX_HOME", "CODEX_SQLITE_HOME"] {
+            assert!(PATH_VARS.contains(&name), "{name} is gathered");
+            gate.path_vars = vec![(name, Some(outside.path().join(".codex").into_os_string()))];
+            assert!(check(&gate).unwrap_err().contains(name));
+        }
         gate.path_vars = vec![("XDG_DATA_HOME", Some(OsString::from("relative/dir")))];
         assert!(check(&gate).unwrap_err().contains("relative"));
     }

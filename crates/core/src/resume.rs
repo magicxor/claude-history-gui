@@ -190,6 +190,9 @@ impl ProgramOverrides {
             Source::Claude => self.claude.as_deref(),
             Source::Pi => self.pi.as_deref(),
             Source::Omp => self.omp.as_deref(),
+            // No `codex_path` yet: Codex threads are not resumed until upstream
+            // eea6d37 is ported (`history::sources::codex`).
+            Source::Codex => None,
         }
     }
 }
@@ -200,6 +203,7 @@ pub fn program_name(source: Source) -> &'static str {
         Source::Claude => "claude",
         Source::Pi => "pi",
         Source::Omp => "omp",
+        Source::Codex => "codex",
     }
 }
 

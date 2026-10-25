@@ -42,6 +42,9 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 - Parse errors that follow a skipped user message (a Warmup message, the records `/clear` leaves behind) show their
   own line number and surrounding lines in Tools > Debug log > Parse errors and in debug.log; they were reported one
   line early, with the wrong context. Claude conversation files are also recognized and read with less work.
+- Codex threads are listed and searchable next to Claude Code, Pi and OMP conversations (marked `CX`), read from
+  `~/.codex` or `CODEX_HOME`, including archived and compressed sessions, with the titles Codex keeps in its state
+  database (only ever read). Opening, resuming, forking, renaming and deleting them is not available yet.
 
 ## v0.1.1
 

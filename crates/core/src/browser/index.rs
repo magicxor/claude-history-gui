@@ -208,7 +208,7 @@ impl KeyIndex {
 
 /// How many conversations of each source the corpus holds.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct SourceCounts([usize; 3]);
+pub(super) struct SourceCounts([usize; 4]);
 
 impl SourceCounts {
     fn slot(source: Source) -> usize {
@@ -216,6 +216,7 @@ impl SourceCounts {
             Source::Claude => 0,
             Source::Pi => 1,
             Source::Omp => 2,
+            Source::Codex => 3,
         }
     }
 

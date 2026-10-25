@@ -588,7 +588,7 @@ impl ListPane {
     }
 
     /// The distinct working directories recorded by the loaded Pi/OMP
-    /// conversations (PD3 rule 3 (c), L-082: the main window passes them to
+    /// conversations (every non-Claude source; PD3 rule 3 (c), L-082: the main window passes them to
     /// `startup::apply_recorded_cwd_workspace` after the first load).
     pub fn recorded_agent_cwds(&self) -> Vec<PathBuf> {
         let mut cwds: Vec<PathBuf> = Vec::new();
