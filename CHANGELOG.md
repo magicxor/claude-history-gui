@@ -4,6 +4,9 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 ## Unreleased
 
+- Semantic search uses the snowflake-arctic-embed-xs model (about 90 MB), which ranks as well or better than the
+  previous one at half the indexing cost. After the update the history is re-embedded in the background, ranking
+  what is indexed so far meanwhile, and the old model download is removed once the new one loads.
 - Semantic indexing is several times faster: the embedding model now runs on half of the processor cores instead of
   one, and embeds passages of similar length together. The background pass that updates the list index runs at a
   lower priority, so the app and other programs stay responsive meanwhile.

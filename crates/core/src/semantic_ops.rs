@@ -51,7 +51,7 @@ use std::sync::Arc;
 /// Creates the embedder when an operation needs one.
 pub type EmbedderFactory<'a> = &'a mut dyn FnMut() -> Result<Box<dyn SemanticEmbedder>>;
 
-/// The production embedder: fastembed BGE-small, downloaded on first use
+/// The production embedder: fastembed snowflake-arctic-embed-xs, downloaded on first use
 /// into [`HistoryEnv::semantic_model_dir`], without a progress bar, on
 /// every core (upstream's `FastembedEmbedder::new()`, 8322afe). Under
 /// `cfg(test)` the embedder refuses to load: tests inject their own.
@@ -1255,10 +1255,10 @@ pub fn semantic_status(
         .and_then(|path| std::fs::metadata(path).ok())
         .map(|metadata| metadata.len());
     let model_dir = env.semantic_model_dir();
-    let model_downloaded = model_dir
-        .as_deref()
-        .and_then(|dir| std::fs::read_dir(dir).ok())
-        .is_some_and(|mut entries| entries.next().is_some());
+    let model_downloaded = model_dir.as_deref().is_some_and(|dir| {
+        dir.join("models--snowflake--snowflake-arctic-embed-xs")
+            .is_dir()
+    });
     let model_dir_size = model_dir.as_deref().map(dir_size).unwrap_or(0);
     let coverage = conversations.map(|conversations| {
         let indices = select_conversation_indices(conversations, workspace);
@@ -2095,8 +2095,15 @@ mod tests {
         std::fs::remove_file(&legacy).unwrap();
 
         let model = env.semantic_model_dir().unwrap();
-        std::fs::create_dir_all(model.join("models--x")).unwrap();
-        std::fs::write(model.join("models--x").join("w.onnx"), b"12345").unwrap();
+        std::fs::create_dir_all(model.join("models--snowflake--snowflake-arctic-embed-xs"))
+            .unwrap();
+        std::fs::write(
+            model
+                .join("models--snowflake--snowflake-arctic-embed-xs")
+                .join("w.onnx"),
+            b"12345",
+        )
+        .unwrap();
         let status = semantic_status(&env, None, None);
         assert!(status.model_downloaded);
         assert_eq!(status.model_dir_size, 5);

@@ -482,6 +482,21 @@ pub const CACHE_LOCK_FILE_NAME: &str = "embeddings.lock";
 /// How long a cache write (or clear) waits for the cache lock.
 pub const CACHE_LOCK_WAIT: Duration = Duration::from_secs(2);
 
+/// Model downloads earlier versions used, in fastembed's cache layout.
+const SUPERSEDED_MODELS: &[&str] = &["models--Xenova--bge-small-en-v1.5"];
+
+/// Removes downloads of models this version no longer uses from the model
+/// directory `dir` (only the exact superseded repo directories). Failures
+/// are ignored; the files are only wasted space.
+pub fn remove_superseded_models(dir: &Path) {
+    for name in SUPERSEDED_MODELS {
+        let path = dir.join(name);
+        if path.is_dir() {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
 /// An exclusive lock on `<semantic dir>/embeddings.lock`, held until it is
 /// dropped. It makes every embedding-cache writer of this process and of
 /// other processes (a second GUI instance, the agent subcommand) take turns:
@@ -1427,6 +1442,22 @@ mod tests {
         let missing = root.path().join("missing");
         assert!(!clear_semantic_cache_files(Some(&missing)).unwrap());
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn remove_superseded_models_removes_only_the_old_model_download() {
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("models--Xenova--bge-small-en-v1.5");
+        let other = root.path().join("models--other--model");
+        std::fs::create_dir_all(old.join("snapshots")).unwrap();
+        std::fs::write(old.join("snapshots").join("model.onnx"), b"x").unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+
+        remove_superseded_models(root.path());
+        remove_superseded_models(&root.path().join("missing"));
+
+        assert!(!old.exists());
+        assert!(other.exists());
     }
 
     fn entry_names(dir: &Path) -> Vec<String> {

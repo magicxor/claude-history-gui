@@ -160,7 +160,7 @@ pub fn refusing_factory(message: &'static str) -> ModelFactory {
     Arc::new(move || Err(AppError::AgentProtocol(message.to_string())))
 }
 
-/// The production factory: the fastembed BGE-small model, downloaded on first
+/// The production factory: the fastembed snowflake-arctic-embed-xs model, downloaded on first
 /// use into `model_dir` (`HistoryEnv::semantic_model_dir`, or the QA run's
 /// pre-downloaded `--qa-model-dir`), embedding on half the cores. Without a
 /// model directory (no home) it fails with a readable message.

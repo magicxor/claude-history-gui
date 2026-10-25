@@ -31,8 +31,9 @@ use std::path::PathBuf;
 #[cfg(feature = "release-dynamic-ort")]
 use std::{path::Path, sync::OnceLock};
 
-/// The embedding model (upstream: `EmbeddingModel::BGESmallENV15`).
-const MODEL: EmbeddingModel = EmbeddingModel::BGESmallENV15;
+/// The embedding model: snowflake-arctic-embed-xs (6 layers, 384 dims,
+/// 512-token window; upstream 2e618bd, replacing bge-small-en-v1.5).
+const MODEL: EmbeddingModel = EmbeddingModel::SnowflakeArcticEmbedXS;
 /// The Hugging Face endpoint. fastembed honored `HF_ENDPOINT`; core does
 /// not read the process environment outside [`crate::env::HistoryEnv`].
 const HF_ENDPOINT: &str = "https://huggingface.co";
@@ -63,7 +64,7 @@ impl EmbedPriority {
 }
 
 impl FastembedEmbedder {
-    /// Load (downloading on first use) the BGE-small model into `model_dir`
+    /// Load (downloading on first use) the snowflake-arctic-embed-xs model into `model_dir`
     /// (normally [`crate::env::HistoryEnv::semantic_model_dir`]).
     ///
     /// The files are fetched with hf-hub directly instead of fastembed's
@@ -71,8 +72,8 @@ impl FastembedEmbedder {
     /// (so `clear_semantic_cache` missed it), honored `HF_ENDPOINT`, read
     /// the real `~/.cache/huggingface/token` (sending it as a bearer token)
     /// and panicked without a home directory. The cache layout under
-    /// `model_dir` (`models--Xenova--bge-small-en-v1.5/...`) is unchanged,
-    /// so earlier downloads are reused; the model is built exactly as
+    /// `model_dir` (`models--snowflake--snowflake-arctic-embed-xs/...`) is fastembed's,
+    /// so a pre-downloaded model is reused; the model is built exactly as
     /// `try_new` builds it (same files, pooling, quantization and output).
     ///
     /// GUI callers must pass `show_download_progress = false`: `true` makes
@@ -108,7 +109,7 @@ impl FastembedEmbedder {
                 "{MODEL:?} needs external model files, which are not supported"
             )));
         }
-        let repo = model_api_builder(model_dir, show_download_progress)
+        let repo = model_api_builder(model_dir.clone(), show_download_progress)
             .build()
             .map_err(to_config_error)?
             .model(info.model_code.clone());
@@ -122,6 +123,7 @@ impl FastembedEmbedder {
             InitOptionsUserDefined::new().with_intra_threads(priority.threads()),
         )
         .map_err(to_config_error)?;
+        crate::semantic::cache::remove_superseded_models(&model_dir);
         Ok(Self { model })
     }
 }
@@ -287,6 +289,8 @@ fn lower_current_thread_priority() {
     }
 }
 
+/// The query instruction snowflake-arctic-embed was trained with; passages
+/// take none.
 pub fn prefixed_query(query: &str) -> String {
     format!("Represent this sentence for searching relevant passages: {query}")
 }
@@ -563,7 +567,7 @@ mod tests {
         let model_dir = temp.path().join("fastembed");
         let info = TextEmbedding::get_model_info(&MODEL).unwrap();
         let repo_dir = model_dir.join(format!("models--{}", info.model_code.replace('/', "--")));
-        assert!(repo_dir.ends_with("models--Xenova--bge-small-en-v1.5"));
+        assert!(repo_dir.ends_with("models--snowflake--snowflake-arctic-embed-xs"));
         std::fs::create_dir_all(repo_dir.join("refs")).unwrap();
         std::fs::write(repo_dir.join("refs").join("main"), "abc123").unwrap();
         let snapshot = repo_dir.join("snapshots").join("abc123");
@@ -597,7 +601,7 @@ mod tests {
             read.tokenizer.tokenizer_config_file,
             b"<tokenizer_config.json>"
         );
-        // The BGE-small model needs no external weight files.
+        // The model needs no external weight files.
         assert!(info.additional_files.is_empty());
     }
 

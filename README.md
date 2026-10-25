@@ -48,7 +48,7 @@ All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-h
   `--all-kinds` lists them, tagged `sub`). Claude Code's internal helper agents (prompt suggestions, compaction) are
   skipped.
 * Search as you type. **Lexical** search (with highlighted matches and a literal mode for quoted text) or
-  **semantic** search (local embedding model, downloaded on first use; it answers from the conversations embedded
+  **semantic** search (local embedding model, snowflake-arctic-embed-xs, about 90 MB, downloaded on first use; it answers from the conversations embedded
   so far while it embeds new ones in the background, and falls back to lexical while nothing embedded matches).
   Ctrl+T toggles the mode.
 * **You only** (Alt+U, View > Search only your own messages, `[keys] user_only`): lexical search matches only what
@@ -246,7 +246,8 @@ alias claude-history='claude-history-gui'
 ```
 
 Semantic modes load the embedding model like the original (downloaded on first use into
-`~/.cache/claude-history-gui/semantic/fastembed`).
+`~/.cache/claude-history-gui/semantic/fastembed`). The model is snowflake-arctic-embed-xs; after an update that
+changes the embedding model the history is re-embedded in the background and the old model download is removed.
 
 ### Windows console output
 

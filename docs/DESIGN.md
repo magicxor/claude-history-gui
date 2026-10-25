@@ -961,7 +961,7 @@ for the dialog's lifetime ("Reload" re-runs). Scope Workspace = `debug_search_re
 │ Scope (All | Workspace)                                  [Run]      │
 │ ┌────────────────────────────────────────────────────────────────┐ │
 │ │ Semantic search: searching 812 cached chunk(s) from 120 recent │ │ read-only Textarea
-│ │ conversation(s) with fastembed BGESmallENV15                   │ │
+│ │ conversation(s) with fastembed SnowflakeArcticEmbedXS          │ │
 │ │ #01 0.812 …                                                    │ │
 │ └────────────────────────────────────────────────────────────────┘ │
 │ [Copy]                                                   [Close]   │
@@ -3276,7 +3276,8 @@ quit 0
      `<dest>\.pi\agent`; `CODEX_HOME` = `<dest>\.codex`; `XDG_*` under `<dest>`; removes
      `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`, `CODEX_SQLITE_HOME`, `OMP_PROFILE`, `PI_PROFILE`; starts the watcher when `-Shots`; waits; prints the report.
   3. Semantic QA: the model downloads into the sandbox cache on first use unless `--qa-model-dir
-     <scratchpad>\qa-model-cache` points at a pre-downloaded copy (feature `qa` only).
+     <scratchpad>\qa-model-cache` points at a pre-downloaded copy (feature `qa` only). That copy must hold the
+     snowflake-arctic-embed-xs model: loading removes superseded models (the old BGE download) from the dir.
   4. Plain dev runs use the same script without `-Scenario`.
   5. A fresh sandbox has no store (upstream 358becb): the first launch lists nothing until the initial reconcile pass
      publishes its first generation (the newest sessions), and the list is ready (`wait-loaded`) from then on while
