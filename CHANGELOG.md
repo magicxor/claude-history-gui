@@ -4,6 +4,9 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 ## Unreleased
 
+- Conversation refs and message anchors in Deep Search and the agent panel change once: a Codex thread keeps its ref
+  across reverts and archiving, and a Pi or OMP ref no longer depends on its working directory still existing. Old
+  refs and anchors still resolve; an anchor whose message was edited or dropped is reported as `stale-anchor`.
 - Pi and OMP messages in Deep Search and the agent panel are numbered by their line in the session file. Reopening
   a conversation viewed recently no longer reads its file again while it is unchanged, and Codex threads open in the
   viewer and exports with the state database `CODEX_SQLITE_HOME` names. Print with `--debug` reports only the records

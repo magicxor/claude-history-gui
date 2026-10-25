@@ -383,16 +383,15 @@ fn full_ref_candidates(response: &mut AgentResponse, env: &HistoryEnv, cancelled
         return;
     };
     if error.kind == claude_history_core::agent::diagnostic::AgentErrorKind::AmbiguousRef {
-        // Pi/OMP refs hash the session id that only core's key discovery
-        // knows (CCR): discover lazily, an error leaves them as handles.
+        // Refs digest the source instance and native id that only core's key
+        // discovery knows: discover lazily, an error leaves the handles.
         // The discovery is blocking and not cancellable: skip it for a job
         // that was cancelled or replaced (the handles stay).
-        let keys = if !cancelled
-            && (error.detail.contains(" source=pi ")
-                || error.detail.contains(" source=omp ")
-                || error.detail.contains(" source=codex "))
-        {
-            claude_history_core::agent::service::discover_agent_keys(env, None, None)
+        let keys = if !cancelled && error.detail.contains(" source=") {
+            // Cards are only needed for Codex keys.
+            let no_cards: &[claude_history_core::history::Conversation] = &[];
+            let listed = (!error.detail.contains(" source=codex ")).then_some(no_cards);
+            claude_history_core::agent::service::discover_agent_keys(env, None, listed)
                 .map(|(keys, _)| keys)
                 .unwrap_or_default()
         } else {
@@ -403,9 +402,9 @@ fn full_ref_candidates(response: &mut AgentResponse, env: &HistoryEnv, cancelled
 }
 
 /// Replace the short handle at the start of every candidate (`ch_… project=…
-/// source=claude directory=D file=F`) with the full ref computed from D and
-/// F; Pi/OMP candidates are looked up in `keys` (core's discovery) and keep
-/// their handle when no key matches.
+/// source=S directory=D file=F`) with the full ref of the matching key in
+/// `keys` (core's discovery); a candidate keeps its handle when no key
+/// matches.
 pub(super) fn expand_handles(
     detail: &str,
     keys: &[claude_history_core::agent::refs::AgentConversationKey],
@@ -429,13 +428,6 @@ pub(super) fn expand_handles(
                 .split_once(" directory=")
                 .and_then(|(_, tail)| tail.rsplit_once(" file="));
             match (source, directory) {
-                (Some("claude"), Some((directory, file))) if handle.starts_with("ch_") => {
-                    let full = claude_history_core::agent::refs::AgentConversationRef::from_parts(
-                        directory, file,
-                    )
-                    .full_ref();
-                    format!("{lead}{full} {rest}")
-                }
                 (Some(source), Some((directory, file))) if handle.starts_with("ch_") => {
                     match claude_history_core::agent::refs::full_ref_for_candidate(
                         keys, source, directory, file,

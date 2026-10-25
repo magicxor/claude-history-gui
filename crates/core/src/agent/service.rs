@@ -857,16 +857,16 @@ pub fn discover_agent_keys(
                 .unwrap_or(header.cwd)
                 .to_string_lossy()
                 .into_owned();
-            let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+            if path.file_name().and_then(|name| name.to_str()).is_none() {
                 continue;
-            };
-            keys.push(agent::refs::AgentConversationKey {
-                source: history::model::SourceKind::Pi,
-                project_dir_name: project_identity,
-                session_filename: filename.to_owned(),
-                session_id: header.id,
+            }
+            keys.push(agent::refs::AgentConversationKey::in_instance(
+                history::model::SourceKind::Pi,
+                &pi_root.path,
+                project_identity,
+                header.id,
                 path,
-            });
+            ));
         }
     }
     if let Ok(omp_root) = history::omp_loader::session_root(env)
@@ -899,16 +899,16 @@ pub fn discover_agent_keys(
                 .unwrap_or(header.cwd)
                 .to_string_lossy()
                 .into_owned();
-            let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+            if path.file_name().and_then(|name| name.to_str()).is_none() {
                 continue;
-            };
-            keys.push(agent::refs::AgentConversationKey {
-                source: history::model::SourceKind::Omp,
-                project_dir_name: project_identity,
-                session_filename: filename.to_owned(),
-                session_id: header.id,
+            }
+            keys.push(agent::refs::AgentConversationKey::in_instance(
+                history::model::SourceKind::Omp,
+                &omp_root.path,
+                project_identity,
+                header.id,
                 path,
-            });
+            ));
         }
     }
     let loaded;
@@ -920,6 +920,7 @@ pub fn discover_agent_keys(
             &loaded
         }
     };
+    let registry = history::sources::Registry::from_env(env);
     keys.extend(
         listed
             .iter()
@@ -928,7 +929,8 @@ pub fn discover_agent_keys(
                     && !conversation.provenance.hidden_by_default()
             })
             .filter_map(|conversation| {
-                agent::refs::AgentConversationKey::from_conversation(conversation).ok()
+                agent::refs::AgentConversationKey::from_conversation_in(conversation, &registry)
+                    .ok()
             }),
     );
     if keys.is_empty() && !root.exists() {
@@ -955,11 +957,14 @@ fn warnings_for_skipped_transcripts(
         .iter()
         .map(|conversation| conversation.path.as_path())
         .collect::<std::collections::HashSet<_>>();
+    let registry = history::sources::Registry::from_env(&service.env);
     let mut warnings = Vec::new();
     for conversation in conversations {
         if key_paths.contains(conversation.path.as_path()) && !conversation.parse_errors.is_empty()
         {
-            let key = agent::refs::AgentConversationKey::from_conversation(conversation).ok();
+            let key =
+                agent::refs::AgentConversationKey::from_conversation_in(conversation, &registry)
+                    .ok();
             warnings.push(AgentWarning {
                 kind: crate::agent::diagnostic::AgentWarningKind::MalformedTranscript,
                 reference: key.as_ref().map(|key| {
@@ -1896,7 +1901,7 @@ pub(crate) fn resolve_agent_read_args(
     } else {
         let conversations =
             crate::store::load_conversations(env, false, None, crate::store::Contents::Cards)?;
-        loaded_keys = agent::refs::conversation_keys_from_conversations(&conversations)?;
+        loaded_keys = agent::refs::conversation_keys_from_conversations(env, &conversations)?;
         &loaded_keys
     };
     let resolved_refs = refs
@@ -1972,7 +1977,7 @@ pub(crate) fn resolve_agent_conversation_arg(
     } else {
         let conversations =
             crate::store::load_conversations(env, false, None, crate::store::Contents::Cards)?;
-        loaded_keys = agent::refs::conversation_keys_from_conversations(&conversations)?;
+        loaded_keys = agent::refs::conversation_keys_from_conversations(env, &conversations)?;
         &loaded_keys
     };
     agent::refs::resolve_conversation_ref(keys, reference)

@@ -476,6 +476,24 @@ fn search_reports_partial_warnings_and_preserves_compact_success_output() {
             .contains("protocol agent-warning kind=malformed-transcript ref=ch_")
     );
     assert!(output.stdout.contains("read ref=ch_"));
+    // The warning's ref addresses the malformed transcript (the same
+    // identity discovery gives it on every platform).
+    let warning_ref = output
+        .stdout
+        .lines()
+        .find(|line| line.contains("agent-warning kind=malformed-transcript"))
+        .and_then(|line| line.split("ref=").nth(1))
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("warning ref")
+        .to_owned();
+    let read = run(home.path(), config.path(), &["agent", "read", &warning_ref]);
+    assert!(
+        read.stderr.starts_with(&format!(
+            "protocol agent-error kind=malformed-transcript ref={warning_ref}"
+        )),
+        "{}",
+        read.stderr
+    );
 }
 
 #[test]
