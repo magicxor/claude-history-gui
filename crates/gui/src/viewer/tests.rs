@@ -891,6 +891,30 @@ mod pure {
         assert!(found(" - / ").is_empty());
     }
 
+    /// V-073 (5896b9e): a letter-digit switch starts a word; case changes do not.
+    #[test]
+    fn search_starts_words_at_letter_digit_switches() {
+        let lines = vec![
+            user("tag v1.2.3 and encode H264"),
+            assistant("the AppConfig type"),
+        ];
+        let (_dir, model) = model_for(&lines, prefs(ToolDisplayMode::Truncated, false, false));
+        let doc = model.document();
+        let items = items_of(&model, 80);
+        let mut index = SearchIndex::build(&items);
+        let mut found = |query: &str| -> Vec<String> {
+            index
+                .find(&items, &doc, query)
+                .into_iter()
+                .map(|m| items[m.item_ix].segments[m.segment_ix].text[m.range].to_string())
+                .collect()
+        };
+        assert_eq!(found("1.2.3"), ["1.2.3"]);
+        assert_eq!(found("264"), ["264"]);
+        assert!(found("onfig").is_empty());
+        assert!(found("64").is_empty());
+    }
+
     #[test]
     fn v075_overlay_gives_the_current_match_its_own_style() {
         use gpui_kit::{FontWeight, HighlightStyle, hsla};

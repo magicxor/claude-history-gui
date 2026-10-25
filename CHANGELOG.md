@@ -18,6 +18,8 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 - List highlights and match snippets follow the search rules: `İstanbul`, `Straße` and CJK words inside a longer run
   are highlighted and shown, and `.net` is no longer highlighted inside `asp.net`.
 - Search finds a word that starts inside a longer match: `1.1` now matches `v1.1.1`.
+- A switch between a letter and a digit starts a word: `1.2.3` finds `v1.2.3`, `264` finds `h264` and `8` finds `utf8`.
+  `AppConfig` is still not split (`onfig` does not find it). The conversation index is rebuilt once.
 - Searching only your own messages, and list previews, keep text after an unclosed tag or an `[Image...` lookalike:
   `[Image upload fails` and a typed `<system-reminder>` stay as typed text (only `[Image]`, `[Image #N]` and
   `[Image: description]` are placeholders), and previews drop a tag only when its opening and closing tag both
@@ -63,8 +65,8 @@ Release notes are taken from the `## v<version>` section of this file by the rel
   load, and they can be opened, resumed and forked at once; rename and delete become available when loading
   finishes, which swaps in the loaded list without moving the selection. The snapshot is kept per workspace and
   Pi/OMP session folder, so a different one never shows another's conversations at startup.
-- Quoted and identifier literals match only at word starts (after a non-alphanumeric character): "Config" no longer
-  matches inside AppConfig.
+- Quoted and identifier literals match only at word starts (after a non-alphanumeric character or at a switch
+  between a letter and a digit): "Config" no longer matches inside AppConfig.
 - Searching works right after startup: while the history is still loading, a keyword query answers from the search
   index saved with the startup snapshot, showing the first page of results before the rest. The snapshot now also
   stores the conversation text and that index (rebuilt in the background after a load that changed anything; quitting
