@@ -440,6 +440,7 @@ fn hermetic_guards_active() {
         },
         args: Vec::new(),
         cwd: Some(root.path().to_path_buf()),
+        env: Vec::new(),
     };
     let launcher = if cfg!(windows) {
         TerminalLauncher::WindowsConsole

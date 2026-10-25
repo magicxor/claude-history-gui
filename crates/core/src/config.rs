@@ -155,8 +155,36 @@ pub struct DisplayConfig {
 #[derive(Clone, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ResumeConfig {
+    /// Arguments Claude Code is resumed with.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_args: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex: Option<AgentResumeConfig>,
+}
+
+/// How the conversations of another agent are resumed.
+#[derive(Clone, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentResumeConfig {
+    /// Arguments the agent is resumed with, before its own subcommand.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_args: Option<Vec<String>>,
+}
+
+impl ResumeConfig {
+    /// The configured arguments for resuming a conversation of `source`.
+    pub fn default_args(&self, source: crate::history::Source) -> &[String] {
+        use crate::history::Source;
+        let args = match source {
+            Source::Claude => self.default_args.as_ref(),
+            Source::Codex => self
+                .codex
+                .as_ref()
+                .and_then(|codex| codex.default_args.as_ref()),
+            Source::Pi | Source::Omp => None,
+        };
+        args.map(Vec::as_slice).unwrap_or(&[])
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
@@ -471,6 +499,9 @@ pub struct GuiSettings {
     /// Explicit path of the `omp` executable (else resolved via PATH).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub omp_path: Option<PathBuf>,
+    /// Explicit path of the `codex` executable (else resolved via PATH).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex_path: Option<PathBuf>,
     /// Workspace directory to start with. It must be an absolute path; see
     /// [`GuiSettings::default_workspace_scope`].
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -632,8 +663,18 @@ impl ConfigFile {
             None => resume,
             Some(top) => {
                 let base = resume.unwrap_or_default();
+                let codex = match &top.codex {
+                    None => base.codex,
+                    Some(top_codex) => {
+                        let base_codex = base.codex.unwrap_or_default();
+                        Some(AgentResumeConfig {
+                            default_args: overlay(base_codex.default_args, &top_codex.default_args),
+                        })
+                    }
+                };
                 Some(ResumeConfig {
                     default_args: overlay(base.default_args, &top.default_args),
+                    codex,
                 })
             }
         };
@@ -1154,6 +1195,64 @@ mode = "vector"
         .expect_err("unknown search mode should fail");
 
         assert!(err.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn codex_resume_args_are_separate_from_claude_ones() {
+        let config: ConfigFile = toml::from_str(
+            r#"
+[resume]
+default_args = ["--dangerously-skip-permissions"]
+
+[resume.codex]
+default_args = ["--yolo"]
+"#,
+        )
+        .unwrap();
+        let resume = config.resume.unwrap();
+        use crate::history::Source;
+        assert_eq!(
+            resume.default_args(Source::Claude),
+            ["--dangerously-skip-permissions"]
+        );
+        assert_eq!(resume.default_args(Source::Codex), ["--yolo"]);
+        assert!(resume.default_args(Source::Pi).is_empty());
+        assert!(
+            ResumeConfig::default()
+                .default_args(Source::Codex)
+                .is_empty()
+        );
+    }
+
+    /// Fork: `gui.toml` overrides `[resume.codex] default_args` on its own,
+    /// and `[gui] codex_path` is a GUI key.
+    #[test]
+    fn codex_resume_args_and_path_layer_like_the_other_keys() {
+        let cli: ConfigFile = toml::from_str(
+            "[resume]\ndefault_args = [\"--verbose\"]\n\n[resume.codex]\ndefault_args = [\"--yolo\"]\n",
+        )
+        .unwrap();
+        let gui: GuiConfigFile = toml::from_str(
+            "[resume.codex]\ndefault_args = [\"--full-auto\"]\n\n[gui]\ncodex_path = \"C:/tools/codex.exe\"\n",
+        )
+        .unwrap();
+        let resume = cli.clone().overlaid_with(&gui).resume.unwrap();
+        use crate::history::Source;
+        assert_eq!(resume.default_args(Source::Claude), ["--verbose"]);
+        assert_eq!(resume.default_args(Source::Codex), ["--full-auto"]);
+        let untouched = cli.overlaid_with(&GuiConfigFile {
+            resume: Some(ResumeConfig::default()),
+            ..GuiConfigFile::default()
+        });
+        assert_eq!(
+            untouched.resume.unwrap().default_args(Source::Codex),
+            ["--yolo"]
+        );
+        assert_eq!(
+            gui.gui_settings().codex_path,
+            Some(PathBuf::from("C:/tools/codex.exe"))
+        );
+        assert!(toml::from_str::<ConfigFile>("[resume.codex]\nmodel = \"x\"\n").is_err());
     }
 
     #[test]

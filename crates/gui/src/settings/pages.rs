@@ -43,7 +43,9 @@ const LABEL_REM: f32 = 12.0;
 pub fn placeholder(field: Field, config: &LayeredConfig) -> SharedString {
     match field {
         Field::Terminal => "auto".into(),
-        Field::ClaudePath | Field::PiPath | Field::OmpPath => "resolved from PATH".into(),
+        Field::ClaudePath | Field::PiPath | Field::OmpPath | Field::CodexPath => {
+            "resolved from PATH".into()
+        }
         Field::DefaultWorkspace => "none".into(),
         Field::Key(action) => {
             let effective = draft::effective_keys(&config.cli, &Default::default());
@@ -508,6 +510,7 @@ impl SettingsDialog {
             (Field::ClaudePath, "claude"),
             (Field::PiPath, "pi"),
             (Field::OmpPath, "omp"),
+            (Field::CodexPath, "codex"),
         ] {
             let status = self.note_one_line(self.program_status_text(field), cx);
             let control = self.input_with_browse(field, cx);
@@ -636,7 +639,22 @@ impl SettingsDialog {
             )),
             cx,
         );
-        v_flex().id("settings-resume").child(row).into_any_element()
+        let codex_args = self.list_input(Field::CodexResumeArgs, 4.0);
+        let codex_row = self.row(
+            Field::CodexResumeArgs,
+            codex_args,
+            Some(self.note(
+                "One argument per line; passed to codex before resume or fork, for example \
+                 --yolo.",
+                cx,
+            )),
+            cx,
+        );
+        v_flex()
+            .id("settings-resume")
+            .child(row)
+            .child(codex_row)
+            .into_any_element()
     }
 
     fn agent_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -785,6 +803,7 @@ pub(crate) fn terminal_preview_for(input: &super::probe::ProbeInput) -> String {
             OsString::from("00000000-0000-4000-8000-000000000000"),
         ],
         cwd: input.cwd.clone(),
+        env: Vec::new(),
     };
     let options = BuildOptions {
         platform,

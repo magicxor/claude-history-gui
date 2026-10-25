@@ -2815,7 +2815,7 @@ impl Render for ViewerPane {
                 prefs: self.prefs,
                 mode: self.mode,
                 has_target: self.target.is_some(),
-                can_modify: self.target.as_ref().is_some_and(|t| t.can_modify()),
+                refusals: toolbar::Refusals::of(self.target.as_ref()),
                 header_id_differs: self.target.as_ref().is_some_and(|t| t.header_id_differs()),
                 find,
                 outline_open: panel_visible,

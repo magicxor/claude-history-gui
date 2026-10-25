@@ -3,8 +3,8 @@
 //! GUI models itself).
 
 use crate::error::AppError;
-use crate::history::Source;
 use crate::history::actions::refusal;
+use crate::history::{Provenance, Source};
 use crate::search::mode::TuiSearchMode;
 use crate::search::query::ParsedQuery;
 use crate::semantic::types::{SemanticExplanation, SemanticScoreBreakdown};
@@ -191,7 +191,9 @@ impl fmt::Display for RenameError {
         match self {
             RenameError::NoTarget => f.write_str("Failed to rename: session not found"),
             RenameError::BecameEmpty => f.write_str("Failed to rename: conversation became empty"),
-            RenameError::Unsupported(source) => f.write_str(&refusal(*source, "Renaming")),
+            RenameError::Unsupported(source) => {
+                f.write_str(&refusal(*source, Provenance::default(), "Renaming"))
+            }
             RenameError::Failed(error) => write!(f, "Failed to rename: {error}"),
         }
     }
@@ -230,7 +232,9 @@ impl fmt::Display for DeleteError {
             DeleteError::SingleFileMode => {
                 f.write_str("Deleting is not available for a single opened file")
             }
-            DeleteError::Unsupported(source) => f.write_str(&refusal(*source, "Deleting")),
+            DeleteError::Unsupported(source) => {
+                f.write_str(&refusal(*source, Provenance::default(), "Deleting"))
+            }
             // Upstream's debug-log line.
             DeleteError::Failed { path, error } => {
                 write!(f, "Failed to delete session {}: {}", path.display(), error)

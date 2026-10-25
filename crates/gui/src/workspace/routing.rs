@@ -38,8 +38,9 @@ use crate::globals::app_state;
 use crate::list::ListPane;
 use crate::model::{
     AgentTab, ConversationTarget, DebugLogTab, HelpSection, OpenRequest, PaneFocus, RowMenuItem,
-    SemanticReportMode,
+    SemanticReportMode, SessionAct,
 };
+use crate::notify::Toast;
 use crate::viewer::ViewerPane;
 use crate::{help, notify, ops, palette, settings, theme_tokens, tools};
 
@@ -292,8 +293,24 @@ pub fn is_session_action(action: &dyn Action) -> bool {
 
 /// Session actions that need a known source (disabled for unknown targets).
 pub fn needs_known_source(action: &dyn Action) -> bool {
+    session_act(action).is_some()
+}
+
+/// The capability-gated conversation action `action` stands for (Resume,
+/// Fork, Rename, Delete; upstream eea6d37).
+pub fn session_act(action: &dyn Action) -> Option<SessionAct> {
     let a = action.as_any();
-    a.is::<Resume>() || a.is::<Fork>() || a.is::<Rename>() || a.is::<Delete>()
+    if a.is::<Resume>() {
+        Some(SessionAct::Resume)
+    } else if a.is::<Fork>() {
+        Some(SessionAct::Fork)
+    } else if a.is::<Rename>() {
+        Some(SessionAct::Rename)
+    } else if a.is::<Delete>() {
+        Some(SessionAct::Delete)
+    } else {
+        None
+    }
 }
 
 /// Session actions a single-file window has no handler for (PD14): their
@@ -401,7 +418,10 @@ pub enum SessionRoute {
 
 /// Run a session action on a captured `target` through the `ops` entry
 /// points, or say what the pane has to do instead ([`SessionRoute`]).
-/// Resume/Fork/Rename/Delete on a target with an unknown source do nothing.
+/// Resume/Fork/Rename/Delete on a target with an unknown source do nothing;
+/// one its capabilities refuse (upstream eea6d37: a Codex rename, any action
+/// on an orphaned thread) shows core's refusal instead, as upstream's status
+/// line does, before any dialog opens.
 pub fn run_session_action(
     action: &dyn Action,
     target: ConversationTarget,
@@ -413,7 +433,12 @@ pub fn run_session_action(
     if !is_session_action(action) {
         return SessionRoute::NotSession;
     }
-    if needs_known_source(action) && !target.can_modify() {
+    if let Some(act) = session_act(action)
+        && let Some(refusal) = target.refusal(act)
+    {
+        if target.source.is_some() {
+            Toast::warning(refusal).show(window, cx);
+        }
         return SessionRoute::Done;
     }
     if a.is::<OpenConversation>() {

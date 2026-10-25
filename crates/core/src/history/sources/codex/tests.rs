@@ -412,11 +412,10 @@ fn registries_key_rollouts_by_thread_id() {
     assert_eq!(registry.key_of(&home.join("session_index.jsonl")), None);
 }
 
-/// Fork: upstream's `actions_run_the_codex_cli_on_the_rollouts_home` checks
-/// the `codex resume|fork` commands, which the fork does not plan yet (see
-/// the module docs): every action is refused, rename as upstream refuses it.
+/// Fork: the commands are the fork's plans (`ResumePlan`, `delete_spec`),
+/// and the deletion runs only outside tests.
 #[test]
-fn actions_are_refused_until_the_codex_cli_is_ported() {
+fn actions_run_the_codex_cli_on_the_rollouts_home() {
     let home = fixture_home();
     let adapter = CodexAdapter::with_sqlite_home(PathBuf::new(), PathBuf::new());
     let path = home.join(format!(
@@ -429,24 +428,63 @@ fn actions_are_refused_until_the_codex_cli_is_ported() {
     };
     let sandbox = tempfile::tempdir().unwrap();
     let env = HistoryEnv::sandbox(sandbox.path());
-    let capabilities = adapter.capabilities();
-    assert!(!capabilities.resume && !capabilities.fork && !capabilities.delete);
-    assert!(!capabilities.rename);
-    for (fork, refused) in [
-        (false, "Resuming CX sessions is not supported"),
-        (true, "Forking CX sessions is not supported"),
-    ] {
-        let error = adapter
-            .resume(&env, target, None, fork, &["--yolo".to_owned()], None)
-            .unwrap_err();
-        assert!(matches!(&error, AppError::Unsupported(text) if text == refused));
-    }
-    assert!(matches!(
-        adapter.delete(&env, &path),
-        Err(AppError::Unsupported(text)) if text == "Deleting CX sessions is not supported"
-    ));
-    assert!(path.is_file(), "a refused delete leaves the rollout");
+    let args = |plan: &ResumePlan| -> Vec<String> {
+        plan.args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    };
+    let resume = adapter
+        .resume(&env, target, None, false, &["--yolo".to_owned()], None)
+        .unwrap();
+    assert!(resume.copy.is_none());
+    assert_eq!(resume.program, "codex");
+    assert_eq!(args(&resume), ["--yolo", "resume", PAGED]);
+    assert_eq!(resume.cwd.as_deref(), Some(project.path()));
+    assert_eq!(
+        resume.env,
+        [(OsString::from("CODEX_HOME"), home.clone().into_os_string())]
+    );
+    let fork = adapter.resume(&env, target, None, true, &[], None).unwrap();
+    assert_eq!(args(&fork), ["fork", PAGED]);
+    assert!(!adapter.capabilities().rename);
     assert!(adapter.rename(&path, "x").is_err());
+
+    // `codex delete --force <id>` on the rollout's home, never run by a test.
+    let codex = sandbox.path().join("codex.exe");
+    std::fs::write(&codex, "").unwrap();
+    let spec = delete_spec(&env, &path, Path::new(""), Some(&codex)).unwrap();
+    assert_eq!(spec.program.path, codex);
+    assert_eq!(
+        spec.args,
+        ["delete", "--force", PAGED].map(OsString::from).to_vec()
+    );
+    assert_eq!(spec.env, resume.env);
+    assert_eq!(thread_rollouts(&path).unwrap(), std::slice::from_ref(&path));
+    let refused = adapter.delete(&env, &path).unwrap_err();
+    assert!(
+        refused.to_string().contains("Could not find 'codex'"),
+        "{refused}"
+    );
+    assert!(path.is_file(), "a test never deletes a rollout");
+    assert!(
+        delete_outcome(&RunOutput {
+            success: true,
+            status: "exit status: 0".to_owned(),
+            stderr: String::new(),
+        })
+        .is_ok()
+    );
+    let failed = delete_outcome(&RunOutput {
+        success: false,
+        status: "exit status: 1".to_owned(),
+        stderr: "no such thread\n".to_owned(),
+    })
+    .unwrap_err();
+    assert_eq!(
+        failed.to_string(),
+        "I/O error: codex delete failed (exit status: 1): no such thread"
+    );
 }
 
 /// Fork: the home and `CODEX_SQLITE_HOME` come from the [`HistoryEnv`]; the
@@ -479,4 +517,105 @@ fn the_env_selects_the_home_and_the_state_database() {
     assert_eq!(adapter.sqlite_home(), home.join("db"));
 
     assert!(CodexAdapter::from_env(&HistoryEnv::default()).is_none());
+}
+
+#[test]
+fn viewed_threads_show_the_dialogue_and_where_a_fork_begins() {
+    use crate::claude::{ContentBlock, LogEntry, UserContent};
+    fn text_of(entry: &LogEntry) -> String {
+        let blocks = match entry {
+            LogEntry::User {
+                message:
+                    crate::claude::UserMessage {
+                        content: UserContent::Blocks(blocks),
+                        ..
+                    },
+                ..
+            } => blocks.as_slice(),
+            LogEntry::Assistant { message, .. } => message.content.as_slice(),
+            LogEntry::PiMetadata { label, .. } => return format!("[{label}]"),
+            _ => return String::new(),
+        };
+        blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let home = home_copy(dir.path());
+    let path_of = |thread: &str| {
+        discover::list(&home)
+            .unwrap()
+            .into_iter()
+            .find(|rollout| rollout.thread_id == thread)
+            .unwrap()
+            .path
+    };
+
+    let fork = view::log_entries(&path_of(FORK)).unwrap().unwrap();
+    let texts: Vec<String> = fork.iter().map(|(_, entry)| text_of(entry)).collect();
+    let walrus = texts.iter().filter(|text| text.contains("walrus")).count();
+    assert_eq!(
+        walrus, 2,
+        "the base's question and answer, once each: {texts:?}"
+    );
+    let boundary = texts.iter().position(|text| text == "[Fork]").unwrap();
+    let ocelot = texts
+        .iter()
+        .position(|text| text.contains("ocelot"))
+        .unwrap();
+    assert!(boundary < ocelot);
+    assert!(
+        texts[..boundary]
+            .iter()
+            .all(|text| !text.contains("ocelot"))
+    );
+    assert!(fork.iter().any(|(_, entry)| matches!(
+        entry,
+        LogEntry::Assistant { agent: Some(agent), .. } if agent == "Codex"
+    )));
+
+    let sub = view::log_entries(&path_of(SUB)).unwrap().unwrap();
+    let texts: Vec<String> = sub.iter().map(|(_, entry)| text_of(entry)).collect();
+    assert!(texts.iter().any(|text| text.contains("armadillo")));
+    assert!(!texts.iter().any(|text| text == "[Fork]"));
+    assert!(!texts.iter().any(|text| text.contains("walrus")));
+
+    let claude = dir.path().join("session.jsonl");
+    std::fs::write(&claude, "{}\n").unwrap();
+    assert!(view::log_entries(&claude).unwrap().is_none());
+}
+
+/// Fork: a rollout opened by path (the viewer, exports, a single-file
+/// window) decodes as its thread, also through the streaming path the list
+/// loaders use, and is listed with its source and provenance.
+#[test]
+fn rollouts_opened_by_path_decode_as_their_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = home_copy(dir.path());
+    let path = discover::list(&home)
+        .unwrap()
+        .into_iter()
+        .find(|rollout| rollout.thread_id == SUB)
+        .unwrap()
+        .path;
+    let transcript = crate::history::sources::decode_path(&path, None, false).unwrap();
+    assert_eq!(transcript.key.instance.kind, SourceKind::Codex);
+    assert_eq!(transcript.key.native_id, SUB);
+    assert!(!transcript.events.is_empty());
+    let conversation = crate::history::process_conversation_file(path.clone(), None, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(conversation.source, SourceKind::Codex);
+    assert!(conversation.provenance.child);
+    let entries = crate::history::normalized_log_entries(&path).unwrap();
+    assert!(!entries.is_empty());
+    assert!(
+        crate::history::normalized_log_entries_cancellable(&path, &|| true)
+            .unwrap()
+            .is_none()
+    );
 }

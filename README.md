@@ -34,8 +34,11 @@ All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-h
   after a rename or delete): the newest ones are shown at once and the full history is never loaded into memory
   for the list. The first run indexes the history in the background, newest first.
 * Codex threads (`~/.codex` or `CODEX_HOME`, archived and compressed sessions included, titles from Codex's state
-  database) are listed and searched too, marked `CX` (automated `codex exec` runs and subagent threads are indexed but stay out of the list, list search and semantic search); they cannot be opened, resumed, renamed or deleted from the
-  app yet.
+  database) are listed and searched too, marked `CX` (automated `codex exec` runs and subagent threads are indexed
+  but stay out of the list, list search and semantic search). They open in the viewer (a forked thread shows the
+  history it continues from, then a `Fork` marker where its own records begin), resume and fork through the Codex
+  CLI and delete through `codex delete`; they cannot be renamed, and a thread whose current rollout Codex no longer
+  has is read-only.
 * Search as you type. **Lexical** search (with highlighted matches and a literal mode for quoted text) or
   **semantic** search (local embedding model, downloaded on first use; falls back to lexical while the cache is
   not ready). Ctrl+T toggles the mode.
@@ -64,6 +67,12 @@ All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-h
 * **Rename** (custom title), **Delete** (every copy of the session, with a confirmation that lists the files),
   **Export** (ledger, plain text, Markdown, raw JSONL), **Copy** (conversation in the same formats, message,
   path, session ID), reveal in the file manager.
+* Codex threads: Resume runs `codex resume <thread-id>` and Fork `codex fork <thread-id>` in the thread's
+  working directory, with `CODEX_HOME` set to the thread's home; Delete runs `codex delete --force <thread-id>`
+  after the usual confirmation (it removes every rollout of the thread). Rename is not supported, and a thread
+  whose current rollout, as recorded by Codex, no longer exists allows no action. Arguments for every Codex
+  resume and fork go in `[resume.codex] default_args` (for example `["--yolo"]`, giving `codex --yolo resume
+  <thread-id>`); `[resume] default_args` are Claude's only.
 
 **Tools menu**
 Delete empty transcripts, generate or clear the semantic cache, debug search and semantic debug search, debug
@@ -313,7 +322,8 @@ is not remembered. An invalid file shows a dialog naming it (Quit / Continue wit
 
 `[gui]` keys in `gui.toml`: `theme` (`system`, `light`, `dark`), `terminal` (`auto`, `wt`, `cmd`, `terminal`,
 `osascript`, a Linux emulator name, or a template with `{cwd}`, `{args}`, `{cmd}`), `claude_path`, `pi_path`,
-`omp_path`, `default_workspace`, `restore_session`.
+`omp_path`, `codex_path`, `default_workspace`, `restore_session`. `[resume] default_args` (Claude) and
+`[resume.codex] default_args` (Codex) hold extra arguments for Resume and Fork.
 
 **Environment variables**
 * `CLAUDE_CONFIG_DIR`: Claude data directory (must be absolute; default `~/.claude`).
@@ -322,7 +332,7 @@ is not remembered. An invalid file shows a dialog naming it (Quit / Continue wit
 * `CODEX_HOME`: the Codex home (default `~/.codex`); `CODEX_SQLITE_HOME`: where Codex keeps its state database
   when the home's `config.toml` sets no `sqlite_home` (default: the home).
   Relative values of the Pi, OMP and Codex variables resolve against the directory the app was started in.
-* `TERMINAL`: preferred terminal emulator on Linux. `PATH`/`PATHEXT` locate `claude`, `pi` and `omp`.
+* `TERMINAL`: preferred terminal emulator on Linux. `PATH`/`PATHEXT` locate `claude`, `pi`, `omp` and `codex`.
 * Development only: `CHG_ALLOW_REAL_HOME`, `CHG_ALLOW_REAL_LAUNCH` (see below).
 
 ## Safety
@@ -332,14 +342,17 @@ to it only through these actions, each of which names the conversation and asks 
 
 * **Rename**: writes the custom title into the conversation.
 * **Delete**: removes the session's files from disk (every copy across projects, and the Pi/OMP artifacts
-  folder); the dialog lists them and cannot be undone. Delete by session ID uses the same plan.
+  folder); the dialog lists them and cannot be undone. Delete by session ID uses the same plan. A Codex thread
+  is deleted by Codex itself: `codex delete --force <thread-id>`, which removes every rollout of the thread
+  (listed in the dialog) and its state.
 * **Delete empty transcripts**: Claude Code transcripts with no messages, listed first; files modified in the
   last 10 minutes are excluded by default. Pi and OMP conversations are never touched.
 * **Cross-project copy** for Resume/Fork into another workspace: copies the session into that project's folder
   in `~/.claude/projects`, listing every file and any existing target that would be overwritten.
 
-Export asks before replacing an existing file. Resume and Fork only open a terminal running `claude`, `pi` or
-`omp`. `config.toml` is never written; the GUI keeps its own settings, state and caches in separate files.
+Export asks before replacing an existing file. Resume and Fork only open a terminal running `claude`, `pi`,
+`omp` or `codex`. `config.toml` is never written; the GUI keeps its own settings, state and caches in separate
+files.
 
 ## Development
 
@@ -372,8 +385,9 @@ fake embedders, and terminal launching is tested on the commands it would spawn.
 Debug builds and `--features qa` builds refuse to start (exit 3, `Refusing to run: ...`) unless the home
 directory is a QA sandbox: it contains a `.qa-sandbox` marker, is not your real profile directory, and every data
 path variable stays inside it. Set `CHG_ALLOW_REAL_HOME=1` to use your real history in a debug build (qa builds
-never skip the gate). Debug builds also refuse to start a real `claude`, `pi` or `omp` from Resume unless
-`CHG_ALLOW_REAL_LAUNCH=1`, or `[gui] claude_path/pi_path/omp_path` point at a harmless program inside the sandbox.
+never skip the gate). Debug builds also refuse to start a real `claude`, `pi`, `omp` or `codex` from Resume (or a
+Codex delete) unless `CHG_ALLOW_REAL_LAUNCH=1`, or `[gui] claude_path/pi_path/omp_path/codex_path` point at a
+harmless program inside the sandbox.
 
 ```powershell
 tools\qa\new-sandbox.ps1 -Source crates\gui\tests\fixtures\qa-home -Dest $env:TEMP\chg-sbx

@@ -1,0 +1,44 @@
+# codex.qa (upstream eea6d37): a Codex thread opens in the viewer, refuses Rename
+# before any dialog, resumes through the (recorded) terminal with CODEX_HOME, and is
+# deleted through a recorded `codex delete --force <thread id>` (FEATURES V-104,
+# A-065, A-066, A-067). Terminals and program runs are only recorded.
+#
+# Run on a FRESH COPY of the sandbox with the Codex thread added:
+#   tools/qa/new-sandbox.ps1 -Source crates/gui/tests/fixtures/qa-home -Dest <sandbox> -WithCodex
+#   tools/qa/run-gui.ps1 -Sandbox <sandbox> -Exe <qa build> -Scenario crates/gui/qa/scenarios/codex.qa -Out <dir> [-Shots]
+# Probes `calls.run.count` / `calls.run.last` are the recorded program runs.
+wait-loaded 30s
+expect dialog == none
+type "walrus"
+wait-for list.selected_title contains "walrus" 10s
+shot codex-row
+
+# Rename is refused before its dialog opens, with core's text.
+key f2
+wait 300ms
+expect dialog == none
+expect toast.last contains "Renaming CX sessions is not supported"
+
+# The viewer shows the thread.
+key enter
+wait-for viewer.items > 0 10s
+shot codex-viewer
+
+# Resume: the Codex CLI with the thread's id and CODEX_HOME.
+expect calls.terminal.count == 0
+key ctrl-r
+wait-for calls.terminal.count == 1 10s
+expect calls.terminal.last contains "resume 01a00000-0000-7000-8000-000000000002"
+expect calls.terminal.last contains "CODEX_HOME"
+expect calls.run.count == 0
+
+# Delete: the confirmation, then one recorded `codex delete --force <id>`.
+key ctrl-x
+wait-for dialog == delete 10s
+shot codex-delete
+key shift-y
+wait-for calls.run.count == 1 10s
+expect calls.run.last contains "delete --force 01a00000-0000-7000-8000-000000000002"
+wait-for dialog == none 5s
+expect toast.last contains "Deleted"
+quit 0

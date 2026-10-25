@@ -69,6 +69,7 @@ fn terminals_are_never_spawned() {
         },
         args: Vec::new(),
         cwd: Some(root.path().to_path_buf()),
+        env: Vec::new(),
     };
     let launcher = if cfg!(windows) {
         TerminalLauncher::WindowsConsole
@@ -87,6 +88,13 @@ fn terminals_are_never_spawned() {
     );
     assert_eq!(
         spawn_terminal_checked(&command, Duration::from_millis(10))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    // Nor is an agent's CLI run to completion (`codex delete`, eea6d37).
+    assert_eq!(
+        claude_history_core::resume::terminal::run_to_completion(&spec)
             .unwrap_err()
             .kind(),
         std::io::ErrorKind::Unsupported

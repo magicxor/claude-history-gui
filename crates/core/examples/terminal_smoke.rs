@@ -128,6 +128,7 @@ fn touch_spec(env: &HistoryEnv, marker: &std::path::Path) -> Result<LaunchSpec, 
                 .chain([marker.as_os_str().to_os_string()])
                 .collect(),
             cwd,
+            env: Vec::new(),
         })
     } else {
         let program = env
@@ -137,6 +138,7 @@ fn touch_spec(env: &HistoryEnv, marker: &std::path::Path) -> Result<LaunchSpec, 
             program,
             args: vec![marker.as_os_str().to_os_string()],
             cwd,
+            env: Vec::new(),
         })
     }
 }

@@ -27,7 +27,8 @@ use gpui_kit::{
 use crate::actions::RenameClear;
 use crate::globals::{BusySpan, BusyTimer, OpenTargets, UiBusy, app_state};
 use crate::model::ConversationTarget;
-use crate::ops::copy::{can_act, clear_dialog, live_target, main_list};
+use crate::model::SessionAct;
+use crate::ops::copy::{can_act, clear_dialog, live_target, main_list, still_allowed};
 use crate::qa_ext::QaExt as _;
 use crate::workspace::startup::register_dialog;
 
@@ -45,12 +46,14 @@ pub const NOT_IN_LIST: &str = "This conversation is no longer in the list";
 /// target may predate an earlier rename or come from an agent hit that never
 /// knew the custom title.
 pub fn open_rename_dialog(target: ConversationTarget, window: &mut Window, cx: &mut App) {
-    if !can_act(&target) {
+    if !can_act(&target, SessionAct::Rename) {
         return;
     }
     window.defer(cx, move |window, cx| {
         let target = live_target(target, cx);
-        open_now(target, window, cx);
+        if still_allowed(&target, SessionAct::Rename, window, cx) {
+            open_now(target, window, cx);
+        }
     });
 }
 

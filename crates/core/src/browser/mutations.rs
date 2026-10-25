@@ -129,7 +129,10 @@ impl Browser {
     ///   `<project>/<uuid>/` session directory;
     /// * Pi: the file, if it parses as a Pi session;
     /// * OMP: the file, if it parses as an OMP session, and its artifact
-    ///   directory.
+    ///   directory;
+    /// * Codex: `codex delete --force <thread id>` through `terminal::run_to_completion`
+    ///   (refused in tests and hermetic builds; the GUI uses plan/`execute_session_delete_with`
+    ///   instead).
     ///
     /// [`DeleteError::Unsupported`] when the adapter cannot delete (nothing
     /// changes). On success the row is removed (other copies of the same

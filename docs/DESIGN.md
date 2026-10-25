@@ -178,7 +178,8 @@ cached on ListPane, never inside the menu builder), then "Choose folder…" (nat
   safety lint (§16.2).
 * Terminal configurable in gui.toml `[gui] terminal` with **core's syntax** (`auto`, `wt`, `cmd`/`console`,
   `terminal`, `osascript`, a Linux emulator name, or a template) (§13.2). Program resolution through
-  `HistoryEnv::resolve_program` (PATH/PATHEXT, `.cmd` shims, `[gui] claude_path|pi_path|omp_path` overrides).
+  `HistoryEnv::resolve_program` (PATH/PATHEXT, `.cmd` shims, `[gui] claude_path|pi_path|omp_path|codex_path`
+  overrides).
 * A CopyToWorkspace plan writes into `~/.claude/projects` and **must** be confirmed in the "Copy conversation to
   workspace" dialog (§5.8) that lists every file/dir to copy (source → destination) and every `existing_target`
   that will be overwritten. The copy runs only through `ResumePlan::execute_copy()` after that confirmation (core
@@ -448,18 +449,18 @@ truth.
 | Module | Items the GUI uses |
 |---|---|
 | `env` | `HistoryEnv { home_dir, claude_config_dir, pi_coding_agent_dir, pi_coding_agent_session_dir, pi_config_dir, omp_profile, pi_profile, codex_home, codex_sqlite_home, xdg_data_home, path_var, pathext, workspace_dir, cache_root, config_file, gui_config_file, debug_log_file }` (+ `env_path_base`, K16: `with_env_path_base`, `launch_base_dir()`, `env_value_base_dir()`; `main` sets it to the launch cwd), `from_process_env()` (main only), `sandbox(root)`, `with_workspace`, `claude_dir()`, `claude_projects_root()`, `claude_projects_dir_for(dir)`, `codex_home()` (`CODEX_HOME`, else `<home>/.codex`) + `codex_sqlite_home()` + `with_codex_home` (upstream 7f5c443), `cache_root()`, `cache_base_dir()` (`cache_root` or its `config-<hash>`, upstream `store::cache_base_dir`), `cli_cache_root()` + `is_in_cli_cache(path)` (the installed CLI's cache root, never deleted from), `semantic_cache_dir()`, `embedding_cache_file()`, `semantic_model_dir()`, `config_file()`, `gui_config_file()`, `debug_log_file()`, `workspace()`, `resolve_program(name, override)`; `WorkspaceScope { dir, project_dir_name }`, `WorkspaceScope::new`, `canonical_dir()`; `STATE_DIR_NAME`, `CACHE_DIR_NAME`, `CLI_CACHE_DIR_NAME`, `is_within(path, dir)` |
-| `config` | `ConfigFile`, `GuiConfigFile`, `GuiSettings { theme, terminal, claude_path, pi_path, omp_path, default_workspace, restore_session }`, `LayeredConfig { cli, gui_file, effective, gui }`, `load_config_from(path)`, `load_gui_config_from(path)` (loaded **independently**, §11.1), `ConfigFile::overlaid_with(&GuiConfigFile)`, `save_gui_config_changes` (K12), `KeyChord::{short_label, help_label, gpui_keystroke, config_string}`, `parse_key_binding`, `KeyBindings { resume, fork, rename, delete, refresh }` + `from_config`, `conflicts_with_ctrl_t`, `AgentScopeConfig`, `AgentConfig` |
-| `settings` | `parse_launch_args(args) -> Result<LaunchCommand, LaunchArgsError>` (`LaunchCommand::{Run(GuiLaunchArgs), Help, Version, DeleteEmpty { local, all, yes }, Update, Agent(AgentCli), SubcommandHelp(String)}`; K14/K15, `SubcommandHelp` added by WP-C: `update --help`, `delete-empty -h`, `help <subcommand>` → print the text, exit 0), `GuiLaunchArgs` (+`display_flags`, `search_mode_override`, `picker`, `time_filter`, `settings`, `validate`), `help_text(program)`, `effective_settings(config, flags, mode_override) -> EffectiveSettings { show_last, show_tools, tool_display, show_thinking, search_mode, list_search_mode, exclude_projects, keys, semantic_toggle_enabled, resume_default_args }`, `EffectiveSettings::initial_view_prefs()`, `initial_tool_display`, `PickerAction::{ShowPath, ShowId, Resume{fork}}`, `picker_output(action, conv)`, `session_id_from_path(path)` |
+| `config` | `ConfigFile`, `GuiConfigFile`, `GuiSettings { theme, terminal, claude_path, pi_path, omp_path, codex_path, default_workspace, restore_session }`, `ResumeConfig { default_args, codex: Option<AgentResumeConfig { default_args }> }` + `default_args(source)` (`[resume]` for Claude, `[resume.codex]` for Codex, eea6d37), `LayeredConfig { cli, gui_file, effective, gui }`, `load_config_from(path)`, `load_gui_config_from(path)` (loaded **independently**, §11.1), `ConfigFile::overlaid_with(&GuiConfigFile)`, `save_gui_config_changes` (K12), `KeyChord::{short_label, help_label, gpui_keystroke, config_string}`, `parse_key_binding`, `KeyBindings { resume, fork, rename, delete, refresh }` + `from_config`, `conflicts_with_ctrl_t`, `AgentScopeConfig`, `AgentConfig` |
+| `settings` | `parse_launch_args(args) -> Result<LaunchCommand, LaunchArgsError>` (`LaunchCommand::{Run(GuiLaunchArgs), Help, Version, DeleteEmpty { local, all, yes }, Update, Agent(AgentCli), SubcommandHelp(String)}`; K14/K15, `SubcommandHelp` added by WP-C: `update --help`, `delete-empty -h`, `help <subcommand>` → print the text, exit 0), `GuiLaunchArgs` (+`display_flags`, `search_mode_override`, `picker`, `time_filter`, `settings`, `validate`), `help_text(program)`, `effective_settings(config, flags, mode_override) -> EffectiveSettings { show_last, show_tools, tool_display, show_thinking, search_mode, list_search_mode, exclude_projects, keys, semantic_toggle_enabled, resume_default_args, resume_codex_default_args }`, `EffectiveSettings::initial_view_prefs()`, `EffectiveSettings::resume_default_args_for(source)` (eea6d37), `initial_tool_display`, `PickerAction::{ShowPath, ShowId, Resume{fork}}`, `picker_output(action, conv)`, `session_id_from_path(path)` |
 | `browser` | `Browser` (`new_loading`, `append_conversations`, `set_query`, `escape -> EscapeOutcome`, `toggle_workspace_filter`, `set_workspace_filter`, `set_workspace`, `set_excluded_projects`, `toggle_list_search_mode`, `set_list_search_mode`, `poll`, `has_search_work_in_flight`, `filtered`, `row`, `selected`, `select*`, `select_half_page_down(viewport_rows)`, `selected_path`, `selected_conversation`, `has_multiple_sources`, `conversation_by_path`, `count_text`, `search_status_text`, `semantic_status_text`, `semantic_activity_status_text`, `semantic_error`, `semantic_progress`, `semantic_result_metadata[_for_selection]`, `lexical_evidence`, `row_preview_input`, `row_header_input`, `uuid_lookup`, `rename_prefill`, `workspace`, `has_project_context`, `list_search_mode`, `is_loading` (`!readiness.list`, 358becb), `readiness() -> Readiness { list, lexical, reconcile: ReconcileState::{Running, Done}, semantic }`; generation mode (358becb): `show_snapshot(store::Snapshot)` (the first `SNAPSHOT_ROWS` cards), `shows_snapshot`, `generation_open`, `generation_len`, `generation_name`, `generation_is_empty`, `history_is_empty`, `is_hidden(index)`, `time_filter`, `set_time_filter(TimeFilter)`, `open_search_index` and `swap_generation(store::Snapshot)` (synchronous; the loader installs a generation opened off the UI thread), `search_index_generation`, `take_reconcile_request`, `set_reconciling`, `fill_visible_evidence(Range)`, `conversation_at`; upstream 3708bb6 replaced `loading_state`), `SNAPSHOT_ROWS`, `BrowserOptions` (+ builders, `embedder_factory`, `waker`, `semantic_available`), `HistoryLoader` (`new`, `reconfigure` (store mode: moves to the store root of the new env), `start_initial_load` (store mode: a reconcile pass), `start_refresh` (store mode: a pass, then `Refreshed` from the generation sizes), `set_time_filter` (store mode: re-scopes the cards at the next poll), `is_running`, `is_refreshing`, `uses_store`, `open_snapshot` (`&mut self`: enters store mode; every card and the index are opened on `generation-open` and installed by a later `poll`), `finish_snapshot_write` (waits for the running pass and the ones asked for after it, returns the last `store::generation::Publish`, e905169), `poll(&mut Browser) -> LoaderPoll` incl. `pending`, `swapped`; `BUSY_RETRY`, `GENERATION_POLL`), `LoaderOptions` (incl. `drain_budget`, default `DEFAULT_DRAIN_BUDGET` = 8 ms, upstream 93e17a5; `snapshot` = store mode, default off, 3708bb6, 358becb), `LoadEvent::{Loaded, NoHistory, LoadFailed, Refreshed, RefreshIncomplete, RefreshFailed, RefreshInterrupted}` (+`status_message`), `ListSearchMode`, `SemanticProgress`, `SemanticResultMetadata`, `UuidLookup`, `PreparedSession` (`Send`; `PreparedSession::new(Conversation)` normalizes the lexical body of a re-parsed session, the O(text) step for a background task; consumed by `Browser::apply_renamed_session` and `Browser::resolve_uuid_lookup_session`, 503fe42), `RenameError`, `DeleteError` (both with `Unsupported(Source)`: the source's adapter cannot rename or delete, 9799550), `Waker`, `SemanticEmbedderFactory`, `query_has_literals`; K1–K4, K6, K18 additions |
 | `display_format` | `build_row_header(&RowHeaderInput) -> RowHeader { project, custom_title, summary, message_count, semantic_score, duration, timestamp, recency, .. }`, `build_row_preview(&RowPreviewInput) -> RowPreview { preview, source, context }`, `HighlightQuery` (`parse`, `needs_literal_context`, `match_ranges`), `HighlightedText`, `Recency`, `format_model_name`, `format_tokens`, `format_tokens_long`, `format_msg_count_long`, `format_duration_minutes`, `format_header_timestamp`, `semantic_row_metadata`, `semantic_rationale_label`, `sanitize_preview` |
 | `view` | `ViewerModel { path, entries, prefs, expanded }` (`open`, `from_entries`, `cycle_tool_display`, `toggle_thinking`, `toggle_timing`, `toggle_expanded`, `document`, `export_options`, `session_id`, `message_text`, `plain_display`), `ViewPrefs`, `ToolDisplayMode` (+`next`, `status_label`), `ConversationDocument` (`navigable_indices`, `navigable_entry_indices`, `nav_position`, `message_at_nav_position`), `DocMessage`, `DocMessageKind`, `DocBlock` (`toggle_id`, `tool_output_id`, `plain_text`), `DocBlockKind`, `DocTiming`, `Fold`, `DocToolCall`, `DocToolResult`, `DocSubagentToolResult`, `ToolBodyLine`, `BodyLineKind`, `LabelRole` (+`color`), `ToolOutputId`, `fitted_name`, `NAME_WIDTH`, `TRUNCATED_BODY_LINES`, `TRUNCATED_RESULT_LINES`, `MessageNav`, `ViewSearch<M>`, `ViewSearchMode`, `escape -> ViewEscape`, `capture_anchor_entry`, `find_entry_or_prev`; K5, K9 additions |
 | `export` | `ExportFormat::{ALL, from_index, index, label, extension}`, `ExportOptions`, `generate_export`, `export_to_path -> Result<(), ExportError>`, `default_export_file_name`, `plain_display(path, options)`, `exported_status`, constants `COPIED_TO_CLIPBOARD`, `MESSAGE_COPIED_TO_CLIPBOARD`, `NO_TEXT_CONTENT`, `MESSAGE_NOT_FOUND`, `PATH_COPIED_TO_CLIPBOARD`, `SESSION_ID_COPIED_TO_CLIPBOARD`; K11 |
-| `resume` | `plan_resume(env, conv, workspace, fork, default_args, &ProgramOverrides) -> Result<ResumePlan>`, `plan_resume_target(…, &ResumeTarget, …)` (planned by the adapter of the target's source, `Adapter::resume`; an action the adapter does not support is refused with `Failed to run Claude CLI: <source> sessions cannot be resumed` / `forked`, 9799550), `ResumeTarget::target()`, `ResumePlan { source, kind, strategy, session_path, program, program_override, args, cwd, copy, warnings }` (+`launch_spec(env)`, `execute_copy()`, `display_command()`), `CopyPlan { files, dirs, existing_targets, target_dir, … }`, `CopyItem`, `CopyReport`, `ResumeStrategy`, `ProgramOverrides::from_gui_settings`, `WORKSPACE_REQUIRED_RESUME`, `WORKSPACE_REQUIRED_FORK`; `terminal::{TerminalLauncher::from_setting, detect_launcher, prepare_terminal_command, build_terminal_command, prepare_launcher_command, LaunchOptions, LaunchSpec, TerminalCommand (+display), Platform}`; K17. **Forbidden in the GUI**: `resume::launch` (copies without confirmation) and direct `terminal::spawn_terminal` outside `services.rs` |
-| `maintenance` | `find_empty_candidates(env, &DeleteEmptyScope) -> Vec<EmptyCandidate>` (+`modified_within`, `cli_lines`), `delete_empty_candidates(&[EmptyCandidate]) -> DeleteEmptyOutcome { deleted, skipped, failure }`, `delete_empty_summary_line`, `format_delete_empty_report`, `find_session_copies(env, uuid) -> Vec<SessionCopyFiles>`, `delete_session_by_uuid(env, uuid) -> DeleteByUuidReport`, `delete_by_uuid_message`, `show_dir(env, workspace)`, `WORKSPACE_REQUIRED_SHOW_DIR`, `load_sorted_conversations(env, show_last, debug, &time_filter)`, `debug_search_report(convs, query, now, workspace) -> DebugSearchReport` (+`to_text`), `DEBUG_SEARCH_TOP`, `parse_error_report(conv)`, `log_parse_errors(env, conv)`; K4 (`plan_session_delete` (a source whose adapter cannot delete is refused with `AppError::Unsupported`: `Deleting <source> sessions is not supported`, 9799550), `execute_session_delete`, `DeletePlan { source, path, session_id, files, dirs }`, `DeleteReport`, `SessionDeleteFailure { error, partial }`) |
+| `resume` | `plan_resume(env, conv, workspace, fork, default_args, &ProgramOverrides) -> Result<ResumePlan>`, `plan_resume_target(…, &ResumeTarget, …)` (planned by the adapter of the target's source, `Adapter::resume`, 9799550; an action the conversation does not support, `history::actions::capabilities_of(source, provenance)`, is refused with `Failed to run Claude CLI: Resuming <source> sessions is not supported` / `Forking …`, or `… is unavailable: <source> no longer has this conversation's current history` for an orphaned one, eea6d37), `ResumeTarget { source, path, project_path, provenance }` (+`target()`), `ResumePlan { source, kind, strategy, session_path, program, program_override, args, cwd, copy, warnings, env }` (+`launch_spec(env)`, `execute_copy()`, `display_command()`; `env`: Codex's `CODEX_HOME`, eea6d37), `CopyPlan { files, dirs, existing_targets, target_dir, … }`, `CopyItem`, `CopyReport`, `ResumeStrategy`, `ProgramOverrides { claude, pi, omp, codex }` (+`from_gui_settings`), `WORKSPACE_REQUIRED_RESUME`, `WORKSPACE_REQUIRED_FORK`; `terminal::{TerminalLauncher::from_setting, detect_launcher, prepare_terminal_command, build_terminal_command, prepare_launcher_command, LaunchOptions, LaunchSpec { program, args, cwd, env }, TerminalCommand (+display; `env` set on the launcher process), Platform, run_to_completion(spec) -> RunOutput { success, status, stderr }}` (the environment reaches the program through every launcher: `env NAME=value` in the POSIX line, `set "NAME=value" &&` in the `cmd.exe` line; `run_to_completion` runs a CLI without a terminal, refused under `cfg(test)`/`hermetic`, eea6d37); K17. **Forbidden in the GUI**: `resume::launch` (copies without confirmation) and direct `terminal::spawn_terminal` outside `services.rs` |
+| `maintenance` | `find_empty_candidates(env, &DeleteEmptyScope) -> Vec<EmptyCandidate>` (+`modified_within`, `cli_lines`), `delete_empty_candidates(&[EmptyCandidate]) -> DeleteEmptyOutcome { deleted, skipped, failure }`, `delete_empty_summary_line`, `format_delete_empty_report`, `find_session_copies(env, uuid) -> Vec<SessionCopyFiles>`, `delete_session_by_uuid(env, uuid) -> DeleteByUuidReport`, `delete_by_uuid_message`, `show_dir(env, workspace)`, `WORKSPACE_REQUIRED_SHOW_DIR`, `load_sorted_conversations(env, show_last, debug, &time_filter)`, `debug_search_report(convs, query, now, workspace) -> DebugSearchReport` (+`to_text`), `DEBUG_SEARCH_TOP`, `parse_error_report(conv)`, `log_parse_errors(env, conv)`; K4 (`plan_session_delete` (a source whose adapter cannot delete is refused with `AppError::Unsupported`: `Deleting <source> sessions is not supported`, 9799550), `execute_session_delete`, `execute_session_delete_with(env, plan, codex_program, run)` (a Codex plan, every rollout of the thread, runs `codex delete --force <thread id>` with `CODEX_HOME` through `run`: the GUI passes `PlatformServices::run_program`, eea6d37), `DeletePlan { source, path, session_id, files, dirs }`, `DeleteReport`, `SessionDeleteFailure { error, partial }`) |
 | `semantic_ops` | `generate_semantic_cache(env, convs, workspace, &time_filter, embedder, progress, &cancel) -> GenerateReport`, `GenerateProgress`, `GenerateOutcome`, `clear_semantic_cache(env) -> ClearReport` (K6 as built: empties `<cache root>/semantic` but keeps the directory and its `embeddings.lock`), `semantic_search_report(env, query, convs, top, workspace, embedder)`, `semantic_debug_report(env, query, convs, workspace, embedder)`, `semantic_status(env, convs, workspace)` (`CacheFileState::{Missing, Unreadable, Incompatible, Ready, Legacy}`: 8919a76 made `Incompatible` field-less, the matrix keeps only a model hash, and added `Legacy` for an unconverted `embeddings-v1.bin`), `clear_embedding_cache(env)` (the matrix and an unconverted v1 file), `EmbedderFactory<'a>`, `fastembed_factory(env)`, `no_conversations_message` |
 | `agent` | `AgentRequest::{Search, Within, Read, Outline}`, `args::{AgentSearchArgs, AgentWithinArgs, AgentReadArgs, AgentOutlineArgs, AgentOutputFlags, AgentSearchModeArgs, TimeRangeArgs, DEFAULT_READ_CONTEXT}` (+`validate`), `AgentService::{new, with_embedder_factory, with_notice_sink, with_cancellation, respond}`, `agent::execute(env, config, request) -> AgentResponse` (headless `agent …`), `cli::{AgentCli::{Request, Help}, parse_agent_args}`, `AgentResponse { stdout, stderr, exit_code, result, warnings, error, notices }` (+`text`, `error_text`, `is_success`), `AgentResult::{Search, Within, Read, Outline}`, `AgentSearchResult { output, conversations }` (+`hits`, `conversation(ref)`), `AgentReadResult`, `AgentOutlineResult`, `AgentConversationInfo { reference, full_ref, uuid, project_id, source, session_id, session_filename, path }`, `AgentNotice::{SemanticProgress, UncachedPassages}`, `agent::service::{EmbedderFactory, discover_agent_keys}`, `refs::{AgentConversationKey::from_conversation, conversation_ref, full_ref, full_ref_for_candidate}`, `diagnostic::{AgentError, AgentWarning}`, `protocol::{ReadMessage, OutlineItem, ProtocolOptions, MessageLineRange}`; K5, K7, K8, K15 |
 | `update` | `check_latest_release(current) -> UpdateStatus` (services only), `update_status_from_response`, `UpdateStatus::{UpToDate, Available, Newer, NoRelease}`, `ReleaseInfo { tag, version, name, url, notes, … }` (+`asset_for(os, arch)`), `RELEASES_PAGE_URL`, `REPOSITORY` |
-| `history` | `Conversation`, `Source` (= `model::SourceKind`: `Claude`, `Pi`, `Omp`, `Codex` (list label `CX`, 7f5c443); +`label`, `list_label`), `model` (normalized transcript model: `Transcript`, `Event`, `Revision`, `ConversationKey`), `adapter` (`Adapter`, `Stamp`, `Located` (+`native`: the adapter's own resolution), `Completeness`, `Discovery`, `Adapter::native_id_of`; an adapter also declares the actions its tool supports, `capabilities`, and resumes, deletes and renames its conversations, 9799550), `actions` (`Capabilities`, `Target`, `refusal`) and `sources::Registry::from_env(env)` (+`for_source(kind)`: the adapter that acts on a source's conversations, 9799550) (one adapter per configured root, the Codex home included: `sources::codex::CodexAdapter::from_env(env)` lists the rollouts of `<codex home>/sessions` and `archived_sessions`, picks each thread's head with Codex's read-only state database and decodes its rollout chain, 7f5c443; its capabilities are none until Codex resume, fork and delete are ported; the store's reconcile pass discovers through it, 8daac4c, and decodes each changed file through `Adapter::decode_into` (`decode` collects the events into a `Transcript`), feeding the events into `index::Indexer` (`push` per event, `finish` with the transcript metadata) to build the card's `Conversation`, fd27225, 350314d), `detect_source(path)`, `process_conversation_file(path, mtime, debug)` (`sources::decode_path_into` feeding `index::Indexer`, 350314d; fork: the list loaders stream through `decode_path_into` too), `service::HistoryService` (`open(key)`, `open_path(path)`; reuses the decoded `Arc<Transcript>` while the stamp is unchanged; the agent commands load transcripts through it, 59b9565), `DeleteEmptyScope::{All, Local(WorkspaceScope)}`, `pi_loader::session_root`, `omp_loader::session_root`; K2 |
+| `history` | `Conversation`, `Source` (= `model::SourceKind`: `Claude`, `Pi`, `Omp`, `Codex` (list label `CX`, 7f5c443); +`label`, `list_label`), `model` (normalized transcript model: `Transcript`, `Event`, `Revision`, `ConversationKey`), `adapter` (`Adapter`, `Stamp`, `Located` (+`native`: the adapter's own resolution), `Completeness`, `Discovery`, `Adapter::native_id_of`; an adapter also declares the actions its tool supports, `capabilities`, and resumes, deletes and renames its conversations, 9799550), `actions` (`Capabilities` (+`ALL`, `NONE`), `capabilities_of(source, provenance)` (none for an orphaned conversation), `refusal(source, provenance, doing)`, `Target`; eea6d37) and `sources::Registry::from_env(env)` (+`for_source(kind)`: the adapter that acts on a source's conversations, 9799550) (one adapter per configured root, the Codex home included: `sources::codex::CodexAdapter::from_env(env)` lists the rollouts of `<codex home>/sessions` and `archived_sessions`, picks each thread's head with Codex's read-only state database and decodes its rollout chain, 7f5c443; it resumes and forks through the Codex CLI (`resume::plan_codex`, `CODEX_HOME`), deletes through `codex delete --force` (`sources::codex::{delete_spec, delete_outcome, thread_rollouts}`) and cannot rename, eea6d37; `sources::codex::view::{log_entries, decode_path}` decodes a rollout opened by path as its thread (`normalized_log_entries`, so the viewer, exports and `process_conversation_file` show Codex threads, with a `Fork` note where a forked thread's own records begin; fork: without the env's `CODEX_SQLITE_HOME` until 9597669); the store's reconcile pass discovers through it, 8daac4c, and decodes each changed file through `Adapter::decode_into` (`decode` collects the events into a `Transcript`), feeding the events into `index::Indexer` (`push` per event, `finish` with the transcript metadata) to build the card's `Conversation`, fd27225, 350314d), `detect_source(path)`, `process_conversation_file(path, mtime, debug)` (`sources::decode_path_into` feeding `index::Indexer`, 350314d; fork: the list loaders stream through `decode_path_into` too), `service::HistoryService` (`open(key)`, `open_path(path)`; reuses the decoded `Arc<Transcript>` while the stamp is unchanged; the agent commands load transcripts through it, 59b9565), `DeleteEmptyScope::{All, Local(WorkspaceScope)}`, `pi_loader::session_root`, `omp_loader::session_root`; K2 |
 | `theme`, `syntax`, `bench`, `debug`, `debug_log`, `markdown`, `time_filter`, `error` | `theme::{set_theme, kind, current, theme_for, ThemeKind, ThemePreference (+resolve), Theme, Rgb}`; `syntax::highlight_code(code, lang)`; `bench::{start(sink), enabled, mark, mark_peak_rss}` (upstream 40fa627 timing marks; explicit sink, no env read, no `--bench-startup`); `debug::{set_sink, reset_sink, DebugLevel (+tag), log, info, warn, error, should_log}`; `debug_log::{log_debug, log_display_error}`; `markdown::expand_tabs` (K10); `time_filter::{TimePoint, TimeFilter (+resolve, matches, is_active), TimeFilterError}`; `AppError`, `Result` |
 
 Duplicates the GUI must **not** write (each was planned in revision 1): its own loader bridge and refresh buffer
@@ -669,8 +670,10 @@ selection (A1). Right-click also selects and previews the row (the list keeps fo
 └──────────────────────────────┘
 ```
 Shortcut labels come from the live keymap. Items that need a known source (Resume, Fork, Rename, Delete) are
-disabled for targets with an unknown source. While loading, Rename and Delete are disabled, and Resume and Fork until
-the rows are listed newest first (the first cards of the store's generation, AD6).
+disabled for targets with an unknown source, and each one the conversation's capabilities refuse (core
+`history::actions::capabilities_of`, eea6d37: Rename of a Codex thread, all four for an orphaned thread) is
+disabled too. While loading, Rename and Delete are disabled, and Resume and Fork until the rows are listed newest
+first (the first cards of the store's generation, AD6).
 
 ### 5.3 Workspace picker and time filter dropdowns
 ```
@@ -813,7 +816,9 @@ Success → close; the row and header update in place (no toast, PD16).
 AlertDialog (not overlay-closable), `.description(..)` + children for the path list (scrollable when long),
 `.ok_text("Delete").ok_variant(Danger)`. A focused `div().key_context("Confirm")` inside the alert binds `y`,
 `shift-y` → confirm, `n`, `shift-n` → cancel, and **`enter` → no-op** (AD18). Pi: one file; OMP: the file +
-`<stem>/` artifacts folder. While the delete runs the buttons are disabled. The same pattern (title naming the
+`<stem>/` artifacts folder; Codex (eea6d37): every rollout of the thread, heading `Codex conversation · … ·
+<thread id>`, note `Runs codex delete --force <thread id>, which removes the thread and its state. This can't be
+undone.` (Codex itself deletes them). While the delete runs the buttons are disabled. The same pattern (title naming the
 target, danger verb, Enter ignored, y/n keys) is used by every destructive confirmation: §5.8 with overwrites,
 §5.10, §5.11 Clear, §5.15, the export "Replace" prompt.
 
@@ -967,7 +972,8 @@ Find = `maintenance::find_session_copies` (errors: `Session not found: <id>`). D
 │ Search  │ claude program   [                     ] [Browse…] resolved: C:\Users\me\.local\bin\claude.exe │
 │ Keys    │ pi program       [                     ] [Browse…] not found on PATH │
 │ Resume  │ omp program      [                     ] [Browse…]                   │
-│ Agent   │ Default workspace[                     ] [Browse…]                   │
+│ Agent   │ codex program    [                     ] [Browse…]                   │
+│         │ Default workspace[                     ] [Browse…]                   │
 │         │ ☑ Restore last session (window, workspace, view options)            │
 │         │ Display page: Default tool display (Summary|Full)                   │
 │         │      from config.toml: Full · applies at startup, before the       │
@@ -1352,6 +1358,10 @@ pub trait PlatformServices: Send + Sync + 'static {
     /// RecordingServices returns Ok(()) to stand for that success: callers treat Ok as "the launching terminal took
     /// over" and quit with exit 0 and no output.
     fn exec_in_current_terminal(&self, spec: &LaunchSpec) -> Result<(), String>;
+    /// Blocking (until the program exits); background. Real: core terminal::run_to_completion after the launch
+    /// guard (Codex: `codex delete --force <id>`, eea6d37). RecordingServices records ServiceCall::Run(spec) and
+    /// answers `set_run_result` (default: exit status 0).
+    fn run_program(&self, spec: &LaunchSpec) -> Result<RunOutput, String>;
     fn stdout_kind(&self) -> StdoutKind;                 // Redirected | Terminal | None (after AttachConsole on Windows)
     fn stdin_is_tty(&self) -> bool;                      // Unix picker exec decision (PD5); false on Windows
     fn write_stdout(&self, text: &str) -> Result<(), String>;
@@ -1407,8 +1417,8 @@ An unanswered prompt in `RecordingServices` answers `Ok(None)` (cancel) after th
 touches the real clipboard whatever has focus. gpui-kit components that perform side effects themselves (`Link` with
 an `href`, `PopupMenu::link`, a `TextView` without a link handler, the `Clipboard` copy button) must not be used
 without routing them through `Services`. `RealServices` refuses every side effect in `cfg(test)` builds.
-Debug builds of `RealServices` refuse `spawn_terminal`/`exec_in_current_terminal` for `claude`/`pi`/`omp` unless a
-program override is configured or `CHG_ALLOW_REAL_LAUNCH=1` (§15.4).
+Debug builds of `RealServices` refuse `spawn_terminal`/`exec_in_current_terminal`/`run_program` for
+`claude`/`pi`/`omp`/`codex` unless a program override is configured or `CHG_ALLOW_REAL_LAUNCH=1` (§15.4).
 
 ### 7.5 Background work model
 
@@ -1512,6 +1522,7 @@ pub struct ConversationTarget {
     pub project_name: Option<SharedString>,
     pub project_path: Option<PathBuf>,
     pub custom_title: Option<String>,
+    pub provenance: Provenance,          // Conversation.provenance; default for agent hits and unparsed files (eea6d37)
 }
 impl ConversationTarget {
     pub fn from_conversation(c: &Conversation) -> Self;                 // source = Some(c.source)
@@ -1521,8 +1532,16 @@ impl ConversationTarget {
     pub fn describe(&self) -> String;                                    // "proj · Fix login bug · 3f2a19c0-…"
     pub fn header_id_differs(&self) -> bool { self.session_id != self.file_stem }
     pub fn can_modify(&self) -> bool { self.source.is_some() }
+    /// eea6d37: core `capabilities_of(source, provenance)` (none for an unknown source), per `SessionAct`
+    /// (Resume, Fork, Rename, Delete), and the reason an act is unavailable (core `refusal`, or
+    /// `Unknown conversation type`).
+    pub fn capabilities(&self) -> Capabilities;
+    pub fn allows(&self, act: SessionAct) -> bool;
+    pub fn refusal(&self, act: SessionAct) -> Option<String>;
 }
 ```
+`ops::copy::live_target` also takes the corpus entry's provenance, so an action started from an agent hit is checked
+again against the live conversation (an orphaned thread is refused).
 Where targets come from:
 * **Pane handlers** resolve their own target synchronously in the action handler: ViewerPane → its open target;
   ListPane → `selected_target()` after `workspace.flush_pending_preview()`; DeepSearchPane → selected hit target;
@@ -2141,7 +2160,9 @@ row), taken from the handle LRU (§9.7).
   (`.selected(bool)`), spacer, find bar (when active), `Outline`, `Resume`, `Fork`, `⋯` dropdown (Export…, Copy to
   clipboard ▸, Copy message, Copy path, Copy session ID, Copy header session ID, Show file path, Reveal in file
   manager, Rename…, Search within conversation…, Read range…, Delete…). Single-file: no Resume/Fork/Rename/Delete;
-  unknown-source targets: those items disabled with tooltip `Unknown conversation type`.
+  unknown-source targets: those items disabled with tooltip `Unknown conversation type`; items the conversation's
+  capabilities refuse (Rename of a Codex thread, all four for an orphaned thread; eea6d37) disabled, the Resume
+  and Fork buttons with core's refusal as tooltip.
 * Status bar (status.rs): `[i/N]` (mono), `tools·sum|trn|all  think·on|off  info·on|off` (`ToolDisplayMode::
   status_label`; key letter accent, rest muted — clickable), `│`, hints (§8.7, focus-dependent, priority-trimmed).
 
@@ -2397,25 +2418,34 @@ the worker (§9.6); Active search `refresh`ed. Clicking an expandable control al
 
 ### 11.8 Rename (F2, menus, palette, row menu; list or viewer; K3)
 1. The pane handler captures `target` (§7.8); while loading, unknown source or single-file → no-op (menu item
-   disabled).
+   disabled). A conversation whose capabilities refuse it (`ConversationTarget::refusal`, core
+   `capabilities_of`: a Codex thread, an orphaned one; eea6d37) → warning toast with core's refusal
+   (`Renaming CX sessions is not supported`) before any dialog opens (`routing::run_session_action`); the row
+   menu and the viewer's ⋯ menu show Rename… disabled.
 2. `ops::rename::open_rename_dialog(target, window, cx)`: `InputState` prefilled with `target.custom_title` (caret at
    end, focus once); dialog §5.6 registered in `OpenTargets`.
 3. Save/Enter → buttons show a spinner; background `history::rename_session(env, path, source, input, show_last).map(PreparedSession::new)` →
    UI: `list.apply_renamed(path, prepared)` → `browser.apply_renamed_session` (K3). Ok → close dialog; row/header update via `CorpusChanged` (no toast).
    `Err(RenameError)` → inline error (`Failed to rename: conversation became empty` / `Failed to rename: <e>` /
-   `Renaming <source> sessions is not supported` when the source's adapter cannot rename, none yet (9799550);
-   dialog stays open, input kept). `NoTarget` (the conversation left the list meanwhile) → inline `This conversation
+   `Renaming <source> sessions is not supported` when the source's adapter cannot rename (9799550; Codex is
+   refused up front, step 1); dialog stays open, input kept). `NoTarget` (the conversation left the list meanwhile) → inline `This conversation
    is no longer in the list`.
 
 ### 11.9 Delete (Ctrl+X, menus, palette, row menu; list or viewer; K4)
-1. Capture `target`; while loading, unknown source or single-file → no-op.
+1. Capture `target`; while loading, unknown source or single-file → no-op; refused by its capabilities (an orphaned
+   Codex thread, eea6d37) → warning toast with core's refusal (§11.8 step 1), checked again with the live corpus
+   entry's provenance after planning (an agent hit does not know it).
 2. Background `maintenance::plan_session_delete(env, &target.path, source)`. Error (e.g. `Session not found: <id>`, or
-   `Deleting <source> sessions is not supported` when the source's adapter cannot delete, none yet: 9799550) → error
-   toast.
-3. Open the confirmation (§5.7) with the plan (files, dirs, copy count); registered in `OpenTargets`. `y`/`Y`/Delete
-   button → buttons disabled; background `execute_session_delete(env, &plan)`.
+   `Deleting <source> sessions is not supported` when the source's adapter cannot delete: 9799550) → error
+   toast. A Codex plan lists every rollout of the thread (eea6d37).
+3. Open the confirmation (§5.7) with the plan (files, dirs, copy count; for Codex `Runs codex delete --force <id>,
+   which removes the thread and its state. This can't be undone.`); registered in `OpenTargets`. `y`/`Y`/Delete
+   button → buttons disabled; background `execute_session_delete_with(env, &plan, [gui] codex_path, run)` with
+   `run` = `PlatformServices::run_program` (only a Codex plan runs a program: `codex delete --force <thread id>`
+   with `CODEX_HOME`, `CREATE_NO_WINDOW` on Windows; a failure is `codex delete failed (<status>): <stderr>`).
 4. Ok(report) → `CorpusNotice::Deleted(plan.files)` (all deleted copies leave the list, the viewer is cleared if it
-   shows one, other dialogs on those paths close, §7.2); toast `Deleted "<title>"` or, for several Claude copies,
+   shows one, other dialogs on those paths close, §7.2; a Codex thread's rollouts leave even when the recorder in a
+   test or QA run removed nothing); toast `Deleted "<title>"` or, for several Claude copies,
    `Deleted session <id> (<n> copies across projects)` (core `delete_by_uuid_message`). Err(e) → error toast
    `Failed to delete session <path>: <e>` (core also appends that line to debug.log; LIST quirk 7 fix). As built
    (K4): `<path>` is `plan.path`, the listed conversation (also when another copy failed); a plan that
@@ -2423,14 +2453,21 @@ the worker (§9.6); Active search `refresh`ed. Clicking an expandable control al
 5. Pending searches: core keeps indices consistent (F8).
 
 ### 11.10 Resume / Fork
-1. Capture `target`; loading before the rows are listed (`list_ready`), unknown source or single-file → no-op.
+1. Capture `target`; loading before the rows are listed (`list_ready`), unknown source or single-file → no-op;
+   refused by its capabilities (an orphaned Codex thread, eea6d37) → warning toast with core's refusal (§11.8
+   step 1), checked again with the live corpus entry's provenance once the plan is made.
 2. `conv` = `list.conversation(&target.path)` (live `project_path`) or, when not in the corpus, a background
    `process_conversation_file` → `ResumeTarget`.
-3. `plan = core::resume::plan_resume(&env, &conv, workspace.as_ref(), fork, &settings.resume_default_args,
-   &ProgramOverrides::from_gui_settings(&config.gui))`:
+3. `plan = core::resume::plan_resume_target(&env, &target, workspace.as_ref(), fork,
+   settings.resume_default_args_for(source), &ProgramOverrides::from_gui_settings(&config.gui))`
+   (`[resume] default_args` for Claude, `[resume.codex] default_args` for Codex, none for Pi/OMP; eea6d37):
    * the adapter of the conversation's source plans it (`Registry::for_source`, `Adapter::resume`; 9799550) and
-     refuses what it does not support (`Failed to run Claude CLI: <source> sessions cannot be resumed` / `forked`;
-     every adapter supports both so far).
+     core refuses what the conversation does not support (`capabilities_of`; `Failed to run Claude CLI: Resuming
+     <source> sessions is not supported` / `… is unavailable: …`, eea6d37).
+   * Codex (eea6d37): `codex [default_args] resume|fork <thread id>` in the thread's project directory, else the
+     workspace with the `Session directory … does not exist` warning; `plan.env` = `CODEX_HOME` of the rollout's
+     home, which every launcher passes on (`env 'CODEX_HOME=…'` in the POSIX line, `set "CODEX_HOME=…" &&` in the
+     `cmd.exe` line, and on the launcher process).
    * `Err(AppError::WorkspaceRequired(msg))` → toast `msg` + action "Choose workspace…"; other errors → toast with the
      error text.
    * `plan.warnings` → warning toast(s) (e.g. `Session directory <dir> does not exist`).
@@ -2647,9 +2684,11 @@ W warning, E error. Every error state offers a recovery action (DG §9.13).
 | Toast E | refresh fatal / interrupted | + [Retry] | `Refresh failed: <err>` / `Refresh failed; keeping the current list` | `Refresh failed: <err>` / `Refresh failed; keeping existing sessions` |
 | Toast W | load/reload with project errors | + [Show debug log] | `N project(s) could not be loaded. See Tools → Debug log.` | (ignored by TUI) |
 | Toast E | UUID not found | | `Session not found: <uuid>` | `UuidLookup::status_message` |
-| Rename dialog | errors (inline) | | `Failed to rename: conversation became empty` / `Failed to rename: <err>` / `This conversation is no longer in the list` / `Renaming <source> sessions is not supported` (no adapter refuses yet) | `RenameError` Display (9799550: the TUI's refusal status) |
+| Rename dialog | errors (inline) | | `Failed to rename: conversation became empty` / `Failed to rename: <err>` / `This conversation is no longer in the list` / `Renaming <source> sessions is not supported` (Codex is refused before the dialog, next row) | `RenameError` Display (9799550: the TUI's refusal status) |
+| Toast W | an action the conversation's capabilities refuse (eea6d37) | | `Renaming CX sessions is not supported` / `<Resuming\|Forking\|Renaming\|Deleting> is unavailable: CX no longer has this conversation's current history` | core `history::actions::refusal` (upstream status line, verbatim) |
 | Rename | success | row + header update, no toast | — | `Session renamed` |
-| Toast S / E | delete | | `Deleted "<title>"` / `Deleted session <id> (<n> copies across projects)` / `Failed to delete session <path>: <err>` / `Deleting <source> sessions is not supported` (no adapter refuses yet) | CLI `delete_by_uuid_message`; TUI debug-log line; TUI refusal status (9799550) |
+| Toast S / E | delete | | `Deleted "<title>"` / `Deleted session <id> (<n> copies across projects)` (Claude only) / `Failed to delete session <path>: <err>` (Codex: `<err>` = `I/O error: codex delete failed (<status>): <stderr>`, eea6d37) / `Deleting <source> sessions is not supported` | CLI `delete_by_uuid_message`; TUI debug-log line; TUI refusal status (9799550); upstream's `codex delete` error |
+| Delete confirmation | Codex note (eea6d37) | | `Runs codex delete --force <thread id>, which removes the thread and its state. This can't be undone.` | — |
 | Toast I | a deletion closed open dialogs | | `Closed: "<title>" was deleted` | — |
 | Viewer | nothing selected | Empty | `No conversation selected` + `Select a conversation on the left, or press Enter.` | — |
 | Viewer | opening | thin progress / Spinner | `Loading conversation…` | — |
@@ -2738,7 +2777,8 @@ Subcommands cannot be combined with top-level flags.
 
 ### 13.2 `gui.toml` and `config.toml`
 * `config.toml` (`~/.config/claude-history/config.toml`): read-only, upstream schema with `deny_unknown_fields`;
-  parse errors → §5.20 dialog. Never written (core refuses).
+  parse errors → §5.20 dialog. Never written (core refuses). `[resume.codex] default_args` (upstream eea6d37) is
+  part of that schema: Codex's resume/fork arguments, separate from Claude's `[resume] default_args`.
 * `gui.toml` (`~/.config/claude-history/gui.toml`, core `GuiConfigFile`): may override `[display]`, `[resume]`,
   `[keys]`, `[tui]`, `[search]`, `[agent]` and holds `[gui]`. Effective value = gui.toml > config.toml > default.
   Written only by `save_gui_config_changes` (K12): changed keys only, comments preserved, refused while the file is
@@ -2752,7 +2792,7 @@ when no config key is set and restore_session is on) or `Default: <value>`; "App
 |---|---|---|---|---|---|
 | General | Theme | `[gui] theme` | Segmented | system / light / dark | immediately |
 | General | Terminal | `[gui] terminal` | Select + custom text | core syntax: `auto` (default), `wt`, `cmd` (`console`), `terminal`, `osascript`, a Linux emulator name (`gnome-terminal`, `ptyxis`, `kgx`, `konsole`, `xfce4-terminal`, `tilix`, `alacritty`, `kitty`, `wezterm`, `xterm`, `x-terminal-emulator`), or a template with `{cwd}`, `{args}`, `{cmd}`; the field previews the command for a sample resume (`build_terminal_command`) | next launch |
-| General | claude / pi / omp program | `[gui] claude_path` / `pi_path` / `omp_path` | path input + Browse… | must exist when set; shows the PATH resolution result | next launch |
+| General | claude / pi / omp / codex program | `[gui] claude_path` / `pi_path` / `omp_path` / `codex_path` (codex: eea6d37; also the Codex delete) | path input + Browse… | must exist when set; shows the PATH resolution result | next launch |
 | General | Default workspace | `[gui] default_workspace` | folder input + Browse… | existing dir | next start |
 | General | Restore last session | `[gui] restore_session` | Switch | default on | next start |
 | Display | Preview shows | `[display] last` | Segmented Last / First | | list refresh |
@@ -2764,6 +2804,7 @@ when no config key is set and restore_session is on) or `Default: <value>`; "App
 | Search | Excluded projects | `[tui] exclude_projects` | list editor | exact names; `repo` also hides `repo/<worktree>` | immediately |
 | Keys | Resume, Fork, Rename, Delete, Refresh | `[keys] …` | text inputs (`ctrl+r` syntax) + live warnings | §8.5 | immediately |
 | Resume | Default arguments | `[resume] default_args` | list editor | Claude only | next resume |
+| Resume | Codex default arguments | `[resume.codex] default_args` (eea6d37) | list editor | Codex only, before `resume`/`fork` | next resume |
 | Agent | Scope | `[agent] scope` | global / local | | next run |
 | Agent | Mode | `[agent] mode` | lexical/semantic/exact/hybrid | | next run |
 | Agent | Output budget (chars) | `[agent] output_chars` | NumberInput ≥ 1 | 6000 default | next run |
@@ -3007,7 +3048,7 @@ quit 0
   `viewer.path`, `viewer.items`, `viewer.messages`, `viewer.nav_focus`, `viewer.indicator`, `viewer.search.count`,
   `viewer.search.current`, `viewer.tool_display`, `viewer.thinking`, `viewer.timing`, `viewer.frame_p95`,
   `focus` (list|viewer|agent|deep|dialog|none), `dialog` (open dialog id or none), `toast.last`, `clipboard`,
-  `stdout`, `calls.terminal.count`, `calls.terminal.last`, `calls.open_url.last`, `deep.hits`, `deep.groups`,
+  `stdout`, `calls.terminal.count`, `calls.terminal.last`, `calls.run.count`, `calls.run.last` (programs run to completion: the Codex delete, eea6d37), `calls.open_url.last`, `deep.hits`, `deep.groups`,
   `deep.mode`, `agent.tab`, `agent.target`, `theme`; since the fix round also `window.frame_p95` and
   `window.frame_max` (the whole main window's frame over its last 512 frames, X-008).
 * Report: `<qa-out>/report.txt` (one `PASS|FAIL|SKIP <line> <step> [detail]` per step + summary) and
@@ -3021,7 +3062,9 @@ quit 0
   the viewer's frame in the main window with 20k rows, V-094); WP3 `rename.qa`, `delete.qa`,
   `resume-fork.qa`, `export-copy.qa`, `picker.qa`, `picker-exit.qa`; WP4 `deep-search.qa`, `agent-panel.qa`; WP5
   `tools.qa`; WP6
-  `settings-keys.qa`, `theme.qa`, `palette.qa`; WP-I `cross-pane.qa`.
+  `settings-keys.qa`, `theme.qa`, `palette.qa`; WP-I `cross-pane.qa`; the eea6d37 backport `codex.qa` (a Codex
+  thread added by `new-sandbox.ps1 -WithCodex`: viewer, refused Rename, Resume with `CODEX_HOME`, the recorded
+  `codex delete`).
 
 ### 15.4 Sandbox gate, sandbox procedure (dev runs and QA)
 * **Gate** (`qa/gate.rs`, runs in `main` for `--features qa` builds **and every debug build**): refuse with exit 3
@@ -3043,8 +3086,8 @@ quit 0
 * Procedure:
   1. `tools/qa/new-sandbox.ps1 -Source <scratchpad>/sandbox/home -Dest $env:TEMP\chg-sbx-<n>`: copies the corpus
      (never use the source in place), creates `<dest>\.qa-sandbox`, `<dest>\.config\claude-history\`,
-     `<dest>\.local\state\`, and a `gui.toml` with `claude_path`/`pi_path`/`omp_path` pointing at a harmless
-     recorder script in the sandbox.
+     `<dest>\.local\state\`, and a `gui.toml` with `claude_path`/`pi_path`/`omp_path`/`codex_path` pointing at a
+     harmless recorder script in the sandbox.
   2. `tools/qa/run-gui.ps1 -Sandbox <dest> -Exe <path> [-Scenario x.qa -Out <dir>] [-Shots]` sets, for the child
      process only: `USERPROFILE`, `HOME` = `<dest>`; `CLAUDE_CONFIG_DIR` = `<dest>\.claude`; `PI_CODING_AGENT_DIR` =
      `<dest>\.pi\agent`; `CODEX_HOME` = `<dest>\.codex`; `XDG_*` under `<dest>`; removes

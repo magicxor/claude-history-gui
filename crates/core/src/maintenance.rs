@@ -8,22 +8,25 @@
 //! * `--delete <uuid>`: [`find_session_copies`] (what would be removed) and
 //!   [`delete_session_by_uuid`];
 //! * deleting a listed conversation (any source) in two steps around the
-//!   confirmation: [`plan_session_delete`] and [`execute_session_delete`];
+//!   confirmation: [`plan_session_delete`] and [`execute_session_delete`]
+//!   ([`execute_session_delete_with`]: a Codex thread through the Codex CLI
+//!   run by the caller);
 //! * `--show-dir`: [`show_dir`];
 //! * `--debug-search`: [`debug_search_report`] (scoring breakdown per result
 //!   plus the CLI's stderr text);
 //! * `--debug` parse-error log: [`parse_error_report`] and
 //!   [`log_parse_errors`].
 //!
-//! All of them write only where upstream wrote (Claude transcripts for the
-//! deletions, the debug log); every location comes from the
-//! [`HistoryEnv`].
+//! All of them write only where upstream wrote (Claude, Pi and OMP
+//! transcripts for the deletions, the debug log; a Codex thread is deleted by
+//! the Codex CLI); every location comes from the [`HistoryEnv`].
 
 use crate::debug::DebugLevel;
 use crate::env::{HistoryEnv, WorkspaceScope};
 use crate::error::{AppError, Result};
-use crate::history::sources::Registry;
+use crate::history::sources::{Registry, codex};
 use crate::history::{self, Conversation, ParseError, Source};
+use crate::resume::terminal::{LaunchSpec, RunOutput, run_to_completion};
 use crate::search;
 use crate::search::literal::CaseMode;
 use crate::time_filter::TimeFilter;
@@ -437,10 +440,11 @@ pub struct DeletePlan {
     /// upstream debug-log line when the delete fails, whichever item failed.
     pub path: PathBuf,
     /// Claude: the transcript's file stem; Pi/OMP: the session header id
-    /// (the file stem when the header has none).
+    /// (the file stem when the header has none); Codex: the thread id.
     pub session_id: String,
     /// Transcripts to remove: every copy of a Claude session across project
-    /// directories (cross-project forks), else the one file.
+    /// directories (cross-project forks), every rollout of a Codex thread,
+    /// else the one file.
     pub files: Vec<PathBuf>,
     /// Directories to remove: the existing `<project>/<uuid>/` session
     /// directories (Claude) or the artifact directory (OMP).
@@ -495,7 +499,10 @@ impl From<Box<SessionDeleteFailure>> for AppError {
 /// * Pi: `path`, if it is a `.jsonl` Pi session, else `SessionNotFound`;
 /// * OMP: `path`, if it is a `.jsonl` OMP session, plus its artifact
 ///   directory when it exists;
-/// * Codex: refused, until `codex delete` is ported (upstream eea6d37).
+/// * Codex: every rollout of the thread of `path`, a rollout of a Codex home
+///   (upstream eea6d37 deletes the thread with `codex delete --force <thread
+///   id>`, which removes them and the thread's state; the execution runs that
+///   command, see [`execute_session_delete_with`]).
 ///
 /// A source whose adapter cannot delete (`Adapter::capabilities`, upstream
 /// 9799550) is refused with [`AppError::Unsupported`]. Nothing is removed.
@@ -506,7 +513,9 @@ pub fn plan_session_delete(env: &HistoryEnv, path: &Path, source: Source) -> Res
         .delete
     {
         return Err(AppError::Unsupported(history::actions::refusal(
-            source, "Deleting",
+            source,
+            history::Provenance::default(),
+            "Deleting",
         )));
     }
     let not_found = || AppError::SessionNotFound(path.display().to_string());
@@ -559,11 +568,23 @@ pub fn plan_session_delete(env: &HistoryEnv, path: &Path, source: Source) -> Res
                     .collect(),
             })
         }
-        // The Codex adapter cannot delete yet, so the check above refuses
-        // first (`history::sources::codex`).
-        Source::Codex => Err(AppError::Unsupported(history::actions::refusal(
-            source, "Deleting",
-        ))),
+        Source::Codex => {
+            let thread = codex::discover::rollout_of(path, false)
+                .filter(|_| codex::discover::home_of(path).is_some())
+                .ok_or_else(not_found)?
+                .thread_id;
+            let files = codex::thread_rollouts(path)?;
+            if files.is_empty() {
+                return Err(not_found());
+            }
+            Ok(DeletePlan {
+                source,
+                path: path.to_path_buf(),
+                session_id: thread,
+                files,
+                dirs: Vec::new(),
+            })
+        }
     }
 }
 
@@ -592,16 +613,43 @@ fn plan_session_id(header_id: Option<String>, path: &Path) -> String {
 /// * Pi: exactly the listed file, a `.jsonl` Pi session (when it still
 ///   exists), and no directory;
 /// * OMP: exactly the listed file, a `.jsonl` OMP session (when it still
-///   exists), and at most its artifact directory.
+///   exists), and at most its artifact directory;
+/// * Codex: the thread id of the listed rollout, rollouts of that thread in
+///   its Codex home, and no directory.
+///
+/// A Codex plan runs `codex delete --force <thread id>` through
+/// [`run_to_completion`] (refused in tests and hermetic builds); see
+/// [`execute_session_delete_with`].
 pub fn execute_session_delete(
     env: &HistoryEnv,
     plan: &DeletePlan,
+) -> std::result::Result<DeleteReport, Box<SessionDeleteFailure>> {
+    execute_session_delete_with(env, plan, None, &mut |spec| {
+        run_to_completion(spec).map_err(|error| error.to_string())
+    })
+}
+
+/// [`execute_session_delete`], with the Codex CLI a Codex plan runs: the
+/// program at `codex_program` (`[gui] codex_path`), else `codex` on the env's
+/// `PATH`, run to completion by `run` (a GUI passes its platform services,
+/// which record it in tests). Upstream eea6d37 runs `codex delete --force
+/// <thread id>` with `CODEX_HOME` set to the thread's home and reports its
+/// stderr when it fails (`codex delete failed (<status>): <stderr>`). The
+/// report lists the planned rollouts that are gone afterwards as removed.
+pub fn execute_session_delete_with(
+    env: &HistoryEnv,
+    plan: &DeletePlan,
+    codex_program: Option<&Path>,
+    run: &mut dyn FnMut(&LaunchSpec) -> std::result::Result<RunOutput, String>,
 ) -> std::result::Result<DeleteReport, Box<SessionDeleteFailure>> {
     if let Err(error) = validate_delete_plan(env, plan) {
         return Err(Box::new(SessionDeleteFailure {
             error,
             partial: DeleteReport::default(),
         }));
+    }
+    if plan.source == Source::Codex {
+        return execute_codex_delete(env, plan, codex_program, run);
     }
     let mut report = DeleteReport::default();
     for file in &plan.files {
@@ -635,11 +683,47 @@ pub fn execute_session_delete(
     Ok(report)
 }
 
+/// Runs a validated Codex `plan` (see [`execute_session_delete_with`]).
+fn execute_codex_delete(
+    env: &HistoryEnv,
+    plan: &DeletePlan,
+    codex_program: Option<&Path>,
+    run: &mut dyn FnMut(&LaunchSpec) -> std::result::Result<RunOutput, String>,
+) -> std::result::Result<DeleteReport, Box<SessionDeleteFailure>> {
+    let fail = |error: AppError, partial: DeleteReport| {
+        Box::new(SessionDeleteFailure {
+            error: log_delete_failure(env, &plan.path, error),
+            partial,
+        })
+    };
+    let spec = codex::delete_spec(env, &plan.path, Path::new(""), codex_program)
+        .map_err(|error| fail(error, DeleteReport::default()))?;
+    let output = run(&spec).map_err(|message| {
+        fail(
+            AppError::Io(std::io::Error::other(message)),
+            DeleteReport::default(),
+        )
+    })?;
+    let report = DeleteReport {
+        removed_files: plan
+            .files
+            .iter()
+            .filter(|file| std::fs::symlink_metadata(file).is_err())
+            .cloned()
+            .collect(),
+        ..DeleteReport::default()
+    };
+    match codex::delete_outcome(&output) {
+        Ok(()) => Ok(report),
+        Err(error) => Err(fail(error, report)),
+    }
+}
+
 fn validate_delete_plan(env: &HistoryEnv, plan: &DeletePlan) -> Result<()> {
     let refuse = || Err(AppError::SessionNotFound(plan.session_id.clone()));
     let jsonl =
         |path: &PathBuf| path.extension().and_then(|extension| extension.to_str()) == Some("jsonl");
-    if !plan.files.iter().all(jsonl) {
+    if plan.source != Source::Codex && !plan.files.iter().all(jsonl) {
         return refuse();
     }
     match plan.source {
@@ -691,8 +775,24 @@ fn validate_delete_plan(env: &HistoryEnv, plan: &DeletePlan) -> Result<()> {
                 return refuse();
             }
         }
-        // Nothing plans a Codex deletion yet.
-        Source::Codex => return refuse(),
+        Source::Codex => {
+            // `codex delete --force <id>` acts on the home of the listed
+            // rollout: the id must be its thread's, and every planned file a
+            // rollout of that thread in that home.
+            let home = codex::discover::home_of(&plan.path);
+            let thread_ok = home.is_some()
+                && codex::discover::rollout_of(&plan.path, false)
+                    .is_some_and(|rollout| rollout.thread_id == plan.session_id);
+            let files_ok = !plan.files.is_empty()
+                && plan.files.iter().all(|file| {
+                    codex::discover::home_of(file) == home
+                        && codex::discover::rollout_of(file, false)
+                            .is_some_and(|rollout| rollout.thread_id == plan.session_id)
+                });
+            if !thread_ok || !files_ok || !plan.dirs.is_empty() {
+                return refuse();
+            }
+        }
     }
     Ok(())
 }
@@ -1614,6 +1714,151 @@ mod tests {
         assert!(transcript.exists() && bystander.exists());
         assert!(outside_transcript.exists() && outside_dir.exists());
         assert!(in_root.exists() && other_project_dir.exists());
+    }
+
+    /// Upstream eea6d37: a Codex thread is deleted by `codex delete --force
+    /// <thread id>` on its home; the plan lists every rollout of the thread,
+    /// and the caller runs the command (a fake here).
+    #[test]
+    fn codex_threads_are_deleted_by_the_codex_cli() {
+        const REVERT: &str = "01a00000-0000-7000-8000-000000000004";
+        const TORN: &str = "01a00000-0000-7000-8000-000000000005";
+        let sandbox = Sandbox::new();
+        let home = codex::tests::home_copy(sandbox.root.path());
+        let rollouts = |thread: &str| -> Vec<PathBuf> {
+            let mut paths: Vec<PathBuf> = codex::discover::list(&home)
+                .unwrap()
+                .into_iter()
+                .filter(|rollout| rollout.thread_id == thread)
+                .map(|rollout| rollout.path)
+                .collect();
+            paths.sort();
+            paths
+        };
+        let listed = rollouts(REVERT).pop().unwrap();
+        let mut plan = plan_session_delete(&sandbox.env, &listed, Source::Codex).unwrap();
+        plan.files.sort();
+        assert_eq!(plan.session_id, REVERT);
+        assert_eq!(plan.files, rollouts(REVERT));
+        assert_eq!(plan.files.len(), 2, "the reverted thread has two rollouts");
+        assert!(plan.dirs.is_empty());
+        assert!(matches!(
+            plan_session_delete(
+                &sandbox.env,
+                &sandbox.root.path().join("x.jsonl"),
+                Source::Codex
+            ),
+            Err(AppError::SessionNotFound(_))
+        ));
+
+        // Tampered plans never reach the CLI.
+        let other = rollouts(TORN).pop().unwrap();
+        let elsewhere = sandbox
+            .root
+            .path()
+            .join("sessions")
+            .join(listed.file_name().unwrap());
+        let mut ran = Vec::new();
+        for tampered in [
+            DeletePlan {
+                session_id: TORN.to_string(),
+                ..plan.clone()
+            },
+            DeletePlan {
+                files: vec![other.clone()],
+                ..plan.clone()
+            },
+            DeletePlan {
+                files: vec![elsewhere],
+                ..plan.clone()
+            },
+            DeletePlan {
+                dirs: vec![home.clone()],
+                ..plan.clone()
+            },
+            DeletePlan {
+                files: Vec::new(),
+                ..plan.clone()
+            },
+            DeletePlan {
+                source: Source::Codex,
+                path: sandbox.root.path().join("notes.jsonl"),
+                session_id: REVERT.to_string(),
+                files: vec![listed.clone()],
+                dirs: Vec::new(),
+            },
+        ] {
+            let failure = execute_session_delete_with(&sandbox.env, &tampered, None, &mut |spec| {
+                ran.push(spec.clone());
+                Err("ran".to_string())
+            })
+            .unwrap_err();
+            assert!(
+                matches!(failure.error, AppError::SessionNotFound(_)),
+                "{tampered:?}"
+            );
+        }
+        assert!(ran.is_empty());
+
+        // The configured CLI runs `codex delete --force <id>` on the home.
+        let codex = sandbox.root.path().join("bin").join("codex.exe");
+        std::fs::create_dir_all(codex.parent().unwrap()).unwrap();
+        std::fs::write(&codex, "").unwrap();
+        let failed = execute_session_delete_with(&sandbox.env, &plan, Some(&codex), &mut |spec| {
+            ran.push(spec.clone());
+            Ok(RunOutput {
+                success: false,
+                status: "exit status: 2".to_string(),
+                stderr: "thread is busy\n".to_string(),
+            })
+        })
+        .unwrap_err();
+        assert_eq!(
+            failed.error.to_string(),
+            "I/O error: codex delete failed (exit status: 2): thread is busy"
+        );
+        assert!(failed.partial.removed_files.is_empty());
+        let log = std::fs::read_to_string(sandbox.env.debug_log_file().unwrap()).unwrap();
+        assert!(
+            log.contains(&format!("Failed to delete session {}", listed.display())),
+            "{log}"
+        );
+        let report = execute_session_delete_with(&sandbox.env, &plan, Some(&codex), &mut |spec| {
+            ran.push(spec.clone());
+            // What Codex does: remove every rollout of the thread.
+            for file in &plan.files {
+                std::fs::remove_file(file).unwrap();
+            }
+            Ok(RunOutput {
+                success: true,
+                status: "exit status: 0".to_string(),
+                stderr: String::new(),
+            })
+        })
+        .unwrap();
+        assert_eq!(report.removed_files, plan.files);
+        assert_eq!(ran.len(), 2);
+        let spec = &ran[1];
+        assert_eq!(spec.program.path, codex);
+        assert_eq!(
+            spec.args,
+            ["delete", "--force", REVERT]
+                .map(std::ffi::OsString::from)
+                .to_vec()
+        );
+        assert_eq!(
+            spec.env,
+            [(
+                std::ffi::OsString::from("CODEX_HOME"),
+                home.clone().into_os_string()
+            )]
+        );
+        assert!(other.is_file(), "other threads stay");
+
+        // Without a runner, core refuses to run the CLI in tests.
+        let plan = plan_session_delete(&sandbox.env, &other, Source::Codex).unwrap();
+        assert!(execute_session_delete(&sandbox.env, &plan).is_err());
+        assert!(other.is_file());
     }
 
     #[test]

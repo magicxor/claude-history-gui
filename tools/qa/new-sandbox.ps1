@@ -9,8 +9,9 @@
     * <Dest>\.qa-sandbox       the marker the sandbox gate requires (debug and qa builds)
     * <Dest>\.config\claude-history\, <Dest>\.local\state\
     * <Dest>\bin\fake-agent.*  a harmless recorder script (appends its arguments to <Dest>\launches.log)
-    * <Dest>\.config\claude-history\gui.toml  with [gui] claude_path / pi_path / omp_path pointing at it,
-      so a Resume in the sandbox can never start a real claude, pi or omp.
+    * <Dest>\.config\claude-history\gui.toml  with [gui] claude_path / pi_path / omp_path / codex_path
+      pointing at it, so a Resume (or a Codex delete) in the sandbox can never start a real claude,
+      pi, omp or codex.
   Never use the template in place and never point -Dest at a real profile: the script refuses
   the current user's profile directory, anything inside it that already exists, and an existing
   -Dest that is not a previous sandbox.
@@ -22,6 +23,10 @@
   need this conversation. Nothing else in the corpus changes, so row counts of other scenarios are
   unaffected unless they ask for it.
 
+  -WithCodex additionally copies one Codex thread (the core fixture's paginated thread, first message
+  "Explain the walrus operator") into <Dest>\.codex\sessions, the Codex home run-gui.ps1 selects
+  (codex.qa).
+
 .EXAMPLE
   .\tools\qa\new-sandbox.ps1 -Source crates\gui\tests\fixtures\qa-home -Dest $env:TEMP\chg-sbx-1
 #>
@@ -31,7 +36,9 @@ param(
     # Replace an existing sandbox (a directory that holds the .qa-sandbox marker).
     [switch]$Force,
     # Add a conversation whose project folder exists inside the sandbox (see .DESCRIPTION).
-    [switch]$WithWorkspace
+    [switch]$WithWorkspace,
+    # Add a Codex thread to the sandbox's Codex home (see .DESCRIPTION).
+    [switch]$WithCodex
 )
 $ErrorActionPreference = 'Stop'
 
@@ -98,6 +105,7 @@ $gui = @"
 claude_path = '$agent'
 pi_path = '$agent'
 omp_path = '$agent'
+codex_path = '$agent'
 "@
 Set-Content -LiteralPath (Join-Path $configDir 'gui.toml') -Value $gui -Encoding utf8
 
@@ -119,6 +127,14 @@ if ($WithWorkspace) {
     $file = Join-Path $projectDir "$session.jsonl"
     Set-Content -LiteralPath $file -Value $lines -Encoding utf8
     (Get-Item -LiteralPath $file).LastWriteTimeUtc = $now
+}
+
+if ($WithCodex) {
+    $rollout = 'rollout-2026-09-01T10-00-00-01a00000-0000-7000-8000-000000000002.jsonl'
+    $fixture = Join-Path $PSScriptRoot "../../crates/core/tests/fixtures/codex/sessions/2026/09/01/$rollout"
+    $day = Join-Path $dest '.codex/sessions/2026/09/01'
+    New-Item -ItemType Directory -Force -Path $day | Out-Null
+    Copy-Item -LiteralPath $fixture -Destination (Join-Path $day $rollout)
 }
 
 Write-Output $dest

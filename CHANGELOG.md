@@ -44,10 +44,16 @@ Release notes are taken from the `## v<version>` section of this file by the rel
   line early, with the wrong context. Claude conversation files are also recognized and read with less work.
 - Codex threads are listed and searchable next to Claude Code, Pi and OMP conversations (marked `CX`), read from
   `~/.codex` or `CODEX_HOME`, including archived and compressed sessions, with the titles Codex keeps in its state
-  database (only ever read). Opening, resuming, forking, renaming and deleting them is not available yet.
+  database (only ever read).
 - Automated runs (such as `codex exec`) and subagent threads no longer appear in the list, list search or semantic
   search (Deep search still finds them); Codex subagent threads whose task came from their parent are no longer
   skipped as empty.
+- Codex threads open in the viewer, in single-file windows and in every export and copy format; a forked thread
+  shows the history it continues from, then a "Fork" marker where its own messages begin. Resume and Fork run
+  `codex resume` / `codex fork` with the thread's id in a new terminal, with `CODEX_HOME` set to the thread's home
+  and the arguments of the new `[resume.codex] default_args`; Delete runs `codex delete --force` after the usual
+  confirmation. Renaming a Codex thread is refused with a message, and a thread whose current history Codex no
+  longer has allows no action. Settings has fields for the codex program and the Codex default arguments.
 
 ## v0.1.1
 

@@ -68,6 +68,12 @@ impl PlatformServices for ScriptedServices {
     fn exec_in_current_terminal(&self, _: &LaunchSpec) -> Result<(), String> {
         unreachable!()
     }
+    fn run_program(
+        &self,
+        _: &LaunchSpec,
+    ) -> Result<claude_history_core::resume::terminal::RunOutput, String> {
+        unreachable!()
+    }
     fn stdout_kind(&self) -> StdoutKind {
         unreachable!()
     }
@@ -128,6 +134,7 @@ fn setup() -> Setup {
         cwd: Some(dir.path().to_path_buf()),
         copy: None,
         warnings: Vec::new(),
+        env: Vec::new(),
     };
     let spec = plan.launch_spec(&env).unwrap();
     Setup {

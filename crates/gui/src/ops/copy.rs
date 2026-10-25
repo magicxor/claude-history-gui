@@ -14,7 +14,7 @@ use gpui_kit::{App, Entity, Window};
 
 use crate::globals::main_panes;
 use crate::list::ListPane;
-use crate::model::ConversationTarget;
+use crate::model::{ConversationTarget, SessionAct};
 use crate::notify::Toast;
 use crate::services::services;
 use crate::workspace::startup::{LastDialog, last_dialog};
@@ -27,17 +27,37 @@ pub(crate) fn main_list(cx: &App) -> Option<Entity<ListPane>> {
 }
 
 /// Resume, Fork, Rename and Delete do nothing for a target of unknown source
-/// ("Unknown conversation type"). The "list still loading" no-op is the
+/// ("Unknown conversation type") or one whose capabilities refuse `act`
+/// (upstream eea6d37; the router already showed core's refusal,
+/// `routing::run_session_action`). The "list still loading" no-op is the
 /// pane's (the list handles those actions before it calls `ops`, and `ops`
 /// entry points run inside the pane's update, where reading it would panic).
-pub(crate) fn can_act(target: &ConversationTarget) -> bool {
-    target.can_modify()
+pub(crate) fn can_act(target: &ConversationTarget, act: SessionAct) -> bool {
+    target.allows(act)
 }
 
-/// `target` with the title, custom title and project of the live corpus entry
-/// (the captured target may be older than the last rename, or built from an
-/// agent hit that has no custom title). Must not run inside the list's own
-/// update.
+/// Whether `act` is still available for the live `target` (after
+/// [`live_target`], whose provenance is the corpus entry's: an agent hit does
+/// not know that its thread is orphaned); otherwise core's refusal is shown.
+pub(crate) fn still_allowed(
+    target: &ConversationTarget,
+    act: SessionAct,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    match target.refusal(act) {
+        None => true,
+        Some(refusal) => {
+            crate::notify::Toast::warning(refusal).show(window, cx);
+            false
+        }
+    }
+}
+
+/// `target` with the title, custom title, project and provenance of the live
+/// corpus entry (the captured target may be older than the last rename, or
+/// built from an agent hit that has no custom title). Must not run inside the
+/// list's own update.
 pub(crate) fn live_target(mut target: ConversationTarget, cx: &App) -> ConversationTarget {
     let Some(list) = main_list(cx) else {
         return target;
@@ -52,6 +72,7 @@ pub(crate) fn live_target(mut target: ConversationTarget, cx: &App) -> Conversat
         if fresh.project_path.is_some() {
             target.project_path = fresh.project_path;
         }
+        target.provenance = fresh.provenance;
     }
     target
 }

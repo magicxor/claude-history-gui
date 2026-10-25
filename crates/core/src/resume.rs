@@ -15,11 +15,13 @@
 //!    running it, and [`launch`] spawns that.
 //!
 //! Planning goes through the source adapter of the conversation (upstream
-//! 9799550): [`plan_resume_target`] takes the adapter of the target's source
-//! (`history::sources::Registry::for_source`), refuses an action it does not
-//! support (`Adapter::capabilities`; upstream's `<source> sessions cannot be
-//! resumed` / `forked`) and has it plan: the Claude adapter with `plan_claude`,
-//! the Pi adapter (Pi and OMP) with `plan_native`. Unlike upstream, whose
+//! 9799550): [`plan_resume_target`] refuses an action the conversation does
+//! not support (`history::actions::capabilities_of`: its source's adapter,
+//! and nothing for an orphaned conversation; upstream eea6d37's
+//! `actions::refusal` texts), takes the adapter of the target's source
+//! (`history::sources::Registry::for_source`) and has it plan: the Claude
+//! adapter with `plan_claude`, the Pi adapter (Pi and OMP) with
+//! `plan_native`, the Codex adapter with `plan_codex`. Unlike upstream, whose
 //! command builders moved into the adapters, the planners stay here with the
 //! plan types and their tests.
 //!
@@ -56,15 +58,24 @@
 //! inherited upstream's cwd, which is the workspace here. Missing
 //! directories fall back (workspace, then project directory, then none) with
 //! a warning instead of failing to spawn.
+//!
+//! # Codex
+//!
+//! `codex [[resume.codex] default_args] resume <thread id>` and `codex [...]
+//! fork <thread id>` (upstream eea6d37) run in the thread's project
+//! directory, else (upstream: its process cwd) the workspace with a warning.
+//! The plan sets `CODEX_HOME` to the Codex home of the thread's rollout
+//! ([`ResumePlan::env`]), which every terminal launcher passes on
+//! ([`terminal`], "Environment variables").
 
 pub mod terminal;
 
 use crate::config::GuiSettings;
 use crate::env::{HistoryEnv, WorkspaceScope};
 use crate::error::{AppError, Result};
-use crate::history::actions::Target;
+use crate::history::actions::{self, Target};
 use crate::history::sources::Registry;
-use crate::history::{Conversation, Source};
+use crate::history::{Conversation, Provenance, Source};
 use crate::program::ResolvedProgram;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -163,17 +174,18 @@ pub enum ResumeStrategy {
     /// Claude: copy the session into the workspace's projects directory,
     /// then resume the copy there (never with `--fork-session`).
     CopyToWorkspace,
-    /// Pi / OMP: the agent's native resume or fork command.
+    /// Pi / OMP / Codex: the agent's native resume or fork command.
     Native,
 }
 
 /// Explicit executable paths (`gui.toml`: `claude_path`, `pi_path`,
-/// `omp_path`). `None` resolves the program through `PATH`.
+/// `omp_path`, `codex_path`). `None` resolves the program through `PATH`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProgramOverrides {
     pub claude: Option<PathBuf>,
     pub pi: Option<PathBuf>,
     pub omp: Option<PathBuf>,
+    pub codex: Option<PathBuf>,
 }
 
 impl ProgramOverrides {
@@ -182,6 +194,7 @@ impl ProgramOverrides {
             claude: settings.claude_path.clone(),
             pi: settings.pi_path.clone(),
             omp: settings.omp_path.clone(),
+            codex: settings.codex_path.clone(),
         }
     }
 
@@ -190,9 +203,7 @@ impl ProgramOverrides {
             Source::Claude => self.claude.as_deref(),
             Source::Pi => self.pi.as_deref(),
             Source::Omp => self.omp.as_deref(),
-            // No `codex_path` yet: Codex threads are not resumed until upstream
-            // eea6d37 is ported (`history::sources::codex`).
-            Source::Codex => None,
+            Source::Codex => self.codex.as_deref(),
         }
     }
 }
@@ -220,13 +231,17 @@ pub fn resolve_program(
     env.resolve_program(name, override_path)
 }
 
-/// What a session to resume is: its source, transcript path and recorded
-/// project directory (normally built from a [`Conversation`]).
+/// What a session to resume is: its source, transcript path, recorded
+/// project directory and provenance (normally built from a
+/// [`Conversation`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResumeTarget {
     pub source: Source,
     pub path: PathBuf,
     pub project_path: Option<PathBuf>,
+    /// An orphaned conversation cannot be resumed or forked (upstream
+    /// eea6d37).
+    pub provenance: Provenance,
 }
 
 impl ResumeTarget {
@@ -245,6 +260,7 @@ impl From<&Conversation> for ResumeTarget {
             source: conversation.source,
             path: conversation.path.clone(),
             project_path: conversation.project_path.clone(),
+            provenance: conversation.provenance,
         }
     }
 }
@@ -294,7 +310,7 @@ pub struct ResumePlan {
     pub strategy: ResumeStrategy,
     /// The session transcript.
     pub session_path: PathBuf,
-    /// Program name: `claude`, `pi` or `omp`.
+    /// Program name: `claude`, `pi`, `omp` or `codex`.
     pub program: String,
     /// Explicit executable path (from [`ProgramOverrides`]).
     pub program_override: Option<PathBuf>,
@@ -306,6 +322,8 @@ pub struct ResumePlan {
     pub copy: Option<CopyPlan>,
     /// Non-fatal notes for the user (fallback directories, overwrites).
     pub warnings: Vec<String>,
+    /// Environment variables the program runs with (Codex: `CODEX_HOME`).
+    pub env: Vec<(OsString, OsString)>,
 }
 
 impl ResumePlan {
@@ -317,6 +335,7 @@ impl ResumePlan {
             program,
             args: self.args.clone(),
             cwd: self.cwd.clone(),
+            env: self.env.clone(),
         })
     }
 
@@ -366,9 +385,10 @@ pub fn plan_resume(
 /// that is not part of the loaded list).
 ///
 /// The adapter of the target's source plans it (`Adapter::resume`), after
-/// checking that it supports the action (`Adapter::capabilities`; upstream's
-/// `Failed to run Claude CLI: <source> sessions cannot be resumed|forked`
-/// otherwise).
+/// checking that the conversation supports the action
+/// (`history::actions::capabilities_of`; otherwise upstream's `Failed to run
+/// Claude CLI: Resuming <source> sessions is not supported`, or `... is
+/// unavailable: ...` for an orphaned conversation).
 pub fn plan_resume_target(
     env: &HistoryEnv,
     target: &ResumeTarget,
@@ -378,19 +398,20 @@ pub fn plan_resume_target(
     programs: &ProgramOverrides,
 ) -> Result<ResumePlan> {
     let source = target.source;
-    let adapter = Registry::from_env(env).for_source(source);
-    let capabilities = adapter.capabilities();
+    let capabilities = actions::capabilities_of(source, target.provenance);
     if !(if fork {
         capabilities.fork
     } else {
         capabilities.resume
     }) {
-        return Err(AppError::ClaudeExecutionError(format!(
-            "{} sessions cannot be {}",
-            source.list_label(),
-            if fork { "forked" } else { "resumed" }
+        let doing = if fork { "Forking" } else { "Resuming" };
+        return Err(AppError::ClaudeExecutionError(actions::refusal(
+            source,
+            target.provenance,
+            doing,
         )));
     }
+    let adapter = Registry::from_env(env).for_source(source);
     adapter.resume(
         env,
         target.target(),
@@ -520,6 +541,7 @@ pub(crate) fn plan_claude(
         cwd: Some(cwd),
         copy,
         warnings,
+        env: Vec::new(),
     })
 }
 
@@ -540,27 +562,11 @@ pub(crate) fn plan_native(
         (Source::Omp, ResumeKind::Resume) => "--resume",
         (_, ResumeKind::Resume) => "--session",
     };
-    let existing_project = target.project.filter(|path| path.is_dir());
-    let existing_workspace = workspace
-        .map(WorkspaceScope::dir)
-        .filter(|dir| dir.is_dir());
     let mut warnings = Vec::new();
     let cwd = match kind {
-        ResumeKind::Resume => {
-            if let Some(project) = existing_project {
-                Some(project.to_path_buf())
-            } else {
-                if let Some(project) = target.project {
-                    warnings.push(format!(
-                        "Session directory {} does not exist",
-                        project.display()
-                    ));
-                }
-                existing_workspace.map(Path::to_path_buf)
-            }
-        }
-        ResumeKind::Fork => existing_workspace
-            .or(existing_project)
+        ResumeKind::Resume => project_or_workspace(target, workspace, &mut warnings),
+        ResumeKind::Fork => existing_dir(workspace.map(WorkspaceScope::dir))
+            .or(existing_dir(target.project))
             .map(Path::to_path_buf),
     };
     ResumePlan {
@@ -574,7 +580,71 @@ pub(crate) fn plan_native(
         cwd,
         copy: None,
         warnings,
+        env: Vec::new(),
     }
+}
+
+/// The Codex adapter's resume plan: upstream's `codex [default_args]
+/// resume|fork <thread id>` (`CodexAdapter::resume`, eea6d37) as data, with
+/// `CODEX_HOME` set to the Codex home of the thread's rollout (else `home`,
+/// the adapter's). Resume and fork both run in the thread's project
+/// directory, as upstream; when it is gone, in the workspace (upstream: its
+/// process cwd), with a warning.
+pub(crate) fn plan_codex(
+    target: Target<'_>,
+    home: &Path,
+    workspace: Option<&WorkspaceScope>,
+    kind: ResumeKind,
+    default_args: &[String],
+    program_override: Option<&Path>,
+) -> Result<ResumePlan> {
+    let thread_id = crate::history::sources::codex::thread_id_of(target.path)?;
+    let mut warnings = Vec::new();
+    let cwd = project_or_workspace(target, workspace, &mut warnings);
+    let mut args: Vec<OsString> = default_args.iter().map(OsString::from).collect();
+    args.push(OsString::from(if kind.is_fork() {
+        "fork"
+    } else {
+        "resume"
+    }));
+    args.push(OsString::from(thread_id));
+    Ok(ResumePlan {
+        source: Source::Codex,
+        kind,
+        strategy: ResumeStrategy::Native,
+        session_path: target.path.to_path_buf(),
+        program: program_name(Source::Codex).to_string(),
+        program_override: program_override.map(Path::to_path_buf),
+        args,
+        cwd,
+        copy: None,
+        warnings,
+        env: crate::history::sources::codex::codex_env(target.path, home),
+    })
+}
+
+/// `dir`, when it is an existing directory.
+fn existing_dir(dir: Option<&Path>) -> Option<&Path> {
+    dir.filter(|dir| dir.is_dir())
+}
+
+/// The session's own directory when it exists, else the workspace (with a
+/// warning naming the missing directory), else none.
+fn project_or_workspace(
+    target: Target<'_>,
+    workspace: Option<&WorkspaceScope>,
+    warnings: &mut Vec<String>,
+) -> Option<PathBuf> {
+    if let Some(project) = existing_dir(target.project) {
+        return Some(project.to_path_buf());
+    }
+    if let Some(project) = target.project {
+        warnings.push(format!(
+            "Session directory {} does not exist",
+            project.display()
+        ));
+    }
+    existing_dir(workspace.map(WorkspaceScope::dir)).map(Path::to_path_buf)
 }
 
 /// Whether `path` is the transcript `<session id>.jsonl` of `session_id`
@@ -762,6 +832,7 @@ mod tests {
                 source: Source::Claude,
                 path: path.to_path_buf(),
                 project_path: project.map(Path::to_path_buf),
+                provenance: Provenance::default(),
             }
         }
 
@@ -891,6 +962,7 @@ mod tests {
             source: Source::Pi,
             path: path.clone(),
             project_path: Some(cwd.clone()),
+            provenance: Provenance::default(),
         };
         let defaults = vec!["--model".to_string(), "opus".to_string()];
 
@@ -928,6 +1000,7 @@ mod tests {
             source: Source::Omp,
             path: path.clone(),
             project_path: Some(cwd.clone()),
+            provenance: Provenance::default(),
         };
 
         let resume = sandbox.plan(&target, Some(&workspace), false, &[]).unwrap();
@@ -956,6 +1029,7 @@ mod tests {
             source: Source::Pi,
             path: sandbox.root.path().join("s.jsonl"),
             project_path: Some(gone.clone()),
+            provenance: Provenance::default(),
         };
 
         let plan = sandbox.plan(&target, Some(&workspace), false, &[]).unwrap();
@@ -965,6 +1039,98 @@ mod tests {
 
         let plan = sandbox.plan(&target, None, false, &[]).unwrap();
         assert_eq!(plan.cwd, None);
+    }
+
+    /// Upstream eea6d37: `codex [[resume.codex] default_args] resume|fork
+    /// <thread id>` in the thread's project, with `CODEX_HOME` set to the
+    /// rollout's home.
+    #[test]
+    fn codex_threads_resume_and_fork_through_the_codex_cli() {
+        const THREAD: &str = "01a00000-0000-7000-8000-000000000002";
+        let sandbox = Sandbox::new();
+        let home = sandbox.root.path().join("codex home");
+        let day = home.join("sessions").join("2026").join("09").join("01");
+        std::fs::create_dir_all(&day).unwrap();
+        let rollout = day.join(format!("rollout-2026-09-01T10-00-00-{THREAD}.jsonl"));
+        std::fs::write(&rollout, "{}\n").unwrap();
+        let project = sandbox.dir("project");
+        let workspace = sandbox.dir("workspace");
+        let target = ResumeTarget {
+            source: Source::Codex,
+            path: rollout.clone(),
+            project_path: Some(project.clone()),
+            provenance: Provenance::default(),
+        };
+        let codex_home = vec![(OsString::from("CODEX_HOME"), home.clone().into_os_string())];
+
+        let resume = sandbox
+            .plan(&target, Some(&workspace), false, &["--yolo".to_string()])
+            .unwrap();
+        assert_eq!(resume.program, "codex");
+        assert_eq!(resume.args, os(&["--yolo", "resume", THREAD]));
+        assert_eq!(resume.cwd, Some(project.clone()));
+        assert_eq!(resume.strategy, ResumeStrategy::Native);
+        assert_eq!(resume.env, codex_home);
+        assert!(resume.copy.is_none() && resume.warnings.is_empty());
+        assert_eq!(
+            resume.display_command(),
+            format!("codex --yolo resume {THREAD}")
+        );
+
+        // Fork runs in the project too (upstream's command for both).
+        let fork = sandbox.plan(&target, Some(&workspace), true, &[]).unwrap();
+        assert_eq!(fork.args, os(&["fork", THREAD]));
+        assert_eq!(fork.cwd, Some(project));
+
+        // A project that is gone: the workspace, with a warning.
+        let gone = sandbox.root.path().join("gone");
+        let moved = ResumeTarget {
+            project_path: Some(gone.clone()),
+            ..target.clone()
+        };
+        let plan = sandbox.plan(&moved, Some(&workspace), false, &[]).unwrap();
+        assert_eq!(plan.cwd, Some(workspace.clone()));
+        assert_eq!(plan.warnings.len(), 1);
+        assert!(plan.warnings[0].contains(&gone.display().to_string()));
+
+        // `[gui] codex_path` and `CODEX_HOME` reach the launch spec.
+        let codex = sandbox.dir("bin").join("codex.exe");
+        std::fs::write(&codex, "").unwrap();
+        let programs = ProgramOverrides {
+            codex: Some(codex.clone()),
+            ..ProgramOverrides::default()
+        };
+        let plan = plan_resume_target(&sandbox.env, &target, None, false, &[], &programs).unwrap();
+        let spec = plan.launch_spec(&sandbox.env).unwrap();
+        assert_eq!(spec.program.path, codex);
+        assert_eq!(spec.env, codex_home);
+
+        // An orphaned thread is refused, with upstream's text.
+        let orphaned = ResumeTarget {
+            provenance: Provenance {
+                orphaned: true,
+                ..Provenance::default()
+            },
+            ..target.clone()
+        };
+        for (fork, doing) in [(false, "Resuming"), (true, "Forking")] {
+            let error = sandbox.plan(&orphaned, None, fork, &[]).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Failed to run Claude CLI: {doing} is unavailable: CX no longer has this \
+                     conversation's current history"
+                )
+            );
+        }
+
+        // A file that is not a rollout.
+        let stray = ResumeTarget {
+            path: sandbox.root.path().join("notes.jsonl"),
+            ..target
+        };
+        let error = sandbox.plan(&stray, None, false, &[]).unwrap_err();
+        assert!(error.to_string().contains("not a Codex rollout"), "{error}");
     }
 
     // --- GUI semantics for Claude. ---
@@ -1267,6 +1433,7 @@ mod tests {
             source: Source::Claude,
             path: PathBuf::from("/"),
             project_path: None,
+            provenance: Provenance::default(),
         };
         let error = sandbox
             .plan(&root_only, Some(&workspace), false, &[])
@@ -1435,6 +1602,7 @@ mod tests {
             cwd: None,
             copy: None,
             warnings: Vec::new(),
+            env: Vec::new(),
         };
         assert_eq!(
             plan.display_command(),

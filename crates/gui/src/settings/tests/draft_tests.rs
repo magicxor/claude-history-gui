@@ -155,7 +155,11 @@ fn sample(field: Field) -> Value {
     match field {
         Field::Theme => Value::Theme(ThemePreference::Dark),
         Field::Terminal => Value::Text("kitty".into()),
-        Field::ClaudePath | Field::PiPath | Field::OmpPath | Field::DefaultWorkspace => {
+        Field::ClaudePath
+        | Field::PiPath
+        | Field::OmpPath
+        | Field::CodexPath
+        | Field::DefaultWorkspace => {
             Value::Text(std::env::temp_dir().join("somewhere").display().to_string())
         }
         Field::RestoreSession => Value::Bool(false),
@@ -163,9 +167,10 @@ fn sample(field: Field) -> Value {
             Value::Bool(true)
         }
         Field::SearchMode | Field::AgentMode => Value::Mode(SearchMode::Hybrid),
-        Field::ExcludeProjects | Field::ResumeArgs | Field::AgentExclude => {
-            Value::List(vec!["a".into(), "b c".into()])
-        }
+        Field::ExcludeProjects
+        | Field::ResumeArgs
+        | Field::CodexResumeArgs
+        | Field::AgentExclude => Value::List(vec!["a".into(), "b c".into()]),
         Field::Key(_) => Value::Key(parse_key_binding("alt+z").unwrap()),
         Field::AgentScope => Value::Scope(AgentScopeConfig::Local),
         Field::AgentOutputChars | Field::AgentTop | Field::AgentWithinTop | Field::AgentHits => {
@@ -181,7 +186,7 @@ fn sample(field: Field) -> Value {
 /// Every field round-trips through the gui.toml model and Reset removes it.
 #[test]
 fn every_field_sets_gets_and_resets() {
-    assert_eq!(Field::ALL.len(), 30);
+    assert_eq!(Field::ALL.len(), 32);
     for field in Field::ALL {
         let mut gui = GuiConfigFile::default();
         assert!(get(field, &gui).is_unset(), "{field:?} starts unset");

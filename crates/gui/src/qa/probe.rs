@@ -277,12 +277,14 @@ fn measurement_key(key: &str, cx: &App) -> Option<String> {
 }
 
 /// Every key this module answers itself (docs and the self-test).
-pub const APP_KEYS: [&str; 14] = [
+pub const APP_KEYS: [&str; 16] = [
     "clipboard",
     "stdout",
     "stderr",
     "calls.terminal.count",
     "calls.terminal.last",
+    "calls.run.count",
+    "calls.run.last",
     "calls.open_url.last",
     "calls.reveal.last",
     "calls.open_with_system.last",
@@ -338,6 +340,29 @@ fn app_key(key: &str, window: &mut Window, cx: &mut App) -> Option<String> {
             .rev()
             .find_map(|call| match call {
                 ServiceCall::Terminal(command) => Some(command.display()),
+                _ => None,
+            })
+            .unwrap_or_default(),
+        // Programs run to completion (`codex delete`, upstream eea6d37).
+        "calls.run.count" => calls()?
+            .iter()
+            .filter(|call| matches!(call, ServiceCall::Run(_)))
+            .count()
+            .to_string(),
+        "calls.run.last" => calls()?
+            .iter()
+            .rev()
+            .find_map(|call| match call {
+                ServiceCall::Run(spec) => Some(
+                    std::iter::once(spec.program.path.display().to_string())
+                        .chain(
+                            spec.args
+                                .iter()
+                                .map(|arg| arg.to_string_lossy().into_owned()),
+                        )
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                ),
                 _ => None,
             })
             .unwrap_or_default(),

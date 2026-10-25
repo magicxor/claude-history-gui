@@ -34,9 +34,9 @@ use gpui_kit::{
 
 use crate::actions::ChooseWorkspace;
 use crate::globals::{OpenTargets, app_state};
-use crate::model::{ConversationTarget, SettingsPage};
+use crate::model::{ConversationTarget, SessionAct, SettingsPage};
 use crate::notify::Toast;
-use crate::ops::copy::{can_act, clear_dialog, live_target};
+use crate::ops::copy::{can_act, clear_dialog, live_target, still_allowed};
 use crate::services::{Services, services};
 use crate::widgets::{
     ConfirmControl, ConfirmOptions, ConfirmOutcome, PathItem, PathList, open_destructive_confirm,
@@ -108,7 +108,7 @@ fn end_pending(cx: &mut App, path: &std::path::Path) {
 /// A second request for a target whose first one has not finished is ignored.
 pub fn resume(target: ConversationTarget, fork: bool, window: &mut Window, cx: &mut App) {
     // Not actionable (nothing to report) or already running.
-    if !can_act(&target) {
+    if !can_act(&target, act_of(fork)) {
         return;
     }
     // Picker mode (`--show-path`, `--show-id`, `--resume`): upstream's picker
@@ -149,6 +149,15 @@ pub fn resume(target: ConversationTarget, fork: bool, window: &mut Window, cx: &
     );
 }
 
+/// Resume or Fork.
+fn act_of(fork: bool) -> SessionAct {
+    if fork {
+        SessionAct::Fork
+    } else {
+        SessionAct::Resume
+    }
+}
+
 /// Everything planning needs, captured on the UI thread.
 struct PlanInput {
     env: HistoryEnv,
@@ -172,13 +181,16 @@ fn plan_input(target: &ConversationTarget, fork: bool, cx: &App) -> Option<PlanI
     Some(PlanInput {
         env: state.env_with_workspace(),
         workspace: state.workspace.clone(),
-        default_args: state.settings.resume_default_args.clone(),
+        // `[resume].default_args` for Claude, `[resume.codex]` for Codex
+        // (upstream eea6d37).
+        default_args: state.settings.resume_default_args_for(source).to_vec(),
         programs: ProgramOverrides::from_gui_settings(&state.config.gui),
         read_file: project_path.is_none(),
         resume_target: ResumeTarget {
             source,
             path: target.path.clone(),
             project_path,
+            provenance: target.provenance,
         },
         fork,
     })
@@ -212,7 +224,7 @@ pub fn plan_and_confirm(
     cx: &mut App,
     then: PlanDone,
 ) {
-    let input = if can_act(&target) {
+    let input = if can_act(&target, act_of(fork)) {
         plan_input(&target, fork, cx)
     } else {
         None
@@ -240,6 +252,14 @@ fn planned(
     window: &mut Window,
     cx: &mut App,
 ) {
+    // An agent hit does not know that its thread is orphaned; the corpus
+    // entry does.
+    let fork = result.as_ref().is_ok_and(|plan| plan.kind.is_fork());
+    if result.is_ok() && !still_allowed(&live_target(target.clone(), cx), act_of(fork), window, cx)
+    {
+        then(Err(UNAVAILABLE.to_string()), window, cx);
+        return;
+    }
     let plan = match result {
         Ok(plan) => plan,
         Err(AppError::WorkspaceRequired(message)) => {

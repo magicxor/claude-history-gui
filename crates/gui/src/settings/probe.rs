@@ -12,10 +12,11 @@ use super::draft::{Field, Value, check_path_text};
 use super::pages::{program_status_for, terminal_preview_for};
 
 /// The program fields and the executable each one resolves.
-pub const PROGRAM_FIELDS: [(Field, &str); 3] = [
+pub const PROGRAM_FIELDS: [(Field, &str); 4] = [
     (Field::ClaudePath, "claude"),
     (Field::PiPath, "pi"),
     (Field::OmpPath, "omp"),
+    (Field::CodexPath, "codex"),
 ];
 
 /// What a probe needs, copied off the UI thread.

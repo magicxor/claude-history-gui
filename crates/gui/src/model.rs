@@ -12,7 +12,8 @@ use chrono::{DateTime, Local};
 use claude_history_core::agent::AgentConversationInfo;
 use claude_history_core::display_format::sanitize_preview;
 use claude_history_core::export::ExportFormat;
-use claude_history_core::history::{Conversation, Source};
+use claude_history_core::history::actions::{Capabilities, capabilities_of, refusal};
+use claude_history_core::history::{Conversation, Provenance, Source};
 use claude_history_core::settings::{GuiLaunchArgs, PickerAction};
 use claude_history_core::time_filter::TimeFilter;
 use gpui_kit::SharedString;
@@ -20,6 +21,42 @@ use serde::{Deserialize, Serialize};
 
 /// Longest conversation title the GUI derives (characters, `…` included).
 pub const TITLE_MAX_CHARS: usize = 80;
+
+/// Why Resume, Fork, Rename and Delete are unavailable for a target whose
+/// source is unknown (a disabled item's tooltip).
+pub const UNKNOWN_SOURCE: &str = "Unknown conversation type";
+
+/// The conversation actions whose availability core decides
+/// (`history::actions::capabilities_of`, upstream eea6d37).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SessionAct {
+    Resume,
+    Fork,
+    Rename,
+    Delete,
+}
+
+impl SessionAct {
+    /// The verb of core's refusal texts (`Resuming CX sessions is not
+    /// supported`).
+    pub fn doing(self) -> &'static str {
+        match self {
+            SessionAct::Resume => "Resuming",
+            SessionAct::Fork => "Forking",
+            SessionAct::Rename => "Renaming",
+            SessionAct::Delete => "Deleting",
+        }
+    }
+
+    fn allowed_by(self, capabilities: &Capabilities) -> bool {
+        match self {
+            SessionAct::Resume => capabilities.resume,
+            SessionAct::Fork => capabilities.fork,
+            SessionAct::Rename => capabilities.rename,
+            SessionAct::Delete => capabilities.delete,
+        }
+    }
+}
 
 /// The conversation an action, dialog, viewer or result set acts on,
 /// captured when it starts (PD15, ADD A1/A2). Code never re-reads the live
@@ -40,6 +77,11 @@ pub struct ConversationTarget {
     pub project_name: Option<SharedString>,
     pub project_path: Option<PathBuf>,
     pub custom_title: Option<String>,
+    /// `Conversation.provenance`: an orphaned conversation allows no action.
+    /// Default (not orphaned) for a target built from an agent result or an
+    /// unparsed file; [`crate::ops::copy::live_target`] takes the corpus
+    /// entry's.
+    pub provenance: Provenance,
 }
 
 impl ConversationTarget {
@@ -60,6 +102,7 @@ impl ConversationTarget {
             project_name: c.project_name.clone().map(SharedString::from),
             project_path: c.project_path.clone(),
             custom_title: non_empty(c.custom_title.as_deref()).map(str::to_string),
+            provenance: c.provenance,
         }
     }
 
@@ -86,6 +129,7 @@ impl ConversationTarget {
             project_name: None,
             project_path: None,
             custom_title: None,
+            provenance: Provenance::default(),
         }
     }
 
@@ -110,6 +154,7 @@ impl ConversationTarget {
                     project_name: None,
                     project_path: None,
                     custom_title: None,
+                    provenance: Provenance::default(),
                 }
             }
         }
@@ -139,6 +184,34 @@ impl ConversationTarget {
     /// Resume, Fork, Rename and Delete need a known source.
     pub fn can_modify(&self) -> bool {
         self.source.is_some()
+    }
+
+    /// The actions core allows for this conversation
+    /// (`history::actions::capabilities_of`: its source's adapter, none for
+    /// an orphaned conversation); none for an unknown source.
+    pub fn capabilities(&self) -> Capabilities {
+        match self.source {
+            Some(source) => capabilities_of(source, self.provenance),
+            None => Capabilities::NONE,
+        }
+    }
+
+    /// Whether `act` is available for this conversation.
+    pub fn allows(&self, act: SessionAct) -> bool {
+        act.allowed_by(&self.capabilities())
+    }
+
+    /// Why `act` is unavailable (`None` when it is available): core's
+    /// refusal text (upstream's status message, e.g. `Renaming CX sessions is
+    /// not supported`), or [`UNKNOWN_SOURCE`].
+    pub fn refusal(&self, act: SessionAct) -> Option<String> {
+        if self.allows(act) {
+            return None;
+        }
+        Some(match self.source {
+            Some(source) => refusal(source, self.provenance, act.doing()),
+            None => UNKNOWN_SOURCE.to_string(),
+        })
     }
 }
 
@@ -672,6 +745,35 @@ mod tests {
         assert_eq!(target.title.as_ref(), "abc");
         assert!(!target.header_id_differs());
         assert_eq!(target.describe(), "abc");
+    }
+
+    /// Upstream eea6d37: Codex threads cannot be renamed, orphaned ones
+    /// allow nothing, and the refusals are core's texts.
+    #[test]
+    fn actions_follow_the_capabilities_of_the_conversation() {
+        let unknown = ConversationTarget::from_parsed_file(Path::new("/tmp/abc.jsonl"), None);
+        assert_eq!(
+            unknown.refusal(SessionAct::Resume).as_deref(),
+            Some(UNKNOWN_SOURCE)
+        );
+        let mut codex = unknown.clone();
+        codex.source = Some(Source::Codex);
+        for act in [SessionAct::Resume, SessionAct::Fork, SessionAct::Delete] {
+            assert!(codex.allows(act), "{act:?}");
+            assert_eq!(codex.refusal(act), None);
+        }
+        assert_eq!(
+            codex.refusal(SessionAct::Rename).as_deref(),
+            Some("Renaming CX sessions is not supported")
+        );
+        codex.provenance.orphaned = true;
+        assert_eq!(
+            codex.refusal(SessionAct::Delete).as_deref(),
+            Some("Deleting is unavailable: CX no longer has this conversation's current history")
+        );
+        let mut claude = unknown;
+        claude.source = Some(Source::Claude);
+        assert!(claude.allows(SessionAct::Rename));
     }
 
     #[test]

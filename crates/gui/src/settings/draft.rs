@@ -11,9 +11,9 @@
 use std::path::PathBuf;
 
 use claude_history_core::config::{
-    AgentOverrides, AgentScopeConfig, ConfigFile, DisplayConfig, GuiConfigFile, GuiSettings,
-    KeyBindings, KeyChord, KeysConfig, LayeredConfig, ResumeConfig, SearchConfig, TuiOverrides,
-    parse_key_binding,
+    AgentOverrides, AgentResumeConfig, AgentScopeConfig, ConfigFile, DisplayConfig, GuiConfigFile,
+    GuiSettings, KeyBindings, KeyChord, KeysConfig, LayeredConfig, ResumeConfig, SearchConfig,
+    TuiOverrides, parse_key_binding,
 };
 use claude_history_core::search::mode::SearchMode;
 use claude_history_core::theme::ThemePreference;
@@ -29,6 +29,7 @@ pub enum Field {
     ClaudePath,
     PiPath,
     OmpPath,
+    CodexPath,
     DefaultWorkspace,
     RestoreSession,
     PreviewLast,
@@ -39,6 +40,7 @@ pub enum Field {
     ExcludeProjects,
     Key(KeyAction),
     ResumeArgs,
+    CodexResumeArgs,
     AgentScope,
     AgentMode,
     AgentOutputChars,
@@ -74,12 +76,13 @@ impl Field {
     }
 
     /// Every field, page by page, in display order.
-    pub const ALL: [Field; 30] = [
+    pub const ALL: [Field; 32] = [
         Field::Theme,
         Field::Terminal,
         Field::ClaudePath,
         Field::PiPath,
         Field::OmpPath,
+        Field::CodexPath,
         Field::DefaultWorkspace,
         Field::RestoreSession,
         Field::PreviewLast,
@@ -94,6 +97,7 @@ impl Field {
         Field::Key(KeyAction::Delete),
         Field::Key(KeyAction::Refresh),
         Field::ResumeArgs,
+        Field::CodexResumeArgs,
         Field::AgentScope,
         Field::AgentMode,
         Field::AgentOutputChars,
@@ -115,6 +119,7 @@ impl Field {
             | Field::ClaudePath
             | Field::PiPath
             | Field::OmpPath
+            | Field::CodexPath
             | Field::DefaultWorkspace
             | Field::RestoreSession => SettingsPage::General,
             Field::PreviewLast | Field::ToolDisplay | Field::ShowThinking | Field::Plain => {
@@ -122,7 +127,7 @@ impl Field {
             }
             Field::SearchMode | Field::ExcludeProjects => SettingsPage::Search,
             Field::Key(_) => SettingsPage::Keys,
-            Field::ResumeArgs => SettingsPage::Resume,
+            Field::ResumeArgs | Field::CodexResumeArgs => SettingsPage::Resume,
             _ => SettingsPage::Agent,
         }
     }
@@ -135,6 +140,7 @@ impl Field {
             Field::ClaudePath => "claude program",
             Field::PiPath => "pi program",
             Field::OmpPath => "omp program",
+            Field::CodexPath => "codex program",
             Field::DefaultWorkspace => "Default workspace",
             Field::RestoreSession => "Restore last session",
             Field::PreviewLast => "Preview shows",
@@ -145,6 +151,7 @@ impl Field {
             Field::ExcludeProjects => "Excluded projects",
             Field::Key(action) => action.label(),
             Field::ResumeArgs => "Default arguments",
+            Field::CodexResumeArgs => "Codex default arguments",
             Field::AgentScope => "Scope",
             Field::AgentMode => "Mode",
             Field::AgentOutputChars => "Output budget (chars)",
@@ -167,6 +174,7 @@ impl Field {
             Field::ClaudePath => "[gui] claude_path",
             Field::PiPath => "[gui] pi_path",
             Field::OmpPath => "[gui] omp_path",
+            Field::CodexPath => "[gui] codex_path",
             Field::DefaultWorkspace => "[gui] default_workspace",
             Field::RestoreSession => "[gui] restore_session",
             Field::PreviewLast => "[display] last",
@@ -181,6 +189,7 @@ impl Field {
             Field::Key(KeyAction::Delete) => "[keys] delete",
             Field::Key(KeyAction::Refresh) => "[keys] refresh",
             Field::ResumeArgs => "[resume] default_args",
+            Field::CodexResumeArgs => "[resume.codex] default_args",
             Field::AgentScope => "[agent] scope",
             Field::AgentMode => "[agent] mode",
             Field::AgentOutputChars => "[agent] output_chars",
@@ -216,7 +225,9 @@ impl Field {
             | Field::ClaudePath
             | Field::PiPath
             | Field::OmpPath
-            | Field::ResumeArgs => "Applies to the next resume",
+            | Field::CodexPath
+            | Field::ResumeArgs
+            | Field::CodexResumeArgs => "Applies to the next resume",
             Field::DefaultWorkspace | Field::RestoreSession => "Applies at the next start",
             Field::PreviewLast => "Applies when the list refreshes",
             Field::ToolDisplay | Field::ShowThinking => {
@@ -280,6 +291,7 @@ pub fn get(field: Field, gui: &GuiConfigFile) -> Value {
         Field::ClaudePath => some_text(&settings.claude_path),
         Field::PiPath => some_text(&settings.pi_path),
         Field::OmpPath => some_text(&settings.omp_path),
+        Field::CodexPath => some_text(&settings.codex_path),
         Field::DefaultWorkspace => some_text(&settings.default_workspace),
         Field::RestoreSession => opt(settings.restore_session, Value::Bool),
         Field::PreviewLast => opt(display.last, Value::Bool),
@@ -300,6 +312,13 @@ pub fn get(field: Field, gui: &GuiConfigFile) -> Value {
         Field::Key(KeyAction::Refresh) => opt(keys.refresh, Value::Key),
         Field::ResumeArgs => opt(
             gui.resume.as_ref().and_then(|r| r.default_args.clone()),
+            Value::List,
+        ),
+        Field::CodexResumeArgs => opt(
+            gui.resume
+                .as_ref()
+                .and_then(|r| r.codex.as_ref())
+                .and_then(|codex| codex.default_args.clone()),
             Value::List,
         ),
         Field::AgentScope => opt(agent.scope, Value::Scope),
@@ -383,6 +402,7 @@ pub fn set(field: Field, gui: &mut GuiConfigFile, value: Value) {
         Field::ClaudePath => gui_table(gui).claude_path = path(&value),
         Field::PiPath => gui_table(gui).pi_path = path(&value),
         Field::OmpPath => gui_table(gui).omp_path = path(&value),
+        Field::CodexPath => gui_table(gui).codex_path = path(&value),
         Field::DefaultWorkspace => gui_table(gui).default_workspace = path(&value),
         Field::PreviewLast => display(gui).last = flag(&value),
         Field::ToolDisplay => display(gui).no_tools = flag(&value),
@@ -404,6 +424,13 @@ pub fn set(field: Field, gui: &mut GuiConfigFile, value: Value) {
         Field::ResumeArgs => {
             gui.resume
                 .get_or_insert_with(ResumeConfig::default)
+                .default_args = list(&value)
+        }
+        Field::CodexResumeArgs => {
+            gui.resume
+                .get_or_insert_with(ResumeConfig::default)
+                .codex
+                .get_or_insert_with(AgentResumeConfig::default)
                 .default_args = list(&value)
         }
         Field::AgentScope => {
@@ -459,6 +486,13 @@ pub fn cli_value(field: Field, cli: &ConfigFile) -> Value {
             cli.resume.as_ref().and_then(|r| r.default_args.clone()),
             Value::List,
         ),
+        Field::CodexResumeArgs => opt(
+            cli.resume
+                .as_ref()
+                .and_then(|r| r.codex.as_ref())
+                .and_then(|codex| codex.default_args.clone()),
+            Value::List,
+        ),
         Field::AgentScope => opt(agent.scope, Value::Scope),
         Field::AgentMode => opt(agent.mode, Value::Mode),
         Field::AgentOutputChars => opt(agent.output_chars, Value::Number),
@@ -507,7 +541,9 @@ pub fn default_value(field: Field) -> Value {
 pub fn describe(field: Field, value: &Value) -> String {
     match value {
         Value::Unset => match field {
-            Field::ClaudePath | Field::PiPath | Field::OmpPath => "resolved from PATH".into(),
+            Field::ClaudePath | Field::PiPath | Field::OmpPath | Field::CodexPath => {
+                "resolved from PATH".into()
+            }
             Field::AgentMode => "from [search] mode, else automatic".into(),
             _ => "not set".into(),
         },

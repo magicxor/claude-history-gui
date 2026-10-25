@@ -49,11 +49,12 @@ pub const DIALOG_WIDTH_REM: f32 = 56.0;
 pub const CONTENT_HEIGHT_REM: f32 = 34.0;
 
 /// Fields edited with a single-line input.
-pub const TEXT_FIELDS: [Field; 14] = [
+pub const TEXT_FIELDS: [Field; 15] = [
     Field::Terminal,
     Field::ClaudePath,
     Field::PiPath,
     Field::OmpPath,
+    Field::CodexPath,
     Field::DefaultWorkspace,
     Field::Key(KeyAction::Resume),
     Field::Key(KeyAction::Fork),
@@ -67,9 +68,10 @@ pub const TEXT_FIELDS: [Field; 14] = [
 ];
 
 /// Fields edited as one item per line.
-pub const LIST_FIELDS: [Field; 3] = [
+pub const LIST_FIELDS: [Field; 4] = [
     Field::ExcludeProjects,
     Field::ResumeArgs,
+    Field::CodexResumeArgs,
     Field::AgentExclude,
 ];
 
@@ -502,7 +504,11 @@ impl SettingsDialog {
                 Ok(())
             }
             // Existence is checked in the background (`apply_probe`).
-            Field::ClaudePath | Field::PiPath | Field::OmpPath | Field::DefaultWorkspace => {
+            Field::ClaudePath
+            | Field::PiPath
+            | Field::OmpPath
+            | Field::CodexPath
+            | Field::DefaultWorkspace => {
                 if text.trim().is_empty() {
                     self.pending_paths.remove(&field);
                     self.set_or_reset(field, text, |t| Value::Text(t.to_string()));
@@ -526,7 +532,10 @@ impl SettingsDialog {
                         .map(|number| self.draft.set(field, Value::Number(number)))
                 }
             }
-            Field::ExcludeProjects | Field::ResumeArgs | Field::AgentExclude => {
+            Field::ExcludeProjects
+            | Field::ResumeArgs
+            | Field::CodexResumeArgs
+            | Field::AgentExclude => {
                 let list = lines_to_list(text);
                 if list.is_empty() {
                     self.draft.reset(field);

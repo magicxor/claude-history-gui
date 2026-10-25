@@ -68,13 +68,17 @@ pub fn normalized_log_entries(
 
 /// [`normalized_log_entries`] that polls `cancelled` before parsing and every
 /// 64 lines; `Ok(None)` when it returned true (the GUI viewer abandons a
-/// superseded parse mid-file, V-101).
+/// superseded parse mid-file, V-101). A Codex rollout is decoded as its
+/// thread in one piece (`sources::codex::view`), checked before and after.
 pub fn normalized_log_entries_cancellable(
     path: &std::path::Path,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Option<Vec<(usize, crate::claude::LogEntry)>>> {
     if cancelled() {
         return Ok(None);
+    }
+    if let Some(entries) = sources::codex::view::log_entries(path)? {
+        return Ok((!cancelled()).then_some(entries));
     }
     if let Some(projection) = pi::parse_file(path)? {
         return Ok((!cancelled()).then_some(projection.entries));

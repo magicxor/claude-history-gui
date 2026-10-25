@@ -101,9 +101,23 @@ pub struct EffectiveSettings {
     pub semantic_toggle_enabled: bool,
     /// `[resume].default_args` (Claude only).
     pub resume_default_args: Vec<String>,
+    /// `[resume.codex].default_args` (Codex only, upstream eea6d37).
+    pub resume_codex_default_args: Vec<String>,
 }
 
 impl EffectiveSettings {
+    /// The configured arguments for resuming a conversation of `source`
+    /// (upstream `ResumeConfig::default_args`): `[resume].default_args` for
+    /// Claude, `[resume.codex].default_args` for Codex, none for Pi and OMP.
+    pub fn resume_default_args_for(&self, source: crate::history::Source) -> &[String] {
+        use crate::history::Source;
+        match source {
+            Source::Claude => &self.resume_default_args,
+            Source::Codex => &self.resume_codex_default_args,
+            Source::Pi | Source::Omp => &[],
+        }
+    }
+
     /// The viewer preferences a session starts with: the initial tool
     /// display and thinking visibility from these settings, timing off (as
     /// upstream, where timing always starts off).
@@ -178,6 +192,11 @@ pub fn effective_settings(
             .resume
             .as_ref()
             .and_then(|resume| resume.default_args.clone())
+            .unwrap_or_default(),
+        resume_codex_default_args: config
+            .resume
+            .as_ref()
+            .map(|resume| resume.default_args(crate::history::Source::Codex).to_vec())
             .unwrap_or_default(),
     }
 }
@@ -1062,6 +1081,7 @@ mod tests {
                 keys: KeyBindings::default(),
                 semantic_toggle_enabled: true,
                 resume_default_args: Vec::new(),
+                resume_codex_default_args: Vec::new(),
             }
         );
     }
@@ -1168,6 +1188,9 @@ mod tests {
             }),
             resume: Some(ResumeConfig {
                 default_args: Some(vec!["--model".into(), "opus".into()]),
+                codex: Some(crate::config::AgentResumeConfig {
+                    default_args: Some(vec!["--yolo".into()]),
+                }),
             }),
             tui: Some(TuiConfig {
                 exclude_projects: vec!["secret".into()],
@@ -1183,6 +1206,16 @@ mod tests {
         assert!(!settings.show_last);
         assert!(settings.show_thinking);
         assert_eq!(settings.resume_default_args, vec!["--model", "opus"]);
+        assert_eq!(settings.resume_codex_default_args, vec!["--yolo"]);
+        assert_eq!(
+            settings.resume_default_args_for(crate::history::Source::Codex),
+            ["--yolo"]
+        );
+        assert!(
+            settings
+                .resume_default_args_for(crate::history::Source::Pi)
+                .is_empty()
+        );
         assert_eq!(settings.exclude_projects, vec!["secret"]);
         assert_eq!(settings.keys.rename, KeyChord::ctrl('t'));
         assert!(!settings.semantic_toggle_enabled);

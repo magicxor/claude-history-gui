@@ -17,30 +17,37 @@
 //!   the env's home. The state database directory is resolved when the home
 //!   is scanned, not when the adapter is built (upstream does the same from
 //!   eea6d37 on), so building a registry reads no file.
-//! * **No actions yet.** Upstream plans `codex [args] resume|fork <id>` and
-//!   runs `codex delete --force <id>` with `std::process::Command`. Core
-//!   spawns no process outside `program` and `resume::terminal`, the fork's
-//!   resume plans carry no environment variables (`CODEX_HOME`) yet, and a
-//!   GUI deletes through its own services after a confirmation. Until that
-//!   is ported (with upstream eea6d37, which wires these actions into the
-//!   TUI), [`CodexAdapter`]'s capabilities are none and `resume` and
-//!   `delete` refuse; rename is refused as upstream refuses it.
+//! * **Actions as the fork's plans.** Upstream plans `codex [args]
+//!   resume|fork <id>` as a `std::process::Command` with `CODEX_HOME` set
+//!   and runs `codex delete --force <id>` itself. Here
+//!   [`CodexAdapter::resume`] plans a [`ResumePlan`] (`resume::plan_codex`)
+//!   whose `env` carries `CODEX_HOME` into the terminal window, and the
+//!   deletion is a [`delete_spec`] run by [`run_to_completion`] (core spawns
+//!   processes only in `program` and `resume::terminal`; refused in tests and
+//!   hermetic builds). A GUI plans the deletion first and runs the same
+//!   command through its own services after a confirmation
+//!   (`maintenance::plan_session_delete`,
+//!   `maintenance::execute_session_delete_with`). The CLI may be configured
+//!   (`[gui] codex_path`), else it is found on `PATH`.
 
 mod decode;
 pub mod discover;
 mod head;
 mod state_db;
+pub mod view;
 
 use crate::env::{HistoryEnv, WorkspaceScope};
 use crate::error::{AppError, Result};
-use crate::history::actions::{Capabilities, Target, refusal};
+use crate::history::actions::{Capabilities, Target};
 use crate::history::adapter::{Adapter, Completeness, Discovery, Located, Native};
 use crate::history::model::{Event, SourceInstance, SourceKind, Transcript};
-use crate::resume::ResumePlan;
+use crate::resume::terminal::{LaunchSpec, RunOutput, run_to_completion};
+use crate::resume::{ResumeKind, ResumePlan};
 use head::{Scan, Thread};
 use rayon::prelude::*;
 use state_db::StateDb;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -171,6 +178,86 @@ fn sqlite_error(error: rusqlite::Error) -> AppError {
     )))
 }
 
+/// The thread id of the rollout at `path`.
+pub(crate) fn thread_id_of(path: &Path) -> Result<String> {
+    discover::rollout_of(path, false)
+        .map(|rollout| rollout.thread_id)
+        .ok_or_else(|| {
+            AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("not a Codex rollout: {}", path.display()),
+            ))
+        })
+}
+
+/// The environment of the Codex CLI acting on the home of the rollout at
+/// `path`, else on `home`: `CODEX_HOME` (upstream's `codex_command`).
+pub(crate) fn codex_env(path: &Path, home: &Path) -> Vec<(OsString, OsString)> {
+    let home = discover::home_of(path).unwrap_or(home);
+    if home.as_os_str().is_empty() {
+        return Vec::new();
+    }
+    vec![(
+        OsString::from("CODEX_HOME"),
+        home.as_os_str().to_os_string(),
+    )]
+}
+
+/// Fork: every rollout of the thread of the rollout at `path`, in the Codex
+/// home holding it: what `codex delete` removes.
+pub fn thread_rollouts(path: &Path) -> Result<Vec<PathBuf>> {
+    let thread_id = thread_id_of(path)?;
+    let home = discover::home_of(path).ok_or_else(|| {
+        AppError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("not a rollout of a Codex home: {}", path.display()),
+        ))
+    })?;
+    Ok(discover::list(home)?
+        .into_iter()
+        .filter(|rollout| rollout.thread_id == thread_id)
+        .map(|rollout| rollout.path)
+        .collect())
+}
+
+/// Fork: upstream's `codex delete --force <thread id>` for the thread of the
+/// rollout at `path`, as a run of the CLI (`program_override`, else `codex`
+/// on the env's `PATH`) with `CODEX_HOME` set to the rollout's home, else
+/// `home`.
+pub fn delete_spec(
+    env: &HistoryEnv,
+    path: &Path,
+    home: &Path,
+    program_override: Option<&Path>,
+) -> Result<LaunchSpec> {
+    let thread_id = thread_id_of(path)?;
+    Ok(LaunchSpec {
+        program: env.resolve_program(
+            crate::resume::program_name(SourceKind::Codex),
+            program_override,
+        )?,
+        args: ["delete", "--force", thread_id.as_str()]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+        cwd: None,
+        env: codex_env(path, home),
+    })
+}
+
+/// Fork: upstream's outcome of a `codex delete` run: its stderr when it
+/// failed.
+pub fn delete_outcome(output: &RunOutput) -> Result<()> {
+    if output.success {
+        return Ok(());
+    }
+    Err(AppError::Io(std::io::Error::other(format!(
+        "codex delete failed ({}): {}",
+        output.status,
+        output.stderr.trim()
+    ))))
+}
+
 impl Adapter for CodexAdapter {
     fn instance(&self) -> &SourceInstance {
         &self.instance
@@ -224,38 +311,44 @@ impl Adapter for CodexAdapter {
         decode::decode(located.key.clone(), &thread, events)
     }
 
-    /// Fork: none until the Codex CLI's actions are ported (see the module
-    /// docs); upstream supports everything but rename.
     fn capabilities(&self) -> Capabilities {
         Capabilities {
-            resume: false,
-            fork: false,
-            delete: false,
             rename: false,
+            ..Capabilities::ALL
         }
     }
 
-    /// Fork: refused until the Codex resume plan is ported (see the module
-    /// docs).
+    /// `codex [default_args] resume|fork <thread id>` in the conversation's
+    /// project (fork: planned by `resume::plan_codex`, see the module docs).
     fn resume(
         &self,
         _env: &HistoryEnv,
-        _target: Target<'_>,
-        _workspace: Option<&WorkspaceScope>,
+        target: Target<'_>,
+        workspace: Option<&WorkspaceScope>,
         fork: bool,
-        _default_args: &[String],
-        _program_override: Option<&Path>,
+        default_args: &[String],
+        program_override: Option<&Path>,
     ) -> Result<ResumePlan> {
-        let doing = if fork { "Forking" } else { "Resuming" };
-        Err(AppError::Unsupported(refusal(SourceKind::Codex, doing)))
+        crate::resume::plan_codex(
+            target,
+            &self.instance.root,
+            workspace,
+            ResumeKind::from_fork(fork),
+            default_args,
+            program_override,
+        )
     }
 
-    /// Fork: refused until `codex delete` is ported (see the module docs).
-    fn delete(&self, _env: &HistoryEnv, _path: &Path) -> Result<usize> {
-        Err(AppError::Unsupported(refusal(
-            SourceKind::Codex,
-            "Deleting",
-        )))
+    /// `codex delete --force <thread id>`, which removes every rollout of
+    /// the thread and its state. Fork: run by [`run_to_completion`] (refused
+    /// in tests and hermetic builds); returns the number of rollouts the
+    /// thread had.
+    fn delete(&self, env: &HistoryEnv, path: &Path) -> Result<usize> {
+        let spec = delete_spec(env, path, &self.instance.root, None)?;
+        let rollouts = thread_rollouts(path).map_or(1, |rollouts| rollouts.len());
+        let output = run_to_completion(&spec).map_err(AppError::Io)?;
+        delete_outcome(&output)?;
+        Ok(rollouts)
     }
 
     fn rename(&self, _path: &Path, _title: &str) -> Result<()> {
