@@ -596,12 +596,14 @@ pub(super) fn spawn_search_worker(
             let memory_pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(1)
                 .thread_name(|_| "lexical-rank-worker".to_string())
+                .stack_size(8 * 1024 * 1024)
                 .build()
                 .expect("failed to create lexical ranking thread pool");
             let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
             let index_pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .thread_name(|i| format!("index-search-{i}"))
+                .stack_size(8 * 1024 * 1024)
                 .build()
                 .expect("failed to create index search thread pool");
             SearchWorker {

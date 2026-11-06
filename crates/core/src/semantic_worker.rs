@@ -274,6 +274,7 @@ pub(crate) fn spawn_semantic_worker_thread(config: SemanticWorkerConfig) -> Sema
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(1)
                 .thread_name(|_| "semantic-rank-worker".to_string())
+                .stack_size(8 * 1024 * 1024)
                 .build()
                 .expect("failed to create semantic ranking thread pool");
             pool.install(|| run_semantic_worker(cmd_rx, res_tx, worker_cancellation, config));

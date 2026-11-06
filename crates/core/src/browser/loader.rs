@@ -1518,6 +1518,7 @@ fn reconcile_store(job: ReconcileJob) -> PassResult {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .thread_name(|i| format!("store-reconcile-{i}"))
+        .stack_size(8 * 1024 * 1024)
         // Upstream's reconcile child ran at nice 10.
         .start_handler(|_| crate::semantic::fastembed::lower_background_thread_priority())
         .build()

@@ -67,12 +67,22 @@ pub fn load_all_conversations_streaming(
 ) -> Receiver<LoaderMessage> {
     let (tx, rx) = mpsc::channel();
 
-    thread::spawn(move || {
-        load_all_streaming_inner(&env, tx, show_last, debug_level, time);
-    });
+    let failed = tx.clone();
+    let spawned = thread::Builder::new()
+        .name("history-loader".into())
+        .stack_size(LOADER_STACK_SIZE)
+        .spawn(move || {
+            load_all_streaming_inner(&env, tx, show_last, debug_level, time);
+        });
+    if let Err(error) = spawned {
+        let _ = failed.send(LoaderMessage::Fatal(AppError::from(error)));
+    }
 
     rx
 }
+
+/// Stack of the loader threads (DESIGN section 7.5: named threads, 8 MiB).
+const LOADER_STACK_SIZE: usize = 8 * 1024 * 1024;
 
 /// How many conversations of the instances other than Claude's one
 /// [`LoaderMessage::Batch`] holds.
@@ -86,7 +96,19 @@ fn load_all_streaming_inner(
     time: TimeFilter,
 ) {
     thread::scope(|scope| {
-        let claude = scope.spawn(|| load_claude_streaming(env, &tx, show_last, debug_level, time));
+        let claude = thread::Builder::new()
+            .name("history-loader-claude".into())
+            .stack_size(LOADER_STACK_SIZE)
+            .spawn_scoped(scope, || {
+                load_claude_streaming(env, &tx, show_last, debug_level, time)
+            });
+        let claude = match claude {
+            Ok(handle) => handle,
+            Err(error) => {
+                let _ = tx.send(LoaderMessage::Fatal(AppError::from(error)));
+                return;
+            }
+        };
         let mut paths = std::collections::HashSet::new();
         let mut emit = |mut conversations: Vec<Conversation>| {
             conversations.retain(|conversation| {
