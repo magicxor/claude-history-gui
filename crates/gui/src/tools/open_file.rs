@@ -1,7 +1,9 @@
 //! File → Open JSONL file… (DESIGN §5.20; T-019). WP5.
 //!
 //! The native picker (multi-select, through `PlatformServices`) opens one
-//! single-file window per chosen file; unavailable in picker mode.
+//! single-file window per chosen file; unavailable in picker mode. Where the
+//! sandbox gate is enforced (§15.4 rule 7), a file it refuses is not opened
+//! and an error toast says why.
 
 use gpui_kit::{App, Window};
 
@@ -10,6 +12,7 @@ use crate::model::OpenPathsOptions;
 use crate::notify;
 use crate::services::services;
 use crate::single_file;
+use crate::workspace::startup::opened_file_refusal;
 
 /// The picker options of §5.20.
 pub fn picker_options() -> OpenPathsOptions {
@@ -33,6 +36,16 @@ pub fn open_jsonl_file_dialog(window: &mut Window, cx: &mut App) {
         Box::new(|result, window, cx| match result {
             Ok(Some(paths)) => {
                 for path in paths {
+                    // The sandbox gate's rule for files opened by path (§15.4):
+                    // a refused file is not opened.
+                    if let Some(reason) = opened_file_refusal(app_state(cx), &path) {
+                        notify::error(
+                            window,
+                            cx,
+                            format!("Couldn't open {}: {reason}", path.display()),
+                        );
+                        continue;
+                    }
                     single_file::open_window(path, cx);
                 }
             }

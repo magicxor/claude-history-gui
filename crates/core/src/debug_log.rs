@@ -132,29 +132,33 @@ pub fn log_display_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::{Conversation, ParseError, Source};
+    use crate::history::model::SourceKind;
+    use crate::history::{Conversation, ParseError};
     use std::path::PathBuf;
 
     fn conversation_with_errors() -> Conversation {
         Conversation {
-            source: Source::Claude,
+            source: SourceKind::Claude,
             session_id: "session".to_string(),
             path: PathBuf::from("session.jsonl"),
             index: 0,
             timestamp: chrono::Local::now(),
-            preview: String::new(),
-            preview_first: String::new(),
-            preview_last: String::new(),
-            full_text: String::new(),
-            agent_search_text: String::new(),
-            semantic_route_text: String::new(),
-            semantic_turns: Vec::new(),
+            preview: String::new().into(),
+            preview_first: String::new().into(),
+            preview_last: String::new().into(),
+            full_text: String::new().into(),
+            own_text: "".into(),
+            agent_search_text: String::new().into(),
+            semantic_route_text: String::new().into(),
+            semantic_turns: Vec::new().into(),
             semantic_turn_ranges: Vec::new(),
-            search_text_lower: String::new(),
             project_name: None,
             project_path: None,
             cwd: None,
+            cwds: Vec::new(),
             message_count: 0,
+            prompt_count: 0,
+            tool_call_count: 0,
             parse_errors: vec![ParseError {
                 line_number: 3,
                 line_content: "x".repeat(250),
@@ -167,6 +171,8 @@ mod tests {
             model: None,
             total_tokens: 0,
             duration_minutes: None,
+            provenance: Default::default(),
+            parent: None,
         }
     }
 

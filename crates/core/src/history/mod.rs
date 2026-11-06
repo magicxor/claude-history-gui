@@ -8,21 +8,29 @@
 //! # Module Structure
 //!
 //! - `loader` - Loading conversations from directories
+//! - `model` - The normalized transcript model adapters decode into
 //! - `parser` - Parsing individual JSONL files
 //! - `path` - Path encoding/decoding utilities
 
-pub mod cache;
+pub mod actions;
+pub mod adapter;
 #[cfg(test)]
 mod feature_tests;
+pub mod index;
 mod loader;
 mod messages;
+pub mod model;
 pub mod omp_loader;
 pub mod parser;
 pub mod path;
 pub mod pi;
 pub mod pi_loader;
 mod rename;
+pub mod service;
 mod session;
+pub mod sources;
+pub mod view;
+mod workspace;
 
 pub(crate) use messages::{MessageOrdinals, Placement};
 pub(crate) use session::apply_preview_mode;
@@ -32,6 +40,7 @@ use crate::env::HistoryEnv;
 use crate::error::{AppError, Result};
 use chrono::{DateTime, Local};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 // Re-export public API
@@ -39,81 +48,16 @@ pub use loader::{
     DeleteEmptyScope, DeleteEmptySummary, EmptyTranscript, EmptyTranscriptDeletion,
     delete_empty_transcript, delete_empty_transcripts, delete_session_by_uuid, delete_transcripts,
     find_all_jsonl_by_uuid, find_empty_transcripts, find_jsonl_by_uuid, list_projects,
-    load_all_conversations, load_all_conversations_streaming, load_conversations,
-    session_artifact_dir,
+    load_all_conversations_streaming, session_artifact_dir,
 };
-pub(crate) use messages::{extract_skill_preview, retained_user_text};
-pub use parser::process_conversation_file;
+pub(crate) use messages::{authored_text, extract_skill_preview, retained_user_text};
+pub use parser::{process_conversation_file, process_conversation_file_in};
 pub use path::{convert_path_to_project_dir_name, format_short_name_from_path, is_same_project};
 pub use rename::append_session_rename;
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum Source {
-    Claude,
-    Pi,
-    Omp,
-}
-
-impl Source {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Pi => "pi",
-            Self::Omp => "omp",
-        }
-    }
-
-    pub fn list_label(self) -> &'static str {
-        match self {
-            Self::Claude => "CC",
-            Self::Pi => "Pi",
-            Self::Omp => "OMP",
-        }
-    }
-}
-
-pub use pi::detect_source;
-
-pub fn normalized_log_entries(
-    path: &std::path::Path,
-) -> Result<Vec<(usize, crate::claude::LogEntry)>> {
-    Ok(normalized_log_entries_cancellable(path, &|| false)?.unwrap_or_default())
-}
-
-/// [`normalized_log_entries`] that polls `cancelled` before parsing and every
-/// 64 lines; `Ok(None)` when it returned true (the GUI viewer abandons a
-/// superseded parse mid-file, V-101).
-pub fn normalized_log_entries_cancellable(
-    path: &std::path::Path,
-    cancelled: &dyn Fn() -> bool,
-) -> Result<Option<Vec<(usize, crate::claude::LogEntry)>>> {
-    if cancelled() {
-        return Ok(None);
-    }
-    if let Some(projection) = pi::parse_file(path)? {
-        return Ok((!cancelled()).then_some(projection.entries));
-    }
-    let file = std::fs::File::open(path)?;
-    let reader = std::io::BufReader::new(file);
-    use std::io::BufRead;
-    let mut entries = Vec::new();
-    for (line_index, line) in reader.lines().enumerate() {
-        if line_index % 64 == 0 && cancelled() {
-            return Ok(None);
-        }
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str(&line) {
-            entries.push((line_index + 1, entry));
-        }
-    }
-    Ok(Some(entries))
-}
+pub use workspace::Workspace;
 
 /// Represents a JSONL parsing error with context for debugging
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ParseError {
     pub line_number: usize,
     pub line_content: String,
@@ -126,29 +70,40 @@ pub struct ParseError {
 
 #[derive(Clone, Debug)]
 pub struct Conversation {
-    pub source: Source,
+    pub source: model::SourceKind,
     pub session_id: String,
     pub path: PathBuf,
     pub index: usize,
     pub timestamp: DateTime<Local>,
-    pub preview: String,
+    pub preview: Arc<str>,
     /// Preview showing first 3 messages (used when show_last=false)
-    pub preview_first: String,
+    pub preview_first: Arc<str>,
     /// Preview showing last 3 messages (used when show_last=true)
-    pub preview_last: String,
-    pub full_text: String,
-    pub agent_search_text: String,
-    pub semantic_route_text: String,
-    pub semantic_turns: Vec<String>,
+    pub preview_last: Arc<str>,
+    pub full_text: Arc<str>,
+    /// What the person typed: the authored text parts of top-level user
+    /// messages (see `messages::authored_text`), without tool results,
+    /// injected or inherited records, or subagent prompts. Empty for a child
+    /// conversation, whose prompts another conversation wrote.
+    pub own_text: Arc<str>,
+    pub agent_search_text: Arc<str>,
+    pub semantic_route_text: Arc<str>,
+    pub semantic_turns: Arc<[String]>,
     pub semantic_turn_ranges: Vec<crate::agent::refs::MessageRange>,
-    /// Pre-normalized lowercase search text (avoids re-normalizing on every startup)
-    pub search_text_lower: String,
     pub project_name: Option<String>,
     pub project_path: Option<PathBuf>,
     /// The working directory extracted from the JSONL file (the actual cwd)
     pub cwd: Option<PathBuf>,
+    /// Every distinct working directory the conversation recorded, in order
+    /// of first appearance and at most `model::MAX_CWDS`; the first is `cwd`.
+    /// A session that changes directory partway records each one.
+    pub cwds: Vec<PathBuf>,
     /// Number of user and assistant messages in the conversation
     pub message_count: usize,
+    /// Number of top-level user messages with text the person typed
+    pub prompt_count: usize,
+    /// Number of distinct tool calls the assistant made
+    pub tool_call_count: usize,
     /// Parse errors encountered while processing this conversation file
     pub parse_errors: Vec<ParseError>,
     /// Summary/title of the conversation (from type=summary JSONL entry)
@@ -161,6 +116,68 @@ pub struct Conversation {
     pub total_tokens: u64,
     /// Conversation duration in minutes (from first to last message)
     pub duration_minutes: Option<u64>,
+    pub provenance: Provenance,
+    /// Session id of the conversation this one was started or branched
+    /// from, in the same source; see `is_parent_of`.
+    pub parent: Option<String>,
+}
+
+/// How a conversation came about, as its source records it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Provenance {
+    /// Run by a tool or script rather than a person.
+    pub automated: bool,
+    /// Started by another conversation, such as a subagent.
+    pub child: bool,
+    /// A side conversation the person branched off another one, such as a
+    /// Claude Code `/btw` fork. Listed like any conversation, but its
+    /// source's tool reaches it only through the one it came from.
+    pub branch: bool,
+    /// The source names a current history that no longer exists, so the
+    /// source's own tool cannot act on this one.
+    pub orphaned: bool,
+}
+
+impl Provenance {
+    /// Whether the conversation stays out of the list and of semantic
+    /// search unless asked for.
+    pub fn hidden_by_default(&self) -> bool {
+        self.automated || self.child
+    }
+
+    /// The tag marking a conversation that is not an ordinary root in the
+    /// list.
+    pub fn list_label(&self) -> Option<&'static str> {
+        if self.child {
+            Some("sub")
+        } else if self.branch {
+            Some("fork")
+        } else if self.automated {
+            Some("auto")
+        } else {
+            None
+        }
+    }
+}
+
+/// Whether `parent` is the conversation `child` names as its parent: the
+/// same source and session id, and for Claude, whose sessions can be copied
+/// between projects with their subagents and forks, the session directory
+/// holding `child`.
+pub fn is_parent_of(parent: &Conversation, child: &Conversation) -> bool {
+    child.source == parent.source
+        && child.parent.as_deref() == Some(parent.session_id.as_str())
+        && parent_in_place(parent.source, &parent.path, &child.path)
+}
+
+/// The path half of `is_parent_of`, for callers holding only the paths.
+pub(crate) fn parent_in_place(
+    source: model::SourceKind,
+    parent_path: &std::path::Path,
+    child_path: &std::path::Path,
+) -> bool {
+    source != model::SourceKind::Claude
+        || sources::claude::parent_transcript(child_path).as_deref() == Some(parent_path)
 }
 
 pub fn semantic_route_text(full_text: &str, agent_search_text: &str) -> String {
@@ -252,6 +269,9 @@ pub struct Project {
 }
 
 /// Message sent from background loader to TUI
+///
+/// Fork note: kept for the streaming in-memory loader (no store), which
+/// upstream 358becb removed.
 pub enum LoaderMessage {
     /// A fatal error occurred (e.g., projects root doesn't exist)
     Fatal(AppError),

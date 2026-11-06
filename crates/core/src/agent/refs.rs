@@ -1,10 +1,19 @@
 use crate::agent::diagnostic::{AgentError, AgentErrorKind};
 use crate::error::{AppError, Result};
-use crate::history::{Conversation, Source};
+use crate::history::Conversation;
+use crate::history::model::SourceKind;
+use crate::history::sources::Registry;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
-const REF_NAMESPACE: &str = "agent-v1";
+/// Namespace of refs digesting a conversation's source instance and native
+/// id.
+const REF_NAMESPACE: &str = "agent-v2";
+/// Namespace of the path-based refs Claude conversations had before refs
+/// digested the source instance; they still resolve.
+const LEGACY_REF_NAMESPACE: &str = "agent-v1";
 const PROJECT_NAMESPACE: &str = "agent-project-v1";
 const MIN_EMITTED_DIGEST_HEX_LEN: usize = 12;
 const PROJECT_DIGEST_HEX_LEN: usize = 16;
@@ -30,13 +39,9 @@ enum ConversationRefInput {
 }
 
 impl AgentConversationRef {
-    pub fn from_parts(project_dir_name: &str, session_filename: &str) -> Self {
-        let digest = digest_parts([REF_NAMESPACE, project_dir_name, session_filename]);
+    fn new(uuid: String, digest: u128) -> Self {
         Self {
-            uuid: session_uuid(session_filename)
-                .filter(|uuid| is_uuid(uuid))
-                .unwrap_or("none")
-                .to_ascii_lowercase(),
+            uuid,
             digest_hex: format!("{digest:032x}"),
             emitted_digest_hex_len: MIN_EMITTED_DIGEST_HEX_LEN,
         }
@@ -62,34 +67,88 @@ impl AgentConversationRef {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentConversationKey {
-    pub source: Source,
+    pub source: SourceKind,
     pub project_dir_name: String,
     pub session_filename: String,
     pub session_id: String,
     pub path: PathBuf,
+    /// Root of the source instance holding the conversation, canonical
+    /// where it resolves.
+    pub root: PathBuf,
+    /// The source adapter's id of the conversation within `root`.
+    pub native_id: String,
 }
 
 impl AgentConversationKey {
+    /// Key of the Claude session file `path`, at
+    /// `<projects root>/<project_dir_name>/<session_filename>`. The native id
+    /// is joined with the platform separator, like the Claude adapter's
+    /// `native_id_of` (fork difference: upstream hardcodes `/`, which on
+    /// Windows would give a different ref than `from_conversation_in`).
     pub fn new(
         project_dir_name: impl Into<String>,
         session_filename: impl Into<String>,
         path: PathBuf,
     ) -> Self {
+        let project_dir_name = project_dir_name.into();
         let session_filename = session_filename.into();
+        let root = path
+            .parent()
+            .and_then(Path::parent)
+            .map(canonical_root)
+            .unwrap_or_default();
         Self {
-            source: Source::Claude,
+            source: SourceKind::Claude,
             session_id: session_filename
                 .strip_suffix(".jsonl")
                 .unwrap_or(&session_filename)
                 .to_owned(),
-            project_dir_name: project_dir_name.into(),
+            native_id: Path::new(&project_dir_name)
+                .join(&session_filename)
+                .to_string_lossy()
+                .into_owned(),
+            project_dir_name,
             session_filename,
+            path,
+            root,
+        }
+    }
+
+    /// Key of the session file `path` under `root`, the root of a source
+    /// instance keeping one file per session.
+    pub fn in_instance(
+        source: SourceKind,
+        root: &Path,
+        project_dir_name: String,
+        session_id: String,
+        path: PathBuf,
+    ) -> Self {
+        let session_filename = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let native_id = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
+        Self {
+            source,
+            project_dir_name,
+            session_filename,
+            session_id,
+            root: canonical_root(root),
+            native_id,
             path,
         }
     }
 
-    pub fn from_conversation(conversation: &Conversation) -> Result<Self> {
-        let project_dir_name = if conversation.source != Source::Claude {
+    /// Key of the conversation stored at `conversation.path`, identified
+    /// within the first instance of `registry` whose root holds it. Fork
+    /// difference: upstream's `from_conversation()` used `Registry::from_env()`
+    /// from the process environment; callers pass `Registry::from_env(env)`.
+    pub fn from_conversation_in(conversation: &Conversation, registry: &Registry) -> Result<Self> {
+        let project_dir_name = if conversation.source != SourceKind::Claude {
             let project = conversation
                 .project_path
                 .as_deref()
@@ -106,9 +165,7 @@ impl AgentConversationKey {
                 .to_string_lossy()
                 .into_owned()
         } else {
-            conversation
-                .path
-                .parent()
+            crate::history::sources::claude::project_dir(&conversation.path)
                 .and_then(|p| p.file_name())
                 .and_then(|n| n.to_str())
                 .ok_or_else(|| {
@@ -124,56 +181,83 @@ impl AgentConversationKey {
                 AppError::ConfigError("conversation path has no session filename".to_string())
             })?
             .to_string();
+        let (root, native_id) = match registry.key_of(&conversation.path) {
+            Some(key) => (canonical_root(&key.instance.root), key.native_id),
+            None => (
+                conversation
+                    .path
+                    .parent()
+                    .map(canonical_root)
+                    .unwrap_or_default(),
+                session_filename.clone(),
+            ),
+        };
         Ok(Self {
             source: conversation.source,
             project_dir_name,
             session_filename,
             session_id: conversation.session_id.clone(),
             path: conversation.path.clone(),
+            root,
+            native_id,
         })
     }
 
+    /// The conversation's ref: a digest of its source instance and native
+    /// id, so it holds while the adapter keeps the id (a Codex thread
+    /// across reverts and archiving).
     pub fn conversation_ref(&self) -> AgentConversationRef {
+        let root = self.root.to_string_lossy();
+        let digest = digest_parts([REF_NAMESPACE, self.source.label(), &root, &self.native_id]);
+        AgentConversationRef::new(self.uuid(), digest)
+    }
+
+    /// The ref the conversation had when refs digested its project and file
+    /// name rather than its source instance.
+    pub fn legacy_ref(&self) -> AgentConversationRef {
+        let digest = match self.source {
+            SourceKind::Claude => digest_parts([
+                LEGACY_REF_NAMESPACE,
+                &self.project_dir_name,
+                &self.session_filename,
+            ]),
+            SourceKind::Pi => digest_parts([
+                "agent-pi-v1",
+                self.source.label(),
+                &self.project_dir_name,
+                &self.session_id,
+                &self.session_filename,
+            ]),
+            SourceKind::Omp => digest_parts([
+                "agent-omp-v1",
+                self.source.label(),
+                &self.project_dir_name,
+                &self.session_id,
+                &self.session_filename,
+            ]),
+            SourceKind::Codex => {
+                digest_parts(["agent-codex-v1", self.source.label(), &self.session_id])
+            }
+        };
+        AgentConversationRef::new(self.uuid(), digest)
+    }
+
+    fn uuid(&self) -> String {
         match self.source {
-            Source::Claude => {
-                AgentConversationRef::from_parts(&self.project_dir_name, &self.session_filename)
-            }
-            Source::Pi => {
-                let digest = digest_parts([
-                    "agent-pi-v1",
-                    self.source.label(),
-                    &self.project_dir_name,
-                    &self.session_id,
-                    &self.session_filename,
-                ]);
-                AgentConversationRef {
-                    uuid: self.session_id.clone(),
-                    digest_hex: format!("{digest:032x}"),
-                    emitted_digest_hex_len: MIN_EMITTED_DIGEST_HEX_LEN,
-                }
-            }
-            Source::Omp => {
-                let digest = digest_parts([
-                    "agent-omp-v1",
-                    self.source.label(),
-                    &self.project_dir_name,
-                    &self.session_id,
-                    &self.session_filename,
-                ]);
-                AgentConversationRef {
-                    uuid: self.session_id.clone(),
-                    digest_hex: format!("{digest:032x}"),
-                    emitted_digest_hex_len: MIN_EMITTED_DIGEST_HEX_LEN,
-                }
-            }
+            SourceKind::Claude => session_uuid(&self.session_filename)
+                .filter(|uuid| is_uuid(uuid))
+                .unwrap_or("none")
+                .to_ascii_lowercase(),
+            _ => self.session_id.clone(),
         }
     }
 
     pub fn project_id(&self) -> String {
         let identity = match self.source {
-            Source::Claude => format!("{PROJECT_NAMESPACE}\0{}", self.project_dir_name),
-            Source::Pi => format!("agent-pi-project-v1\0{}", self.project_dir_name),
-            Source::Omp => format!("agent-omp-project-v1\0{}", self.project_dir_name),
+            SourceKind::Claude => format!("{PROJECT_NAMESPACE}\0{}", self.project_dir_name),
+            SourceKind::Pi => format!("agent-pi-project-v1\0{}", self.project_dir_name),
+            SourceKind::Omp => format!("agent-omp-project-v1\0{}", self.project_dir_name),
+            SourceKind::Codex => format!("agent-codex-project-v1\0{}", self.project_dir_name),
         };
         format!(
             "pr_{}",
@@ -310,23 +394,42 @@ pub fn resolve_conversation_ref(
     reference: &str,
 ) -> Result<ResolvedConversation> {
     let input = validate_conversation_ref(reference)?;
-    let matches: Vec<ResolvedConversation> = keys
+    let mut matches: Vec<&AgentConversationKey> = keys
         .iter()
         .filter(|key| match &input {
             ConversationRefInput::Digest(prefix) => {
                 key.conversation_ref().digest_hex.starts_with(prefix)
             }
-            ConversationRefInput::Uuid(uuid) => {
-                key.conversation_ref().uuid().eq_ignore_ascii_case(uuid)
-            }
+            ConversationRefInput::Uuid(uuid) => key.uuid().eq_ignore_ascii_case(uuid),
             ConversationRefInput::Filename(stem) => {
                 key.session_filename.strip_suffix(".jsonl") == Some(stem.as_str())
             }
         })
-        .map(|key| resolved_conversation_for_key(keys, key))
         .collect();
+    if matches.is_empty()
+        && let ConversationRefInput::Digest(prefix) = &input
+    {
+        matches = legacy_matches(keys, prefix);
+    }
 
-    finish_resolution(reference, matches)
+    finish_resolution(
+        reference,
+        matches
+            .into_iter()
+            .map(|key| resolved_conversation_for_key(keys, key))
+            .collect(),
+    )
+}
+
+/// Keys whose legacy ref starts with `prefix`, for refs issued before refs
+/// digested the source instance.
+fn legacy_matches<'a>(
+    keys: &'a [AgentConversationKey],
+    prefix: &str,
+) -> Vec<&'a AgentConversationKey> {
+    keys.iter()
+        .filter(|key| key.legacy_ref().digest_hex.starts_with(prefix))
+        .collect()
 }
 
 pub fn resolved_conversation_for_key(
@@ -447,8 +550,8 @@ fn finish_resolution(
 /// error lists (`<handle> project=<id> source=<label> directory=<dir>
 /// file=<name>`): the key of `keys` (from
 /// [`crate::agent::service::discover_agent_keys`]) with that source,
-/// directory and file name. Pi/OMP candidates need this because their ref
-/// also hashes the session id that only discovery knows.
+/// directory and file name. Every candidate needs the discovered key,
+/// because refs digest the source instance root and the adapter's native id.
 pub fn full_ref_for_candidate(
     keys: &[AgentConversationKey],
     source_label: &str,
@@ -464,10 +567,13 @@ pub fn full_ref_for_candidate(
         .map(|key| key.conversation_ref().full_ref())
 }
 
-/// The agent key of the transcript at `path` (K8): among every Claude, Pi
-/// and OMP transcript the agent commands discover for `env` (all roots, no
-/// workspace scope), the one whose canonical path equals `path`'s. `None`
-/// for a file outside the session roots (an export, an attachment, a copy)
+/// The agent key of the transcript at `path` (K8): among every Claude, Pi,
+/// OMP and Codex transcript the agent commands discover for `env` (all roots,
+/// no workspace scope, automated and child Codex threads included, as `agent
+/// read`/`outline`/`within` resolve them), the one whose canonical path equals
+/// `path`'s. A Codex rollout inside the env's Codex home maps by thread id
+/// instead, so an older or archived rollout resolves to its thread's key.
+/// `None` for a file outside the session roots (an export, an attachment, a copy)
 /// or one that does not exist: a file with the same name elsewhere never
 /// resolves to another transcript. Use [`AgentConversationKey::conversation_ref`]
 /// `.full_ref()` to address it in `agent read` / `outline` / `within`.
@@ -487,7 +593,37 @@ pub fn conversation_key_for_path(
     let Some(file_name) = target.file_name() else {
         return Ok(None);
     };
-    let (keys, _) = crate::agent::service::discover_agent_keys(env, None)?;
+    // A Codex rollout is also keyed by its thread: the thread's key holds the
+    // head rollout, so an older rollout or an archived copy maps to it too.
+    // Codex keys come from the store's cards, loaded only for such a file.
+    // Only a rollout inside the env's own Codex home counts.
+    let in_codex_home = env.codex_home().is_some_and(|home| {
+        crate::history::sources::codex::discover::home_of(&target)
+            .zip(home.canonicalize().ok())
+            .is_some_and(|(found, home)| found == home)
+    });
+    let rollout =
+        crate::history::sources::codex::discover::rollout_of(path, false).filter(|_| in_codex_home);
+    // A Claude sidecar (a subagent or `/btw` fork, upstream 3c2ffeb) is
+    // keyed from its card as well.
+    let sidecar = crate::history::sources::claude::sidecar(path).is_some();
+    let no_cards: &[Conversation] = &[];
+    // Hidden (automated and child) threads resolve too: a lookup by identity
+    // (upstream cb990e6: read, outline and within).
+    let (keys, _) = crate::agent::service::discover_agent_keys(
+        env,
+        None,
+        (rollout.is_none() && !sidecar).then_some(no_cards),
+        true,
+    )?;
+    if let Some(rollout) = rollout
+        && let Some(key) = keys.iter().find(|key| {
+            key.source == SourceKind::Codex
+                && key.session_id.eq_ignore_ascii_case(&rollout.thread_id)
+        })
+    {
+        return Ok(Some(key.clone()));
+    }
     Ok(keys.into_iter().find(|key| {
         // Cheap name check first: canonicalizing every key is slow.
         key.path
@@ -501,11 +637,13 @@ pub fn conversation_key_for_path(
 }
 
 pub fn conversation_keys_from_conversations(
+    env: &crate::env::HistoryEnv,
     conversations: &[Conversation],
 ) -> Result<Vec<AgentConversationKey>> {
+    let registry = Registry::from_env(env);
     conversations
         .iter()
-        .map(AgentConversationKey::from_conversation)
+        .map(|conversation| AgentConversationKey::from_conversation_in(conversation, &registry))
         .collect()
 }
 
@@ -552,6 +690,21 @@ fn validate_conversation_ref(reference: &str) -> Result<ConversationRefInput> {
         return Ok(ConversationRefInput::Filename(stem.to_owned()));
     }
     Err(AgentError::invalid_ref(reference, "use a full UUID, UUID-based session basename/filename (not a path), or ref=ch_... from agent output").into())
+}
+
+/// `root`, canonical where it resolves, so a ref does not depend on how the
+/// root is spelled (a symlinked home, a relative `CLAUDE_CONFIG_DIR`).
+/// Resolved once per root and thread.
+fn canonical_root(root: &Path) -> PathBuf {
+    thread_local! {
+        static ROOTS: RefCell<HashMap<PathBuf, PathBuf>> = RefCell::default();
+    }
+    ROOTS.with_borrow_mut(|roots| {
+        roots
+            .entry(root.to_path_buf())
+            .or_insert_with(|| root.canonicalize().unwrap_or_else(|_| root.to_path_buf()))
+            .clone()
+    })
 }
 
 fn session_uuid(session_filename: &str) -> Option<&str> {
@@ -643,6 +796,123 @@ mod tests {
     }
 
     #[test]
+    fn conversation_key_for_path_resolves_codex_rollouts_by_thread() {
+        let home = tempfile::tempdir().unwrap();
+        let codex = crate::history::sources::codex::tests::home_copy(home.path());
+        let env = crate::env::HistoryEnv::sandbox(home.path()).with_codex_home(&codex);
+        let config = crate::config::ConfigFile::default();
+        const FORK: &str = "01a00000-0000-7000-8000-000000000003";
+        let rollout = crate::history::sources::codex::discover::list(&codex)
+            .unwrap()
+            .into_iter()
+            .find(|rollout| rollout.thread_id == FORK)
+            .expect("fork rollout");
+        let key = conversation_key_for_path(&env, &config, &rollout.path)
+            .unwrap()
+            .expect("a Codex rollout has a key");
+        assert_eq!(key.source, SourceKind::Codex);
+        assert_eq!(key.session_id, FORK);
+    }
+
+    #[test]
+    fn conversation_key_for_path_resolves_hidden_codex_threads() {
+        // An exec run is hidden from the list, yet the viewer's agent panel and
+        // Deep search's ref expansion still find it (cb990e6).
+        let home = tempfile::tempdir().unwrap();
+        let codex = crate::history::sources::codex::tests::home_copy(home.path());
+        let env = crate::env::HistoryEnv::sandbox(home.path()).with_codex_home(&codex);
+        let config = crate::config::ConfigFile::default();
+        const EXEC: &str = "01a00000-0000-7000-8000-000000000006";
+        let rollout = crate::history::sources::codex::discover::list(&codex)
+            .unwrap()
+            .into_iter()
+            .find(|rollout| rollout.thread_id == EXEC)
+            .expect("exec rollout");
+        let key = conversation_key_for_path(&env, &config, &rollout.path)
+            .unwrap()
+            .expect("a hidden Codex thread has a key");
+        assert_eq!(key.source, SourceKind::Codex);
+        assert_eq!(key.session_id, EXEC);
+        let (keys, _) = crate::agent::service::discover_agent_keys(&env, None, None, true).unwrap();
+        let full_ref = key.conversation_ref().full_ref();
+        let resolved = resolve_conversation_ref(&keys, &full_ref).unwrap();
+        assert_eq!(resolved.key.session_id, EXEC);
+        assert_eq!(
+            resolved.key.path.canonicalize().unwrap(),
+            rollout.path.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn claude_keys_agree_between_discovery_and_the_registry() {
+        // Windows: `AgentConversationKey::new` and `Registry::key_of` must
+        // build the same native id (same separator), or a warning's ref
+        // matches no hit.
+        let home = tempfile::tempdir().unwrap();
+        let env = crate::env::HistoryEnv::sandbox(home.path());
+        let uuid = "12345678-1234-4234-9234-123456789abc";
+        let path = env
+            .claude_projects_root()
+            .unwrap()
+            .join("-work-a")
+            .join(format!("{uuid}.jsonl"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let line = crate::agent::test_support::user_jsonl_line("hello");
+        std::fs::write(
+            &path,
+            format!(
+                "{line}
+"
+            ),
+        )
+        .unwrap();
+
+        let discovered = crate::agent::service::discover_agent_keys(&env, None, None, true)
+            .unwrap()
+            .0
+            .into_iter()
+            .find(|key| key.session_filename == format!("{uuid}.jsonl"))
+            .expect("discovered key");
+        let conversations =
+            crate::store::load_conversations(&env, false, None, crate::store::Contents::Cards)
+                .unwrap();
+        let keys = conversation_keys_from_conversations(&env, &conversations).unwrap();
+        let from_registry = keys
+            .iter()
+            .find(|key| key.session_filename == format!("{uuid}.jsonl"))
+            .expect("registry key");
+        assert_eq!(discovered.native_id, from_registry.native_id);
+        assert_eq!(
+            discovered.conversation_ref().full_ref(),
+            from_registry.conversation_ref().full_ref()
+        );
+    }
+
+    /// Upstream 3c2ffeb: a subagent transcript is keyed from its card, so
+    /// the viewer's agent panel works on it, hidden or not.
+    #[test]
+    fn conversation_key_for_path_keys_claude_sidecars_from_their_cards() {
+        let home = tempfile::tempdir().unwrap();
+        let env = crate::env::HistoryEnv::sandbox(home.path());
+        let config = crate::config::ConfigFile::default();
+        let uuid = "12345678-1234-4234-9234-123456789abc";
+        let project = env.claude_projects_root().unwrap().join("-work-a");
+        let session = project.join(format!("{uuid}.jsonl"));
+        let sidecar = project.join(uuid).join("subagents").join("agent-a1.jsonl");
+        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        let line = crate::agent::test_support::user_jsonl_line("hello");
+        std::fs::write(&session, format!("{line}\n")).unwrap();
+        std::fs::write(&sidecar, format!("{line}\n")).unwrap();
+
+        let key = conversation_key_for_path(&env, &config, &sidecar)
+            .unwrap()
+            .expect("the sidecar's key");
+        assert_eq!(key.path, sidecar);
+        assert_eq!(key.session_id, "a1");
+        assert_eq!(key.project_dir_name, "-work-a");
+    }
+
+    #[test]
     fn conversation_key_for_path_resolves_only_discovered_transcripts() {
         // K8: the viewer's file maps to its own agent key; exports, copies
         // and same-named files elsewhere never resolve to another file.
@@ -662,7 +932,7 @@ mod tests {
         let key = conversation_key_for_path(&env, &config, &first)
             .unwrap()
             .expect("an in-root transcript has a key");
-        assert_eq!(key.source, Source::Claude);
+        assert_eq!(key.source, SourceKind::Claude);
         assert_eq!(key.project_dir_name, "-work-a");
         assert_eq!(key.path, first);
         let fork_key = conversation_key_for_path(&env, &config, &fork)
@@ -674,7 +944,7 @@ mod tests {
             fork_key.conversation_ref().full_ref()
         );
         // The full ref addresses exactly this transcript.
-        let keys = crate::agent::service::discover_agent_keys(&env, None)
+        let keys = crate::agent::service::discover_agent_keys(&env, None, None, true)
             .unwrap()
             .0;
         let resolved = resolve_conversation_ref(&keys, &key.conversation_ref().full_ref()).unwrap();
@@ -714,59 +984,106 @@ mod tests {
         let pi_key = conversation_key_for_path(&env, &config, &pi)
             .unwrap()
             .expect("a Pi session has a key");
-        assert_eq!(pi_key.source, Source::Pi);
+        assert_eq!(pi_key.source, SourceKind::Pi);
         assert_eq!(pi_key.path, pi);
     }
 
-    #[test]
-    fn pi_refs_include_source_project_and_header_session_identity() {
-        let pi = AgentConversationKey {
-            source: Source::Pi,
+    fn pi(native_id: &str, session_id: &str) -> AgentConversationKey {
+        let path = PathBuf::from(format!("/sessions/{native_id}"));
+        AgentConversationKey {
+            source: SourceKind::Pi,
             project_dir_name: "/tmp/project".to_owned(),
-            session_filename: "2024_custom_id_with_underscores.jsonl".to_owned(),
-            session_id: "custom_id_with_underscores".to_owned(),
-            path: PathBuf::from("/sessions/2024_custom_id_with_underscores.jsonl"),
-        };
-        let other_project = AgentConversationKey {
-            project_dir_name: "/tmp/other".to_owned(),
+            session_filename: path.file_name().unwrap().to_str().unwrap().to_owned(),
+            session_id: session_id.to_owned(),
+            path,
+            root: PathBuf::from("/sessions"),
+            native_id: native_id.to_owned(),
+        }
+    }
+
+    #[test]
+    fn refs_digest_the_source_instance_and_native_id() {
+        let pi = pi(
+            "--tmp-project--/2024_custom_id_with_underscores.jsonl",
+            "custom_id_with_underscores",
+        );
+        let omp = AgentConversationKey {
+            source: SourceKind::Omp,
             ..pi.clone()
         };
-        let claude = key("/tmp/project", "custom_id_with_underscores.jsonl");
-        let omp = AgentConversationKey {
-            source: Source::Omp,
+        let other_root = AgentConversationKey {
+            root: PathBuf::from("/other"),
+            ..pi.clone()
+        };
+        let moved_project = AgentConversationKey {
+            project_dir_name: "/tmp/other".to_owned(),
             ..pi.clone()
         };
 
         assert_eq!(pi.conversation_ref().uuid(), "custom_id_with_underscores");
         assert_ne!(
             pi.conversation_ref().full_ref(),
-            other_project.conversation_ref().full_ref()
-        );
-        assert_ne!(
-            pi.conversation_ref().full_ref(),
             omp.conversation_ref().full_ref()
         );
         assert_ne!(
             pi.conversation_ref().full_ref(),
-            claude.conversation_ref().full_ref()
+            other_root.conversation_ref().full_ref()
         );
+        // The project a session ran in is not part of its identity.
+        assert_eq!(
+            pi.conversation_ref().full_ref(),
+            moved_project.conversation_ref().full_ref()
+        );
+        assert_ne!(
+            pi.legacy_ref().full_ref(),
+            moved_project.legacy_ref().full_ref()
+        );
+        assert_ne!(pi.conversation_ref(), pi.legacy_ref());
         assert!(pi.conversation_ref().canonical().starts_with("ch_"));
     }
 
     #[test]
-    fn pi_refs_distinguish_duplicate_session_ids_in_one_project() {
-        let first = AgentConversationKey {
-            source: Source::Pi,
+    fn codex_refs_hold_across_rollouts_of_a_thread() {
+        let thread = "019a0000-0000-7000-8000-000000000001";
+        let codex = |path: &str| AgentConversationKey {
+            source: SourceKind::Codex,
             project_dir_name: "/tmp/project".to_owned(),
-            session_filename: "first.jsonl".to_owned(),
-            session_id: "copied-session".to_owned(),
-            path: PathBuf::from("/sessions/first.jsonl"),
+            session_filename: format!("rollout-{thread}.jsonl"),
+            session_id: thread.to_owned(),
+            path: PathBuf::from(path),
+            root: PathBuf::from("/home/.codex"),
+            native_id: thread.to_owned(),
         };
-        let second = AgentConversationKey {
-            session_filename: "second.jsonl".to_owned(),
-            path: PathBuf::from("/sessions/second.jsonl"),
-            ..first.clone()
-        };
+        let live = codex("/home/.codex/sessions/2026/10/16/rollout-a.jsonl");
+        let reverted = codex("/home/.codex/sessions/2026/10/17/rollout-b.jsonl");
+        let archived = codex("/home/.codex/archived_sessions/rollout-b.jsonl");
+
+        assert_eq!(live.conversation_ref(), reverted.conversation_ref());
+        assert_eq!(live.conversation_ref(), archived.conversation_ref());
+    }
+
+    #[test]
+    fn legacy_refs_resolve_to_the_current_ref() {
+        let claude = key("project-a", "12345678-1234-4234-9234-123456789abc.jsonl");
+        let pi = pi("--tmp--/2024_session.jsonl", "session");
+        let keys = vec![claude.clone(), pi.clone()];
+        for key in &keys {
+            let legacy = key.legacy_ref();
+            let resolved = resolve_conversation_ref(&keys, &legacy.canonical()).unwrap();
+            assert_eq!(resolved.key, *key);
+            assert_eq!(
+                resolved.reference.full_ref(),
+                key.conversation_ref().full_ref()
+            );
+            let full = resolve_conversation_ref(&keys, &legacy.full_ref()).unwrap();
+            assert_eq!(full.key, *key);
+        }
+    }
+
+    #[test]
+    fn pi_refs_distinguish_duplicate_session_ids_in_one_project() {
+        let first = pi("--tmp-project--/first.jsonl", "copied-session");
+        let second = pi("--tmp-project--/second.jsonl", "copied-session");
 
         assert_ne!(
             first.conversation_ref().full_ref(),
@@ -786,9 +1103,9 @@ mod tests {
 
     #[test]
     fn emitted_refs_extend_colliding_minimum_prefixes() {
-        let mut first = AgentConversationRef::from_parts("project-a", "one.jsonl");
+        let mut first = key("project-a", "one.jsonl").conversation_ref();
         first.digest_hex = "aaaaaaaaaaaa0bbbbbbbbbbbbbbbbbbb".to_string();
-        let mut second = AgentConversationRef::from_parts("project-b", "two.jsonl");
+        let mut second = key("project-b", "two.jsonl").conversation_ref();
         second.digest_hex = "aaaaaaaaaaaa1ccccccccccccccccccc".to_string();
 
         let emitted = unique_emitted_references(&[first, second]);
@@ -800,8 +1117,8 @@ mod tests {
     #[test]
     fn emitted_refs_keep_documented_twelve_hex_minimum() {
         let refs = unique_emitted_references(&[
-            AgentConversationRef::from_parts("project-a", "one.jsonl"),
-            AgentConversationRef::from_parts("project-b", "two.jsonl"),
+            key("project-a", "one.jsonl").conversation_ref(),
+            key("project-b", "two.jsonl").conversation_ref(),
         ]);
 
         assert!(
@@ -832,9 +1149,9 @@ mod tests {
 
     #[test]
     fn duplicate_full_digests_emit_full_refs() {
-        let mut first = AgentConversationRef::from_parts("project-a", "one.jsonl");
+        let mut first = key("project-a", "one.jsonl").conversation_ref();
         first.digest_hex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
-        let mut second = AgentConversationRef::from_parts("project-b", "two.jsonl");
+        let mut second = key("project-b", "two.jsonl").conversation_ref();
         second.digest_hex = first.digest_hex.clone();
 
         let emitted = unique_emitted_references(&[first, second]);
@@ -857,20 +1174,14 @@ mod tests {
 
     #[test]
     fn canonical_ref_is_internal_digest_ref() {
-        let reference = AgentConversationRef::from_parts(
-            "project-a",
-            "12345678-1234-4234-9234-123456789abc.jsonl",
-        );
-        assert_eq!(reference.canonical(), "ch_98bd40760a01");
+        let key = key("project-a", "12345678-1234-4234-9234-123456789abc.jsonl");
+        let reference = key.conversation_ref();
+        assert_eq!(reference.canonical().len(), "ch_".len() + 12);
         assert_eq!(reference.full_ref().len(), "ch_".len() + DIGEST_HEX_LEN);
         assert_eq!(reference.uuid(), "12345678-1234-4234-9234-123456789abc");
-        assert_eq!(
-            reference,
-            AgentConversationRef::from_parts(
-                "project-a",
-                "12345678-1234-4234-9234-123456789abc.jsonl"
-            )
-        );
+        assert_eq!(reference, key.conversation_ref());
+        // Refs agents were given before keep their digest.
+        assert_eq!(key.legacy_ref().canonical(), "ch_98bd40760a01");
     }
 
     #[test]
@@ -917,7 +1228,7 @@ mod tests {
         let uuid = "01a082ad-c8d8-7149-8d3e-dd8f74bb7ed4";
         let stem = format!("2026-09-08T20-20-22-361Z_{uuid}");
         let mut pi = key("project-a", &format!("{stem}.jsonl"));
-        pi.source = Source::Pi;
+        pi.source = SourceKind::Pi;
         pi.session_id = uuid.to_owned();
         let keys = vec![pi.clone()];
         for input in [uuid.to_owned(), stem.clone(), format!("{stem}.jsonl")] {
@@ -950,10 +1261,12 @@ mod tests {
     fn candidate_lines_map_back_to_full_refs_for_every_source() {
         let uuid = "01a082ad-c8d8-7149-8d3e-dd8f74bb7ed4";
         let mut pi = key("/work/a", &format!("2026-01-01T00-00-00-000Z_{uuid}.jsonl"));
-        pi.source = Source::Pi;
+        pi.source = SourceKind::Pi;
         pi.session_id = uuid.to_owned();
         let mut pi_b = pi.clone();
         pi_b.project_dir_name = "/work/b".to_owned();
+        // Refs digest the native id: the copy lives in its own session directory.
+        pi_b.native_id = format!("--work-b--/{}", pi_b.session_filename);
         let claude = key("-work-a", "12345678-1234-4234-9234-123456789abc.jsonl");
         let keys = vec![pi.clone(), pi_b.clone(), claude.clone()];
 
@@ -992,7 +1305,7 @@ mod tests {
         );
         // An OMP session maps to its own full ref, also when ambiguous.
         let mut omp = key("/work/a", &format!("2026-01-01T00-00-00-000Z_{uuid}.jsonl"));
-        omp.source = Source::Omp;
+        omp.source = SourceKind::Omp;
         omp.session_id = uuid.to_owned();
         let keys = vec![pi.clone(), omp.clone()];
         let full = full_ref_for_candidate(&keys, "omp", "/work/a", &omp.session_filename).unwrap();
@@ -1009,11 +1322,9 @@ mod tests {
             key("project-a", "12345678-1234-4234-9234-123456789abc.jsonl"),
             key("project-b", "87654321-1234-4234-9234-123456789abc.jsonl"),
         ];
-        let internal = AgentConversationRef::from_parts(
-            "project-a",
-            "12345678-1234-4234-9234-123456789abc.jsonl",
-        )
-        .digest_hex;
+        let internal = key("project-a", "12345678-1234-4234-9234-123456789abc.jsonl")
+            .conversation_ref()
+            .digest_hex;
         let resolved = resolve_conversation_ref(&keys, &format!("ch_{}", &internal[..8])).unwrap();
         assert_eq!(
             resolved.key.session_filename,
@@ -1123,10 +1434,10 @@ mod tests {
 
     #[test]
     fn validates_focus_inside_read_ranges() {
-        let reads = vec![parse_read_ref("ch_12345678:m2..m5").unwrap()];
+        let reads = [parse_read_ref("ch_12345678:m2..m5").unwrap()];
         let resolved = ResolvedConversation {
             key: key("project-a", "one.jsonl"),
-            reference: AgentConversationRef::from_parts("project-a", "one.jsonl"),
+            reference: key("project-a", "one.jsonl").conversation_ref(),
         };
         let resolved_reads = vec![(reads[0].clone(), resolved)];
         validate_resolved_focus_in_ranges(&resolved_reads, &parse_focus_ref("m3").unwrap(), None)
@@ -1142,17 +1453,17 @@ mod tests {
 
     #[test]
     fn bare_focus_is_rejected_for_multiple_conversations() {
-        let reads = vec![
+        let reads = [
             parse_read_ref("ch_12345678:m1..m5").unwrap(),
             parse_read_ref("ch_87654321:m1..m5").unwrap(),
         ];
         let first = ResolvedConversation {
             key: key("project-a", "one.jsonl"),
-            reference: AgentConversationRef::from_parts("project-a", "one.jsonl"),
+            reference: key("project-a", "one.jsonl").conversation_ref(),
         };
         let second = ResolvedConversation {
             key: key("project-b", "two.jsonl"),
-            reference: AgentConversationRef::from_parts("project-b", "two.jsonl"),
+            reference: key("project-b", "two.jsonl").conversation_ref(),
         };
         let resolved_reads = vec![(reads[0].clone(), first), (reads[1].clone(), second)];
         let err = validate_resolved_focus_in_ranges(

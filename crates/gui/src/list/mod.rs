@@ -3,9 +3,12 @@
 //! `ListPane` owns core's `Browser` and `HistoryLoader` exclusively (UI
 //! thread, bounded work only: every O(corpus) or I/O step runs on core
 //! threads or GUI background tasks, K1–K4) and renders the visible rows
-//! with a `uniform_list`. Results arrive through the waker: a bounded
+//! with a `uniform_list`. The rows are the cards of the store's generation
+//! (store mode, upstream 358becb), or the history loaded in memory when the
+//! store is off. Results arrive through the waker: a bounded
 //! `async_channel` wakes `_poll_task`, which drains the loader and the
-//! search workers (`poll_all`).
+//! search workers (`poll_all`) and then yields, so a frame can be drawn
+//! between polls while the loader streams batches.
 //!
 //! Frozen contracts this pane follows:
 //! * key contexts: `ConversationList` on the pane root, `ListToolbar` on the
@@ -49,11 +52,12 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
 use claude_history_core::browser::{
-    Browser, BrowserOptions, HistoryLoader, ListSearchMode, LoaderOptions, RenameError,
+    Browser, BrowserOptions, HistoryLoader, ListHit, ListSearchMode, LoaderOptions,
+    PreparedSession, RenameError, SemanticWorkerExit,
 };
 #[cfg(test)]
 use claude_history_core::browser::{LoadEvent, UuidLookup};
-use claude_history_core::display_format::HighlightQuery;
+use claude_history_core::display_format::{HighlightQuery, truncate_start};
 use claude_history_core::export::ExportOptions;
 use claude_history_core::history::Conversation;
 use claude_history_core::time_filter::TimeFilter;
@@ -62,7 +66,7 @@ use gpui_kit::component::scroll::Scrollbar;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Action, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    Action, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, Global,
     InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels, Point, Render,
     ScrollStrategy, SharedString, Styled as _, Subscription, Task, UniformListScrollHandle, Window,
     div, px, uniform_list,
@@ -72,7 +76,7 @@ use crate::actions::*;
 use crate::exit;
 use crate::globals::{ActivePane, BusyTimer, UiBusy, app_state, update_app_state};
 use crate::keymap::CTX_LIST;
-use crate::model::{AgentTab, ConversationTarget, HeaderInfo, PaneFocus};
+use crate::model::{AgentTab, ConversationTarget, FamilyMember, HeaderInfo, PaneFocus};
 #[cfg(any(test, feature = "qa"))]
 use crate::notify::ToastKind;
 use crate::notify::{self, Toast};
@@ -82,13 +86,22 @@ use crate::workspace::routing::{self, SessionRoute};
 use load::{ReloadState, ViewState};
 use rows::{RowContext, RowStyle};
 
-/// Events of the conversation list (§7.2).
+/// Events of the conversation list (§7.2). The search hit of the selected
+/// row ([`ListPane::list_hit_for`]) goes with `SelectionChanged` and
+/// `OpenRequested`: the workspace reads it when it handles them.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ListPaneEvent {
     /// Selection changed (any cause). `user` = keyboard/mouse navigation by the user.
     SelectionChanged {
         target: Option<ConversationTarget>,
         user: bool,
+    },
+    /// The selected row stayed, but its search hit changed: the query was
+    /// edited or cleared, or semantic results brought other evidence
+    /// (upstream 411e227 list preview; `None`: the query is blank).
+    HitChanged {
+        target: ConversationTarget,
+        hit: Option<ListHit>,
     },
     /// Enter / double-click / row-menu Open; with `agent_tab` also the agent
     /// panel on that tab (row menu Search within conversation… / Outline,
@@ -109,16 +122,36 @@ pub enum ListPaneEvent {
 /// semantic worker reports `InitializingModel`: the shared embedder loads its
 /// model lazily at the first embedding call, which would hide the model load
 /// behind `Embedding 0/n` (the TUI created the embedder eagerly). The warm-up
-/// call embeds nothing; its result is ignored (a load failure shows again at
-/// the first real call).
+/// call embeds nothing. A load failure fails the factory, so the search or
+/// prewarm that needed the model reports it: the first real embedding runs
+/// in the worker's background indexing (upstream c6d0421), where nothing
+/// would report it to a prewarm. The worker calls the factory again for the
+/// next search.
 fn warmed_factory(
     inner: claude_history_core::browser::SemanticEmbedderFactory,
 ) -> claude_history_core::browser::SemanticEmbedderFactory {
     Arc::new(move || {
         let mut embedder = inner()?;
-        let _ = embedder.embed_passages(&[]);
+        embedder.embed_passages(&[])?;
         Ok(embedder)
     })
+}
+
+/// Return to the executor once. gpui's Windows platform draws a pending
+/// frame between foreground tasks once they ran for about 10 ms; a task that
+/// never returns `Pending` is never interrupted.
+async fn yield_now() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded {
+            std::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await
 }
 
 /// Pasted text for the one-line search: `\r\n`, `\n`, `\r` and tabs become
@@ -137,12 +170,30 @@ const ROW_MENU_TOKENS_KEPT: usize = 8;
 const DEFAULT_VISIBLE_ROWS: usize = 10;
 /// The pane width assumed before the first layout (rem).
 const DEFAULT_PANE_REM: f32 = 30.0;
+/// The rem size assumed before the first frame (px).
+const DEFAULT_REM_PX: f32 = 16.0;
+/// The search input's text size (`Input::small`: `text_sm`), rem.
+const PROMPT_FONT_REM: f32 = 0.875;
+/// The share of the pane the prompt's folder takes before it is cut from
+/// the start (upstream 82b355a: a third of the search bar).
+const PROMPT_FOLDER_SHARE: f32 = 1.0 / 3.0;
+/// The fewest characters the prompt's folder keeps (upstream: 8 cells).
+const PROMPT_FOLDER_MIN_CHARS: usize = 8;
+
+/// How many characters of the prompt's folder fit about a third of a pane
+/// `pane_px` wide (average glyph width, like the rows' budgets).
+pub fn prompt_folder_chars(pane_px: f32, rem_px: f32) -> usize {
+    let avg = (PROMPT_FONT_REM * rem_px * rows::AVG_CHAR_WIDTH_EM).max(1.0);
+    ((pane_px * PROMPT_FOLDER_SHARE / avg).floor() as usize).max(PROMPT_FOLDER_MIN_CHARS)
+}
 
 /// Measurements the render pass records for the next frame.
 #[derive(Clone, Copy, Debug, Default)]
 struct Metrics {
     /// The pane's width in px (last layout).
     pane_width: Option<Pixels>,
+    /// The window's rem size in px (last frame).
+    rem: Option<Pixels>,
 }
 
 /// The conversation list.
@@ -159,6 +210,9 @@ pub struct ListPane {
     loader_env: Arc<claude_history_core::HistoryEnv>,
     /// `(loading, refreshing)` as last announced with `LoadStateChanged`.
     load_flags: (bool, bool),
+    /// Whether the store was reconciling at the last poll (a transition to
+    /// `false` announces `CorpusChanged`: the list may now be complete).
+    was_reconciling: bool,
     view: ViewState,
     scroll: UniformListScrollHandle,
     /// `HighlightQuery::parse` of the query, parsed once per query change.
@@ -167,6 +221,12 @@ pub struct ListPane {
     now: DateTime<Local>,
     /// The path whose `SelectionChanged` was emitted last.
     emitted_selection: Option<PathBuf>,
+    /// The selected row index when `emitted_selection` was last checked: a kept
+    /// path that moved (refreshed results) is scrolled back into view.
+    emitted_position: Option<usize>,
+    /// The search hit of the selected row when the last `SelectionChanged`
+    /// or `HitChanged` was emitted.
+    emitted_hit: Option<ListHit>,
     /// `[tui] exclude_projects` (for the empty-scope state, L-079).
     exclude_projects: Vec<String>,
     time_filter: TimeFilter,
@@ -228,6 +288,10 @@ pub struct ListPane {
     #[cfg(test)]
     loading_snapshots: Vec<LoadingSnapshot>,
     _subscriptions: Vec<Subscription>,
+    /// Tests: the world's directory, released after `loader` (declared
+    /// before it, so dropped first) joined its reconcile pass.
+    #[cfg(test)]
+    _world_dir: Option<crate::test_support::WorldDir>,
 }
 
 /// The state right after a poll that appended batches mid-load (tests).
@@ -244,6 +308,23 @@ pub(crate) struct LoadingSnapshot {
 thread_local! {
     /// The next `ListPane::new` on this thread starts with its poll loop paused.
     pub(crate) static PAUSE_NEW_POLLS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the list comes from the store's generations (store mode: the
+/// rows are cards, a reconcile pass keeps the store up to date with the
+/// session files and each newer generation is swapped in; DESIGN §11.2,
+/// upstream 3708bb6, e905169, 358becb). Off, the history is loaded in memory.
+/// On unless set: `app::init_for_test` sets it on too, and
+/// `test_support::use_memory_list` turns it off for tests of the in-memory
+/// loader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ListSnapshots(pub bool);
+
+impl Global for ListSnapshots {}
+
+fn snapshots_enabled(cx: &App) -> bool {
+    cx.try_global::<ListSnapshots>()
+        .is_none_or(|snapshots| snapshots.0)
 }
 
 /// A toast the list pushed (tests and QA read them; `LastToast` only keeps the last text).
@@ -269,19 +350,21 @@ impl ListPane {
         let focus = cx.focus_handle();
         let toolbar_focus = cx.focus_handle();
 
-        let (env, workspace, mode, local, launch_filter, show_last, excluded, recents) = {
+        let (env, workspace, mode, local, all_kinds, launch_filter, show_last, excluded, recents) = {
             let state = app_state(cx);
             (
                 state.env.clone(),
                 state.workspace.clone(),
                 state.list_mode,
                 state.launch.args.local,
+                state.launch.args.all_kinds,
                 state.launch.time_filter,
                 state.settings.show_last,
                 state.settings.exclude_projects.clone(),
                 state.ui.recent_workspaces.clone(),
             )
         };
+        let excluded_paths = app_state(cx).settings.exclude_paths.clone();
         let level = Some(crate::debug_sink::capture_level(cx));
 
         // The waker: worker threads post to a one-slot channel, the poll task
@@ -295,19 +378,33 @@ impl ListPane {
             .with_show_last(show_last)
             .with_default_mode(mode)
             .with_exclude_projects(excluded.clone())
+            .with_exclude_paths(excluded_paths)
             .with_workspace(workspace.clone())
             .with_workspace_filter(local && workspace.is_some())
+            .with_all_kinds(all_kinds)
             .with_waker(waker.clone())
             .with_embedder_factory(warmed_factory(crate::embedder::browser_factory(cx)));
-        let browser = Browser::new_loading(options);
+        let mut browser = Browser::new_loading(options);
         let loader_env = env.clone();
         let mut loader = HistoryLoader::new(
             env,
             LoaderOptions::new(show_last)
                 .with_debug_level(level)
                 .with_time_filter(launch_filter)
-                .with_waker(waker),
+                .with_waker(waker)
+                .with_snapshot(snapshots_enabled(cx)),
         );
+        // Store mode: the first frame lists the newest cards of the store's
+        // current generation (bounded: the manifest is mapped and validated,
+        // at most `SNAPSHOT_ROWS` cards are built). Core materializes every
+        // card and opens the generation's index on its own thread, and a
+        // later poll installs them (`Loaded`, keeping the selection); the
+        // initial load is a reconcile pass whose newer generations are
+        // swapped in (§11.2). Without a generation the rows wait for the
+        // first one the pass publishes; with the store off they stream in.
+        if let Some(snapshot) = loader.open_snapshot() {
+            browser.show_snapshot(snapshot);
+        }
         loader.start_initial_load();
 
         let poll_task = cx.spawn_in(window, async move |this, cx| {
@@ -330,6 +427,11 @@ impl ListPane {
                     Ok(None) => {}
                     Err(_) => break,
                 }
+                // Hand the UI thread back before the next poll: a wake that
+                // arrived meanwhile (for example a batch core's drain budget
+                // held back, §11.2) would otherwise be polled at once, and no
+                // frame would be drawn while batches keep coming.
+                yield_now().await;
             }
         });
         let tick_task = cx.spawn(async move |this, cx| {
@@ -393,12 +495,15 @@ impl ListPane {
             loader,
             loader_env,
             load_flags: (true, false),
+            was_reconciling: false,
             view: ViewState::Loading,
             scroll: UniformListScrollHandle::new(),
             highlight: HighlightQuery::parse(""),
             literal: false,
             now,
             emitted_selection: None,
+            emitted_position: None,
+            emitted_hit: None,
             exclude_projects: excluded,
             time_filter: launch_filter,
             time_label: crate::widgets::time_range::launch_filter_label(&launch_filter, now),
@@ -442,6 +547,8 @@ impl ListPane {
             #[cfg(test)]
             loading_snapshots: Vec::new(),
             _subscriptions: subscriptions,
+            #[cfg(test)]
+            _world_dir: cx.try_global::<crate::test_support::WorldDir>().cloned(),
         };
         this.refresh_recent_workspaces(recents, cx);
         this
@@ -479,6 +586,17 @@ impl ListPane {
             .map(ConversationTarget::from_conversation)
     }
 
+    /// The search hit the viewer shows `path` at, when `path` is the
+    /// selected row and the query is not blank (core `Browser::list_hit`,
+    /// upstream 411e227 list preview; L-109).
+    pub fn list_hit_for(&self, path: &Path) -> Option<ListHit> {
+        let selected = self.browser.selected_conversation()?;
+        if !path_matches(&selected.path, path) {
+            return None;
+        }
+        self.browser.list_hit()
+    }
+
     /// The loaded conversation at `path` (live `project_path`).
     pub fn conversation(&self, path: &Path) -> Option<Arc<Conversation>> {
         self.conversation_index(path)
@@ -497,7 +615,10 @@ impl ListPane {
             self.browser
                 .conversations()
                 .iter()
-                .position(|conversation| path_matches(&conversation.path, path))
+                .enumerate()
+                .position(|(index, conversation)| {
+                    path_matches(&conversation.path, path) && !self.browser.is_hidden(index)
+                })
         } else {
             None
         }
@@ -520,12 +641,14 @@ impl ListPane {
     }
 
     /// The distinct working directories recorded by the loaded Pi/OMP
-    /// conversations (PD3 rule 3 (c), L-082: the main window passes them to
+    /// conversations (every listed, i.e. not automated or child, non-Claude source; PD3 rule 3 (c), L-082: the main window passes them to
     /// `startup::apply_recorded_cwd_workspace` after the first load).
     pub fn recorded_agent_cwds(&self) -> Vec<PathBuf> {
         let mut cwds: Vec<PathBuf> = Vec::new();
         for conversation in self.browser.conversations() {
-            if conversation.source == claude_history_core::history::Source::Claude {
+            if conversation.source == claude_history_core::history::model::SourceKind::Claude
+                || conversation.provenance.hidden_by_default()
+            {
                 continue;
             }
             if let Some(cwd) = &conversation.cwd
@@ -537,10 +660,26 @@ impl ListPane {
         cwds
     }
 
-    /// The viewer header for `path` from the live corpus (`None`: not loaded).
+    /// The viewer header for `path` from the live corpus (`None`: not
+    /// loaded), with the conversation's parent, subagents and forks (core
+    /// `Browser::family_of` over every card, hidden ones included; upstream
+    /// 3c2ffeb).
     pub fn header_info(&self, path: &Path) -> Option<HeaderInfo> {
-        self.conversation(path)
-            .map(|conversation| HeaderInfo::from_conversation(&conversation))
+        self.conversation(path).map(|conversation| {
+            let mut info = HeaderInfo::from_conversation(&conversation);
+            // Cards carry no parse errors: the viewer counts them.
+            info.parse_errors_known = !self.browser.shows_snapshot();
+            let family = self.browser.family_of(&conversation.path);
+            info.family.parent = family
+                .parent
+                .map(|parent| FamilyMember::from_conversation(&parent));
+            info.family.children = family
+                .children
+                .iter()
+                .map(|child| FamilyMember::from_conversation(child))
+                .collect();
+            info
+        })
     }
 
     /// Select the row of `path`; `false` when it is not listed.
@@ -557,9 +696,28 @@ impl ListPane {
         true
     }
 
+    /// Store mode: a reconcile pass runs or is due, or a generation it
+    /// published is still being opened. `false` once the newest generation
+    /// is shown in full (always `false` in memory). On a fresh store the
+    /// list is partial until the first pass is done.
+    pub fn is_reconciling(&self) -> bool {
+        self.loader.uses_store()
+            && (self.browser.readiness().reconcile
+                == claude_history_core::browser::ReconcileState::Running
+                || self.loader.is_preparing())
+    }
+
     /// Whether the initial load is still running.
     pub fn is_loading(&self) -> bool {
         matches!(self.view, ViewState::Loading)
+    }
+
+    /// Whether the rows are listed newest first and can be opened, resumed
+    /// and forked: the first cards of the generation during the initial
+    /// load, else once it has finished (core's `Readiness::list`). Rename and
+    /// delete wait for [`ListPane::is_loading`] to end (AD6).
+    pub fn list_ready(&self) -> bool {
+        self.browser.readiness().list
     }
 
     pub fn mode(&self) -> ListSearchMode {
@@ -570,17 +728,54 @@ impl ListPane {
         self.browser.workspace_filter()
     }
 
+    /// Whether automated (Codex exec) and subagent conversations are listed
+    /// (upstream cb990e6, `ToggleAllKinds`).
+    pub fn all_kinds(&self) -> bool {
+        self.browser.all_kinds()
+    }
+
+    /// Whether search is limited to the user's own messages (upstream
+    /// ae7ae39, `ToggleUserOnly`), whatever the mode.
+    pub fn user_only(&self) -> bool {
+        self.browser.user_only()
+    }
+
+    /// Whether the current query matches only the user's own messages: the
+    /// toggle is on and the mode is lexical (semantic search ignores it).
+    pub fn searches_user_only(&self) -> bool {
+        self.browser.searches_user_only()
+    }
+
     pub fn has_workspace(&self) -> bool {
         self.browser.has_project_context()
     }
 
-    /// The prompt in front of the query: `❯`, or `Project ❯` with the
+    /// The folder in front of the prompt while the Workspace scope is on
+    /// (L-031, upstream 82b355a): the workspace with `~` for the home
+    /// directory (core `Browser::workspace_display`), cut from the start
+    /// (`…/group/repo`) when it would take more than about a third of the
+    /// pane; `Project` without a workspace.
+    pub fn prompt_folder(&self) -> Option<String> {
+        if !self.scope_is_workspace() {
+            return None;
+        }
+        let metrics = self.metrics.get();
+        let rem = metrics.rem.map_or(DEFAULT_REM_PX, |rem| rem.as_f32());
+        let pane = metrics
+            .pane_width
+            .map_or(DEFAULT_PANE_REM * rem, |width| width.as_f32());
+        Some(match self.browser.workspace_display() {
+            Some(folder) => truncate_start(&folder, prompt_folder_chars(pane, rem)),
+            None => "Project".to_string(),
+        })
+    }
+
+    /// The prompt in front of the query: `❯`, or `<folder> ❯` with the
     /// Workspace scope (L-031).
-    pub fn prompt_text(&self) -> &'static str {
-        if self.scope_is_workspace() {
-            "Project ❯"
-        } else {
-            "❯"
+    pub fn prompt_text(&self) -> String {
+        match self.prompt_folder() {
+            Some(folder) => format!("{folder} ❯"),
+            None => "❯".to_string(),
         }
     }
 
@@ -620,15 +815,16 @@ impl ListPane {
         }
     }
 
-    /// Apply a rename written in the background (K3).
+    /// Apply a rename written in the background (K3). The session's text is
+    /// normalized there too ([`PreparedSession::new`]), not on this thread.
     pub fn apply_renamed(
         &mut self,
         path: &Path,
-        renamed: Conversation,
+        renamed: PreparedSession,
         cx: &mut Context<Self>,
     ) -> Result<(), RenameError> {
         let started = Instant::now();
-        let result = self.browser.apply_renamed(path, renamed);
+        let result = self.browser.apply_renamed_session(path, renamed);
         if result.is_ok() {
             self.after_corpus_edit(cx);
         }
@@ -659,6 +855,18 @@ impl ListPane {
         self.browser.excluded_projects()
     }
 
+    /// `[tui] exclude_paths` changed in Settings (upstream 982aea9; the
+    /// fork applies it without a restart, like `exclude_projects`).
+    pub fn set_exclude_paths(&mut self, excluded: Vec<String>, cx: &mut Context<Self>) {
+        self.browser.set_excluded_paths(excluded);
+        self.after_filter_change(cx);
+    }
+
+    /// The excluded working-directory prefixes the list currently applies.
+    pub fn excluded_paths(&self) -> &[String] {
+        self.browser.excluded_paths()
+    }
+
     /// Whether previews show the last messages.
     pub fn show_last(&self) -> bool {
         self.browser.show_last()
@@ -671,19 +879,24 @@ impl ListPane {
             return;
         }
         self.browser.set_show_last(show_last);
-        if !self.loader.is_running() {
-            let mut options = self.loader.options().clone();
-            options.show_last = show_last;
-            self.loader = HistoryLoader::new(self.loader_env.clone(), options);
+        // Store mode: reconfiguring is safe while a pass runs, the next poll
+        // reopens the generation with the new preview. In memory a running
+        // load keeps its stream: the loader follows when it ends (the
+        // queued reload in `start_queued_reload`).
+        if self.loader.uses_store() || !self.loader.is_running() {
+            self.sync_loader_show_last();
         }
         self.refresh(cx);
     }
 
-    /// Semantic gate entered (§7.6): join the semantic worker, footer `sem paused`.
-    pub fn suspend_semantic(&mut self, cx: &mut Context<Self>) {
+    /// Semantic gate entered (§7.6): stop the semantic worker, footer `sem
+    /// paused`. The worker may still be finishing its current step: the
+    /// returned exit joins it, off the UI thread (core K6).
+    pub fn suspend_semantic(&mut self, cx: &mut Context<Self>) -> SemanticWorkerExit {
         self.semantic_suspended = true;
-        self.browser.suspend_semantic();
+        let exit = self.browser.suspend_semantic();
         cx.notify();
+        exit
     }
 
     /// Semantic gate left: the worker restarts and reloads the cache.
@@ -737,6 +950,12 @@ impl ListPane {
         } else if any.is::<ToggleScope>() {
             let next = !self.scope_is_workspace();
             self.set_scope_workspace(next, cx);
+        } else if any.is::<ToggleAllKinds>() {
+            let next = !self.all_kinds();
+            self.set_all_kinds(next, cx);
+        } else if any.is::<ToggleUserOnly>() {
+            let next = !self.user_only();
+            self.set_user_only(next, cx);
         } else if any.is::<ShowSemanticDetails>() {
             self.show_semantic_details(window, cx);
         } else if any.is::<Refresh>() {
@@ -772,6 +991,31 @@ impl ListPane {
         };
         update_app_state(cx, |state, _| state.ui.search_mode = Some(remembered));
         crate::persist::schedule_save(cx);
+    }
+
+    /// List or hide automated (Codex exec) and subagent conversations,
+    /// keeping the query and the selected conversation (core
+    /// `Browser::set_all_kinds`; not remembered, as upstream).
+    pub fn set_all_kinds(&mut self, all_kinds: bool, cx: &mut Context<Self>) {
+        if self.all_kinds() == all_kinds {
+            return;
+        }
+        self.browser.set_all_kinds(all_kinds);
+        // The selected conversation stays selected but moves when rows come
+        // in above it (or go): keep it in view.
+        self.scroll_to_selection();
+        self.after_filter_change(cx);
+    }
+
+    /// Search only the user's own messages, or everything again, keeping
+    /// the query and the selected conversation (core
+    /// `Browser::set_user_only`; not remembered, as upstream).
+    pub fn set_user_only(&mut self, user_only: bool, cx: &mut Context<Self>) {
+        if self.user_only() == user_only {
+            return;
+        }
+        self.browser.set_user_only(user_only);
+        self.after_filter_change(cx);
     }
 
     fn set_scope_workspace(&mut self, workspace: bool, cx: &mut Context<Self>) {
@@ -846,6 +1090,9 @@ impl ListPane {
         self.highlight = HighlightQuery::parse(&query);
         self.literal = rows::literal_mode_of(&self.highlight, &query);
         self.browser.set_query(query);
+        // The selected row's hit follows the query at once (the rows follow
+        // when the search answers).
+        self.emit_hit(cx);
         self.check_uuid_lookup(window, cx);
         cx.notify();
     }
@@ -905,18 +1152,41 @@ impl ListPane {
     }
 
     /// Emit `SelectionChanged` when the selected path differs from the last
-    /// one emitted.
+    /// one emitted, else `HitChanged` when only its search hit did.
     fn emit_selection(&mut self, user: bool, cx: &mut Context<Self>) {
         let path = self.browser.selected_path();
+        let position = self.browser.selected();
         if path == self.emitted_selection {
+            if position != self.emitted_position {
+                // The same row moved (refreshed results): keep it in view.
+                self.emitted_position = position;
+                self.scroll_to_selection();
+            }
+            self.emit_hit(cx);
             return;
         }
+        self.emitted_position = position;
         self.emitted_selection = path;
+        self.emitted_hit = self.browser.list_hit();
         // Every selection change keeps the row visible (§10.5): a new result
         // set resets the selection to row 0 without going through navigate().
         self.scroll_to_selection();
         let target = self.selected_target();
         cx.emit(ListPaneEvent::SelectionChanged { target, user });
+    }
+
+    /// Emit `HitChanged` when the selected row's search hit differs from
+    /// the last one emitted (the query changed, or semantic results brought
+    /// other evidence; upstream 411e227 re-finds the hit every frame).
+    fn emit_hit(&mut self, cx: &mut Context<Self>) {
+        let hit = self.browser.list_hit();
+        if hit == self.emitted_hit {
+            return;
+        }
+        self.emitted_hit = hit.clone();
+        if let Some(target) = self.selected_target() {
+            cx.emit(ListPaneEvent::HitChanged { target, hit });
+        }
     }
 
     /// Keyboard navigation: apply, keep the selection visible, notify.
@@ -1073,7 +1343,7 @@ impl ListPane {
         while self.row_menus.len() > ROW_MENU_TOKENS_KEPT {
             self.row_menus.pop_front();
         }
-        let model = context_menu::build(token, &target, self.is_loading(), cx);
+        let model = context_menu::build(token, &target, self.is_loading(), self.list_ready(), cx);
         context_menu::show(&model, at, window, cx);
         self.last_menu = Some(model);
     }
@@ -1113,11 +1383,17 @@ impl ListPane {
             }
             return;
         };
-        // While loading, Resume/Fork/Rename/Delete/Select no-op (AD6, quirk 3).
-        if self.is_loading()
-            && (routing::needs_known_source(action) || action.as_any().is::<SelectAndExit>())
-        {
-            return;
+        // While loading, Rename and Delete no-op; Resume, Fork and Select
+        // (Ctrl+O, picker) work once the rows are listed newest first:
+        // snapshot cards carry the path, source and project they need (AD6,
+        // quirk 3, upstream 3708bb6).
+        if self.is_loading() {
+            let any = action.as_any();
+            let edit = any.is::<Rename>() || any.is::<Delete>();
+            let act = any.is::<Resume>() || any.is::<Fork>() || any.is::<SelectAndExit>();
+            if edit || (act && !self.list_ready()) {
+                return;
+            }
         }
         match routing::run_session_action(action, target.clone(), options, window, cx) {
             SessionRoute::Open { agent_tab } => cx.emit(ListPaneEvent::OpenRequested {
@@ -1185,7 +1461,36 @@ impl ListPane {
             "list.total" => self.browser.conversations().len().to_string(),
             "list.loaded" => (!self.is_loading()).to_string(),
             "list.loading" => self.is_loading().to_string(),
+            // Rows listed newest first and actionable (the first cards while
+            // loading, upstream 3708bb6).
+            "list.ready" => self.list_ready().to_string(),
+            // Store mode: the rows are cards of this generation (upstream
+            // 358becb), empty with the store off.
+            "list.snapshot" => self.browser.shows_snapshot().to_string(),
+            "list.generation" => self
+                .browser
+                .generation_name()
+                .unwrap_or_default()
+                .to_string(),
+            // The store generation whose index lexical queries run on
+            // (upstream ac7f591), empty without one.
+            "list.index" => self
+                .browser
+                .search_index_generation()
+                .unwrap_or_default()
+                .to_string(),
             "list.refreshing" => self.is_refreshing().to_string(),
+            // Store mode: a reconcile pass runs or is due, or a generation it
+            // published is still being opened; `false` once the newest
+            // generation is shown in full (always `false` in memory).
+            "list.reconciling" => self.is_reconciling().to_string(),
+            // Store mode: the footer's indexing text while a pass is shown as
+            // indexing (upstream 04c714b), empty otherwise.
+            "list.indexing" => self
+                .browser
+                .indexing_status_text()
+                .map(|text| crate::notify::gui_text(&text))
+                .unwrap_or_default(),
             "list.query" => self.query(cx).to_string(),
             "list.query_calls" => self.query_calls.to_string(),
             "list.mode" => self.mode().label().to_string(),
@@ -1195,6 +1500,8 @@ impl ListPane {
                 "all"
             }
             .to_string(),
+            "list.all_kinds" => self.all_kinds().to_string(),
+            "list.user_only" => self.user_only().to_string(),
             "list.time" => self
                 .time_label
                 .as_ref()
@@ -1294,14 +1601,24 @@ impl Render for ListPane {
         let sidebar = theme.sidebar;
         let roles = crate::theme_tokens::roles(cx);
         let status = self.search_status();
-        let prompt = if self.scope_is_workspace() {
-            div()
+        let mut metrics = self.metrics.get();
+        if metrics.rem != Some(window.rem_size()) {
+            metrics.rem = Some(window.rem_size());
+            self.metrics.set(metrics);
+        }
+        let prompt = match self.prompt_folder() {
+            Some(folder) => div()
                 .flex()
                 .gap_1()
-                .child(div().text_color(roles.muted_foreground).child("Project"))
-                .child(div().text_color(roles.accent).child("❯"))
-        } else {
-            div().text_color(roles.accent).child("❯")
+                .child(
+                    div()
+                        .flex_none()
+                        .whitespace_nowrap()
+                        .text_color(roles.muted_foreground)
+                        .child(folder),
+                )
+                .child(div().text_color(roles.accent).child("❯")),
+            None => div().text_color(roles.accent).child("❯"),
         };
         let search = self.search.clone();
         let toolbar = toolbar::render_toolbar(self, cx);
@@ -1344,6 +1661,12 @@ impl Render for ListPane {
                 this.handle_forwarded(a, w, cx);
             }))
             .on_action(cx.listener(|this, a: &SetScopeWorkspace, w, cx| {
+                this.handle_forwarded(a, w, cx);
+            }))
+            .on_action(cx.listener(|this, a: &ToggleAllKinds, w, cx| {
+                this.handle_forwarded(a, w, cx);
+            }))
+            .on_action(cx.listener(|this, a: &ToggleUserOnly, w, cx| {
                 this.handle_forwarded(a, w, cx);
             }))
             .on_action(cx.listener(|this, _: &ShowSemanticDetails, w, cx| {
@@ -1462,6 +1785,10 @@ impl ListPane {
     ) -> Vec<gpui_kit::AnyElement> {
         let started = Instant::now();
         self.rendered_rows = range.clone();
+        // Store mode: the literal context of visible rows the search worker
+        // left without evidence is read from their text frames in the
+        // background (a later poll repaints them).
+        self.browser.fill_visible_evidence(range.clone());
         let roles = crate::theme_tokens::roles(cx);
         let mono = cx.theme().mono_font_family.clone();
         let rem = window.rem_size().as_f32();
@@ -1531,7 +1858,7 @@ impl ListPane {
     #[cfg(any(test, feature = "qa"))]
     pub fn debug_state(&self) -> String {
         format!(
-            "view={:?} mode={:?} query={:?} rows={} total={} in_flight={} progress={:?} activity={:?} error={:?} status={:?} loader_running={} refreshing={}",
+            "view={:?} mode={:?} query={:?} rows={} total={} in_flight={} progress={:?} indexing={:?} busy={} activity={:?} error={:?} status={:?} loader_running={} refreshing={}",
             self.view,
             self.mode(),
             self.browser.query(),
@@ -1539,6 +1866,8 @@ impl ListPane {
             self.browser.conversations().len(),
             self.browser.has_search_work_in_flight(),
             self.browser.semantic_progress(),
+            self.browser.semantic_indexing(),
+            self.browser.semantic_worker_busy(),
             self.browser.semantic_activity_status_text(),
             self.browser.semantic_error(),
             self.browser.search_status_text(),
@@ -1570,6 +1899,15 @@ impl ListPane {
         &self.loader
     }
 
+    /// Wait for the running reconcile pass and the ones asked for after it
+    /// (tests: before the world's temporary directory goes).
+    #[cfg(test)]
+    pub(crate) fn finish_snapshot_write(
+        &mut self,
+    ) -> Option<claude_history_core::store::generation::Publish> {
+        self.loader.finish_snapshot_write()
+    }
+
     /// The UUID lookup outcome of the current query (tests).
     #[cfg(test)]
     pub(crate) fn uuid_lookup(&self) -> Option<&UuidLookup> {
@@ -1598,6 +1936,12 @@ impl ListPane {
     #[cfg(test)]
     pub(crate) fn set_poll_paused(&mut self, paused: bool) {
         self.poll_paused = paused;
+    }
+
+    /// The preview mode the loader parses with (tests).
+    #[cfg(test)]
+    pub(crate) fn loader_show_last(&self) -> bool {
+        self.loader.options().show_last
     }
 
     /// The snapshots of mid-load polls (tests).

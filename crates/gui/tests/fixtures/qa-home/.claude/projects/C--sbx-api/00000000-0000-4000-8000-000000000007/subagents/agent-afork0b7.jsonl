@@ -1,0 +1,3 @@
+{"type":"fork-context-ref","agentId":"afork0b7","parentSessionId":"00000000-0000-4000-8000-000000000007"}
+{"type":"user","sessionId":"00000000-0000-4000-8000-000000000007","cwd":"C:\\sbx\\api","timestamp":"2026-09-01T10:05:00Z","message":{"role":"user","content":"<fork-boilerplate>\nYou are a forked agent.\n</fork-boilerplate>\n\nYour directive: how large is the LRU?"}}
+{"type":"assistant","sessionId":"00000000-0000-4000-8000-000000000007","cwd":"C:\\sbx\\api","timestamp":"2026-09-01T10:06:00Z","message":{"role":"assistant","model":"claude-opus-4-5","content":[{"type":"text","text":"It holds 512 entries."}],"usage":{"input_tokens":120,"output_tokens":340}}}

@@ -1,4 +1,4 @@
-//! claude-history-gui: a desktop browser for Claude Code, Pi and OMP
+//! claude-history-gui: a desktop browser for Claude Code, Codex, Pi and OMP
 //! conversation history on gpui-kit 0.7.3. All history logic lives in
 //! `claude-history-core`; this crate is the GUI (DESIGN.md in `docs/`).
 //!

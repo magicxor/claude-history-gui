@@ -23,6 +23,11 @@ pub enum AppError {
     #[error("Failed to run Claude CLI: {0}")]
     ClaudeExecutionError(String),
 
+    /// The program that starts an agent (its own binary or the user's
+    /// `command`) is missing (upstream 8a99ccc, `history::actions::Launcher`).
+    #[error("Cannot start agent: {0}")]
+    AgentLaunch(String),
+
     /// The action needs a workspace folder and none is selected (GUI; the
     /// upstream CLI used its process cwd). The text is shown verbatim.
     #[error("{0}")]
@@ -44,6 +49,12 @@ pub enum AppError {
 
     #[error("Failed to launch terminal: {0}")]
     TerminalLaunch(String),
+
+    /// An action the adapter of the conversation's source does not support
+    /// (upstream 9799550 shows the text as a TUI status message,
+    /// `history::actions::refusal`). The text is shown verbatim.
+    #[error("{0}")]
+    Unsupported(String),
 
     #[error("Configuration error: {0}")]
     ConfigError(String),
@@ -105,6 +116,10 @@ mod tests {
                 "Failed to run Claude CLI: boom".into(),
             ),
             (
+                AppError::AgentLaunch("`pi` was not found on PATH".into()),
+                "Cannot start agent: `pi` was not found on PATH".into(),
+            ),
+            (
                 AppError::ConfigError("bad".into()),
                 "Configuration error: bad".into(),
             ),
@@ -140,6 +155,10 @@ mod tests {
             (
                 AppError::TerminalLaunch("no terminal".into()),
                 "Failed to launch terminal: no terminal".into(),
+            ),
+            (
+                AppError::Unsupported("Deleting Pi sessions is not supported".into()),
+                "Deleting Pi sessions is not supported".into(),
             ),
         ];
         for (error, expected) in cases {

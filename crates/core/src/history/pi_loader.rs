@@ -1,7 +1,3 @@
-use super::parser::process_conversation_file;
-use super::{Conversation, Source, format_short_name_from_path};
-use crate::debug;
-use crate::debug::DebugLevel;
 use crate::env::HistoryEnv;
 use crate::error::{AppError, Result};
 use serde_json::Value;
@@ -40,20 +36,7 @@ fn session_root_from(
 ) -> Result<PiSessionRoot> {
     let base = cwd.as_deref();
     let env_base = env_base.as_deref();
-    let agent_dir = if let Some(value) = agent_override {
-        expand_path_with_home(value, home_dir.as_deref(), env_base)?
-    } else {
-        home_dir
-            .clone()
-            .ok_or_else(|| {
-                AppError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "Could not determine home directory",
-                ))
-            })?
-            .join(".pi")
-            .join("agent")
-    };
+    let agent_dir = agent_dir_from(agent_override, home_dir.as_deref(), env_base)?;
 
     if let Some(value) = session_override {
         return Ok(PiSessionRoot {
@@ -77,6 +60,61 @@ fn session_root_from(
         path: agent_dir.join("sessions"),
         flat: false,
     })
+}
+
+/// Pi's agent directory: `PI_CODING_AGENT_DIR` (resolved like
+/// [`session_root`] resolves it), else `<home>/.pi/agent`.
+fn agent_dir_from(
+    agent_override: Option<PathBuf>,
+    home_dir: Option<&Path>,
+    env_base: Option<&Path>,
+) -> Result<PathBuf> {
+    if let Some(value) = agent_override {
+        return expand_path_with_home(value, home_dir, env_base);
+    }
+    Ok(home_dir
+        .ok_or_else(|| {
+            AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Could not determine home directory",
+            ))
+        })?
+        .join(".pi")
+        .join("agent"))
+}
+
+/// Fork: the Pi settings files of `env` that name a `sessionDir`, each with
+/// the directory it names, resolved as [`session_root`] resolves it (`~`
+/// against the home, a relative value against the workspace): the agent
+/// directory's `settings.json`, then the workspace's `.pi/settings.json`.
+/// A file that is missing or not JSON, names no (or a blank) `sessionDir`,
+/// or whose value cannot be resolved (relative, without a workspace) is
+/// left out: [`session_root`] then does not use it either. Whichever of
+/// them [`session_root`] picks (the workspace's wins), the GUI's QA
+/// sandbox gate checks every one.
+pub fn session_dir_settings(env: &HistoryEnv) -> Vec<(PathBuf, PathBuf)> {
+    let home_dir = env.home_dir.as_deref();
+    let cwd = env.workspace_base_dir();
+    let env_base = env.env_value_base_dir();
+    let global = agent_dir_from(
+        env.pi_coding_agent_dir.clone(),
+        home_dir,
+        env_base.as_deref(),
+    )
+    .ok()
+    .map(|agent_dir| agent_dir.join("settings.json"));
+    let project = cwd
+        .as_deref()
+        .map(|cwd| cwd.join(".pi").join("settings.json"));
+    global
+        .into_iter()
+        .chain(project)
+        .filter_map(|file| {
+            let value = configured_session_dir(&file)??;
+            let dir = expand_path_with_home(value, home_dir, cwd.as_deref()).ok()?;
+            Some((file, dir))
+        })
+        .collect()
 }
 
 fn configured_session_dir(path: &Path) -> Option<Option<PathBuf>> {
@@ -138,7 +176,13 @@ pub fn discover_files(root: &PiSessionRoot) -> Result<Vec<PathBuf>> {
         for entry in read_dir(&root.path)? {
             let entry = entry?;
             let path = entry.path();
-            if path.is_dir() {
+            // The listing's file type saves a stat per directory; a symlink
+            // is followed to see whether it leads to one.
+            let is_dir = match entry.file_type() {
+                Ok(kind) if !kind.is_symlink() => kind.is_dir(),
+                _ => path.is_dir(),
+            };
+            if is_dir {
                 collect_jsonl(&path, &mut files)?;
             }
         }
@@ -156,93 +200,6 @@ fn collect_jsonl(directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
         }
     }
     Ok(())
-}
-
-pub fn load_pi_conversations(
-    env: &HistoryEnv,
-    show_last: bool,
-    debug_level: Option<DebugLevel>,
-) -> Result<Vec<Conversation>> {
-    let root = session_root(env)?;
-    let files = discover_files(&root)?;
-    let cached = super::cache::read_pi_cache(env, &root.path).unwrap_or_default();
-    let mut updated_cache = std::collections::HashMap::new();
-    let mut conversations = Vec::new();
-    for path in files {
-        let Ok(metadata) = std::fs::metadata(&path) else {
-            continue;
-        };
-        let modified = metadata.modified().ok();
-        let cache_key = path
-            .strip_prefix(&root.path)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .into_owned();
-        let mut conversation = modified
-            .and_then(|mtime| {
-                cached.get(&cache_key).filter(|entry| {
-                    super::cache::entry_matches(&entry.metadata, metadata.len(), mtime)
-                })
-            })
-            .map(|entry| {
-                let mut conversation =
-                    super::cache::conversation_from_entry(&entry.metadata, path.clone(), show_last);
-                conversation.source = Source::Pi;
-                conversation.session_id = entry.session_id.clone();
-                conversation.cwd = Some(entry.project_path.clone());
-                conversation.project_path = Some(entry.project_path.clone());
-                conversation.project_name = Some(format_short_name_from_path(&entry.project_path));
-                conversation
-            });
-        if conversation.is_none() {
-            conversation = match process_conversation_file(path.clone(), modified, debug_level) {
-                Ok(Some(conversation)) if conversation.source == Source::Pi => Some(conversation),
-                Ok(_) => None,
-                Err(error) => {
-                    debug::warn(
-                        debug_level,
-                        &format!("Failed to parse Pi session {}: {error}", path.display()),
-                    );
-                    None
-                }
-            };
-        }
-        let Some(mut conversation) = conversation else {
-            continue;
-        };
-        conversation.preview = if show_last {
-            conversation.preview_last.clone()
-        } else {
-            conversation.preview_first.clone()
-        };
-        let project_path = conversation
-            .cwd
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("unknown"));
-        conversation.project_name = Some(format_short_name_from_path(&project_path));
-        conversation.project_path = Some(project_path.clone());
-        if let Some(mtime) = modified {
-            updated_cache.insert(
-                cache_key,
-                super::cache::PiCacheEntry {
-                    metadata: super::cache::entry_from_conversation(
-                        &conversation,
-                        metadata.len(),
-                        mtime,
-                    ),
-                    session_id: conversation.session_id.clone(),
-                    project_path,
-                },
-            );
-        }
-        conversations.push(conversation);
-    }
-    super::cache::write_pi_cache(env, &root.path, updated_cache);
-    conversations.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
-    for (index, conversation) in conversations.iter_mut().enumerate() {
-        conversation.index = index;
-    }
-    Ok(conversations)
 }
 
 pub fn delete_session(path: &Path) -> Result<()> {
@@ -390,6 +347,77 @@ mod tests {
         trailing.push(std::path::MAIN_SEPARATOR_STR);
         let root = session_root(&env.clone().with_workspace(trailing)).unwrap();
         assert_eq!(root.path, workspace.join("relative-sessions"));
+    }
+
+    /// Fork: the settings that can choose the session root, each resolved
+    /// as `session_root` resolves it (the GUI's sandbox gate checks them).
+    #[test]
+    fn session_dir_settings_name_every_configured_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let env = HistoryEnv::sandbox(home.path());
+        assert!(session_dir_settings(&env).is_empty(), "no settings files");
+
+        let agent = home.path().join(".pi").join("agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        let global = agent.join("settings.json");
+        std::fs::write(&global, r#"{"sessionDir":"~/global-sessions"}"#).unwrap();
+        let named = home.path().join("global-sessions");
+        assert_eq!(
+            session_dir_settings(&env),
+            vec![(global.clone(), named.clone())]
+        );
+        assert_eq!(session_root(&env).unwrap().path, named);
+
+        // A relative value resolves against the workspace; without one it
+        // names nothing (and `session_root` fails).
+        std::fs::write(&global, r#"{"sessionDir":"relative"}"#).unwrap();
+        assert!(session_dir_settings(&env).is_empty());
+        assert!(session_root(&env).is_err());
+        let workspace = home.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(".pi")).unwrap();
+        let env = env.with_workspace(&workspace);
+        assert_eq!(
+            session_dir_settings(&env),
+            vec![(global.clone(), workspace.join("relative"))]
+        );
+
+        // The workspace's own settings follow (and win in `session_root`).
+        let project = workspace.join(".pi").join("settings.json");
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            &project,
+            serde_json::json!({ "sessionDir": outside.path() }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            session_dir_settings(&env),
+            vec![
+                (global.clone(), workspace.join("relative")),
+                (project.clone(), outside.path().to_path_buf()),
+            ]
+        );
+        assert_eq!(session_root(&env).unwrap().path, outside.path());
+
+        // Blank values and files that are not JSON name nothing.
+        std::fs::write(&global, r#"{"sessionDir":"  "}"#).unwrap();
+        std::fs::write(&project, "not json").unwrap();
+        assert!(session_dir_settings(&env).is_empty());
+
+        // PI_CODING_AGENT_DIR moves the agent directory's settings file.
+        let other_agent = home.path().join("other-agent");
+        std::fs::create_dir_all(&other_agent).unwrap();
+        std::fs::write(
+            other_agent.join("settings.json"),
+            r#"{"sessionDir":"~/other-sessions"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            session_dir_settings(&env.with_pi_coding_agent_dir(&other_agent)),
+            vec![(
+                other_agent.join("settings.json"),
+                home.path().join("other-sessions")
+            )]
+        );
     }
 
     #[test]

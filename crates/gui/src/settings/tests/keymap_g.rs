@@ -193,6 +193,8 @@ fn table() -> Vec<Row> {
         row!("shift-y", VIEWER, CopyPath),
         row!("shift-i", VIEWER, CopySessionId),
         row!("p", VIEWER, ShowPath),
+        row!("s", VIEWER, ShowSubagentsAndForks),
+        row!("shift-p", VIEWER, OpenParentConversation),
         row!("o", VIEWER, ToggleOutline),
         row!("o", AGENT, ToggleOutline),
         // The same keys in a single-file window.
@@ -230,6 +232,14 @@ fn table() -> Vec<Row> {
         row!("up", "ExportMenu", SelectUp),
         row!("enter", "ExportMenu", Confirm { secondary: false }),
         row!("escape", "ExportMenu", Cancel),
+        row!("j", "FamilyMenu", SelectDown),
+        row!("down", "FamilyMenu", SelectDown),
+        row!("k", "FamilyMenu", SelectUp),
+        row!("up", "FamilyMenu", SelectUp),
+        row!("enter", "FamilyMenu", Confirm { secondary: false }),
+        row!("escape", "FamilyMenu", Cancel),
+        row!("q", "FamilyMenu", Cancel),
+        row!("s", "FamilyMenu", Cancel),
         // Input editing (§8.4).
         row!("ctrl-e", LIST_INPUT, MoveEnd),
         row!("ctrl-k", LIST_INPUT, DeleteToEndOfLine),
@@ -373,8 +383,25 @@ fn rebind(cx: &mut TestAppContext, keys: KeyBindings) {
 
 fn chords(rename: &str, refresh: &str, fork: &str, resume: &str, delete: &str) -> KeyBindings {
     KeyBindings {
+        all_kinds: KeyBindings::default().all_kinds,
+        ..chords_with_all_kinds(rename, refresh, "ctrl+g", fork, resume, delete)
+    }
+}
+
+/// `chords` with the all-kinds key chosen too.
+fn chords_with_all_kinds(
+    rename: &str,
+    refresh: &str,
+    all_kinds: &str,
+    fork: &str,
+    resume: &str,
+    delete: &str,
+) -> KeyBindings {
+    KeyBindings {
         rename: parse_key_binding(rename).unwrap(),
         refresh: parse_key_binding(refresh).unwrap(),
+        all_kinds: parse_key_binding(all_kinds).unwrap(),
+        user_only: KeyBindings::default().user_only,
         fork: parse_key_binding(fork).unwrap(),
         resume: parse_key_binding(resume).unwrap(),
         delete: parse_key_binding(delete).unwrap(),
@@ -452,6 +479,65 @@ fn duplicate_bindings_resolve_by_the_tui_check_order(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let got = winner(cx, "ctrl-k", LIST);
         assert!(got.is_some_and(|got| got.partial_eq(&Refresh)));
+    });
+    // Refresh, all kinds and rename on one key → Refresh; all kinds and rename → ToggleAllKinds.
+    rebind(
+        cx,
+        chords_with_all_kinds("ctrl+k", "ctrl+k", "ctrl+k", "f7", "f8", "f9"),
+    );
+    cx.update(|cx| {
+        for declaration in [LIST, VIEWER] {
+            let got = winner(cx, "ctrl-k", declaration);
+            assert!(
+                got.as_ref().is_some_and(|got| got.partial_eq(&Refresh)),
+                "ctrl-k in [{declaration}]: {}",
+                name_of(&got)
+            );
+        }
+    });
+    rebind(
+        cx,
+        chords_with_all_kinds("ctrl+k", "f6", "ctrl+k", "f7", "f8", "f9"),
+    );
+    cx.update(|cx| {
+        for declaration in [LIST, VIEWER] {
+            let got = winner(cx, "ctrl-k", declaration);
+            assert!(
+                got.as_ref()
+                    .is_some_and(|got| got.partial_eq(&ToggleAllKinds)),
+                "ctrl-k in [{declaration}]: {}",
+                name_of(&got)
+            );
+        }
+    });
+    // All kinds, user only and rename on one key → ToggleAllKinds; user only
+    // and rename → ToggleUserOnly (upstream checks user_only after
+    // all_kinds, before rename).
+    let user_only_on_k = |all_kinds: &str| KeyBindings {
+        user_only: parse_key_binding("ctrl+k").unwrap(),
+        ..chords_with_all_kinds("ctrl+k", "f6", all_kinds, "f7", "f8", "f9")
+    };
+    rebind(cx, user_only_on_k("ctrl+k"));
+    cx.update(|cx| {
+        let got = winner(cx, "ctrl-k", LIST);
+        assert!(
+            got.as_ref()
+                .is_some_and(|got| got.partial_eq(&ToggleAllKinds)),
+            "{}",
+            name_of(&got)
+        );
+    });
+    rebind(cx, user_only_on_k("f4"));
+    cx.update(|cx| {
+        for declaration in [LIST, LIST_INPUT, VIEWER] {
+            let got = winner(cx, "ctrl-k", declaration);
+            assert!(
+                got.as_ref()
+                    .is_some_and(|got| got.partial_eq(&ToggleUserOnly)),
+                "ctrl-k in [{declaration}]: {}",
+                name_of(&got)
+            );
+        }
     });
 }
 

@@ -1,5 +1,6 @@
-//! The list toolbar (DESIGN §5.1): mode Lexical/Semantic, scope
-//! All/Workspace, workspace picker, time filter, Refresh. WP1.
+//! The list toolbar (DESIGN §5.1): mode Lexical/Semantic, the `You only`
+//! toggle (upstream ae7ae39), scope All/Workspace, workspace picker, time
+//! filter, Refresh. WP1.
 
 use claude_history_core::WorkspaceScope;
 use claude_history_core::browser::ListSearchMode;
@@ -13,8 +14,10 @@ use gpui_kit::{
     div,
 };
 
-use crate::actions::{Refresh, SetModeLexical, SetModeSemantic, SetScopeAll, SetScopeWorkspace};
-use crate::keymap::{CTX_LIST_TOOLBAR, CTX_WORKSPACE};
+use crate::actions::{
+    Refresh, SetModeLexical, SetModeSemantic, SetScopeAll, SetScopeWorkspace, ToggleUserOnly,
+};
+use crate::keymap::{CTX_LIST, CTX_LIST_TOOLBAR, CTX_WORKSPACE};
 use crate::widgets::time_range::{TimeRangeChoice, time_range_button};
 
 use super::ListPane;
@@ -23,6 +26,13 @@ use super::ListPane;
 pub const NO_WORKSPACE_TOOLTIP: &str = "Choose a workspace to filter by project";
 /// The tooltip of the enabled Workspace segment.
 pub const WORKSPACE_TOOLTIP: &str = "Only conversations of the workspace";
+/// The label of the user-only toggle (upstream ae7ae39's `you only`).
+pub const USER_ONLY_BUTTON: &str = "You only";
+/// The user-only toggle's tooltip in lexical mode.
+pub const USER_ONLY_TOOLTIP: &str = crate::menus::USER_ONLY_LABEL;
+/// The user-only toggle's tooltip in semantic mode, which ignores it.
+pub const USER_ONLY_SEMANTIC_TOOLTIP: &str =
+    "Search only your own messages (lexical search; semantic search ignores it)";
 
 /// The workspace button label: the folder's short name, else "No workspace".
 pub fn workspace_label(workspace: Option<&WorkspaceScope>) -> String {
@@ -40,6 +50,10 @@ pub fn workspace_label(workspace: Option<&WorkspaceScope>) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolbarModel {
     pub mode: ListSearchMode,
+    /// The `You only` toggle is on (search matches only the user's own
+    /// messages in lexical mode).
+    pub user_only: bool,
+    pub user_only_tooltip: &'static str,
     pub scope_workspace: bool,
     /// The Workspace segment is enabled (a workspace exists).
     pub workspace_enabled: bool,
@@ -56,6 +70,12 @@ impl ListPane {
         let enabled = self.has_workspace();
         ToolbarModel {
             mode: self.mode(),
+            user_only: self.user_only(),
+            user_only_tooltip: if self.mode() == ListSearchMode::Semantic {
+                USER_ONLY_SEMANTIC_TOOLTIP
+            } else {
+                USER_ONLY_TOOLTIP
+            },
             scope_workspace: self.scope_is_workspace(),
             workspace_enabled: enabled,
             workspace_tooltip: if enabled {
@@ -113,6 +133,22 @@ pub fn render_toolbar(list: &ListPane, cx: &mut Context<ListPane>) -> impl IntoE
                                     window.dispatch_action(Box::new(SetModeSemantic), cx)
                                 }),
                         ),
+                )
+                .child(
+                    Button::new("user-only")
+                        .label(USER_ONLY_BUTTON)
+                        .xsmall()
+                        .outline()
+                        .compact()
+                        .selected(model.user_only)
+                        .tooltip_with_action(
+                            model.user_only_tooltip,
+                            &ToggleUserOnly,
+                            Some(CTX_LIST),
+                        )
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(ToggleUserOnly), cx)
+                        }),
                 )
                 .child(
                     ButtonGroup::new("list-scope")

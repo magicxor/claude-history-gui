@@ -104,8 +104,12 @@ fn export_writes_replaces_and_remembers_the_folder(cx: &mut TestAppContext) {
     let path = claude_session(&world, "proj", 1, "Fix login bug");
     let out = out_dir(&world);
     let f = OpsFixture::open(cx, &world, &[]);
-    let expected =
-        generate_export(&path, ExportFormat::Markdown, ExportOptions::default()).unwrap();
+    let expected = generate_export(
+        &crate::test_support::transcript(&path),
+        ExportFormat::Markdown,
+        ExportOptions::default(),
+    )
+    .unwrap();
 
     f.recording.answer_save(Ok(Some(out.join("x"))));
     export_menu(cx, &f, &path);
@@ -228,7 +232,12 @@ fn exported_files_hold_each_formats_content(cx: &mut TestAppContext) {
         f.settle(cx);
         let file = out.join(format!("{name}.{}", format.extension()));
         let content = std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("{file:?}: {e}"));
-        let expected = generate_export(&path, format, ExportOptions::default()).unwrap();
+        let expected = generate_export(
+            &crate::test_support::transcript(&path),
+            format,
+            ExportOptions::default(),
+        )
+        .unwrap();
         assert_eq!(content, expected, "{format:?}");
         assert!(content.starts_with(prefix), "{format:?}: {content:?}");
         assert!(!content.is_empty());

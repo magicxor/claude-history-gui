@@ -1,26 +1,24 @@
-//! Shared message ordinal assignment for history and agent transcript readers.
+//! Shared message ordinal assignment for the indexer and agent transcripts.
 //!
-//! The history parser and agent transcript reader use the same placement rules
+//! The indexer and the agent transcript reader use the same placement rules
 //! so semantic evidence ranges resolve to the same `mN` messages as reads.
 
-use crate::claude::{
-    AgentContent, AgentProgressData, AssistantMessage, ContentBlock, LogEntry, UserContent,
-    UserMessage,
-};
+use super::model::{Event, EventKind, Message, Part, Role};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
-/// Where a transcript record lands in the message sequence.
+/// Where a transcript event lands in the message sequence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Placement {
     /// A new message with this ordinal.
     Message(usize),
-    /// A streamed assistant record replacing an earlier message.
+    /// A streamed assistant message replacing an earlier message.
     Replaces(usize),
-    /// A control record or filtered message.
+    /// A control event or filtered message.
     Control,
 }
 
-/// Assigns message ordinals to transcript records in file order.
+/// Assigns message ordinals to transcript events in order.
 #[derive(Debug, Default)]
 pub(crate) struct MessageOrdinals {
     count: usize,
@@ -37,39 +35,39 @@ impl MessageOrdinals {
         self.count
     }
 
-    /// Places user, assistant, and Pi/OMP metadata records. Progress records
-    /// are parsed by each caller and placed with [`Self::place_subagent`].
-    pub(crate) fn place(&mut self, entry: &LogEntry) -> Placement {
-        match entry {
-            LogEntry::User { message, .. } => self.place_user(message),
-            LogEntry::Assistant { message, .. } => self.place_assistant(message),
-            LogEntry::PiMetadata { searchable, .. } => {
+    /// Places messages, searchable notes and subagent messages; everything
+    /// else is control.
+    pub(crate) fn place(&mut self, event: &Event) -> Placement {
+        match &event.kind {
+            EventKind::Message(message) => match message.role {
+                Role::User => self.place_user(&message.parts),
+                Role::Assistant => self.place_assistant(message),
+            },
+            EventKind::Note { searchable, .. } => {
                 if *searchable {
                     self.next()
                 } else {
                     Placement::Control
                 }
             }
-            _ => Placement::Control,
+            EventKind::Subagent { message, .. } => {
+                if parts_count_as_message(&message.parts) {
+                    self.next()
+                } else {
+                    Placement::Control
+                }
+            }
+            EventKind::Title { .. } | EventKind::Other => Placement::Control,
         }
     }
 
-    pub(crate) fn place_subagent(&mut self, progress: &AgentProgressData) -> Placement {
-        if !matches!(progress.message.message_type.as_str(), "user" | "assistant") {
-            return Placement::Control;
-        }
-        let AgentContent::Blocks(blocks) = &progress.message.message.content;
-        if blocks_count_as_message(blocks) {
-            self.next()
-        } else {
-            Placement::Control
-        }
-    }
-
-    fn place_user(&mut self, message: &UserMessage) -> Placement {
-        // This mirrors blocks_to_parts in agent/transcript.rs: clear and
+    fn place_user(&mut self, parts: &[Part]) -> Placement {
+        // This mirrors parts_to_agent in agent/transcript.rs: clear and
         // warmup checks see the first retained text part, not joined raw text.
-        let first_text = first_retained_user_text(message);
+        let first_text = parts.iter().find_map(|part| match part {
+            Part::Text(text) => retained_user_text_ref(text),
+            _ => None,
+        });
         if first_text.as_deref().is_some_and(is_clear_metadata_message) {
             return Placement::Control;
         }
@@ -80,12 +78,7 @@ impl MessageOrdinals {
         {
             return Placement::Control;
         }
-
-        let counts = match &message.content {
-            UserContent::String(_) => first_text.is_some(),
-            UserContent::Blocks(blocks) => blocks_count_as_message(blocks),
-        };
-        if !counts {
+        if !parts_count_as_message(parts) {
             return Placement::Control;
         }
 
@@ -93,8 +86,8 @@ impl MessageOrdinals {
         self.next()
     }
 
-    fn place_assistant(&mut self, message: &AssistantMessage) -> Placement {
-        if !self.seen_real_user || !blocks_count_as_message(&message.content) {
+    fn place_assistant(&mut self, message: &Message) -> Placement {
+        if !self.seen_real_user || !parts_count_as_message(&message.parts) {
             return Placement::Control;
         }
         let Some(id) = &message.id else {
@@ -114,14 +107,13 @@ impl MessageOrdinals {
     }
 }
 
-/// Content blocks give a message substance when any carries visible text, a
-/// tool call, a tool result, or non-empty thinking content.
-pub(crate) fn blocks_count_as_message(blocks: &[ContentBlock]) -> bool {
-    blocks.iter().any(|block| match block {
-        ContentBlock::Text { text } => !text.trim().is_empty(),
-        ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => true,
-        ContentBlock::Thinking { thinking, .. } => !thinking.trim().is_empty(),
-        ContentBlock::Image { .. } | ContentBlock::Other => false,
+/// Parts give a message substance when any carries visible text, a tool
+/// call, a tool result, or non-empty thinking content.
+pub(crate) fn parts_count_as_message(parts: &[Part]) -> bool {
+    parts.iter().any(|part| match part {
+        Part::Text(text) | Part::Thinking(text) => !text.trim().is_empty(),
+        Part::ToolCall { .. } | Part::ToolResult { .. } => true,
+        Part::Image | Part::Other => false,
     })
 }
 
@@ -130,16 +122,12 @@ pub(crate) fn retained_user_text(text: String) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
 }
 
-fn first_retained_user_text(message: &UserMessage) -> Option<String> {
-    match &message.content {
-        UserContent::String(text) => retained_user_text(text.clone()),
-        UserContent::Blocks(blocks) => blocks.iter().find_map(|block| {
-            let ContentBlock::Text { text } = block else {
-                return None;
-            };
-            retained_user_text(text.clone())
-        }),
-    }
+fn retained_user_text_ref(text: &str) -> Option<Cow<'_, str>> {
+    let text = match extract_skill_preview(text) {
+        Some(preview) => Cow::Owned(preview),
+        None => Cow::Borrowed(text),
+    };
+    (!text.trim().is_empty()).then_some(text)
 }
 
 /// Detects metadata emitted by the /clear command wrapper messages and other
@@ -190,13 +178,150 @@ pub(crate) fn extract_skill_preview(message: &str) -> Option<String> {
     Some(command_name.to_string())
 }
 
+/// Text that opens a user record written by the tool rather than typed:
+/// interruption markers, compaction summaries and continuations, hook
+/// feedback and prompt suggestion requests.
+const GENERATED_PREFIXES: &[&str] = &[
+    "[Request interrupted by user",
+    "This session is being continued from a previous conversation",
+    "Compaction completed. Continue.",
+    "Stop hook feedback:",
+    "[SUGGESTION MODE:",
+];
+
+/// Spans the tool inserts into typed text, removed with their contents.
+const INSERTED_SPANS: &[(&str, &str)] = &[
+    ("<system-reminder>", "</system-reminder>"),
+    ("<task-notification>", "</task-notification>"),
+    ("<local-command-stdout>", "</local-command-stdout>"),
+    ("<local-command-stderr>", "</local-command-stderr>"),
+    ("<bash-stdout>", "</bash-stdout>"),
+    ("<bash-stderr>", "</bash-stderr>"),
+];
+
+/// What the person typed in one text part of a top-level user message, or
+/// `None` when the tool wrote the part: what `is_clear_metadata_message`
+/// rejects and texts starting with `GENERATED_PREFIXES`. A skill invocation
+/// reads as its command line (`/name args`), a Codex realtime delegation as
+/// the spoken input it carries, and `INSERTED_SPANS` and image placeholders
+/// are removed from the rest.
+pub(crate) fn authored_text(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if is_clear_metadata_message(trimmed)
+        || GENERATED_PREFIXES
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix))
+    {
+        return None;
+    }
+    if let Some(delegation) = trimmed.strip_prefix("<realtime_delegation>") {
+        // The transcript beside the input holds both sides of the call.
+        let input = delegation
+            .split_once("<input>")?
+            .1
+            .split_once("</input>")?
+            .0;
+        let input = input.trim();
+        return (!input.is_empty()).then(|| input.to_owned());
+    }
+    if let Some(command) = extract_skill_preview(trimmed).or_else(|| pi_skill_command(trimmed)) {
+        return Some(command);
+    }
+    let mut kept = trimmed.to_owned();
+    for (open, close) in INSERTED_SPANS {
+        kept = without_spans(&kept, open, close);
+    }
+    let kept = without_image_placeholders(&kept);
+    let kept = kept
+        .replace("<bash-input>", "")
+        .replace("</bash-input>", "");
+    let kept = kept.trim();
+    (!kept.is_empty()).then(|| kept.to_owned())
+}
+
+/// The command line of a Pi skill invocation, which inlines the skill as
+/// `<skill name="NAME" ...>...</skill>` followed by the typed arguments.
+fn pi_skill_command(text: &str) -> Option<String> {
+    let rest = text.strip_prefix("<skill name=\"")?;
+    let name = &rest[..rest.find('"')?];
+    let args = text[text.find("</skill>")? + "</skill>".len()..].trim();
+    Some(if args.is_empty() {
+        format!("/{name}")
+    } else {
+        format!("/{name} {args}")
+    })
+}
+
+/// `text` without the spans from `open` to the next `close`. An `open` with
+/// no `close` after it is text the person typed and stays.
+fn without_spans(text: &str, open: &str, close: &str) -> String {
+    let mut kept = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(open) {
+        let after = &rest[start + open.len()..];
+        let Some(end) = after.find(close) else {
+            break;
+        };
+        kept.push_str(&rest[..start]);
+        rest = &after[end + close.len()..];
+    }
+    kept.push_str(rest);
+    kept
+}
+
+/// `text` without the image placeholders that stand in for attached images:
+/// `[Image]`, `[Image #N]` and `[Image: description]` on one line. Other text
+/// starting with `[Image` stays.
+fn without_image_placeholders(text: &str) -> String {
+    const OPEN: &str = "[Image";
+    let mut kept = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(OPEN) {
+        let after = &rest[start + OPEN.len()..];
+        let len = image_placeholder_rest(after);
+        kept.push_str(&rest[..start]);
+        match len {
+            Some(len) => rest = &after[len..],
+            None => {
+                kept.push_str(OPEN);
+                rest = after;
+            }
+        }
+    }
+    kept.push_str(rest);
+    kept
+}
+
+/// Length of the rest of an image placeholder after `[Image`, or `None` when
+/// `after` does not complete one.
+fn image_placeholder_rest(after: &str) -> Option<usize> {
+    if after.starts_with(']') {
+        return Some(1);
+    }
+    if let Some(number) = after.strip_prefix(" #") {
+        let digits = number.bytes().take_while(u8::is_ascii_digit).count();
+        return (digits > 0 && number[digits..].starts_with(']')).then_some(2 + digits + 1);
+    }
+    let description = after.strip_prefix(':')?;
+    let end = description.find([']', '\n'])?;
+    (description[end..].starts_with(']')).then_some(1 + end + 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::claude::LogEntry;
+    use crate::history::model::Origin;
     use serde_json::json;
 
     fn entry(value: serde_json::Value) -> LogEntry {
         serde_json::from_value(value).expect("valid log entry")
+    }
+
+    fn event(entry: LogEntry) -> Event {
+        crate::history::sources::claude::Records::default()
+            .push(entry, Origin::default())
+            .expect("a conversation record")
     }
 
     fn user(text: &str) -> LogEntry {
@@ -215,8 +340,13 @@ mod tests {
     }
 
     fn placements(entries: &[LogEntry]) -> Vec<Placement> {
+        let events: Vec<Event> = entries.iter().map(|entry| event(entry.clone())).collect();
+        placements_of(&events)
+    }
+
+    fn placements_of(events: &[Event]) -> Vec<Placement> {
         let mut ordinals = MessageOrdinals::new();
-        entries.iter().map(|entry| ordinals.place(entry)).collect()
+        events.iter().map(|event| ordinals.place(event)).collect()
     }
 
     #[test]
@@ -307,13 +437,26 @@ mod tests {
 
     #[test]
     fn searchable_empty_metadata_counts_without_opening_assistant_gate() {
-        let searchable = entry(json!({
-            "type":"pi-metadata","label":"Hook","text":"","searchable":true
-        }));
-        let early_assistant = assistant(None, "early");
-        let user = user("question");
+        let searchable = Event {
+            origin: Origin::default(),
+            timestamp: None,
+            visibility: crate::history::model::Visibility::Dialogue,
+            kind: EventKind::Note {
+                label: "Hook".to_owned(),
+                text: String::new(),
+                searchable: true,
+                usage: None,
+            },
+        };
+        let early_assistant = event(assistant(None, "early"));
+        let user = event(user("question"));
         assert_eq!(
-            placements(&[searchable, early_assistant, user, assistant(None, "answer")]),
+            placements_of(&[
+                searchable,
+                early_assistant,
+                user,
+                event(assistant(None, "answer"))
+            ]),
             vec![
                 Placement::Message(1),
                 Placement::Control,
@@ -337,16 +480,88 @@ mod tests {
 
     #[test]
     fn progress_uses_separate_placement() {
-        let progress: AgentProgressData = serde_json::from_value(json!({
+        let progress = entry(json!({"type":"progress","data":{
             "type":"agent_progress","agentId":"a1","message":{
                 "type":"assistant","message":{"role":"assistant","content":[
                     {"type":"text","text":"subagent"}
                 ]}
             }
-        }))
-        .unwrap();
+        }}));
         let mut ordinals = MessageOrdinals::new();
-        assert_eq!(ordinals.place_subagent(&progress), Placement::Message(1));
+        assert_eq!(ordinals.place(&event(progress)), Placement::Message(1));
         assert_eq!(ordinals.count(), 1);
+    }
+
+    #[test]
+    fn authored_text_keeps_what_the_person_typed() {
+        assert_eq!(
+            authored_text("  fix the cache  ").as_deref(),
+            Some("fix the cache")
+        );
+        assert_eq!(
+            authored_text(
+                "<command-message>consult</command-message>\n<command-name>/consult</command-name>\n<command-args>how to X</command-args>"
+            )
+            .as_deref(),
+            Some("/consult how to X")
+        );
+        assert_eq!(
+            authored_text(
+                "<skill name=\"merge\" location=\"/s/SKILL.md\">\nbody\n</skill>\n\n--keep"
+            )
+            .as_deref(),
+            Some("/merge --keep")
+        );
+        assert_eq!(
+            authored_text("look [Image #1] here<system-reminder>injected</system-reminder> now")
+                .as_deref(),
+            Some("look  here now")
+        );
+        assert_eq!(
+            authored_text("the bug: [Image upload fails for pangolin").as_deref(),
+            Some("the bug: [Image upload fails for pangolin")
+        );
+        assert_eq!(
+            authored_text("[Images] of [Image #12] and [Image: image/png] and [Image] x [Image #]")
+                .as_deref(),
+            Some("[Images] of  and  and  x [Image #]")
+        );
+        assert_eq!(
+            authored_text("explain the <system-reminder> tag handling for axolotl").as_deref(),
+            Some("explain the <system-reminder> tag handling for axolotl")
+        );
+        assert_eq!(
+            authored_text("a <system-reminder>x</system-reminder> b <system-reminder> c")
+                .as_deref(),
+            Some("a  b <system-reminder> c")
+        );
+        assert_eq!(
+            authored_text("<bash-input>ls -la</bash-input><bash-stdout>out</bash-stdout>")
+                .as_deref(),
+            Some("ls -la")
+        );
+        assert_eq!(
+            authored_text(
+                "<realtime_delegation>\n  <input>What is Aven project</input>\n  \
+                 <transcript_delta>assistant:  Let me check that.\nuser:  What is Aven \
+                 project</transcript_delta>\n</realtime_delegation>"
+            )
+            .as_deref(),
+            Some("What is Aven project")
+        );
+        for generated in [
+            "[Request interrupted by user for tool use]",
+            "This session is being continued from a previous conversation that ran out",
+            "Base directory for this skill: /x",
+            "<local-command-caveat>Caveat</local-command-caveat>",
+            "<local-command-stdout>done</local-command-stdout>",
+            "<command-name>/clear</command-name>",
+            "Stop hook feedback:\n[done]",
+            "<task-notification>finished</task-notification>",
+            "[Image: source: /tmp/a.png]",
+            "  ",
+        ] {
+            assert_eq!(authored_text(generated), None, "{generated:?}");
+        }
     }
 }

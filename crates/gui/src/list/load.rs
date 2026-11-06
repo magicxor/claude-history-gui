@@ -4,6 +4,14 @@
 //! that revert on failure, the UUID lookup and the semantic-error toast.
 //! WP1. Methods of `ListPane` that live here are private to the `list`
 //! module except the public API (`set_workspace`, `set_time_filter`).
+//!
+//! In store mode (upstream 358becb) core's loader keeps the same events: a
+//! refresh or a reload runs a reconcile pass and ends when the generation it
+//! left is shown, a time filter re-scopes the cards, and a generation swapped
+//! in outside a refresh only reports `LoaderPoll::swapped` (the corpus
+//! changed under the list). A pass shown as indexing that ends, or a failed
+//! pass no load event reports, leaves an `IndexNotice` (upstream 04c714b's
+//! status messages), shown as a toast that replaces the refresh toasts.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -11,9 +19,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use claude_history_core::browser::{
-    HistoryLoader, ListSearchMode, LoadEvent, RefreshPolicy, UuidLookup,
+    IndexNotice, ListSearchMode, LoadEvent, PreparedSession, RefreshPolicy, UuidLookup,
 };
-use claude_history_core::history::{self, Conversation};
+use claude_history_core::history;
 use claude_history_core::time_filter::TimeFilter;
 use claude_history_core::{HistoryEnv, WorkspaceScope};
 use gpui_kit::{Context, SharedString, Window};
@@ -110,19 +118,30 @@ impl ListPane {
             };
             self.loading_snapshots.push(snapshot);
         }
-        let installed = loader_poll.event.is_some();
+        let installed = loader_poll.event.is_some() || loader_poll.swapped;
         let span = match &loader_poll.event {
             Some(LoadEvent::Loaded { .. } | LoadEvent::NoHistory(_)) => Some(BusySpan::LoadEnd),
             Some(LoadEvent::Refreshed { .. }) => Some(BusySpan::RefreshEnd),
             _ => None,
         };
-        if let Some(event) = loader_poll.event {
-            self.on_load_event(event, window, cx);
+        // Before the event: a refresh's toast replaces the notice of its pass.
+        self.check_index_notice(window, cx);
+        match loader_poll.event {
+            Some(event) => self.on_load_event(event, window, cx),
+            // A newer generation swapped in by a background pass.
+            None if loader_poll.swapped && !self.is_loading() => self.after_corpus_load(cx),
+            None => {}
         }
         self.check_semantic_error(window, cx);
         self.check_uuid_lookup(window, cx);
         self.emit_selection(false, cx);
         self.start_queued_reload(cx);
+        let reconciling = self.is_reconciling();
+        if std::mem::replace(&mut self.was_reconciling, reconciling) && !reconciling {
+            // The pass is done, with or without a newer generation: whoever
+            // waited for the complete list (PD3 rule 3 (c)) looks again.
+            cx.emit(ListPaneEvent::CorpusChanged);
+        }
         let flags = (self.is_loading(), self.is_refreshing());
         if flags != self.load_flags {
             self.load_flags = flags;
@@ -333,6 +352,36 @@ impl ListPane {
         cx.notify();
     }
 
+    /// What a reconcile pass left for the status line (upstream 04c714b):
+    /// `Indexed <n> conversations` once a pass shown as indexing ends, or
+    /// `Indexing failed: <message>` for a failed pass that no load event
+    /// reports (§11.2). One toast at a time with the refresh toasts, as
+    /// upstream's status line held one message.
+    fn check_index_notice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(notice) = self.browser.take_index_notice() else {
+            return;
+        };
+        match &notice {
+            IndexNotice::Indexed { .. } => {
+                let text = crate::notify::gui_text(&notice.status_message());
+                self.toast(
+                    Toast::success(text).replacing::<RefreshToast>("refresh"),
+                    Vec::new(),
+                    window,
+                    cx,
+                );
+            }
+            IndexNotice::Failed(_) => {
+                let toast = Toast::error(notice.status_message())
+                    .replacing::<RefreshToast>("refresh")
+                    .action("Show debug log", |window, cx| {
+                        window.dispatch_action(Box::new(ShowDebugLog), cx);
+                    });
+                self.toast(toast, vec!["Show debug log".to_string()], window, cx);
+            }
+        }
+    }
+
     /// `N project(s) could not be loaded. See Tools → Debug log.` (§11.2).
     fn warn_project_errors(&mut self, count: usize, window: &mut Window, cx: &mut Context<Self>) {
         if count == 0 {
@@ -366,6 +415,8 @@ impl ListPane {
 
     /// Change the workspace: reload with `ApplyPartial`, revert on failure (§11.20).
     /// `AppState.workspace` is already the new one (the caller updated it).
+    /// In store mode the reload is a reconcile pass (of the store of the new
+    /// workspace's Pi/OMP session roots when they differ).
     pub fn set_workspace(&mut self, workspace: Option<WorkspaceScope>, cx: &mut Context<Self>) {
         if self.browser.workspace() == workspace.as_ref() {
             return;
@@ -390,6 +441,8 @@ impl ListPane {
     }
 
     /// Change the time filter: reload with `ApplyPartial`, revert on failure (§11.21).
+    /// In store mode the cards shown are re-scoped at the next poll and the
+    /// reload is a reconcile pass.
     pub fn set_time_filter(
         &mut self,
         filter: TimeFilter,
@@ -432,14 +485,18 @@ impl ListPane {
         let level_changed = self.loader.options().debug_level != level;
         if changes.workspace.is_some() || level_changed {
             // The loader's environment carries the workspace (Pi's
-            // `<workspace>/.pi/settings.json`): a new loader with the same
-            // options; the Debug log level applies from this load on (T-022).
+            // `<workspace>/.pi/settings.json`): the same options in the new
+            // environment; the Debug log level applies from this load on
+            // (T-022). Reconfigured, not replaced: dropping the loader would
+            // give up its reconcile pass (and join its threads on the UI
+            // thread).
             let env = app_state(cx).env.clone();
             let mut options = self.loader.options().clone();
             options.debug_level = level;
-            self.loader = HistoryLoader::new(env.clone(), options);
+            self.loader.reconfigure(env.clone(), options);
             self.loader_env = env;
         }
+        self.sync_loader_show_last();
         self.loader.set_time_filter(self.time_filter);
         // A retry after a failed initial load tolerates project errors like
         // the initial load does (it applies the partial result).
@@ -467,6 +524,19 @@ impl ListPane {
         }
         if let Some(changes) = self.reload.queued.take() {
             self.start_reload(changes, cx);
+        } else if self.loader.options().show_last != self.browser.show_last() {
+            // A preview-mode change made while the load ran.
+            self.start_plain_refresh(cx);
+        }
+    }
+
+    /// Give the loader the preview mode the browser shows.
+    pub(super) fn sync_loader_show_last(&mut self) {
+        let show_last = self.browser.show_last();
+        if self.loader.options().show_last != show_last {
+            let mut options = self.loader.options().clone();
+            options.show_last = show_last;
+            self.loader.reconfigure(self.loader_env.clone(), options);
         }
     }
 
@@ -477,7 +547,7 @@ impl ListPane {
         let workspace = undo.workspace;
         update_app_state(cx, |state, _| state.set_workspace(workspace));
         let options = self.loader.options().clone();
-        self.loader = HistoryLoader::new(undo.env.clone(), options);
+        self.loader.reconfigure(undo.env.clone(), options);
         self.loader_env = undo.env;
     }
 
@@ -524,6 +594,9 @@ impl ListPane {
                             let Some(path) = &conversation.project_path else {
                                 continue;
                             };
+                            if conversation.provenance.hidden_by_default() {
+                                continue;
+                            }
                             if !seen.insert(path.clone()) {
                                 continue;
                             }
@@ -602,12 +675,14 @@ impl ListPane {
         let show_last = self.browser.show_last();
         self.uuid_task = cx.spawn_in(window, async move |this, cx| {
             let lookup_uuid = uuid.clone();
-            let result: Option<Conversation> = cx
+            // The text is normalized here, off the UI thread.
+            let result: Option<PreparedSession> = cx
                 .background_executor()
                 .spawn(async move {
                     history::load_session_by_uuid(&env, &lookup_uuid, show_last)
                         .ok()
                         .flatten()
+                        .map(PreparedSession::new)
                 })
                 .await;
             this.update_in(cx, |this, window, cx| {
@@ -620,7 +695,7 @@ impl ListPane {
     fn finish_uuid_lookup(
         &mut self,
         uuid: String,
-        loaded: Option<Conversation>,
+        loaded: Option<PreparedSession>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -628,7 +703,7 @@ impl ListPane {
             self.uuid_in_flight = None;
         }
         let started = Instant::now();
-        self.browser.resolve_uuid_lookup(&uuid, loaded);
+        self.browser.resolve_uuid_lookup_session(&uuid, loaded);
         self.check_uuid_lookup(window, cx);
         if matches!(
             self.browser.uuid_lookup(),

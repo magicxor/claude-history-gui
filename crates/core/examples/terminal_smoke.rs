@@ -14,7 +14,9 @@
 //! directory must.
 
 use claude_history_core::HistoryEnv;
-use claude_history_core::program::{ProgramKind, ResolvedProgram, windows_cmd_exe};
+use claude_history_core::program::{
+    ProgramKind, ResolvedProgram, find_program_path, windows_cmd_exe,
+};
 use claude_history_core::resume::terminal::{
     BuildOptions, LaunchOptions, LaunchSpec, SpawnOutcome, build_terminal_command,
     launcher_candidates, spawn_terminal_checked,
@@ -128,15 +130,21 @@ fn touch_spec(env: &HistoryEnv, marker: &std::path::Path) -> Result<LaunchSpec, 
                 .chain([marker.as_os_str().to_os_string()])
                 .collect(),
             cwd,
+            env: Vec::new(),
         })
     } else {
-        let program = env
-            .resolve_program("touch", None)
-            .map_err(|error| error.to_string())?;
+        let program = find_program_path(
+            std::path::Path::new("touch"),
+            env.path_var.as_deref(),
+            env.pathext.as_deref(),
+            false,
+        )
+        .ok_or_else(|| "Could not find 'touch' on PATH".to_string())?;
         Ok(LaunchSpec {
             program,
             args: vec![marker.as_os_str().to_os_string()],
             cwd,
+            env: Vec::new(),
         })
     }
 }

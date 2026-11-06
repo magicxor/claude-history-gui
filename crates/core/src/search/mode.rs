@@ -4,9 +4,10 @@ use std::str::FromStr;
 
 /// Search mode. Upstream derived `clap::ValueEnum`; core provides
 /// `FromStr`/`Display` with the same lowercase spellings instead.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchMode {
+    #[default]
     Lexical,
     Semantic,
     Exact,
@@ -52,12 +53,6 @@ impl FromStr for SearchMode {
 impl fmt::Display for SearchMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-impl Default for SearchMode {
-    fn default() -> Self {
-        Self::Lexical
     }
 }
 

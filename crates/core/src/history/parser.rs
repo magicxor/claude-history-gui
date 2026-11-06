@@ -1,29 +1,14 @@
-//! JSONL conversation file parsing.
-//!
-//! This module handles parsing Claude conversation JSONL files and extracting
-//! conversation metadata like preview text, message counts, and working directory.
+//! Conversation file parsing: decodes a session file into a transcript and
+//! indexes it into the conversation the list shows.
 
+use super::Conversation;
+use super::index::Skipped;
 #[cfg(test)]
 use super::messages::is_clear_metadata_message;
-use super::messages::{MessageOrdinals, Placement, extract_skill_preview};
-use super::{Conversation, ParseError};
-use crate::agent::refs::MessageRange;
-use crate::agent::transcript::{AgentMessageRole, agent_search_text_from_blocks};
-use crate::claude::{
-    AgentContent, LogEntry, TokenUsage, extract_search_text_from_assistant,
-    extract_search_text_from_user, extract_text_from_assistant, extract_text_from_user,
-    parse_agent_progress,
-};
 use crate::debug;
 use crate::debug::DebugLevel;
+use crate::env::HistoryEnv;
 use crate::error::Result;
-use crate::search::normalize_for_search;
-use crate::semantic::filter::{SemanticTurnRole, filter_turn};
-use chrono::{DateTime, Local};
-use std::collections::{HashMap, VecDeque};
-use std::fs::File;
-use std::io::{BufRead, BufReader};
-
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -33,536 +18,116 @@ pub fn process_conversation_file(
     modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
 ) -> Result<Option<Conversation>> {
-    process_conversation_file_with_source(path, modified, debug_level, None)
+    stream_conversation(None, &path, modified, debug_level)
 }
 
-pub fn process_omp_conversation_file(
+/// Fork: [`process_conversation_file`] of a file opened in `env` (the
+/// single-file browser): a rollout of `env`'s own Codex home is decoded
+/// through the env's adapter, with its `CODEX_SQLITE_HOME`, as the viewer's
+/// history service opens it (`sources::decode_path_in`).
+pub fn process_conversation_file_in(
+    env: &HistoryEnv,
     path: PathBuf,
     modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
 ) -> Result<Option<Conversation>> {
-    process_conversation_file_with_source(path, modified, debug_level, Some(super::Source::Omp))
+    stream_conversation(Some(env), &path, modified, debug_level)
 }
 
-fn process_conversation_file_with_source(
-    path: PathBuf,
+/// Decodes `path` straight into an incremental indexer. Upstream collects the
+/// events here (its list no longer loads files this way); the fork's loaders
+/// still do, so the events are not all held at once.
+fn stream_conversation(
+    env: Option<&HistoryEnv>,
+    path: &std::path::Path,
     modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
-    source: Option<super::Source>,
 ) -> Result<Option<Conversation>> {
-    let projection = match source {
-        Some(super::Source::Omp) => super::pi::parse_omp_file(&path)?,
-        _ => super::pi::parse_file(&path)?,
-    };
-    if let Some(projection) = projection {
-        let normalized = projection
-            .entries
-            .iter()
-            .filter_map(|(_, entry)| serde_json::to_string(entry).ok())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mut conversation = process_conversation_reader(
-            path.clone(),
-            std::io::Cursor::new(normalized),
-            modified,
-            debug_level,
-        )?;
-        if let Some(conversation) = conversation.as_mut() {
-            conversation.source = projection.source;
-            conversation.session_id = projection.header.id;
-            conversation.cwd = Some(projection.header.cwd.clone());
-            conversation.project_path = Some(projection.header.cwd.clone());
-            conversation.project_name =
-                Some(super::format_short_name_from_path(&projection.header.cwd));
-            conversation
-                .parse_errors
-                .extend(
-                    projection
-                        .malformed_lines
-                        .into_iter()
-                        .map(|line_number| ParseError {
-                            line_number,
-                            line_content: String::new(),
-                            error_message: format!(
-                                "malformed {} JSONL record",
-                                projection.source.label()
-                            ),
-                            context_before: Vec::new(),
-                            context_after: Vec::new(),
-                        }),
-                );
-            conversation.timestamp = latest_activity_timestamp(&projection.entries)
-                .or_else(|| {
-                    DateTime::parse_from_rfc3339(&projection.header.timestamp)
-                        .ok()
-                        .map(|timestamp| timestamp.with_timezone(&Local))
-                })
-                .or_else(|| modified.map(DateTime::<Local>::from))
-                .unwrap_or_else(Local::now);
-        }
-        return Ok(conversation);
-    }
-
-    let file = File::open(&path)?;
-    let reader = BufReader::new(file);
-    process_conversation_reader(path, reader, modified, debug_level)
+    let mut indexer = super::index::Indexer::default();
+    let transcript = super::sources::decode_path_into(env, path, modified, false, &mut |event| {
+        indexer.push(&event)
+    })?;
+    Ok(index_with(&transcript, debug_level, |t| indexer.finish(t)))
 }
 
-fn latest_activity_timestamp(entries: &[(usize, LogEntry)]) -> Option<DateTime<Local>> {
-    entries
-        .iter()
-        .filter_map(|(_, entry)| match entry {
-            LogEntry::User { timestamp, .. } | LogEntry::Assistant { timestamp, .. } => {
-                timestamp.as_deref()
-            }
-            _ => None,
-        })
-        .filter_map(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
-        .map(|timestamp| timestamp.with_timezone(&Local))
-        .max()
-}
-
-/// Process a conversation from any BufRead source (for testability)
-pub fn process_conversation_reader<R: BufRead>(
+/// Process a Claude conversation from any BufRead source (for testability)
+#[cfg(test)]
+pub fn process_conversation_reader<R: std::io::BufRead>(
     path: PathBuf,
     reader: R,
     modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
 ) -> Result<Option<Conversation>> {
-    let filename = path
+    let key = super::model::ConversationKey {
+        instance: super::model::SourceInstance {
+            kind: super::model::SourceKind::Claude,
+            root: PathBuf::new(),
+        },
+        native_id: path.to_string_lossy().into_owned(),
+    };
+    let mut events = Vec::new();
+    let mut transcript =
+        super::sources::claude::decode_reader(key, &path, reader, modified, &mut |event| {
+            events.push(event)
+        })?;
+    transcript.events = events;
+    Ok(index_with(&transcript, debug_level, super::index::index))
+}
+
+/// Indexes `transcript`, logging its parse errors and why it was skipped.
+/// Claude conversations are left without a project: callers list them under
+/// the project directory they found the file in.
+///
+/// `finish` does the indexing: `index::index` for a collected transcript, an
+/// [`Indexer`](super::index::Indexer)'s `finish` for a streamed one.
+fn index_with(
+    transcript: &super::model::Transcript,
+    debug_level: Option<DebugLevel>,
+    finish: impl FnOnce(&super::model::Transcript) -> std::result::Result<Conversation, Skipped>,
+) -> Option<Conversation> {
+    let filename = transcript
+        .path()
         .file_name()
         .and_then(|f| f.to_str())
         .unwrap_or("unknown");
-
-    // Stream lines with a sliding window for parse error context.
-    // A VecDeque lookahead holds the current line + up to 2 context_after lines,
-    // and a context_before deque holds the last 2 lines for error diagnostics.
-    let mut lines_iter = reader.lines();
-    let mut context_window: VecDeque<String> = VecDeque::with_capacity(2);
-    let mut context_before: VecDeque<String> = VecDeque::with_capacity(2);
-
-    // Pre-fill the lookahead window (current line + 1 lookahead;
-    // a second lookahead line is added when the current line is popped)
-    for _ in 0..2 {
-        match lines_iter.next() {
-            Some(Ok(line)) => context_window.push_back(line),
-            Some(Err(e)) => return Err(e.into()),
-            None => break,
-        }
-    }
-
-    let mut all_parts = Vec::new();
-    let mut agent_search_parts = Vec::new();
-    let mut semantic_turns = Vec::new();
-    let mut semantic_turn_ranges = Vec::new();
-    let mut preview_parts = Vec::new();
-    let mut user_messages = Vec::new();
-    let mut extracted_cwd: Option<PathBuf> = None;
-    let mut ordinals = MessageOrdinals::new();
-    let mut parse_errors: Vec<ParseError> = Vec::new();
-    let mut extracted_summary: Option<String> = None;
-    let mut extracted_custom_title: Option<String> = None;
-    let mut extracted_model: Option<String> = None;
-    // Track token usage per message ID to avoid double-counting streaming entries
-    let mut token_usage_by_msg: HashMap<String, TokenUsage> = HashMap::new();
-    let mut assistant_id_semantic_indices: HashMap<String, usize> = HashMap::new();
-    let mut assistant_id_preview_indices: HashMap<String, usize> = HashMap::new();
-    let mut anonymous_token_count: u64 = 0;
-    // Track first and last message timestamps for conversation duration
-    let mut first_timestamp: Option<chrono::DateTime<chrono::FixedOffset>> = None;
-    let mut last_timestamp: Option<chrono::DateTime<chrono::FixedOffset>> = None;
-
-    let mut line_idx: usize = 0;
-
-    while let Some(line) = context_window.pop_front() {
-        // Top up the lookahead window from the iterator
-        match lines_iter.next() {
-            Some(Ok(next_line)) => context_window.push_back(next_line),
-            Some(Err(e)) => return Err(e.into()),
-            None => {}
-        }
-
-        if line.trim().is_empty() {
-            // Blank lines participate in context buffers but are not parsed
-            context_before.push_back(line);
-            if context_before.len() > 2 {
-                context_before.pop_front();
-            }
-            line_idx += 1;
-            continue;
-        }
-
-        match serde_json::from_str::<LogEntry>(&line) {
-            Ok(entry) => {
-                let placement = ordinals.place(&entry);
-                match entry {
-                    LogEntry::User {
-                        message,
-                        cwd,
-                        timestamp,
-                        usage,
-                        ..
-                    } => {
-                        if let Some(usage) = usage {
-                            anonymous_token_count += usage.input_tokens
-                                + usage.output_tokens
-                                + usage.cache_creation_input_tokens
-                                + usage.cache_read_input_tokens;
-                        }
-                        // Track timestamps for conversation duration
-                        if let Some(ref ts_str) = timestamp
-                            && let Ok(ts) = chrono::DateTime::parse_from_rfc3339(ts_str)
-                        {
-                            if first_timestamp.is_none() {
-                                first_timestamp = Some(ts);
-                            }
-                            last_timestamp = Some(ts);
-                        }
-
-                        // Extract cwd from the first user message that has it
-                        if extracted_cwd.is_none()
-                            && let Some(cwd_str) = cwd
-                        {
-                            extracted_cwd = Some(PathBuf::from(cwd_str));
-                        }
-
-                        let preview_text = extract_text_from_user(&message);
-                        let search_text = extract_search_text_from_user(&message);
-
-                        if !preview_text.is_empty() {
-                            user_messages.push(preview_text.clone());
-                        }
-                        if !search_text.is_empty() {
-                            all_parts.push(search_text);
-                        }
-
-                        let Placement::Message(ordinal) = placement else {
-                            continue;
-                        };
-                        // Check for skill invocations first - extract clean preview
-                        // (e.g. "/consult how to do X?" from command XML tags)
-                        let semantic_input = preview_text.clone();
-                        let effective_preview =
-                            extract_skill_preview(&preview_text).unwrap_or(preview_text);
-                        if !effective_preview.is_empty() {
-                            if let Some(turn) = filter_turn(SemanticTurnRole::User, &semantic_input)
-                            {
-                                semantic_turns.push(turn);
-                                semantic_turn_ranges.push(MessageRange::single(ordinal));
-                            }
-                            preview_parts.push(effective_preview);
-                        }
-                    }
-                    LogEntry::Assistant {
-                        message, timestamp, ..
-                    } => {
-                        let assistant_message_id = message.id.clone();
-                        // Track timestamps for conversation duration
-                        if let Some(ref ts_str) = timestamp
-                            && let Ok(ts) = chrono::DateTime::parse_from_rfc3339(ts_str)
-                        {
-                            if first_timestamp.is_none() {
-                                first_timestamp = Some(ts);
-                            }
-                            last_timestamp = Some(ts);
-                        }
-
-                        // Extract model name from first assistant message that has it
-                        if extracted_model.is_none()
-                            && let Some(model) = &message.model
-                        {
-                            extracted_model = Some(model.clone());
-                        }
-
-                        // Track token usage by message ID to avoid double-counting
-                        // Multiple JSONL entries can exist for the same message (streaming)
-                        if let Some(usage) = &message.usage {
-                            if let Some(msg_id) = &message.id {
-                                // Store/update usage for this message ID (last one wins)
-                                token_usage_by_msg.insert(msg_id.clone(), usage.clone());
-                            } else {
-                                // No message ID - accumulate directly (legacy format)
-                                anonymous_token_count += usage.input_tokens
-                                    + usage.output_tokens
-                                    + usage.cache_creation_input_tokens
-                                    + usage.cache_read_input_tokens;
-                            }
-                        }
-
-                        let preview_text = extract_text_from_assistant(&message);
-                        let search_text = extract_search_text_from_assistant(&message);
-
-                        if !search_text.is_empty() {
-                            all_parts.push(search_text);
-                        }
-
-                        if let Placement::Message(ordinal) | Placement::Replaces(ordinal) =
-                            placement
-                        {
-                            let message_range = MessageRange::single(ordinal);
-                            let semantic_turn =
-                                filter_turn(SemanticTurnRole::Assistant, &preview_text);
-                            if let Some(id) = assistant_message_id.as_ref() {
-                                if let Some(existing_index) =
-                                    assistant_id_semantic_indices.get(id).copied()
-                                {
-                                    if let Some(turn) = semantic_turn {
-                                        semantic_turns[existing_index] = turn;
-                                        semantic_turn_ranges[existing_index] = message_range;
-                                    } else {
-                                        semantic_turns[existing_index].clear();
-                                    }
-                                } else if let Some(turn) = semantic_turn {
-                                    assistant_id_semantic_indices
-                                        .insert(id.clone(), semantic_turns.len());
-                                    semantic_turns.push(turn);
-                                    semantic_turn_ranges.push(message_range);
-                                }
-
-                                if !preview_text.is_empty() {
-                                    if let Some(existing_index) =
-                                        assistant_id_preview_indices.get(id).copied()
-                                    {
-                                        preview_parts[existing_index] = preview_text;
-                                    } else {
-                                        assistant_id_preview_indices
-                                            .insert(id.clone(), preview_parts.len());
-                                        preview_parts.push(preview_text);
-                                    }
-                                }
-                            } else if !preview_text.is_empty() {
-                                if let Some(turn) = semantic_turn {
-                                    semantic_turns.push(turn);
-                                    semantic_turn_ranges.push(message_range);
-                                }
-                                preview_parts.push(preview_text);
-                            }
-                        }
-                    }
-                    LogEntry::Summary { summary } => {
-                        if extracted_summary.is_none() {
-                            extracted_summary = Some(summary.clone());
-                        }
-                    }
-                    LogEntry::AiTitle { ai_title } => {
-                        let trimmed = ai_title.trim();
-                        if !trimmed.is_empty() {
-                            extracted_summary = Some(trimmed.to_owned());
-                        }
-                    }
-                    LogEntry::CustomTitle { custom_title } => {
-                        let trimmed = custom_title.trim();
-                        extracted_custom_title = if trimmed.is_empty() {
-                            None
-                        } else {
-                            Some(trimmed.to_owned())
-                        };
-                    }
-                    LogEntry::PiMetadata {
-                        label,
-                        text,
-                        searchable: _,
-                        usage,
-                        ..
-                    } => {
-                        if let Some(usage) = usage {
-                            anonymous_token_count += usage.input_tokens
-                                + usage.output_tokens
-                                + usage.cache_creation_input_tokens
-                                + usage.cache_read_input_tokens;
-                        }
-                        if label == "Model" && !text.is_empty() {
-                            extracted_model = Some(text.clone());
-                        }
-                        if let Placement::Message(ordinal) = placement
-                            && !text.is_empty()
-                        {
-                            all_parts.push(text.clone());
-                            if let Some(turn) = filter_turn(SemanticTurnRole::User, &text) {
-                                semantic_turns.push(turn);
-                                semantic_turn_ranges.push(MessageRange::single(ordinal));
-                            }
-                        }
-                    }
-                    LogEntry::Progress { data, .. } => {
-                        if let Some(progress) = parse_agent_progress(&data) {
-                            let progress_placement = ordinals.place_subagent(&progress);
-                            if let Placement::Message(_) = progress_placement {
-                                let AgentContent::Blocks(blocks) = progress.message.message.content;
-                                let role = match progress.message.message_type.as_str() {
-                                    "user" => AgentMessageRole::User,
-                                    "assistant" => AgentMessageRole::Assistant,
-                                    _ => unreachable!("progress placement was checked above"),
-                                };
-                                let agent_search_text =
-                                    agent_search_text_from_blocks(role, &blocks);
-                                if !agent_search_text.is_empty() {
-                                    agent_search_parts.push(agent_search_text);
-                                }
-                            }
-                        }
-                    }
-                    LogEntry::AgentName { .. } => {}
-                    LogEntry::System { .. } => {}
-                    _ => {}
-                }
-            }
-            Err(e) => {
-                // Capture parse error with surrounding context from the sliding window
-                parse_errors.push(ParseError {
-                    line_number: line_idx + 1, // 1-indexed for display
-                    line_content: line.clone(),
-                    error_message: e.to_string(),
-                    context_before: context_before.iter().cloned().collect(),
-                    context_after: context_window.iter().cloned().collect(),
-                });
-
-                debug::warn(
-                    debug_level,
-                    &format!(
-                        "Parse error in {} at line {}: {}",
-                        filename,
-                        line_idx + 1,
-                        e
-                    ),
-                );
-            }
-        }
-
-        // Update the trailing context window
-        context_before.push_back(line);
-        if context_before.len() > 2 {
-            context_before.pop_front();
-        }
-        line_idx += 1;
-    }
-
-    // Check if this is a clear-only conversation or if preview is empty after filtering
-    if is_clear_only_conversation(&user_messages) {
-        debug::debug(
-            debug_level,
-            &format!("Filtered {}: clear-only conversation", filename),
-        );
-        return Ok(None);
-    }
-
-    if all_parts.is_empty() || preview_parts.is_empty() {
-        debug::debug(
+    for error in &transcript.diagnostics {
+        debug::warn(
             debug_level,
             &format!(
-                "Filtered {}: empty conversation (all_parts={}, preview_parts={})",
-                filename,
-                all_parts.len(),
-                preview_parts.len()
+                "Parse error in {} at line {}: {}",
+                filename, error.line_number, error.error_message
             ),
         );
-        return Ok(None);
     }
-
-    // Use file modification time, falling back to current time if unavailable
-    let timestamp = modified
-        .map(DateTime::<Local>::from)
-        .unwrap_or_else(Local::now);
-
-    // Create both preview variants (first and last 3 messages)
-    // Skip leading assistant messages by using preview_parts instead of all_parts
-    let preview_first = preview_parts
-        .iter()
-        .take(3)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(" ... ");
-    let preview_last = preview_parts
-        .iter()
-        .rev()
-        .take(3)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(" ... ");
-
-    // Create full text for searching (all messages + summary + custom title)
-    let mut full_text = all_parts.join(" ");
-    if let Some(ref summary) = extracted_summary {
-        full_text = format!("{} {}", summary, full_text);
-    }
-    if let Some(ref custom_title) = extracted_custom_title {
-        full_text = format!("{} {}", custom_title, full_text);
-    }
-
-    // Normalize whitespace
-    let preview_first = normalize_whitespace(&preview_first);
-    let preview_last = normalize_whitespace(&preview_last);
-    let full_text = normalize_whitespace(&full_text);
-    let agent_search_text = normalize_whitespace(&agent_search_parts.join(" "));
-    let semantic_route_text = super::semantic_route_text(&full_text, &agent_search_text);
-
-    // Pre-normalize search text to avoid re-normalizing on every startup
-    let search_text_lower = normalize_for_search(&full_text);
-
-    let semantic_pairs = semantic_turns
-        .into_iter()
-        .zip(semantic_turn_ranges)
-        .filter(|(turn, _)| !turn.is_empty())
-        .collect::<Vec<_>>();
-    let (semantic_turns, semantic_turn_ranges): (Vec<_>, Vec<_>) =
-        semantic_pairs.into_iter().unzip();
-
-    // Sum token usage from deduplicated messages (all token types)
-    let total_tokens: u64 = token_usage_by_msg
-        .values()
-        .map(|u| {
-            u.input_tokens
-                + u.output_tokens
-                + u.cache_creation_input_tokens
-                + u.cache_read_input_tokens
-        })
-        .sum::<u64>()
-        + anonymous_token_count;
-
-    // Calculate conversation duration in minutes
-    let duration_minutes = match (first_timestamp, last_timestamp) {
-        (Some(first), Some(last)) => {
-            let duration = last.signed_duration_since(first);
-            let minutes = duration.num_minutes();
-            if minutes > 0 {
-                Some(minutes as u64)
-            } else {
-                None
+    match finish(transcript) {
+        Ok(mut conversation) => {
+            if conversation.source == super::model::SourceKind::Claude {
+                conversation.project_name = None;
+                conversation.project_path = None;
             }
+            Some(conversation)
         }
-        _ => None,
-    };
-
-    Ok(Some(Conversation {
-        source: super::Source::Claude,
-        session_id: path
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_owned(),
-        path,
-        index: 0,
-        timestamp,
-        preview: preview_first.clone(),
-        preview_first,
-        preview_last,
-        full_text,
-        agent_search_text,
-        semantic_route_text,
-        semantic_turns,
-        semantic_turn_ranges,
-        search_text_lower,
-        project_name: None,
-        project_path: None,
-        cwd: extracted_cwd,
-        message_count: ordinals.count(),
-        parse_errors,
-        summary: extracted_summary,
-        custom_title: extracted_custom_title,
-        model: extracted_model,
-        total_tokens,
-        duration_minutes,
-    }))
+        Err(Skipped::ClearOnly) => {
+            debug::debug(
+                debug_level,
+                &format!("Filtered {}: clear-only conversation", filename),
+            );
+            None
+        }
+        Err(Skipped::Empty {
+            search_parts,
+            preview_parts,
+        }) => {
+            debug::debug(
+                debug_level,
+                &format!(
+                    "Filtered {}: empty conversation (all_parts={}, preview_parts={})",
+                    filename, search_parts, preview_parts
+                ),
+            );
+            None
+        }
+    }
 }
 
 pub(crate) fn is_clear_only_conversation(user_messages: &[String]) -> bool {
@@ -613,8 +178,10 @@ pub(crate) fn normalize_whitespace(s: &str) -> String {
 /// Truncate a string to at most `max` bytes, on a char boundary
 #[cfg(test)]
 mod tests {
+    use super::super::messages::extract_skill_preview;
     use super::*;
-    use crate::agent::transcript::AgentTranscript;
+    use crate::agent::refs::MessageRange;
+    use crate::agent::transcript::{AgentMessageRole, AgentTranscript};
     use std::io::Cursor;
 
     /// Helper to create a user message JSON line
@@ -873,6 +440,22 @@ mod tests {
             2,
             "context_after should have at most 2 lines"
         );
+    }
+
+    #[test]
+    fn parse_errors_after_filtered_user_records_keep_their_line() {
+        let content = [
+            user_msg("Warmup", None),
+            "invalid json".to_string(),
+            user_msg("Question", None),
+            assistant_msg("Answer"),
+        ]
+        .join("\n");
+
+        let conv = parse_jsonl(&content).unwrap().unwrap();
+        assert_eq!(conv.parse_errors.len(), 1);
+        assert_eq!(conv.parse_errors[0].line_number, 2);
+        assert_eq!(conv.parse_errors[0].context_before.len(), 1);
     }
 
     // === Preview order ===
@@ -1422,6 +1005,33 @@ mod tests {
     }
 
     #[test]
+    fn own_text_holds_only_what_the_person_typed() {
+        let content = [
+            user_msg("Real question", None),
+            assistant_msg("assistant only words"),
+            user_msg_with_tool_result_blocks("check file", "tool output words"),
+            user_msg(
+                "Caveat: The messages below were generated by the user while running local commands.",
+                None,
+            ),
+            user_msg(
+                "<local-command-stdout>local stdout payload</local-command-stdout>",
+                None,
+            ),
+            user_msg(
+                "Follow up<system-reminder>reminder words</system-reminder>",
+                None,
+            ),
+            user_msg("[Request interrupted by user]", None),
+        ]
+        .join("\n");
+
+        let conv = parse_jsonl(&content).unwrap().unwrap();
+        assert!(conv.full_text.contains("tool output words"));
+        assert_eq!(conv.own_text.as_ref(), "Real question check file Follow up");
+    }
+
+    #[test]
     fn tool_result_not_in_preview() {
         let content = [
             user_msg_with_tool_result(
@@ -1463,11 +1073,6 @@ mod tests {
             conv.full_text
         );
         assert!(
-            conv.search_text_lower.contains("verbose tool output"),
-            "Tool result should remain in lexical search_text_lower: {}",
-            conv.search_text_lower
-        );
-        assert!(
             !conv
                 .semantic_turns
                 .join(" ")
@@ -1475,7 +1080,7 @@ mod tests {
             "Tool result should not be in semantic_turns: {:?}",
             conv.semantic_turns
         );
-        assert_eq!(conv.semantic_turns, vec!["run this", "Done"]);
+        assert_eq!(conv.semantic_turns.to_vec(), vec!["run this", "Done"]);
     }
 
     #[test]
@@ -1503,7 +1108,7 @@ mod tests {
         let conv = parse_jsonl(&content).unwrap().unwrap();
 
         assert!(conv.full_text.contains(middle));
-        assert!(conv.search_text_lower.contains(middle));
+        assert!(crate::search::normalize_for_search(&conv.full_text).contains(middle));
     }
 
     #[test]
@@ -1551,7 +1156,7 @@ mod tests {
         let semantic = conv.semantic_turns.join(" ");
 
         assert_eq!(
-            conv.semantic_turns,
+            conv.semantic_turns.to_vec(),
             vec![
                 "visible user semantic sentinel",
                 "visible mixed assistant semantic sentinel",
@@ -1583,11 +1188,6 @@ mod tests {
                 "{included} missing from {}",
                 conv.full_text
             );
-            assert!(
-                conv.search_text_lower.contains(included),
-                "{included} missing from {}",
-                conv.search_text_lower
-            );
         }
         assert!(!conv.full_text.contains("/cwd/private-sentinel"));
         assert_eq!(conv.project_name, None);
@@ -1615,9 +1215,11 @@ mod tests {
 
         let conv = parse_jsonl(&content).unwrap().unwrap();
         assert!(conv.full_text.contains("local stdout payload"));
-        assert!(conv.search_text_lower.contains("local stdout payload"));
+        assert!(
+            crate::search::normalize_for_search(&conv.full_text).contains("local stdout payload")
+        );
         assert_eq!(
-            conv.semantic_turns,
+            conv.semantic_turns.to_vec(),
             vec![
                 "Real question",
                 "Real answer",
@@ -1648,7 +1250,7 @@ mod tests {
         assert!(!semantic.contains("<command-message>"));
         assert!(!semantic.contains("/goal"));
         assert_eq!(
-            conv.semantic_turns,
+            conv.semantic_turns.to_vec(),
             vec![
                 "Find conversations about semantic search",
                 "Relevant answer",
@@ -1674,7 +1276,7 @@ mod tests {
         assert!(conv.full_text.contains("cargo test"));
         assert!(conv.full_text.contains("Validation passed"));
         assert_eq!(
-            conv.semantic_turns,
+            conv.semantic_turns.to_vec(),
             vec![
                 "Implement semantic cache",
                 "I’ll run cargo test and just check before committing.",
@@ -1765,7 +1367,10 @@ mod tests {
 
         let conv = parse_jsonl(&content).unwrap().unwrap();
 
-        assert_eq!(conv.semantic_turns, vec!["question", "final", "next"]);
+        assert_eq!(
+            conv.semantic_turns.to_vec(),
+            vec!["question", "final", "next"]
+        );
         assert_eq!(
             conv.semantic_turn_ranges,
             vec![
@@ -1798,7 +1403,10 @@ mod tests {
 
         let conv = parse_jsonl(&content).unwrap().unwrap();
 
-        assert_eq!(conv.semantic_turns, vec!["question", "final", "next"]);
+        assert_eq!(
+            conv.semantic_turns.to_vec(),
+            vec!["question", "final", "next"]
+        );
         assert_eq!(
             conv.semantic_turn_ranges,
             vec![
@@ -1842,7 +1450,10 @@ mod tests {
 
         let conv = parse_jsonl(&content).unwrap().unwrap();
 
-        assert_eq!(conv.semantic_turns, vec!["question", "second final"]);
+        assert_eq!(
+            conv.semantic_turns.to_vec(),
+            vec!["question", "second final"]
+        );
         assert_eq!(
             conv.semantic_turn_ranges,
             vec![MessageRange::single(1), MessageRange::single(3)]
@@ -1861,7 +1472,7 @@ mod tests {
         let conv = parse_jsonl(&content).unwrap().unwrap();
 
         assert_eq!(
-            conv.semantic_turns,
+            conv.semantic_turns.to_vec(),
             vec!["first visible", "second visible", "third visible"]
         );
         assert_eq!(
@@ -1887,7 +1498,7 @@ mod tests {
         let conv = parse_jsonl(&content).unwrap().unwrap();
 
         assert_eq!(
-            conv.semantic_turns,
+            conv.semantic_turns.to_vec(),
             vec!["first visible", "final assistant text"]
         );
         assert_eq!(
@@ -1915,7 +1526,7 @@ mod tests {
         let conv = parse_jsonl(&content).unwrap().unwrap();
 
         assert_eq!(
-            conv.semantic_turns,
+            conv.semantic_turns.to_vec(),
             vec!["first visible", "final assistant text"]
         );
         assert_eq!(
@@ -1953,7 +1564,7 @@ mod tests {
         let conv = parse_jsonl(&content).unwrap().unwrap();
 
         assert_eq!(
-            conv.semantic_turns,
+            conv.semantic_turns.to_vec(),
             vec!["first visible", "final assistant text"]
         );
         assert_eq!(
@@ -1972,7 +1583,7 @@ mod tests {
 
         let conversation = parse_jsonl(&content).unwrap().unwrap();
         assert_eq!(conversation.message_count, 2);
-        assert_eq!(conversation.preview_first, "answer");
+        assert_eq!(&*conversation.preview_first, "answer");
         assert_eq!(
             conversation.semantic_turn_ranges,
             vec![MessageRange::single(2)]
@@ -1999,35 +1610,6 @@ mod tests {
         assert_eq!(
             conversation.semantic_turn_ranges,
             vec![MessageRange::single(1), MessageRange::single(2),]
-        );
-    }
-
-    #[test]
-    fn empty_searchable_metadata_occupies_an_ordinal() {
-        let content = [
-            r#"{"type":"pi-metadata","label":"Hook","text":"","searchable":true}"#.to_string(),
-            user_msg("question", None),
-            assistant_msg("answer"),
-        ]
-        .join("\n");
-
-        let conversation = parse_jsonl(&content).unwrap().unwrap();
-        assert_eq!(conversation.message_count, 3);
-        assert_eq!(
-            conversation.semantic_turn_ranges,
-            vec![MessageRange::single(2), MessageRange::single(3),]
-        );
-
-        let transcript =
-            AgentTranscript::from_reader(PathBuf::from("test.jsonl"), Cursor::new(content))
-                .unwrap();
-        assert_eq!(
-            transcript
-                .messages
-                .iter()
-                .map(|message| message.ordinal)
-                .collect::<Vec<_>>(),
-            vec![1, 2, 3]
         );
     }
 
@@ -2082,6 +1664,28 @@ mod tests {
                 .iter()
                 .all(|range| range.end <= conversation.message_count)
         );
+    }
+
+    #[test]
+    fn counts_prompts_and_distinct_tool_calls() {
+        let content = [
+            r#"{"type":"user","message":{"role":"user","content":"Warmup"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"<command-name>/clear</command-name>"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"first question"}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","id":"a1","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","id":"a1","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}},{"type":"tool_use","id":"t2","name":"Read","input":{}}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1"}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2"}]}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","id":"a2","content":[{"type":"text","text":"done"}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"second question"}}"#,
+        ]
+        .join("\n");
+
+        let conversation = parse_jsonl(&content).unwrap().unwrap();
+
+        assert_eq!(conversation.message_count, 6);
+        assert_eq!(conversation.prompt_count, 2);
+        assert_eq!(conversation.tool_call_count, 2);
     }
 
     #[test]

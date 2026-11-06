@@ -8,13 +8,18 @@
 //! [`agent_factory`] (`agent::service::EmbedderFactory`) and
 //! [`ops_factory`] (an owned `FnMut` for `semantic_ops::EmbedderFactory<'_>`).
 //! Each adapter locks the shared model per call, so one model is in memory
-//! and Clear semantic cache can drop it ([`drop_model`]).
+//! and Clear semantic cache can drop it ([`SharedEmbedder::drop_model`]).
 //!
 //! [`install`] sets up fastembed
-//! (`FastembedEmbedder::new_in(env.semantic_model_dir(), false)`, or
-//! `--qa-model-dir`); the model is loaded lazily, off the UI thread, by the
-//! first consumer. Tests get a refusing factory from `init_for_test` and opt
-//! in to a fake with [`install_fake`].
+//! (`FastembedEmbedder::new_in(env.semantic_model_dir(), false, Background)`,
+//! or `--qa-model-dir`); the model is loaded lazily, off the UI thread, by the
+//! first consumer. It embeds on half the cores (`EmbedPriority::Background`,
+//! upstream 8322afe) for every consumer, Tools included (upstream's CLI
+//! commands used every core); the list's semantic worker also lowers its own
+//! thread's scheduling priority (core). As the process's first embedder it also sets ONNX Runtime up
+//! with core's low-priority global inference pool (upstream 9ee0a03), so every consumer's inference
+//! runs on `semantic-embed` threads below normal priority (DESIGN §7.6). Tests get a refusing factory from
+//! `init_for_test` and opt in to a fake with [`install_fake`].
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -24,7 +29,7 @@ use claude_history_core::AppError;
 use claude_history_core::agent::service::EmbedderFactory as AgentEmbedderFactory;
 use claude_history_core::browser::SemanticEmbedderFactory;
 use claude_history_core::semantic::embed::SemanticEmbedder;
-use claude_history_core::semantic::fastembed::FastembedEmbedder;
+use claude_history_core::semantic::fastembed::{EmbedPriority, FastembedEmbedder};
 use gpui_kit::{App, Global};
 
 use crate::globals::AppState;
@@ -132,6 +137,11 @@ impl SemanticEmbedder for SharedModelEmbedder {
         &mut self,
         passages: &[String],
     ) -> claude_history_core::Result<Vec<Vec<f32>>> {
+        if passages.is_empty() {
+            // Only loads the model (the list's warm-up), whatever the model
+            // makes of an empty batch.
+            return self.shared.with_model(|_| Ok(Vec::new()));
+        }
         self.shared
             .with_model(|model| model.embed_passages(passages))
     }
@@ -152,16 +162,17 @@ pub fn refusing_factory(message: &'static str) -> ModelFactory {
     Arc::new(move || Err(AppError::AgentProtocol(message.to_string())))
 }
 
-/// The production factory: the fastembed BGE-small model, downloaded on first
+/// The production factory: the fastembed snowflake-arctic-embed-xs model, downloaded on first
 /// use into `model_dir` (`HistoryEnv::semantic_model_dir`, or the QA run's
-/// pre-downloaded `--qa-model-dir`). Without a model directory (no home) it
-/// fails with a readable message.
+/// pre-downloaded `--qa-model-dir`), embedding on half the cores on the global low-priority
+/// inference pool (every consumer, Deep Search queries included). Without a
+/// model directory (no home) it fails with a readable message.
 pub fn fastembed_factory(model_dir: Option<PathBuf>) -> ModelFactory {
     Arc::new(move || {
         let dir = model_dir.clone().ok_or_else(|| {
             AppError::ConfigError("No home directory: cannot place the semantic model".to_string())
         })?;
-        let model = FastembedEmbedder::new_in(dir, false)?;
+        let model = FastembedEmbedder::new_in(dir, false, EmbedPriority::Background)?;
         Ok(Box::new(model) as Box<dyn SemanticEmbedder + Send>)
     })
 }
@@ -236,11 +247,12 @@ pub fn ops_factory(cx: &App) -> OpsEmbedderFactory {
     })
 }
 
-/// Drop the shared model (Clear semantic cache, under the semantic gate).
-pub fn drop_model(cx: &mut App) {
-    if let Some(handle) = cx.try_global::<SharedEmbedderHandle>() {
-        handle.0.drop_model();
-    }
+/// The shared embedder when one is installed. Clear semantic cache drops its
+/// model ([`SharedEmbedder::drop_model`]) on its own thread, under the
+/// semantic gate, once the list's semantic worker has ended.
+pub fn installed(cx: &App) -> Option<Arc<SharedEmbedder>> {
+    cx.try_global::<SharedEmbedderHandle>()
+        .map(|handle| handle.0.clone())
 }
 
 #[cfg(test)]
@@ -352,8 +364,10 @@ mod tests {
         assert!(!handle.is_loaded());
         browser().unwrap().embed_query("q").unwrap();
         assert_eq!(created.load(Ordering::SeqCst), 2);
-        // Clear semantic cache through the App entry point.
-        cx.update(drop_model);
+        // Clear semantic cache drops the installed embedder's model.
+        let installed = cx.read(installed).expect("installed");
+        assert!(Arc::ptr_eq(&installed, &handle));
+        installed.drop_model();
         assert!(!handle.is_loaded());
         ops().unwrap().embed_query("q").unwrap();
         assert_eq!(created.load(Ordering::SeqCst), 3);
@@ -397,6 +411,35 @@ mod tests {
         let error = thin(&shared).embed_passages(&[]).unwrap_err().to_string();
         assert!(error.contains(NOT_AVAILABLE_IN_TESTS), "{error}");
         assert_eq!(shared.load_count(), 0);
+    }
+
+    /// The list's warm-up (an empty batch) loads the model without asking
+    /// it to embed nothing.
+    #[test]
+    fn an_empty_batch_only_loads_the_model() {
+        struct NoEmptyBatches;
+        impl SemanticEmbedder for NoEmptyBatches {
+            fn embed_passages(
+                &mut self,
+                passages: &[String],
+            ) -> claude_history_core::Result<Vec<Vec<f32>>> {
+                assert!(!passages.is_empty(), "the model got an empty batch");
+                Ok(passages.iter().map(|_| vec![1.0]).collect())
+            }
+
+            fn embed_query(
+                &mut self,
+                _query: &str,
+            ) -> claude_history_core::Result<Option<Vec<f32>>> {
+                Ok(Some(vec![1.0]))
+            }
+        }
+        let shared = Arc::new(SharedEmbedder::new(Arc::new(|| {
+            Ok(Box::new(NoEmptyBatches) as Box<dyn SemanticEmbedder + Send>)
+        })));
+        assert!(thin(&shared).embed_passages(&[]).unwrap().is_empty());
+        assert!(shared.is_loaded());
+        assert_eq!(shared.load_count(), 1);
     }
 
     #[test]

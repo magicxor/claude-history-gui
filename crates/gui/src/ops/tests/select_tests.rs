@@ -179,7 +179,12 @@ fn redirected_stdout_prints_the_ledger_export(cx: &mut TestAppContext) {
             show_thinking: settings.show_thinking,
         }
     });
-    let expected = generate_export(&path, ExportFormat::Ledger, options).unwrap();
+    let expected = generate_export(
+        &crate::test_support::transcript(&path),
+        ExportFormat::Ledger,
+        options,
+    )
+    .unwrap();
     ctrl_o(cx, &f, &path);
     assert_eq!(stdouts(&f), vec![expected.clone()]);
     assert!(!expected.contains("\u{1b}["), "no ANSI");
@@ -224,7 +229,7 @@ fn output_options_are_the_startup_ones(cx: &mut TestAppContext) {
     let f = OpsFixture::open(cx, &world, &[]);
     f.recording.set_stdout_kind(StdoutKind::Redirected);
     let with_tools = generate_export(
-        &path,
+        &crate::test_support::transcript(&path),
         ExportFormat::Ledger,
         ExportOptions {
             show_tools: true,
@@ -233,7 +238,7 @@ fn output_options_are_the_startup_ones(cx: &mut TestAppContext) {
     )
     .unwrap();
     let without_tools = generate_export(
-        &path,
+        &crate::test_support::transcript(&path),
         ExportFormat::Ledger,
         ExportOptions {
             show_tools: false,
@@ -259,7 +264,7 @@ fn show_tools_flag_prints_the_tools(cx: &mut TestAppContext) {
     let f = OpsFixture::open(cx, &world, &["--show-tools"]);
     f.recording.set_stdout_kind(StdoutKind::Redirected);
     let with_tools = generate_export(
-        &path,
+        &crate::test_support::transcript(&path),
         ExportFormat::Ledger,
         ExportOptions {
             show_tools: true,
@@ -285,7 +290,7 @@ fn plain_flag_prints_the_cli_plain_format(cx: &mut TestAppContext) {
             show_thinking: settings.show_thinking,
         }
     });
-    let expected = plain_display(&path, options).unwrap();
+    let expected = plain_display(&crate::test_support::transcript(&path), options);
     ctrl_o(cx, &f, &path);
     assert_eq!(stdouts(&f), vec![expected.clone()]);
     assert!(expected.starts_with("You:"));

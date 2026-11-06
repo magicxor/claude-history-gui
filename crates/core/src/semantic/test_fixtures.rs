@@ -3,7 +3,6 @@ use std::path::PathBuf;
 
 use crate::agent::refs::MessageRange;
 use crate::history::Conversation;
-use crate::search::normalize_for_search;
 use chrono::Local;
 
 #[cfg(test)]
@@ -19,7 +18,6 @@ pub struct SemanticConversationFixture {
     preview_first: String,
     preview_last: String,
     full_text: String,
-    search_text_lower: String,
     project_name: String,
     project_path: PathBuf,
     cwd: Option<PathBuf>,
@@ -49,7 +47,6 @@ impl SemanticConversationFixture {
             preview_first: preview.to_string(),
             preview_last: preview.to_string(),
             full_text: full_text.to_string(),
-            search_text_lower: full_text.to_string(),
             project_name: "project sentinel".to_string(),
             project_path: PathBuf::from("/projects/project-sentinel"),
             cwd: Some(PathBuf::from("/cwd/sentinel")),
@@ -64,7 +61,6 @@ impl SemanticConversationFixture {
         self.preview_first = title.clone();
         self.preview_last = title.clone();
         self.full_text = title.clone();
-        self.search_text_lower = title.clone();
         self.custom_title = Some(title);
         self
     }
@@ -85,15 +81,10 @@ impl SemanticConversationFixture {
         self
     }
 
-    pub fn with_normalized_search_text_lower(mut self) -> Self {
-        self.search_text_lower = normalize_for_search(&self.full_text);
-        self
-    }
-
     pub fn build(self) -> Conversation {
         let semantic_route_text = crate::history::semantic_route_text(&self.full_text, "");
         Conversation {
-            source: crate::history::Source::Claude,
+            source: crate::history::model::SourceKind::Claude,
             session_id: self
                 .path
                 .file_stem()
@@ -103,27 +94,32 @@ impl SemanticConversationFixture {
             path: self.path,
             index: 0,
             timestamp: Local::now(),
-            preview: self.preview,
-            preview_first: self.preview_first,
-            preview_last: self.preview_last,
-            full_text: self.full_text,
-            agent_search_text: String::new(),
-            semantic_route_text,
+            preview: self.preview.into(),
+            preview_first: self.preview_first.into(),
+            preview_last: self.preview_last.into(),
+            full_text: self.full_text.into(),
+            own_text: "".into(),
+            agent_search_text: "".into(),
+            semantic_route_text: semantic_route_text.into(),
             semantic_turn_ranges: (1..=self.semantic_turns.len())
                 .map(MessageRange::single)
                 .collect(),
-            semantic_turns: self.semantic_turns,
-            search_text_lower: self.search_text_lower,
+            semantic_turns: self.semantic_turns.into(),
             project_name: Some(self.project_name),
             project_path: Some(self.project_path),
+            cwds: self.cwd.iter().cloned().collect(),
             cwd: self.cwd,
             message_count: 1,
+            prompt_count: 1,
+            tool_call_count: 0,
             parse_errors: Vec::new(),
             summary: self.summary,
             custom_title: self.custom_title,
             model: None,
             total_tokens: 0,
             duration_minutes: None,
+            provenance: Default::default(),
+            parent: None,
         }
     }
 }

@@ -174,6 +174,24 @@ fn view_checks_follow_the_viewer_and_the_collapsed_state(cx: &mut TestAppContext
     assert!(checked(&leaves, "View", "Show timestamps"));
     assert!(checked(&leaves, "View › Tool display", "Full"));
     assert!(!checked(&leaves, "View › Tool display", "Summary"));
+    // Upstream d0aca95's off mode is the first item.
+    cx.dispatch_action(handle, SetToolsOff);
+    cx.run_until_parked();
+    let leaves = installed(cx);
+    let modes: Vec<&str> = leaves
+        .iter()
+        .filter(|(path, _, _)| path == "View › Tool display")
+        .map(|(_, name, _)| name.as_str())
+        .collect();
+    assert_eq!(modes, ["Off", "Summary", "Calls", "Truncated", "Full"]);
+    assert!(checked(&leaves, "View › Tool display", "Off"));
+    assert!(!checked(&leaves, "View › Tool display", "Full"));
+    // Upstream a60dfe9's calls mode sits between Summary and Truncated.
+    cx.dispatch_action(handle, SetToolsCalls);
+    cx.run_until_parked();
+    let leaves = installed(cx);
+    assert!(checked(&leaves, "View › Tool display", "Calls"));
+    assert!(!checked(&leaves, "View › Tool display", "Off"));
     // Focus viewer mode.
     assert!(!checked(&leaves, "View", "Focus viewer"));
     cx.dispatch_action(handle, ToggleListPane);
@@ -189,14 +207,17 @@ fn view_checks_follow_the_viewer_and_the_collapsed_state(cx: &mut TestAppContext
 #[test]
 fn the_tree_marks_each_state() {
     use claude_history_core::theme::ThemePreference;
+    use claude_history_core::view::ToolDisplayMode;
     let tree = menus::build_tree(&menus::MenuChecks {
         theme: ThemePreference::Dark,
         list_collapsed: true,
-        tool_display: Some(2),
+        tool_display: Some(ToolDisplayMode::Full),
         show_thinking: true,
         show_timing: true,
         semantic_mode: true,
         workspace_scope: true,
+        all_kinds: true,
+        user_only: true,
         picker: false,
         header_session_id: false,
     });
@@ -209,12 +230,16 @@ fn the_tree_marks_each_state() {
         ("View", "Show timestamps"),
         ("View › Search mode", "Semantic"),
         ("View › Scope", "Workspace"),
+        ("View", menus::ALL_KINDS_LABEL),
+        ("View", menus::USER_ONLY_LABEL),
     ] {
         assert!(checked(&leaves, path, name), "{path} / {name}");
     }
     for (path, name) in [
         ("View › Theme", "System"),
+        ("View › Tool display", "Off"),
         ("View › Tool display", "Summary"),
+        ("View › Tool display", "Calls"),
         ("View › Search mode", "Lexical"),
         ("View › Scope", "All"),
     ] {

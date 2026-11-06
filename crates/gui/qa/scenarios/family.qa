@@ -1,0 +1,75 @@
+# family.qa (upstream 3c2ffeb; FEATURES L-108, V-106, V-107): a Claude session's subagent and
+# /btw fork. The fork is listed (tagged `fork`), the subagent is not; the viewer header names
+# them, `s` picks one, `P` opens the parent, Esc walks back through the conversations opened
+# and only then leaves the viewer.
+#
+#   tools/qa/run-gui.ps1 -Sandbox <sandbox> -Exe <qa build> -Scenario crates/gui/qa/scenarios/family.qa -Out <dir> [-Shots]
+# The sandbox is a copy of crates/gui/tests/fixtures/qa-home (tools/qa/new-sandbox.ps1): its
+# "Cache eviction review" session has the subagent "Explore: Find cache users" and the fork
+# "Ask about the LRU size".
+wait-loaded 30s
+expect dialog == none
+
+# The fork is a conversation of its own; its question is searchable in the session too.
+type "LRU size"
+wait-for list.selected_title contains "Ask about the LRU size" 10s
+key ctrl-u
+type "cache eviction"
+wait-for list.selected_title contains "Cache eviction review" 10s
+
+# The session's header counts its subagent and fork.
+key enter
+wait-for viewer.path contains "000000000007.jsonl" 10s
+wait-for viewer.loading == false 10s
+expect focus == viewer
+wait-for viewer.family == "1 subagent, 1 fork" 10s
+shot family-header
+
+# `s` lists them, oldest first; Enter opens the subagent, the list keeps its selection.
+key s
+expect dialog == family-menu
+shot family-picker
+key enter
+expect dialog == none
+wait-for viewer.path contains "agent-a71c0de" 10s
+wait-for viewer.loading == false 10s
+expect viewer.family == "↳ subagent of Cache eviction review"
+expect viewer.back == 1
+expect list.selected_title contains "Cache eviction review"
+shot family-subagent
+
+# `P` opens the parent; Esc walks back to the subagent, then to the session, then leaves.
+key shift-p
+wait-for viewer.path contains "000000000007.jsonl" 10s
+expect viewer.back == 2
+key escape
+wait-for viewer.path contains "agent-a71c0de" 10s
+key escape
+wait-for viewer.path contains "000000000007.jsonl" 10s
+expect viewer.back == 0
+expect focus == viewer
+key escape
+expect focus == list
+
+# The fork from the picker: a fork cannot be forked.
+key enter
+wait-for viewer.loading == false 10s
+key s
+expect dialog == family-menu
+key j enter
+wait-for viewer.path contains "agent-afork0b7" 10s
+expect viewer.family == "↳ fork of Cache eviction review"
+action history::Fork
+wait-for toast.last contains "not supported" 5s
+
+# The list opening the conversation the viewer already shows starts over: no way back.
+expect viewer.back == 1
+action history::FocusConversations
+key ctrl-a
+type "LRU size"
+wait-for list.selected_title contains "Ask about the LRU size" 10s
+key enter
+wait-for viewer.loading == false 10s
+expect viewer.path contains "agent-afork0b7"
+expect viewer.back == 0
+quit 0

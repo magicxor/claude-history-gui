@@ -23,9 +23,27 @@
 //! State machines are core's: `view::MessageNav` (J/K, focus mark),
 //! `view::ViewSearch<SegMatch>` (find bar, n/N), `view::escape` (Esc order),
 //! `capture_anchor_entry` / `find_entry_or_prev` (anchored rebuilds).
+//!
+//! The list's search hit (upstream 411e227 list preview, [`hit`], §9.8a): a
+//! conversation opened from the list while it has a query is shown at the
+//! hit (its message focused, the query's matches highlighted); a new hit
+//! for the conversation shown re-anchors it without a rebuild. The hit's
+//! overlay and the `/` search's are never drawn together: the newer one
+//! replaces the other.
+//!
+//! Related conversations (upstream 3c2ffeb, [`family`]): the header's family
+//! line names the conversation's parent and counts its subagents and forks;
+//! `P` (`OpenParentConversation`) opens the parent, `s`
+//! (`ShowSubagentsAndForks`) picks a subagent or fork. Such an open goes
+//! through the workspace ([`ViewerPaneEvent::OpenRelated`], the list's
+//! selection stays) and keeps the conversation it came from on a back
+//! stack: Esc after unwinding and `q` return to it before they leave the
+//! viewer. Any other open forgets the stack.
 
 pub mod code;
+pub mod family;
 pub mod header;
+pub mod hit;
 pub mod items;
 pub mod lru;
 pub mod nav;
@@ -46,6 +64,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use claude_history_core::browser::ListHit;
 use claude_history_core::export::ExportOptions;
 use claude_history_core::theme::ThemeKind;
 use claude_history_core::view::{
@@ -84,11 +103,12 @@ use crate::services::services;
 use crate::theme_tokens;
 use crate::workspace::routing;
 
+use self::hit::{HitAnchor, HitFound};
 use self::items::{BuildInfo, ItemId, ViewerItem};
 use self::lru::{HandleCache, TokenCache};
 use self::search::{MatchesByItem, SearchIndex, SegMatch};
 use self::seltext::LinkHandler;
-use self::worker::{BuildJob, BuildResult, ViewerWorker};
+use self::worker::{BuildJob, BuildResult, ParseCount, Recounter, ViewerWorker};
 use gpui_kit::AnyWindowHandle;
 
 /// Uniform item height hint (rem) for unmeasured rows (scrollbar size).
@@ -121,6 +141,11 @@ pub enum ViewerPaneEvent {
     LeaveRequested,
     /// The viewer opened or cleared a conversation.
     TargetChanged(Option<ConversationTarget>),
+    /// Open a conversation related to the one shown (its parent, a
+    /// subagent or fork, or the one it was opened from) as a related open
+    /// (`OpenRequest::related`), leaving the list's selection alone
+    /// (upstream 3c2ffeb).
+    OpenRelated(ConversationTarget),
 }
 
 /// What the transcript area shows.
@@ -182,6 +207,32 @@ struct RevealTarget {
     item: usize,
     segment: usize,
     byte: usize,
+}
+
+/// What was found for the list's search hit in the installed items.
+struct HitView {
+    anchor: Option<HitAnchor>,
+    matches: Rc<MatchesByItem>,
+}
+
+/// The list hit's placement in progress (upstream `ListPreview::
+/// scroll_offset` in pixels): the hit's message starts at the top while the
+/// hit stays in the upper two thirds of the viewport, else the hit sits a
+/// third of the way down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HitScroll {
+    phase: HitPhase,
+    /// A frame was drawn in this phase (its paint reports the hit's y).
+    shown: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HitPhase {
+    /// The message's first item is at the viewport top.
+    MessageTop,
+    /// The hit's item is at the viewport top (the hit lies too far into
+    /// its message, or in no navigable message).
+    Third,
 }
 
 /// Performance probes (§15.8).
@@ -264,6 +315,9 @@ pub struct ViewerPane {
     /// Focus of the transcript column (`Viewer` context).
     viewer_focus: FocusHandle,
     target: Option<ConversationTarget>,
+    /// The conversations a related open left, most recent last: Esc and `q`
+    /// return to them first (upstream 3c2ffeb `view_stack`).
+    back_stack: Vec<ConversationTarget>,
     header: Option<HeaderInfo>,
     prefs: ViewPrefs,
     agent_panel: Entity<AgentPanel>,
@@ -292,6 +346,16 @@ pub struct ViewerPane {
     hovered_link: Option<SharedString>,
     reveal: Option<RevealTarget>,
     reveal_y: Rc<Cell<Option<Point<Pixels>>>>,
+    /// The list's search hit the conversation is shown at (upstream 411e227
+    /// list preview, L-109): kept until another conversation opens without
+    /// one, the list's query is cleared or a `/` search starts.
+    list_hit: Option<ListHit>,
+    /// What was found for `list_hit` in the installed items.
+    hit_view: Option<HitView>,
+    /// The hit's placement in progress (drives `reveal`).
+    hit_scroll: Option<HitScroll>,
+    /// Finds a new `list_hit` in the installed items.
+    _hit_task: Task<()>,
     probe: Option<RevealTarget>,
     probe_point: Rc<Cell<Option<Point<Pixels>>>>,
     painted: Rc<RefCell<Vec<usize>>>,
@@ -317,6 +381,19 @@ pub struct ViewerPane {
     window: AnyWindowHandle,
     /// The latest build request (dropping it cancels an unstarted build).
     _build_task: Task<()>,
+    /// The malformed lines of the last file opened (counted by its open
+    /// build) or counted again after it changed: the badge of a header that
+    /// does not know them (a card's, V-008), kept through the headers of
+    /// later corpus changes.
+    parse_count: Option<ParseCount>,
+    /// Counts them again when a card's header arrives after the file changed.
+    recounter: Recounter,
+    /// The latest recount (dropping it cancels an unstarted one).
+    _parse_count_task: Task<()>,
+    /// A recount is running.
+    recounting: bool,
+    /// A header arrived while a recount ran: stat the file again after it.
+    recount_again: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -359,6 +436,7 @@ impl ViewerPane {
             mode,
             viewer_focus,
             target: None,
+            back_stack: Vec::new(),
             header: None,
             prefs,
             agent_panel,
@@ -385,6 +463,10 @@ impl ViewerPane {
             hovered_link: None,
             reveal: None,
             reveal_y: Rc::new(Cell::new(None)),
+            list_hit: None,
+            hit_view: None,
+            hit_scroll: None,
+            _hit_task: Task::ready(()),
             probe: None,
             probe_point: Rc::new(Cell::new(None)),
             painted: Rc::new(RefCell::new(Vec::new())),
@@ -398,6 +480,11 @@ impl ViewerPane {
             action_log: Vec::new(),
             window: window.window_handle(),
             _build_task: Task::ready(()),
+            parse_count: None,
+            recounter: Recounter::new(),
+            _parse_count_task: Task::ready(()),
+            recounting: false,
+            recount_again: false,
             _subscriptions: subscriptions,
         }
     }
@@ -409,25 +496,35 @@ impl ViewerPane {
     // ----- public API (§17.4) ----------------------------------------------------
 
     /// Show `req.target` (keeps the previous content until the new one is
-    /// installed); a request for the shown path only focuses/reveals. With
-    /// `req.agent_tab` the agent panel opens on that tab and takes the focus.
+    /// installed); a request for the shown path only focuses/reveals, and
+    /// with a list hit shows that hit. With `req.agent_tab` the agent panel
+    /// opens on that tab and takes the focus.
     pub fn open(&mut self, req: OpenRequest, window: &mut Window, cx: &mut Context<Self>) {
         let same = self
             .target
             .as_ref()
             .is_some_and(|target| same_path(&target.path, &req.target.path));
+        if !req.related {
+            self.back_stack.clear();
+        }
         if !same {
             self.target = Some(req.target.clone());
             self.header = None;
             self.file_error = None;
             self.prefs = app_state(cx).view_defaults;
+            self.list_hit = req.list_hit.clone();
             self.start_open(req.reveal.clone(), cx);
             self.agent_panel.update(cx, |panel, cx| {
                 panel.set_viewer_target(Some(req.target.clone()), cx)
             });
             cx.emit(ViewerPaneEvent::TargetChanged(Some(req.target)));
-        } else if let Some(reveal) = req.reveal {
-            self.reveal(reveal, window, cx);
+        } else {
+            if req.list_hit.is_some() {
+                self.set_list_hit(req.list_hit, cx);
+            }
+            if let Some(reveal) = req.reveal {
+                self.reveal(reveal, window, cx);
+            }
         }
         match req.agent_tab {
             Some(tab) => self.open_agent_panel(tab, window, cx),
@@ -441,12 +538,16 @@ impl ViewerPane {
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.worker.invalidate();
         self._build_task = Task::ready(());
+        self.cancel_recount();
         self.pending = None;
         self.reset_view_state();
         self.loaded = None;
         self.list.reset(0);
         self.status = LoadStatus::Empty;
         self.file_error = None;
+        self.back_stack.clear();
+        self.list_hit = None;
+        self._hit_task = Task::ready(());
         if self.target.take().is_some() {
             self.header = None;
             self.agent_panel
@@ -459,6 +560,97 @@ impl ViewerPane {
     /// The open conversation.
     pub fn target(&self) -> Option<&ConversationTarget> {
         self.target.as_ref()
+    }
+
+    /// The conversations Esc and `q` return to, most recent last.
+    pub fn back_stack(&self) -> &[ConversationTarget] {
+        &self.back_stack
+    }
+
+    /// Open `target`, a conversation related to the one shown, keeping the
+    /// one shown to return to (upstream 3c2ffeb `open_related`).
+    pub fn open_related(
+        &mut self,
+        target: ConversationTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Only the main window's workspace opens it (a single-file window
+        // has no family).
+        if self.mode != ViewerMode::Main {
+            return;
+        }
+        if self
+            .target
+            .as_ref()
+            .is_some_and(|current| same_path(&current.path, &target.path))
+        {
+            self.focus(window, cx);
+            return;
+        }
+        if let Some(current) = self.target.clone() {
+            self.back_stack.push(current);
+        }
+        cx.emit(ViewerPaneEvent::OpenRelated(target));
+    }
+
+    /// Return to the conversation the one shown was opened from; `false`
+    /// when there is none (upstream 3c2ffeb `leave_view`).
+    fn go_back(&mut self, cx: &mut Context<Self>) -> bool {
+        match self.back_stack.pop() {
+            Some(previous) => {
+                cx.emit(ViewerPaneEvent::OpenRelated(previous));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The header's family line; none in a single-file window, which has
+    /// no other conversation to open.
+    fn family_line(&self) -> Option<header::FamilyLine> {
+        (self.mode == ViewerMode::Main)
+            .then(|| header::family_line(self.header.as_ref()))
+            .flatten()
+    }
+
+    /// Forget deleted conversations on the back stack.
+    pub fn forget_paths(&mut self, paths: &[std::path::PathBuf]) {
+        self.back_stack
+            .retain(|target| !paths.iter().any(|path| same_path(path, &target.path)));
+    }
+
+    /// `P`: open the parent of the conversation shown, else say why not
+    /// (upstream 3c2ffeb `open_view_parent`).
+    fn open_parent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let family = self.header.as_ref().map(|header| &header.family);
+        match family.and_then(|family| family.parent.clone()) {
+            Some(parent) => self.open_related(parent.target, window, cx),
+            None => {
+                let names_one = family.is_some_and(|family| family.parent_id.is_some());
+                Toast::info(if names_one {
+                    family::PARENT_NOT_FOUND
+                } else {
+                    family::NO_PARENT
+                })
+                .show(window, cx);
+            }
+        }
+    }
+
+    /// `s`: pick one of the subagents and forks of the conversation shown,
+    /// else say there are none (upstream 3c2ffeb `open_children_dialog`).
+    fn show_family(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let children = self
+            .header
+            .as_ref()
+            .map(|header| header.family.children.clone())
+            .unwrap_or_default();
+        if children.is_empty() {
+            Toast::info(family::NO_CHILDREN).show(window, cx);
+        } else {
+            family::open_family_menu(cx.entity().downgrade(), children, window, cx);
+        }
     }
 
     /// The open conversation's view toggles (menu check marks).
@@ -478,9 +670,96 @@ impl ViewerPane {
     }
 
     /// The header from the live corpus (`None`: the file stem only, V-006).
+    /// A header that does not know its parse errors (a card in store mode)
+    /// shows the count the open build took from the transcript it decoded
+    /// (V-008), so the headers of later corpus changes (a generation swapped
+    /// in every few seconds while the store is indexed) keep it without
+    /// reading the file. Only when the file changed since it was counted is
+    /// it counted again, in the background and cancellably (V-101).
     pub fn set_header(&mut self, info: Option<HeaderInfo>, cx: &mut Context<Self>) {
+        let unknown = info
+            .as_ref()
+            .is_some_and(|header| !header.parse_errors_known);
         self.header = info;
+        // A pending open brings its own count.
+        let opening = matches!(
+            self.pending,
+            Some(PendingBuild {
+                kind: PendingKind::Open { .. },
+                ..
+            })
+        );
+        if unknown && !opening {
+            self.recount_if_changed(cx);
+        }
         cx.notify();
+    }
+
+    /// The open file's malformed lines for a header that does not know them
+    /// (a card's; V-008): the count of the file shown, once there is one.
+    fn counted_parse_errors(&self) -> Option<usize> {
+        let target = self.target.as_ref()?;
+        if self.header.as_ref()?.parse_errors_known {
+            return None;
+        }
+        self.parse_count
+            .as_ref()
+            .filter(|count| same_path(&count.path, &target.path))
+            .map(|count| count.errors)
+    }
+
+    /// Count the open file's malformed lines again if it changed since its
+    /// count (no build re-reads it, V-082); a stat only when it did not.
+    /// While a recount runs, later headers wait for its count rather than
+    /// start the decode over (a live file changes at every corpus change);
+    /// the count belongs to the version read before its decode, so the
+    /// file is checked once more afterwards.
+    fn recount_if_changed(&mut self, cx: &mut Context<Self>) {
+        if self.recounting {
+            self.recount_again = true;
+            return;
+        }
+        let Some(target) = self.target.as_ref() else {
+            return;
+        };
+        // Without a count (a failed open) there is nothing to recount.
+        let Some(known) = self
+            .parse_count
+            .clone()
+            .filter(|count| same_path(&count.path, &target.path))
+        else {
+            return;
+        };
+        let work = self.recounter.job(known, crate::globals::env_history(cx));
+        self.recounting = true;
+        self._parse_count_task = cx.spawn(async move |this, cx| {
+            let count = cx.background_spawn(async move { work() }).await;
+            this.update(cx, |this, cx| {
+                this.recounting = false;
+                if let Some(count) = count {
+                    let shown = this
+                        .target
+                        .as_ref()
+                        .is_some_and(|target| same_path(&target.path, &count.path));
+                    if shown {
+                        this.parse_count = Some(count);
+                        cx.notify();
+                    }
+                }
+                if std::mem::take(&mut this.recount_again) {
+                    this.recount_if_changed(cx);
+                }
+            })
+            .ok();
+        });
+    }
+
+    /// Cancel a running recount (another open counts the file itself).
+    fn cancel_recount(&mut self) {
+        self.recounter.cancel();
+        self._parse_count_task = Task::ready(());
+        self.recounting = false;
+        self.recount_again = false;
     }
 
     /// Export options of the open conversation's current view.
@@ -608,6 +887,13 @@ impl ViewerPane {
                 .header_layout()
                 .map(|layout| layout.text())
                 .unwrap_or_default(),
+            // The family line under it (upstream 3c2ffeb).
+            "viewer.family" => self
+                .family_line()
+                .map(|line| line.text())
+                .unwrap_or_default(),
+            // How many conversations Esc returns to before the list.
+            "viewer.back" => self.back_stack.len().to_string(),
             "viewer.path" => self
                 .target
                 .as_ref()
@@ -673,6 +959,15 @@ impl ViewerPane {
                 .to_string(),
             "viewer.nav_active" => self.nav.is_active().to_string(),
             "viewer.search.mode" => format!("{:?}", self.search.mode()).to_lowercase(),
+            // The list's search hit (L-109): its query, and the line it is
+            // at (empty when there is none or it was not found).
+            "viewer.hit" => self
+                .hit_view
+                .as_ref()
+                .and(self.list_hit.as_ref())
+                .map(|hit| hit.query.clone())
+                .unwrap_or_default(),
+            "viewer.hit_line" => self.hit_line_text().unwrap_or_default(),
             "viewer.agent_panel" => self.agent_panel.read(cx).is_visible().to_string(),
             "viewer.find" => self.find_bar_text(),
             "viewer.status" => match &self.status {
@@ -778,11 +1073,15 @@ impl ViewerPane {
     /// The header laid out for the current width (V-004, V-006).
     pub fn header_layout(&self) -> Option<header::HeaderLayout> {
         let target = self.target.as_ref()?;
-        Some(header::layout(
+        let mut layout = header::layout(
             self.header.as_ref(),
             &target.file_stem,
             self.pane_cells.max(60),
-        ))
+        );
+        if let Some(errors) = self.counted_parse_errors() {
+            layout.parse_errors = errors;
+        }
+        Some(layout)
     }
 
     /// The status hints shown with focus in the transcript (V-011).
@@ -914,6 +1213,8 @@ impl ViewerPane {
         self.hovered_link = None;
         self.reveal = None;
         self.reveal_y.set(None);
+        self.hit_view = None;
+        self.hit_scroll = None;
         self.last_selection = None;
         self.last_selected_text = None;
         self.select_all = false;
@@ -944,12 +1245,16 @@ impl ViewerPane {
         let Some(target) = self.target.clone() else {
             return;
         };
+        // The open counts the file's malformed lines itself.
+        self.cancel_recount();
         self.reset_view_state();
         self.status = LoadStatus::Loading;
         let generation = self.submit(
             BuildJob::Open {
                 path: target.path.clone(),
                 prefs: self.prefs,
+                history: crate::globals::env_history(cx),
+                hit: self.list_hit.clone(),
             },
             cx,
         );
@@ -985,7 +1290,12 @@ impl ViewerPane {
                         .show(window, cx);
                 }
             }
-            Ok(built) => {
+            Ok(mut built) => {
+                // An open's count of the file's malformed lines (V-008),
+                // shown with the header even while a width rebuild follows.
+                if let Some(count) = built.parse_count.take() {
+                    self.parse_count = Some(count);
+                }
                 // Built at a stale width (the pane was measured while it was
                 // building): rebuild at the measured one before showing it.
                 if matches!(pending.kind, PendingKind::Open { .. })
@@ -994,7 +1304,11 @@ impl ViewerPane {
                     && built.cols != self.measured_cols
                 {
                     self.cols = self.measured_cols;
-                    let generation = self.submit(BuildJob::Rebuild { model: built.model }, cx);
+                    let job = BuildJob::Rebuild {
+                        model: built.model,
+                        hit: self.list_hit.clone(),
+                    };
+                    let generation = self.submit(job, cx);
                     self.pending = Some(PendingBuild {
                         generation,
                         kind: pending.kind,
@@ -1004,6 +1318,7 @@ impl ViewerPane {
                 }
                 self.perf.build_ms = built.build_ms;
                 let rem = window.rem_size();
+                let found = built.hit.take();
                 match pending.kind {
                     PendingKind::Open { reveal } => {
                         self.reset_view_state();
@@ -1023,12 +1338,17 @@ impl ViewerPane {
                         self.status = LoadStatus::Ready;
                         self.perf.open_to_content_ms =
                             pending.submitted.elapsed().as_secs_f64() * 1000.0;
+                        // Shown at the list's hit (L-109); a reveal wins.
+                        self.apply_found(found, reveal.is_none(), cx);
                         if let Some(reveal) = reveal {
                             self.apply_reveal(reveal, window, cx);
                         }
                     }
                     PendingKind::Rebuild { anchor, then } => {
                         self.install_rebuild(built, anchor, rem, cx);
+                        // The anchored rebuild keeps the viewport: only the
+                        // hit's highlights follow the new items.
+                        self.apply_found(found, false, cx);
                         self.after_rebuild(then, window, cx);
                     }
                 }
@@ -1089,12 +1409,22 @@ impl ViewerPane {
         let (item_ix, offset, exact) = match resolved_ix {
             Some(ix) => (ix, anchor.offset, true),
             None => {
-                let ix = anchor
+                let position = anchor
                     .entry
-                    .and_then(|entry| find_entry_or_prev(&built.info.nav_entries, entry))
+                    .and_then(|entry| find_entry_or_prev(&built.info.nav_entries, entry));
+                let ix = position
                     .and_then(|position| nav::first_item_of(&built.info, position))
                     .unwrap_or(0);
-                (ix, px(0.), false)
+                // The focused message is still there and only its first item
+                // was replaced (an expanded or collapsed summary group or
+                // calls row, a mode change): keep its top where it was, but
+                // only while that top was in view. A top scrolled above the
+                // viewport has no row to keep (the new first item may be
+                // much shorter than the offset).
+                let same_message = anchor.relative.is_some_and(|relative| relative >= px(0.))
+                    && position.and_then(|position| built.info.nav_entries.get(position))
+                        == anchor.entry.as_ref();
+                (ix, px(0.), same_message)
             }
         };
         if built.items.is_empty() {
@@ -1130,6 +1460,7 @@ impl ViewerPane {
         self.search_index = None;
         self.hovered = None;
         self.reveal = None;
+        self.hit_scroll = None;
         self.status = LoadStatus::Ready;
     }
 
@@ -1199,7 +1530,8 @@ impl ViewerPane {
         };
         loaded.model.prefs = prefs;
         let model = loaded.model.clone();
-        let generation = self.submit(BuildJob::Rebuild { model }, cx);
+        let hit = self.list_hit.clone();
+        let generation = self.submit(BuildJob::Rebuild { model, hit }, cx);
         self.pending = Some(PendingBuild {
             generation,
             kind: PendingKind::Rebuild { anchor, then },
@@ -1270,11 +1602,7 @@ impl ViewerPane {
         if remember {
             update_app_state(cx, |state, _| {
                 state.view_defaults = prefs;
-                state.ui.view.tool_display = Some(match prefs.tool_display {
-                    ToolDisplayMode::Hidden => crate::persist::RememberedToolDisplay::Summary,
-                    ToolDisplayMode::Truncated => crate::persist::RememberedToolDisplay::Truncated,
-                    ToolDisplayMode::Full => crate::persist::RememberedToolDisplay::Full,
-                });
+                state.ui.view.tool_display = Some(prefs.tool_display.into());
                 state.ui.view.show_thinking = Some(prefs.show_thinking);
                 state.ui.view.show_timing = Some(prefs.show_timing);
             });
@@ -1369,7 +1697,7 @@ impl ViewerPane {
         };
         if let Some(hint) = hint {
             let mut prefs = self.prefs;
-            if (hint.tools || hint.tool_results) && prefs.tool_display == ToolDisplayMode::Hidden {
+            if (hint.tools || hint.tool_results) && !prefs.tool_display.shows_details() {
                 prefs.tool_display = ToolDisplayMode::Truncated;
             }
             if hint.thinking || hint.subagents {
@@ -1408,6 +1736,199 @@ impl ViewerPane {
             });
         }
         cx.notify();
+    }
+
+    // ----- list hit (§9.8a) ----------------------------------------------------------
+
+    /// The list's search hit the conversation is shown at (L-109).
+    pub fn list_hit(&self) -> Option<&ListHit> {
+        self.list_hit.as_ref()
+    }
+
+    /// Show the open conversation at `hit`, the list's new search hit in it
+    /// (its query changed while the list kept the row selected), or drop
+    /// the hit's highlights (`None`: the query was cleared). A new hit
+    /// replaces a `/` search; the viewport moves only when the hit's line
+    /// does.
+    pub fn set_list_hit(&mut self, hit: Option<ListHit>, cx: &mut Context<Self>) {
+        if hit == self.list_hit {
+            return;
+        }
+        if hit.is_none() {
+            self.forget_list_hit();
+            cx.notify();
+            return;
+        }
+        self.list_hit = hit;
+        if self.search.mode() != ViewSearchMode::Off {
+            self.search = ViewSearch::new();
+            self.find_open = false;
+            self.update_match_map();
+        }
+        // A build in flight carries the old hit; its install finds this one.
+        if self.pending.is_none() {
+            self.refind_hit(cx);
+        }
+        cx.notify();
+    }
+
+    /// Drop the list hit and its highlights (the viewport stays).
+    fn forget_list_hit(&mut self) {
+        self.list_hit = None;
+        self.hit_view = None;
+        self._hit_task = Task::ready(());
+        if self.hit_scroll.take().is_some() {
+            self.reveal = None;
+        }
+    }
+
+    /// The matches drawn: the `/` search's while it runs, else the list
+    /// hit's (never both, §9.8a).
+    fn shown_matches(&self) -> Rc<MatchesByItem> {
+        match &self.hit_view {
+            Some(view) if self.search.mode() == ViewSearchMode::Off => view.matches.clone(),
+            _ => self.matches_by_item.clone(),
+        }
+    }
+
+    /// Install what a build found for its hit; `place` shows it (an open).
+    /// A hit that changed while the build ran is found again.
+    fn apply_found(
+        &mut self,
+        found: Option<(ListHit, HitFound)>,
+        place: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.hit_view = None;
+        let Some(current) = self.list_hit.clone() else {
+            return;
+        };
+        match found {
+            Some((hit, found)) if hit == current => {
+                self.hit_view = Some(HitView {
+                    anchor: found.anchor,
+                    matches: Rc::new(found.matches),
+                });
+                if place {
+                    self.place_hit(cx);
+                }
+            }
+            _ => self.refind_hit(cx),
+        }
+    }
+
+    /// Find `list_hit` in the installed items in the background; the
+    /// highlights of the previous hit stay until it is found, and the hit is
+    /// shown when its line moved.
+    fn refind_hit(&mut self, cx: &mut Context<Self>) {
+        let (Some(loaded), Some(hit)) = (self.loaded.as_ref(), self.list_hit.clone()) else {
+            self._hit_task = Task::ready(());
+            return;
+        };
+        let previous = self.hit_view.as_ref().and_then(|view| view.anchor.clone());
+        let items = loaded.items.clone();
+        let info = loaded.info.clone();
+        self._hit_task = cx.spawn(async move |this, cx| {
+            let (items, hit, found) = cx
+                .background_spawn(async move {
+                    let found = hit::find(&items, &info, &hit);
+                    (items, hit, found)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                let current = this
+                    .loaded
+                    .as_ref()
+                    .is_some_and(|loaded| Arc::ptr_eq(&loaded.items, &items))
+                    && this.list_hit.as_ref() == Some(&hit);
+                if !current {
+                    return;
+                }
+                let moved = found.anchor.as_ref().map(|a| (a.item, a.segment, &a.line))
+                    != previous.as_ref().map(|a| (a.item, a.segment, &a.line));
+                this.hit_view = Some(HitView {
+                    anchor: found.anchor,
+                    matches: Rc::new(found.matches),
+                });
+                if moved {
+                    this.place_hit(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+    }
+
+    /// Scroll the hit into place and focus its message (upstream's preview
+    /// marks the line in its gutter): its message's first item goes to the
+    /// top, and the next frames move the hit a third of the way down when
+    /// it lies below the upper two thirds (`render_transcript`).
+    fn place_hit(&mut self, cx: &mut Context<Self>) {
+        let (Some(loaded), Some(anchor)) = (
+            self.loaded.as_ref(),
+            self.hit_view.as_ref().and_then(|view| view.anchor.clone()),
+        ) else {
+            return;
+        };
+        if anchor.item >= loaded.items.len() {
+            return;
+        }
+        let first = anchor
+            .position
+            .and_then(|position| nav::first_item_of(&loaded.info, position));
+        let (top, phase) = match first {
+            Some(first) => (first, HitPhase::MessageTop),
+            None => (anchor.item, HitPhase::Third),
+        };
+        if let Some(position) = anchor.position {
+            self.nav.focus(position);
+        }
+        self.list.scroll_to(ListOffset {
+            item_ix: top,
+            offset_in_item: px(0.),
+        });
+        // A position reported for an earlier target must not move this one.
+        self.reveal_y.set(None);
+        self.reveal = Some(RevealTarget {
+            item: anchor.item,
+            segment: anchor.segment,
+            byte: anchor.byte,
+        });
+        self.hit_scroll = Some(HitScroll {
+            phase,
+            shown: false,
+        });
+        cx.notify();
+    }
+
+    /// Where the list hit was found (tests, QA).
+    pub fn hit_anchor(&self) -> Option<&HitAnchor> {
+        self.hit_view.as_ref().and_then(|view| view.anchor.as_ref())
+    }
+
+    /// The list hit's highlights per item: `(segment, range, emphasis)`
+    /// (tests).
+    pub fn hit_matches(&self) -> Option<Rc<MatchesByItem>> {
+        self.hit_view.as_ref().map(|view| view.matches.clone())
+    }
+
+    /// Whether the list hit is still being scrolled into place (tests).
+    pub fn hit_placing(&self) -> bool {
+        self.hit_scroll.is_some()
+    }
+
+    /// The text of the line the list hit is at (QA).
+    #[cfg(any(test, feature = "qa"))]
+    fn hit_line_text(&self) -> Option<String> {
+        let anchor = self.hit_anchor()?;
+        let segment = self
+            .loaded
+            .as_ref()?
+            .items
+            .get(anchor.item)?
+            .segments
+            .get(anchor.segment)?;
+        segment.text.get(anchor.line.clone()).map(str::to_string)
     }
 
     // ----- search ------------------------------------------------------------------
@@ -1534,6 +2055,8 @@ impl ViewerPane {
         if self.loaded.is_none() {
             return;
         }
+        // The `/` search replaces the list hit's overlay (§9.8a).
+        self.forget_list_hit();
         self.search.start();
         self.update_match_map();
         self.find_open = true;
@@ -1543,11 +2066,16 @@ impl ViewerPane {
         cx.notify();
     }
 
+    /// Enter in the find bar: the find bar closes, so a query with no matches
+    /// says so in a toast (`No matches for /<query>`, upstream's status line).
     fn commit_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.search.commit();
+        let no_matches = self.search.commit();
         self.find_open = false;
         self.update_match_map();
         self.focus(window, cx);
+        if let Some(message) = no_matches {
+            Toast::info(message).show(window, cx);
+        }
         cx.notify();
     }
 
@@ -1586,7 +2114,11 @@ impl ViewerPane {
                 self.focus(window, cx);
             }
             ViewEscape::ExitedNav => {}
-            ViewEscape::Leave => cx.emit(ViewerPaneEvent::LeaveRequested),
+            ViewEscape::Leave => {
+                if !self.go_back(cx) {
+                    cx.emit(ViewerPaneEvent::LeaveRequested);
+                }
+            }
         }
         cx.notify();
     }
@@ -1950,8 +2482,14 @@ impl ViewerPane {
         if a.is::<CycleToolDisplay>() {
             prefs.tool_display = prefs.tool_display.next();
             self.set_prefs(prefs, true, cx);
+        } else if a.is::<SetToolsOff>() {
+            prefs.tool_display = ToolDisplayMode::Off;
+            self.set_prefs(prefs, true, cx);
         } else if a.is::<SetToolsSummary>() {
-            prefs.tool_display = ToolDisplayMode::Hidden;
+            prefs.tool_display = ToolDisplayMode::Summary;
+            self.set_prefs(prefs, true, cx);
+        } else if a.is::<SetToolsCalls>() {
+            prefs.tool_display = ToolDisplayMode::Calls;
             self.set_prefs(prefs, true, cx);
         } else if a.is::<SetToolsTruncated>() {
             prefs.tool_display = ToolDisplayMode::Truncated;
@@ -2017,6 +2555,10 @@ impl ViewerPane {
             }
         } else if a.is::<YankOrCopyMessage>() && self.nav.is_active() {
             self.copy_focused_message(window, cx);
+        } else if a.is::<OpenParentConversation>() {
+            self.open_parent(window, cx);
+        } else if a.is::<ShowSubagentsAndForks>() {
+            self.show_family(window, cx);
         } else {
             return false;
         }
@@ -2035,6 +2577,17 @@ impl ViewerPane {
     ) -> bool {
         if self.mode == ViewerMode::SingleFile && routing::is_main_window_only(action) {
             return false;
+        }
+        // Cards can be opened while the initial load runs (AD6); like the
+        // list, Rename and Delete wait for the load (upstream 3708bb6 gates
+        // the viewer's delete key the same way).
+        if self.mode == ViewerMode::Main
+            && (action.as_any().is::<Rename>() || action.as_any().is::<Delete>())
+            && crate::globals::main_panes(cx)
+                .list()
+                .is_some_and(|list| list.read(cx).is_loading())
+        {
+            return true;
         }
         let Some(target) = self.target.clone() else {
             notify::no_conversation_open(window, cx);
@@ -2089,7 +2642,9 @@ impl ViewerPane {
     }
 
     fn on_back(&mut self, _: &ViewerBack, _: &mut Window, cx: &mut Context<Self>) {
-        cx.emit(ViewerPaneEvent::LeaveRequested);
+        if !self.go_back(cx) {
+            cx.emit(ViewerPaneEvent::LeaveRequested);
+        }
     }
 
     // ----- rendering ---------------------------------------------------------------
@@ -2193,6 +2748,7 @@ impl ViewerPane {
                     .text_color(roles.header_summary)
                     .child(SharedString::from(summary))
             });
+        let family_line = self.render_family_line(cx);
         Some(
             v_flex()
                 .id("viewer-header")
@@ -2205,9 +2761,74 @@ impl ViewerPane {
                 .text_sm()
                 .child(row)
                 .children(second_line)
+                .children(family_line)
                 .test_support()
                 .into_any_element(),
         )
+    }
+
+    /// The family line (upstream 3c2ffeb): `↳ fork of <parent>` with the
+    /// parent as a link (Shift+P) and `2 subagents, 1 fork` as a button
+    /// opening the picker (`s`).
+    fn render_family_line(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let line = self.family_line()?;
+        let roles = theme_tokens::roles(cx);
+        let radius = cx.theme().radius;
+        let mut row = h_flex()
+            .id("viewer-family")
+            .qa_id("viewer.family")
+            .flex_wrap()
+            .gap_x_1p5()
+            .items_center()
+            .text_color(roles.text_muted);
+        if let Some(parent) = line.parent {
+            row = row.child(SharedString::from(parent.prefix));
+            if let Some(label) = parent.label {
+                row = row.child(
+                    div()
+                        .id("viewer-family-parent")
+                        .qa_id("viewer.family.parent")
+                        .px_0p5()
+                        .rounded(radius)
+                        .cursor_pointer()
+                        .text_color(roles.accent)
+                        .hover(|style| style.underline())
+                        .child(SharedString::from(label))
+                        .tooltip(|window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new(
+                                "Open the parent conversation (Shift+P)",
+                            )
+                            .build(window, cx)
+                        })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.handle_viewer_action(&OpenParentConversation, window, cx);
+                        }))
+                        .test_support(),
+                );
+            }
+        }
+        if let Some(children) = line.children {
+            row = row.child(
+                div()
+                    .id("viewer-family-children")
+                    .qa_id("viewer.family.children")
+                    .px_1()
+                    .rounded(radius)
+                    .cursor_pointer()
+                    .text_color(roles.text_secondary)
+                    .hover(|style| style.underline())
+                    .child(SharedString::from(children))
+                    .tooltip(|window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new("Subagents and forks (s)")
+                            .build(window, cx)
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.handle_viewer_action(&ShowSubagentsAndForks, window, cx);
+                    }))
+                    .test_support(),
+            );
+        }
+        Some(row.into_any_element())
     }
 
     fn render_status(
@@ -2482,18 +3103,53 @@ impl ViewerPane {
             self.theme_kind = Some(roles.kind);
         }
         // An exact reveal reported its y last frame: put the match a few
-        // lines from the top when it is outside the viewport (§9.8).
+        // lines from the top when it is outside the viewport (§9.8), the
+        // list hit by upstream's preview rule (§9.8a).
         if self.reveal.is_none() {
             self.reveal_y.set(None);
         }
         if let Some(position) = self.reveal_y.take() {
             let y = position.y;
             let viewport = self.list.viewport_bounds();
-            let line = Self::line_height(window);
-            if y < viewport.top() || y > viewport.bottom() - line {
-                self.list.scroll_by(y - viewport.top() - line * 3.);
+            if let Some(scroll) = self.hit_scroll.take() {
+                let below_top = y - viewport.top();
+                let height = viewport.size.height;
+                let keeps_message_start = scroll.phase == HitPhase::MessageTop
+                    && below_top >= px(0.)
+                    && below_top < height * (2. / 3.);
+                if !keeps_message_start {
+                    self.list.scroll_by(below_top - height / 3.);
+                }
+            } else {
+                let line = Self::line_height(window);
+                if y < viewport.top() || y > viewport.bottom() - line {
+                    self.list.scroll_by(y - viewport.top() - line * 3.);
+                }
             }
             self.reveal = None;
+        } else if let (Some(scroll), Some(reveal)) = (self.hit_scroll, self.reveal)
+            && scroll.shown
+        {
+            // The last frame painted no position for the hit: from its
+            // message's start it lies below the viewport. Start at its item
+            // and put it a third of the way down; give up when even that
+            // paints nothing.
+            if scroll.phase == HitPhase::MessageTop {
+                self.list.scroll_to(ListOffset {
+                    item_ix: reveal.item,
+                    offset_in_item: px(0.),
+                });
+                self.hit_scroll = Some(HitScroll {
+                    phase: HitPhase::Third,
+                    shown: false,
+                });
+            } else {
+                self.reveal = None;
+                self.hit_scroll = None;
+            }
+        }
+        if let Some(scroll) = self.hit_scroll.as_mut() {
+            scroll.shown = true;
         }
         // Evict selection handles far from the viewport.
         let top = self.list.logical_scroll_top().item_ix;
@@ -2524,7 +3180,7 @@ impl ViewerPane {
             show_timing: self.prefs.show_timing,
             focused_message: self.nav.highlighted(),
             hovered: self.hovered.clone(),
-            matches: self.matches_by_item.clone(),
+            matches: self.shown_matches(),
             handles: self.handles.clone(),
             tokens: self.tokens.clone(),
             reveal: self.reveal.map(|r| (r.item, r.segment, r.byte)),
@@ -2713,7 +3369,7 @@ impl Render for ViewerPane {
                 prefs: self.prefs,
                 mode: self.mode,
                 has_target: self.target.is_some(),
-                can_modify: self.target.as_ref().is_some_and(|t| t.can_modify()),
+                refusals: toolbar::Refusals::of(self.target.as_ref()),
                 header_id_differs: self.target.as_ref().is_some_and(|t| t.header_id_differs()),
                 find,
                 outline_open: panel_visible,
@@ -2762,11 +3418,18 @@ impl Render for ViewerPane {
             ]
         );
         let column = if main_mode {
-            crate::on_actions!(
+            let column = crate::on_actions!(
                 column,
                 cx,
                 Self::on_session_action,
                 [Resume, Fork, Rename, Delete, SelectAndExit]
+            );
+            // A single-file window has no other conversation to relate to.
+            crate::on_actions!(
+                column,
+                cx,
+                Self::on_viewer_action,
+                [OpenParentConversation, ShowSubagentsAndForks]
             )
         } else {
             column
@@ -2777,7 +3440,9 @@ impl Render for ViewerPane {
             Self::on_viewer_action,
             [
                 CycleToolDisplay,
+                SetToolsOff,
                 SetToolsSummary,
+                SetToolsCalls,
                 SetToolsTruncated,
                 SetToolsFull,
                 ToggleThinking,

@@ -452,3 +452,26 @@ fn x023_a_config_parse_error_opens_its_dialog(cx: &mut TestAppContext) {
     })
     .unwrap();
 }
+
+/// Changing the workspace replaces the environment's history service (the
+/// Pi session root may follow the workspace's `.pi/settings.json`), and the
+/// service opens a file of the environment's roots, not as a loose file.
+#[gpui_kit::test]
+fn set_workspace_builds_a_new_history_service(cx: &mut TestAppContext) {
+    let world = TestWorld::new();
+    synth::corpus(&world, 2);
+    ListFixture::init_app(cx, &world, &[]);
+    let before = cx.read(crate::globals::env_history);
+    let dir = world.home().to_path_buf();
+    cx.update(|cx| {
+        crate::globals::update_app_state(cx, |state, _| {
+            let scope = claude_history_core::WorkspaceScope::new(&dir).ok();
+            state.set_workspace(scope);
+        });
+    });
+    let after = cx.read(crate::globals::env_history);
+    assert!(
+        !std::ptr::eq(before.service(), after.service()),
+        "set_workspace must build a new service"
+    );
+}

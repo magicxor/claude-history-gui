@@ -312,7 +312,9 @@ impl Render for SingleFileWindow {
             Self::route_fallback,
             [
                 CycleToolDisplay,
+                SetToolsOff,
                 SetToolsSummary,
+                SetToolsCalls,
                 SetToolsTruncated,
                 SetToolsFull,
                 ToggleThinking,

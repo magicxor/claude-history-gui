@@ -11,30 +11,35 @@ use std::path::PathBuf;
 
 fn test_conversation() -> Conversation {
     Conversation {
-        source: crate::history::Source::Claude,
+        source: crate::history::model::SourceKind::Claude,
         session_id: "session".to_owned(),
         path: PathBuf::from("/tmp/session.jsonl"),
         index: 0,
         timestamp: Local.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
-        preview: "lexical preview sentinel".to_string(),
-        preview_first: "lexical preview sentinel".to_string(),
-        preview_last: "lexical preview sentinel".to_string(),
-        full_text: "tool output sentinel summary sentinel cwd sentinel".to_string(),
-        agent_search_text: String::new(),
-        semantic_route_text: String::new(),
-        semantic_turns: vec!["semantic visible text".to_string()],
+        preview: "lexical preview sentinel".into(),
+        preview_first: "lexical preview sentinel".into(),
+        preview_last: "lexical preview sentinel".into(),
+        full_text: "tool output sentinel summary sentinel cwd sentinel".into(),
+        own_text: "".into(),
+        agent_search_text: "".into(),
+        semantic_route_text: "".into(),
+        semantic_turns: vec!["semantic visible text".to_string()].into(),
         semantic_turn_ranges: vec![crate::agent::refs::MessageRange::single(1)],
-        search_text_lower: "lexical preview sentinel".to_string(),
         project_name: Some("project sentinel".to_string()),
         project_path: None,
         cwd: Some(PathBuf::from("/cwd/sentinel")),
+        cwds: vec![PathBuf::from("/cwd/sentinel")],
         message_count: 1,
+        prompt_count: 1,
+        tool_call_count: 0,
         parse_errors: Vec::new(),
         summary: Some("summary sentinel".to_string()),
         custom_title: Some("title sentinel".to_string()),
         model: None,
         total_tokens: 0,
         duration_minutes: None,
+        provenance: Default::default(),
+        parent: None,
     }
 }
 
@@ -124,6 +129,7 @@ fn row_header(
         query: &query,
         width,
         show_source_label: false,
+        show_kind_label: true,
         semantic_mode,
         semantic_metadata: metadata,
         now: Local::now(),
@@ -140,7 +146,7 @@ fn header_line(header: &RowHeader) -> String {
         line.push_str(&format!(" · {}", summary.text));
     }
     line.push_str(&" ".repeat(header.padding));
-    line.push_str(&header.message_count);
+    line.push_str(&header.prompt_count);
     for part in [&header.semantic_score, &header.duration]
         .into_iter()
         .flatten()
@@ -245,11 +251,26 @@ fn test_format_tokens_long() {
 
 #[test]
 fn counts_durations_and_header_timestamp() {
-    assert_eq!(format_msg_count_short(1), "1 msg");
-    assert_eq!(format_msg_count_short(0), "0 msgs");
-    assert_eq!(format_msg_count_short(12), "12 msgs");
-    assert_eq!(format_msg_count_long(1), "1 message");
-    assert_eq!(format_msg_count_long(3), "3 messages");
+    assert_eq!(count_label(1, "prompt", "prompts"), "1 prompt");
+    assert_eq!(count_label(0, "prompt", "prompts"), "0 prompts");
+    assert_eq!(count_label(12, "prompt", "prompts"), "12 prompts");
+    // The header omits tool calls when there are none.
+    assert_eq!(format_header_counts(1, 0), "1 prompt");
+    assert_eq!(format_header_counts(2, 0), "2 prompts");
+    assert_eq!(format_header_counts(1, 1), "1 prompt · 1 tool call");
+    assert_eq!(
+        format_header_counts(113, 948),
+        "113 prompts · 948 tool calls"
+    );
+    assert_eq!(header_count_parts(2, 0), ("2 prompts".to_string(), None));
+    assert_eq!(
+        header_count_parts(1, 5),
+        ("1 prompt".to_string(), Some("5 tool calls".to_string()))
+    );
+    let mut conversation = test_conversation();
+    conversation.prompt_count = 0;
+    conversation.tool_call_count = 3;
+    assert_eq!(header_counts(&conversation), "0 prompts · 3 tool calls");
     assert_eq!(format_duration_minutes(0), "0m");
     assert_eq!(format_duration_minutes(59), "59m");
     assert_eq!(format_duration_minutes(60), "1h 0m");
@@ -268,9 +289,15 @@ fn header_fits_single_line_measures_every_part() {
     conversation.model = Some("claude-opus-4-5-20251101".to_string());
     conversation.total_tokens = 926_000;
     conversation.duration_minutes = Some(75);
-    // "  project sentinel · " + "title sentinel · " + "opus-4.5 · " + "1 message"
+    // "  project sentinel · " + "title sentinel · " + "opus-4.5 · " + "1 prompt"
     // + " · 1h 15m" + " · " + "926k tokens · " + "YYYY-MM-DD HH:MM" + " · " + summary
-    let expected = 2 + 16 + 3 + 17 + 11 + 9 + 9 + 3 + 14 + 16 + 3 + 16;
+    let expected = 2 + 16 + 3 + 17 + 11 + 8 + 9 + 3 + 14 + 16 + 3 + 16;
+    assert!(header_fits_single_line(&conversation, expected as u16));
+    assert!(!header_fits_single_line(&conversation, expected as u16 - 1));
+
+    // The counts are measured in cells: their "·" is one cell, two bytes.
+    conversation.tool_call_count = 5;
+    let expected = expected + " · 5 tool calls".chars().count();
     assert!(header_fits_single_line(&conversation, expected as u16));
     assert!(!header_fits_single_line(&conversation, expected as u16 - 1));
 }
@@ -367,8 +394,28 @@ fn sanitize_preview_strips_tags_and_collapses_whitespace() {
         sanitize_preview("  <tag attr=\"x\">hello</tag>\n\n\tworld   again  "),
         "hello world again"
     );
-    assert_eq!(sanitize_preview("a < b > c"), "a c");
+    assert_eq!(sanitize_preview("a < b > c"), "a < b > c");
     assert_eq!(sanitize_preview(""), "");
+}
+
+#[test]
+fn sanitize_preview_strips_paired_tags_and_keeps_other_angle_brackets() {
+    assert_eq!(
+        sanitize_preview("<command-message>run</command-message>\n  <bash-input>ls</bash-input>"),
+        "run ls"
+    );
+    assert_eq!(
+        sanitize_preview("[Y3] explain the <system-reminder> tag handling for axolotl"),
+        "[Y3] explain the <system-reminder> tag handling for axolotl"
+    );
+    assert_eq!(
+        sanitize_preview("if a < b and Vec<T> or x>y then <br/>"),
+        "if a < b and Vec<T> or x>y then <br/>"
+    );
+    assert_eq!(
+        sanitize_preview("a <task id=\"1\">done</task> b"),
+        "a done b"
+    );
 }
 
 #[test]
@@ -420,6 +467,26 @@ fn highlight_query_uses_unquoted_terms_and_literals_for_context() {
             .collect::<Vec<_>>(),
         vec!["Lit", "snake_case"]
     );
+}
+
+/// Upstream 949ec4e: a match covers the query when it holds every word
+/// (folded, anywhere in it) and every literal (as literals match).
+#[test]
+fn highlight_query_covers_all_terms_only_with_every_word_and_literal() {
+    let query = HighlightQuery::parse("flaky test");
+    assert!(query.covers_all_terms("Flaky Test"));
+    assert!(query.covers_all_terms("flaky tests"));
+    assert!(!query.covers_all_terms("tests"));
+    assert!(!query.covers_all_terms("flakyness"));
+
+    let query = HighlightQuery::parse("deploy \"API_KEY\"");
+    assert!(query.covers_all_terms("deploy the API_KEY"));
+    assert!(!query.covers_all_terms("deploy the api_key"));
+    assert!(!query.covers_all_terms("API_KEY"));
+
+    // No terms at all: anything covers it.
+    assert!(HighlightQuery::parse("").covers_all_terms("text"));
+    assert!(ViewSearchQuery::parse("flaky test").covers_all_terms("a flaky test"));
 }
 
 #[test]
@@ -614,6 +681,68 @@ fn find_normalized_ranges_prefix_match() {
     assert_eq!(
         &"Extend log redaction to cover"[ranges[0].0..ranges[0].1],
         "red"
+    );
+}
+
+#[test]
+fn find_normalized_ranges_follow_keyword_search() {
+    let found = |text: &'static str, query: &str| {
+        find_normalized_match_ranges(text, &normalize_for_search(query))
+            .into_iter()
+            .map(|(start, end)| &text[start..end])
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(found("the İstanbul trip", "istanbul"), ["İstanbul"]);
+    assert_eq!(found("ΛΟΓΟΣ and λογος", "λογος"), ["ΛΟΓΟΣ", "λογος"]);
+    assert_eq!(found("中间这是测试会话内容", "测试会话"), ["测试会话"]);
+    assert_eq!(found("asp.net", ".net"), Vec::<&str>::new());
+    assert_eq!(found("bump v1.1.1", "1.1"), ["1.1"]);
+}
+
+#[test]
+fn view_search_ranges_are_the_highlight_ranges_of_each_line() {
+    let lines = [
+        "the hidden needle_token appears",
+        "late mention of İstanbul and STRAẞE",
+        "exact audio_generation, audio generation",
+        "the fired plan, 测试会话内容",
+        "",
+        "needle needle-token",
+    ];
+    let text = lines.join("\n");
+    for query in [
+        "needle token",
+        "istanbul strasse",
+        "\"audio_generation\"",
+        "audio_generation",
+        "ired",
+        "测试",
+        "needle \"fired\"",
+    ] {
+        let view = ViewSearchQuery::parse(query);
+        let highlight = HighlightQuery::parse(query);
+        let mut expected = Vec::new();
+        let mut at = 0;
+        for line in lines {
+            let ranges = highlight.match_ranges(line);
+            assert_eq!(view.match_ranges(line), ranges, "{line:?} {query}");
+            assert_eq!(view.has_match(line), !ranges.is_empty(), "{line:?} {query}");
+            expected.extend(ranges.iter().map(|&(start, end)| (at + start, at + end)));
+            at += line.len() + 1;
+        }
+        // The lines of one text keep their own ranges: the trailing
+        // "needle" of a line never merges with the next line's first word.
+        assert_eq!(view.match_ranges(&text), expected, "{query}");
+        let form = NormalizedForm::new(&text);
+        assert_eq!(view.match_ranges_in(&text, &form), expected, "{query}");
+    }
+    assert!(ViewSearchQuery::parse(" - / ").is_empty());
+    assert!(ViewSearchQuery::parse("\"\"").is_empty());
+    assert!(!ViewSearchQuery::parse("\"x\"").is_empty());
+    let text = "token\ntoken token";
+    assert_eq!(
+        ViewSearchQuery::parse("token").match_ranges(text),
+        [(0, 5), (6, 17)]
     );
 }
 
@@ -898,19 +1027,58 @@ fn context_segments_from_ranges_require_ranges_and_width() {
 #[test]
 fn lexical_mixed_query_cached_context_uses_unquoted_and_literals() {
     let mut conversation = test_conversation();
-    conversation.preview = "visible preview".to_string();
-    conversation.full_text = format!("hidden_unquoted {} exact_literal", "x ".repeat(120));
+    conversation.preview = "visible preview".into();
+    conversation.full_text = format!("hidden_unquoted {} exact_literal", "x ".repeat(120)).into();
     let evidence = crate::search::build_lexical_evidence(
-        &conversation,
+        &conversation.full_text,
+        &conversation.preview,
         &ParsedQuery::parse("hidden_unquoted \"exact_literal\""),
     )
     .unwrap();
     let ctx =
-        build_context_segments_from_ranges(&conversation.full_text, &evidence.context_ranges, 120)
-            .unwrap();
+        build_context_segments_from_ranges(&evidence.text, &evidence.context_ranges, 120).unwrap();
 
     assert!(ctx.contains("exact_literal"), "{ctx:?}");
     assert!(ctx.contains("hidden_unquoted"), "{ctx:?}");
+}
+
+#[test]
+fn evidence_windows_give_the_same_context_as_the_full_text() {
+    let filler = |n: usize| "héllo <tag> wörld 测试 ".repeat(n);
+    let texts = [
+        format!("needle {} needle", filler(10)),
+        format!(
+            "{} needle {} other_needle {}",
+            filler(400),
+            filler(3),
+            filler(400)
+        ),
+        format!("{} needle {} other_needle", filler(2), filler(900)),
+        format!("needle{}", filler(1)),
+    ];
+    for full_text in &texts {
+        for query in ["needle", "needle \"other_needle\""] {
+            let parsed = ParsedQuery::parse(query);
+            let preview = "unrelated preview";
+            let ranges =
+                crate::search::evidence::full_text_context_ranges(full_text, preview, &parsed)
+                    .unwrap();
+            let evidence =
+                crate::search::build_lexical_evidence(full_text, preview, &parsed).unwrap();
+            assert!(evidence.text.len() < full_text.len() || full_text.len() < 4096);
+            for width in [10, 40, 80, 200, 1000, 2000] {
+                assert_eq!(
+                    build_context_segments_from_ranges(
+                        &evidence.text,
+                        &evidence.context_ranges,
+                        width
+                    ),
+                    build_context_segments_from_ranges(full_text, &ranges, width),
+                    "{query:?} width {width}"
+                );
+            }
+        }
+    }
 }
 
 // --- word boundary tests ---
@@ -963,7 +1131,7 @@ fn list_truncates_long_project_names_on_narrow_rows() {
     conversation.custom_title = Some("semantic status title".to_string());
     conversation.summary = Some("semantic status summary".to_string());
     let header = row_header(&conversation, 70, false, None);
-    assert_eq!(header.project.text, "claude-history/drop-semantic…");
+    assert_eq!(header.project.text, "claude-history/drop-semant…");
     let line = header_line(&header);
     assert!(
         !line.contains("claude-history/drop-semantic-feature-gate"),
@@ -991,7 +1159,7 @@ fn list_uses_available_width_for_custom_titles() {
         line.contains("generated summary remains visible"),
         "{line:?}"
     );
-    assert!(line.contains("1 msg · Jan 01, 00:00"), "{line:?}");
+    assert!(line.contains("1 prompt · Jan 01, 00:00"), "{line:?}");
     assert_eq!(header.recency, Recency::Old);
 }
 
@@ -1006,10 +1174,10 @@ fn list_truncates_custom_titles_to_preserve_metadata() {
     let header = row_header(&conversation, 72, false, None);
     let line = header_line(&header);
     assert!(
-        line.contains("fork lineage alpha beta gamma delta e…"),
+        line.contains("fork lineage alpha beta gamma delt…"),
         "{line:?}"
     );
-    assert!(line.contains("1 msg · Jan 01, 00:00"), "{line:?}");
+    assert!(line.contains("1 prompt · Jan 01, 00:00"), "{line:?}");
     // Upstream leaves one trailing cell free.
     assert_eq!(UnicodeWidthStr::width(line.as_str()), 71, "{line:?}");
 }
@@ -1038,7 +1206,7 @@ fn semantic_list_shows_compact_score_metadata_on_wide_rows() {
 #[test]
 fn row_header_shows_source_labels_duration_and_highlights() {
     let mut conversation = test_conversation();
-    conversation.source = crate::history::Source::Omp;
+    conversation.source = crate::history::model::SourceKind::Omp;
     conversation.duration_minutes = Some(75);
     let query = HighlightQuery::parse("sentinel");
     let header = build_row_header(&RowHeaderInput {
@@ -1046,6 +1214,7 @@ fn row_header_shows_source_labels_duration_and_highlights() {
         query: &query,
         width: 160,
         show_source_label: true,
+        show_kind_label: true,
         semantic_mode: false,
         semantic_metadata: None,
         now: Local::now(),
@@ -1062,12 +1231,13 @@ fn row_header_shows_source_labels_duration_and_highlights() {
     );
     assert_eq!(header.summary.as_ref().unwrap().highlights.len(), 1);
 
-    conversation.source = crate::history::Source::Pi;
+    conversation.source = crate::history::model::SourceKind::Pi;
     let header = build_row_header(&RowHeaderInput {
         conversation: &conversation,
         query: &query,
         width: 160,
         show_source_label: true,
+        show_kind_label: true,
         semantic_mode: false,
         semantic_metadata: None,
         now: Local::now(),
@@ -1077,6 +1247,41 @@ fn row_header_shows_source_labels_duration_and_highlights() {
     conversation.project_name = None;
     let header = row_header(&conversation, 160, false, None);
     assert_eq!(header.project.text, "");
+}
+
+#[test]
+fn row_header_tags_automated_and_child_conversations_after_the_source() {
+    // Upstream cb990e6: listed hidden kinds are tagged `auto` / `sub`.
+    let mut conversation = test_conversation();
+    conversation.source = crate::history::model::SourceKind::Codex;
+    conversation.provenance.automated = true;
+    fn project(conversation: &Conversation, show_kind_label: bool) -> String {
+        let query = HighlightQuery::parse("");
+        build_row_header(&RowHeaderInput {
+            conversation,
+            query: &query,
+            width: 160,
+            show_source_label: true,
+            show_kind_label,
+            semantic_mode: false,
+            semantic_metadata: None,
+            now: Local::now(),
+        })
+        .project
+        .text
+    }
+    assert_eq!(
+        project(&conversation, true),
+        "CX  · auto · project sentinel"
+    );
+    // A subagent run of an exec run is tagged as the child it is.
+    conversation.provenance.child = true;
+    assert_eq!(project(&conversation, true), "CX  · sub · project sentinel");
+    assert_eq!(project(&conversation, false), "CX  · project sentinel");
+    conversation.provenance = Default::default();
+    conversation.provenance.orphaned = true;
+    let header = row_header(&conversation, 160, false, None);
+    assert_eq!(header.project.text, "project sentinel");
 }
 
 // --- row preview (upstream render_list tests) ---
@@ -1129,11 +1334,15 @@ fn semantic_list_truncates_cleanly_at_narrow_width() {
 #[test]
 fn lexical_unquoted_render_shows_cached_hidden_full_text_context() {
     let mut conversation = test_conversation();
-    conversation.preview = "visible lexical preview".to_string();
-    conversation.full_text = format!("visible lexical preview {} hiddenneedle", "x ".repeat(200));
-    let evidence =
-        crate::search::build_lexical_evidence(&conversation, &ParsedQuery::parse("hiddenneedle"))
-            .unwrap();
+    conversation.preview = "visible lexical preview".into();
+    conversation.full_text =
+        format!("visible lexical preview {} hiddenneedle", "x ".repeat(200)).into();
+    let evidence = crate::search::build_lexical_evidence(
+        &conversation.full_text,
+        &conversation.preview,
+        &ParsedQuery::parse("hiddenneedle"),
+    )
+    .unwrap();
     let preview = row_preview(
         &conversation,
         "hiddenneedle",
@@ -1154,8 +1363,9 @@ fn lexical_unquoted_render_shows_cached_hidden_full_text_context() {
 #[test]
 fn lexical_quoted_render_shows_hidden_literal_context() {
     let mut conversation = test_conversation();
-    conversation.preview = "visible lexical preview".to_string();
-    conversation.full_text = format!("visible lexical preview {} hidden_literal", "x ".repeat(80));
+    conversation.preview = "visible lexical preview".into();
+    conversation.full_text =
+        format!("visible lexical preview {} hidden_literal", "x ".repeat(80)).into();
     let preview = row_preview(&conversation, "\"hidden_literal\"", false, None, None, 80);
     assert_eq!(preview.preview.text, "visible lexical preview");
     let context = preview.context.expect("literal context line");
@@ -1169,11 +1379,11 @@ fn literal_query_rows_without_context_keep_the_four_line_pitch() {
     // hides it in full_text (context line). Upstream reserved a fourth
     // line for both.
     let mut visible = test_conversation();
-    visible.preview = "preview with hidden_literal shown".to_string();
+    visible.preview = "preview with hidden_literal shown".into();
     visible.full_text = visible.preview.clone();
     let mut hidden = test_conversation();
-    hidden.preview = "visible lexical preview".to_string();
-    hidden.full_text = format!("visible lexical preview {} hidden_literal", "x ".repeat(80));
+    hidden.preview = "visible lexical preview".into();
+    hidden.full_text = format!("visible lexical preview {} hidden_literal", "x ".repeat(80)).into();
     let query = "\"hidden_literal\"";
     assert!(crate::browser::query_has_literals(query));
     assert_eq!(
@@ -1200,9 +1410,10 @@ fn semantic_list_uses_semantic_evidence_preview_without_full_text_context() {
 #[test]
 fn semantic_rows_with_metadata_ignore_lexical_evidence() {
     let mut conversation = test_conversation();
-    conversation.full_text = format!("{} sentinel", "x ".repeat(100));
+    conversation.full_text = format!("{} sentinel", "x ".repeat(100)).into();
     let evidence = LexicalEvidence {
         context_ranges: vec![(200, 208)],
+        text: conversation.full_text.to_string(),
     };
     let metadata = test_semantic_metadata("semantic evidence only");
     let with_metadata = row_preview(
@@ -1223,7 +1434,7 @@ fn semantic_rows_with_metadata_ignore_lexical_evidence() {
 #[test]
 fn semantic_list_shows_literal_context_when_evidence_lacks_literal() {
     let mut conversation = test_conversation();
-    conversation.full_text = "tool output sentinel includes audio_generation literal".to_string();
+    conversation.full_text = "tool output sentinel includes audio_generation literal".into();
     let preview = row_preview(
         &conversation,
         "semantic \"audio_generation\"",
@@ -1287,7 +1498,7 @@ fn semantic_literal_preview_merges_overlapping_ranges() {
 #[test]
 fn semantic_literal_context_requires_all_literals_visible() {
     let mut conversation = test_conversation();
-    conversation.full_text = "alpha_exact near preview. beta_exact hidden deeper.".to_string();
+    conversation.full_text = "alpha_exact near preview. beta_exact hidden deeper.".into();
     let metadata = test_semantic_metadata("semantic alpha_exact only");
     let preview = row_preview(
         &conversation,
@@ -1305,10 +1516,25 @@ fn semantic_literal_context_requires_all_literals_visible() {
 #[test]
 fn lexical_rows_window_around_normalized_matches() {
     let mut conversation = test_conversation();
-    conversation.preview = format!("{} needle at the end", "words ".repeat(30));
+    conversation.preview = format!("{} needle at the end", "words ".repeat(30)).into();
     let preview = row_preview(&conversation, "needle", false, None, None, 44);
     assert_eq!(preview.source, PreviewSource::Preview);
     assert!(preview.preview.text.starts_with('…'), "{preview:?}");
     assert!(preview.preview.text.contains("needle"), "{preview:?}");
     assert!(UnicodeWidthStr::width(preview.preview.text.as_str()) <= 40);
+}
+
+/// Upstream 3c2ffeb: the viewer names a parent, subagent or fork by its
+/// title, else its summary, else its first message, else its session id.
+#[test]
+fn conversation_labels_fall_back_from_title_to_session_id() {
+    let mut conversation = test_conversation();
+    assert_eq!(conversation_label(&conversation), "title sentinel");
+    conversation.custom_title = None;
+    assert_eq!(conversation_label(&conversation), "summary sentinel");
+    conversation.summary = Some("  ".to_string());
+    conversation.preview_first = "<b>first</b> question ... last answer".into();
+    assert_eq!(conversation_label(&conversation), "first question");
+    conversation.preview_first = "".into();
+    assert_eq!(conversation_label(&conversation), "session");
 }

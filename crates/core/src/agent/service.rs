@@ -20,7 +20,7 @@ use crate::agent::response::{
     AgentSearchResult, conversations_for_output,
 };
 use crate::config::{AgentConfig, AgentScopeConfig, ConfigFile};
-use crate::env::{HistoryEnv, WorkspaceScope};
+use crate::env::HistoryEnv;
 use crate::error::{AppError, Result};
 use crate::history;
 use crate::search;
@@ -32,6 +32,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 type ResolvedReadRefs = Vec<(agent::refs::ReadRef, agent::refs::ResolvedConversation)>;
 
@@ -99,7 +100,7 @@ fn configured_scope(
 }
 
 fn project_is_excluded(path: &Path, excluded: &[String]) -> bool {
-    path.parent()
+    history::sources::claude::project_dir(path)
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
         .is_some_and(|project| {
@@ -159,6 +160,7 @@ impl fmt::Display for AgentNotice {
 /// explicitly), a per-invocation transcript cache, and collected notices.
 #[derive(Default)]
 pub struct AgentService {
+    history: crate::history::service::HistoryService,
     env: HistoryEnv,
     config: ConfigFile,
     embedder_factory: Option<EmbedderFactory>,
@@ -240,6 +242,9 @@ fn error_envelope(error: AppError) -> (String, Option<AgentError>) {
 impl AgentService {
     pub fn new(env: HistoryEnv, config: ConfigFile) -> Self {
         Self {
+            history: crate::history::service::HistoryService::new(
+                crate::history::sources::Registry::from_env(&env),
+            ),
             env,
             config,
             ..Self::default()
@@ -325,8 +330,13 @@ impl AgentService {
                 "Could not determine home directory",
             ))
         })?;
-        // Refuses under cfg(test): tests inject an embedder factory.
-        semantic::fastembed::quiet_embedder_in(model_dir)
+        // Refuses under cfg(test): tests inject an embedder factory. Every
+        // core, as upstream's `FastembedEmbedder::new()` (8322afe): a
+        // command the person is waiting on.
+        semantic::fastembed::quiet_embedder_in(
+            model_dir,
+            semantic::fastembed::EmbedPriority::Foreground,
+        )
     }
 
     /// Run `request` and return the compact protocol text (errors carry the
@@ -386,20 +396,29 @@ impl AgentService {
         #[cfg(test)]
         self.transcript_parse_count
             .set(self.transcript_parse_count.get() + 1);
-        let loaded = agent::transcript::AgentTranscript::load(path).map_err(|error| match error {
-            AppError::Agent(error) => error,
-            AppError::Io(error) => AgentError::io(
-                Some(&path.to_string_lossy()),
-                format!("failed to read transcript: {error}"),
-            ),
-            AppError::Json(error) => AgentError::malformed_transcript(
-                Some(&path.to_string_lossy()),
-                format!("failed to parse transcript JSONL: {error}"),
-            ),
-            error => {
-                AgentError::malformed_transcript(Some(&path.to_string_lossy()), error.to_string())
-            }
-        });
+        // Fork: an I/O failure of the open stays an `io` error (the GUI's
+        // warnings banner counts it apart from malformed transcripts).
+        let loaded = self
+            .history
+            .open_path(path)
+            .and_then(|(_, transcript)| {
+                agent::transcript::AgentTranscript::from_transcript(&transcript)
+            })
+            .map_err(|error| match error {
+                AppError::Agent(error) => error,
+                AppError::Io(error) => AgentError::io(
+                    Some(&path.to_string_lossy()),
+                    format!("failed to read transcript: {error}"),
+                ),
+                AppError::Json(error) => AgentError::malformed_transcript(
+                    Some(&path.to_string_lossy()),
+                    format!("failed to parse transcript JSONL: {error}"),
+                ),
+                error => AgentError::malformed_transcript(
+                    Some(&path.to_string_lossy()),
+                    error.to_string(),
+                ),
+            });
         self.transcripts
             .borrow_mut()
             .insert(path.to_path_buf(), loaded.clone());
@@ -409,35 +428,60 @@ impl AgentService {
     fn run_search(&self, args: &AgentSearchArgs) -> Result<Served> {
         let search_config = self.config.search.clone().unwrap_or_default();
         let agent_config = self.agent_config();
+        let tui_config = self.config.tui.clone().unwrap_or_default();
+        let exclude_paths = tui_config.exclude_paths;
+        // Projects the list hides stay out of agent search too.
+        let tui_excluded_projects = tui_config
+            .exclude_projects
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
         // Resolved before loading so an inverted range fails without paying for
         // a full corpus parse.
         let time = args.time.resolve()?;
         self.check_cancelled()?;
-        let mut conversations = history::load_all_conversations(&self.env, false, None)?;
+        let excluded_paths = std::sync::Mutex::new(std::collections::HashSet::new());
+        // Fork: the load may wait for the GUI list's reconcile pass, so a
+        // cancel (K7) also ends that wait.
+        let cancellation = self.semantic_cancellation();
+        let loaded = crate::store::load_conversations_where_cancellable(
+            &self.env,
+            false,
+            None,
+            crate::store::Contents::Full,
+            &|| cancellation.is_cancelled(),
+            &|conversation| {
+                if history::path::cwd_is_excluded(conversation.cwd.as_deref(), &exclude_paths)
+                    || conversation.project_name.as_deref().is_some_and(|name| {
+                        history::path::project_is_excluded(name, &tui_excluded_projects)
+                    })
+                {
+                    excluded_paths
+                        .lock()
+                        .unwrap()
+                        .insert(conversation.path.clone());
+                    return false;
+                }
+                (args.all_kinds || !conversation.provenance.hidden_by_default())
+                    && !project_is_excluded(&conversation.path, &agent_config.exclude_projects)
+                    && time.matches(conversation.timestamp)
+            },
+        );
         self.check_cancelled()?;
-        conversations.retain(|conversation| {
-            !project_is_excluded(&conversation.path, &agent_config.exclude_projects)
-                && time.matches(conversation.timestamp)
-        });
-        conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        let mut conversations = loaded?;
+        let excluded_paths = excluded_paths.into_inner().unwrap();
+        conversations.sort_by_key(|a| std::cmp::Reverse(a.timestamp));
         let scope = configured_scope(args, &agent_config);
         // Upstream derived the local scope from the process cwd; core uses
         // the environment's workspace (W1: encoded from the non-canonical
         // path).
         let workspace = if scope == agent::search::AgentSearchScope::Local {
-            self.env.workspace()?
+            history::Workspace::of_env(&self.env)?
         } else {
             None
         };
-        let current_project_dir_name = workspace
-            .as_ref()
-            .map(|workspace| workspace.project_dir_name().to_string());
-        let scoped = agent::search::scoped_conversation_inputs(
-            &conversations,
-            scope,
-            current_project_dir_name.as_deref(),
-        )?;
-        let request = agent::search::AgentSearchRequest {
+        let scoped =
+            agent::search::scoped_conversation_inputs(&conversations, scope, workspace.as_ref())?;
+        let mut request = agent::search::AgentSearchRequest {
             query: args.query.clone(),
             top: configured_usize(args.top, DEFAULT_SEARCH_TOP, agent_config.top),
             cli_mode: args.mode_override(),
@@ -452,15 +496,58 @@ impl AgentService {
             retrieval_hits_per_conversation: None,
             all_hits: args.all_hits,
             budget: configured_budget(args.no_budget, args.budget, agent_config.output_chars),
+            user_only: args.user_only,
         };
-        let mode = agent::search::effective_agent_mode(
+        let mut mode = agent::search::effective_agent_mode(
             &request.query,
             request.cli_mode,
             request.config_mode,
             request.tui_semantic_search,
         );
-        let (mut keys, mut base_warnings) = discover_agent_keys(&self.env, workspace.as_ref())?;
-        keys.retain(|key| !project_is_excluded(&key.path, &agent_config.exclude_projects));
+        let mut user_only_warning = None;
+        if args.forces_lexical() && matches!(mode, SearchMode::Semantic | SearchMode::Hybrid) {
+            // Embeddings cover chunks of both sides of a conversation, so
+            // only lexical search can keep to the person's own messages.
+            user_only_warning = Some(AgentWarning::from_error(&AgentError::semantic_unavailable(
+                "semantic and hybrid search cannot be limited to your own messages; \
+                     searched lexically",
+            )));
+            mode = SearchMode::Lexical;
+            request.cli_mode = Some(SearchMode::Lexical);
+        }
+        // Ranks on what the person typed when only that is searched.
+        let own_view;
+        let ranked_conversations = if args.user_only {
+            own_view = search::user_only_view(&conversations);
+            &own_view
+        } else {
+            &conversations
+        };
+        let (mut keys, mut base_warnings) = discover_agent_keys(
+            &self.env,
+            workspace.as_ref(),
+            Some(&conversations),
+            args.all_kinds,
+        )?;
+        // The workspace also takes in sessions stored under other projects
+        // that recorded a cwd inside it; their references must resolve too.
+        let registry = history::sources::Registry::from_env(&self.env);
+        let keyed: std::collections::HashSet<PathBuf> =
+            keys.iter().map(|key| key.path.clone()).collect();
+        for &index in &scoped {
+            let conversation = &conversations[index];
+            if !keyed.contains(&conversation.path)
+                && let Ok(key) =
+                    agent::refs::AgentConversationKey::from_conversation_in(conversation, &registry)
+            {
+                keys.push(key);
+            }
+        }
+        keys.sort_by(|left, right| left.path.cmp(&right.path));
+        keys.retain(|key| {
+            !excluded_paths.contains(&key.path)
+                && !project_is_excluded(&key.path, &agent_config.exclude_projects)
+        });
         if time.is_active() {
             // Key discovery walks the projects directory independently, so
             // without this every conversation outside the window would be
@@ -475,10 +562,11 @@ impl AgentService {
             &conversations,
             &keys,
         ));
+        base_warnings.extend(user_only_warning);
         self.check_cancelled()?;
         match mode {
             SearchMode::Lexical | SearchMode::Exact => {
-                let ranked = lexically_rank_scoped(&conversations, &args.query, &scoped);
+                let ranked = lexically_rank_scoped(ranked_conversations, &args.query, &scoped);
                 self.check_cancelled()?;
                 let warnings = RefCell::new(base_warnings.clone());
                 let mut output = agent::search::run_global_lexical_search_reporting(
@@ -502,11 +590,11 @@ impl AgentService {
                 // cancel, not those failures.
                 self.check_cancelled()?;
                 apply_configured_render_policy(&mut output, &agent_config);
-                return Ok(Served::search(
+                Ok(Served::search(
                     output,
                     warnings.into_inner(),
                     &agent::refs::resolved_conversations_for_keys(&keys),
-                ));
+                ))
             }
             SearchMode::Semantic => {
                 let (mut output, mut warnings) =
@@ -514,11 +602,11 @@ impl AgentService {
                 self.check_cancelled()?;
                 apply_configured_render_policy(&mut output, &agent_config);
                 warnings.splice(0..0, base_warnings);
-                return Ok(Served::search(
+                Ok(Served::search(
                     output,
                     warnings,
                     &agent::refs::resolved_conversations_for_keys(&keys),
-                ));
+                ))
             }
             SearchMode::Hybrid => {
                 let lexical_request = agent::search::AgentSearchRequest {
@@ -560,15 +648,15 @@ impl AgentService {
                         attach_input_transcript_metadata(self, &mut output, &inputs);
                         self.check_cancelled()?;
                         apply_configured_render_policy(&mut output, &agent_config);
-                        return Ok(Served::search(
+                        Ok(Served::search(
                             output,
                             warnings.into_inner(),
                             &agent::refs::resolved_conversations_for_keys(&keys),
-                        ));
+                        ))
                     }
                     // A cancel is not a semantic failure to fall back from.
                     Err(AppError::SemanticSearchCancelled) => {
-                        return Err(AppError::SemanticSearchCancelled);
+                        Err(AppError::SemanticSearchCancelled)
                     }
                     Err(error) => {
                         warnings
@@ -594,11 +682,11 @@ impl AgentService {
                         let mut output = lexical;
                         output.mode = SearchMode::Hybrid;
                         apply_configured_render_policy(&mut output, &agent_config);
-                        return Ok(Served::search(
+                        Ok(Served::search(
                             output,
                             warnings.into_inner(),
                             &agent::refs::resolved_conversations_for_keys(&keys),
-                        ));
+                        ))
                     }
                 }
             }
@@ -608,7 +696,7 @@ impl AgentService {
     fn run_within(&self, args: &AgentWithinArgs) -> Result<Served> {
         let search_config = self.config.search.clone().unwrap_or_default();
         let agent_config = self.agent_config();
-        let (keys, _) = discover_agent_keys(&self.env, None)?;
+        let (keys, _) = discover_agent_keys(&self.env, None, None, true)?;
         let resolved = resolve_agent_conversation_arg(&self.env, &args.conversation, Some(&keys))?;
         let transcript = self
             .load_transcript(&resolved.key.path)
@@ -699,17 +787,25 @@ impl AgentService {
     }
 }
 
-/// Discover every Claude/Pi/OMP transcript key (public so a GUI can turn the
-/// candidates of an ambiguous-ref error into durable full refs). With `local`, only the
-/// workspace's Claude project directories (worktree-aware) and the Pi/OMP
-/// sessions whose working directory is the workspace are returned.
+/// Discover every Claude session and Pi/OMP transcript key (public so a GUI
+/// can turn the candidates of an ambiguous-ref error into durable full refs),
+/// and the keys of the listed Codex threads and Claude sidecars (subagents
+/// and `/btw` forks, upstream 3c2ffeb) among `listed`, else among the store's
+/// cards; automated and child conversations only with `all_kinds`. Codex keys
+/// need the thread's working directory and sidecar keys their metadata, which
+/// only decoding reveals, so they come from the cards the store keeps. With a
+/// `workspace`, only the workspace's Claude project directories
+/// (worktree-aware), the sidecars it contains and the Pi/OMP sessions whose
+/// working directory or project is the workspace or a folder below it are
+/// returned (upstream 82b355a); Codex keys are not narrowed (as upstream),
+/// search scopes its conversations itself and keys the ones a recorded cwd
+/// puts in the workspace.
 pub fn discover_agent_keys(
     env: &HistoryEnv,
-    local: Option<&WorkspaceScope>,
+    workspace: Option<&history::Workspace>,
+    listed: Option<&[history::Conversation]>,
+    all_kinds: bool,
 ) -> Result<(Vec<agent::refs::AgentConversationKey>, Vec<AgentWarning>)> {
-    let project_filter = local.map(WorkspaceScope::project_dir_name);
-    // Upstream compared against the canonicalized process cwd.
-    let current = local.map(WorkspaceScope::canonical_dir);
     let root = env.claude_projects_root().map_err(structured_agent_error)?;
     let projects = if root.exists() {
         std::fs::read_dir(&root)
@@ -744,7 +840,7 @@ pub fn discover_agent_keys(
         let Some(project_name) = project_path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if project_filter.is_some_and(|filter| !history::is_same_project(project_name, filter)) {
+        if workspace.is_some_and(|workspace| !workspace.contains_project_key(project_name, false)) {
             continue;
         }
         let entries = match std::fs::read_dir(&project_path) {
@@ -799,93 +895,101 @@ pub fn discover_agent_keys(
         && let Ok(pi_files) = history::pi_loader::discover_files(&pi_root)
     {
         for path in pi_files {
-            let Ok(Some(projection)) = history::pi::parse_file(&path) else {
+            let Ok(Some((history::model::SourceKind::Pi, header))) =
+                history::pi::read_header(&path, None)
+            else {
                 continue;
             };
-            if projection.source != history::Source::Pi {
-                continue;
-            }
-            if project_filter.is_some() {
-                // Upstream additionally re-encoded the canonicalized cwd and
-                // compared it with the filter derived from the same cwd. On
-                // Windows the canonical form (`\\?\C:\...`) never matched,
-                // so local Pi/OMP sessions were always dropped (W1). The
-                // workspace scope already is that project, so only the
-                // working-directory equality remains.
-                let cwd = projection
-                    .header
-                    .cwd
-                    .canonicalize()
-                    .unwrap_or_else(|_| projection.header.cwd.clone());
-                if current.as_ref() != Some(&cwd) {
-                    continue;
-                }
-            }
-            let project_identity = projection
-                .header
+            let project_identity = header
                 .cwd
                 .canonicalize()
-                .unwrap_or(projection.header.cwd)
+                .unwrap_or_else(|_| header.cwd.clone())
                 .to_string_lossy()
                 .into_owned();
-            let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+            if workspace.is_some_and(|workspace| {
+                !workspace.contains_cwd(&header.cwd)
+                    && !workspace.contains_project_key(&project_identity, true)
+            }) {
                 continue;
-            };
-            keys.push(agent::refs::AgentConversationKey {
-                source: history::Source::Pi,
-                project_dir_name: project_identity,
-                session_filename: filename.to_owned(),
-                session_id: projection.header.id,
+            }
+            if path.file_name().and_then(|name| name.to_str()).is_none() {
+                continue;
+            }
+            keys.push(agent::refs::AgentConversationKey::in_instance(
+                history::model::SourceKind::Pi,
+                &pi_root.path,
+                project_identity,
+                header.id,
                 path,
-            });
+            ));
         }
     }
     if let Ok(omp_root) = history::omp_loader::session_root(env)
         && let Ok(omp_files) = history::omp_loader::discover_files(&omp_root)
     {
         for path in omp_files {
-            let Ok(Some(projection)) = history::pi::parse_omp_file(&path) else {
+            let Ok(Some((_, header))) =
+                history::pi::read_header(&path, Some(history::model::SourceKind::Omp))
+            else {
                 continue;
             };
-            if project_filter.is_some() {
-                // Upstream additionally re-encoded the canonicalized cwd and
-                // compared it with the filter derived from the same cwd. On
-                // Windows the canonical form (`\\?\C:\...`) never matched,
-                // so local Pi/OMP sessions were always dropped (W1). The
-                // workspace scope already is that project, so only the
-                // working-directory equality remains.
-                let cwd = projection
-                    .header
-                    .cwd
-                    .canonicalize()
-                    .unwrap_or_else(|_| projection.header.cwd.clone());
-                if current.as_ref() != Some(&cwd) {
-                    continue;
-                }
-            }
-            let project_identity = projection
-                .header
+            let project_identity = header
                 .cwd
                 .canonicalize()
-                .unwrap_or(projection.header.cwd)
+                .unwrap_or_else(|_| header.cwd.clone())
                 .to_string_lossy()
                 .into_owned();
-            let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+            if workspace.is_some_and(|workspace| {
+                !workspace.contains_cwd(&header.cwd)
+                    && !workspace.contains_project_key(&project_identity, true)
+            }) {
                 continue;
-            };
-            keys.push(agent::refs::AgentConversationKey {
-                source: history::Source::Omp,
-                project_dir_name: project_identity,
-                session_filename: filename.to_owned(),
-                session_id: projection.header.id,
+            }
+            if path.file_name().and_then(|name| name.to_str()).is_none() {
+                continue;
+            }
+            keys.push(agent::refs::AgentConversationKey::in_instance(
+                history::model::SourceKind::Omp,
+                &omp_root.path,
+                project_identity,
+                header.id,
                 path,
-            });
+            ));
         }
     }
+    let loaded;
+    let listed = match listed {
+        Some(listed) => listed,
+        None => {
+            loaded =
+                crate::store::load_conversations(env, false, None, crate::store::Contents::Cards)?;
+            &loaded
+        }
+    };
+    let registry = history::sources::Registry::from_env(env);
+    keys.extend(
+        listed
+            .iter()
+            .filter(|conversation| {
+                let from_cards = match conversation.source {
+                    history::model::SourceKind::Codex => true,
+                    history::model::SourceKind::Claude => {
+                        history::sources::claude::sidecar(&conversation.path).is_some()
+                            && workspace.is_none_or(|workspace| workspace.contains(conversation))
+                    }
+                    _ => false,
+                };
+                from_cards && (all_kinds || !conversation.provenance.hidden_by_default())
+            })
+            .filter_map(|conversation| {
+                agent::refs::AgentConversationKey::from_conversation_in(conversation, &registry)
+                    .ok()
+            }),
+    );
     if keys.is_empty() && !root.exists() {
         return Err(AgentError::io(
             Some(&root.to_string_lossy()),
-            "no Claude, Pi, or OMP history storage is available",
+            "no Claude, Pi, OMP, or Codex history storage is available",
         )
         .into());
     }
@@ -906,11 +1010,14 @@ fn warnings_for_skipped_transcripts(
         .iter()
         .map(|conversation| conversation.path.as_path())
         .collect::<std::collections::HashSet<_>>();
+    let registry = history::sources::Registry::from_env(&service.env);
     let mut warnings = Vec::new();
     for conversation in conversations {
         if key_paths.contains(conversation.path.as_path()) && !conversation.parse_errors.is_empty()
         {
-            let key = agent::refs::AgentConversationKey::from_conversation(conversation).ok();
+            let key =
+                agent::refs::AgentConversationKey::from_conversation_in(conversation, &registry)
+                    .ok();
             warnings.push(AgentWarning {
                 kind: crate::agent::diagnostic::AgentWarningKind::MalformedTranscript,
                 reference: key.as_ref().map(|key| {
@@ -949,7 +1056,7 @@ fn warnings_for_skipped_transcripts(
 
 fn conversation_from_agent_transcript(
     transcript: &agent::transcript::AgentTranscript,
-    source: history::Source,
+    source: history::model::SourceKind,
 ) -> history::Conversation {
     let message_text = transcript
         .messages
@@ -964,12 +1071,13 @@ fn conversation_from_agent_transcript(
         })
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>();
-    let preview = message_text
+    let preview: Arc<str> = message_text
         .iter()
         .take(3)
         .cloned()
         .collect::<Vec<_>>()
-        .join(" ... ");
+        .join(" ... ")
+        .into();
     let preview_last = message_text
         .iter()
         .rev()
@@ -996,23 +1104,28 @@ fn conversation_from_agent_transcript(
         timestamp,
         preview: preview.clone(),
         preview_first: preview,
-        preview_last,
-        search_text_lower: crate::search::normalize_for_search(&full_text),
-        full_text,
-        agent_search_text: String::new(),
-        semantic_route_text,
-        semantic_turns: Vec::new(),
+        preview_last: preview_last.into(),
+        full_text: full_text.into(),
+        own_text: "".into(),
+        agent_search_text: Arc::from(""),
+        semantic_route_text: semantic_route_text.into(),
+        semantic_turns: Arc::new([]),
         semantic_turn_ranges: Vec::new(),
         project_name: None,
         project_path: None,
         cwd: None,
+        cwds: Vec::new(),
         message_count: transcript.messages.len(),
+        prompt_count: 0,
+        tool_call_count: 0,
         parse_errors: Vec::new(),
         summary: transcript.summary.clone(),
         custom_title: transcript.custom_title.clone(),
         model: None,
         total_tokens: 0,
         duration_minutes: None,
+        provenance: Default::default(),
+        parent: None,
     }
 }
 
@@ -1133,7 +1246,7 @@ fn run_agent_semantic_hits(
             conversation: std::sync::Arc::new(stripped_semantic_conversation(
                 input.conversation,
                 input.conversation.path.clone(),
-                input.conversation.semantic_turns.clone(),
+                input.conversation.semantic_turns.to_vec(),
                 input.conversation.semantic_turn_ranges.clone(),
             )),
         });
@@ -1166,7 +1279,7 @@ pub fn agent_route_semantic_conversation(
             .or(conversation.summary.as_deref())?
             .to_string()
     } else {
-        conversation.semantic_route_text.clone()
+        conversation.semantic_route_text.to_string()
     };
     let file_name = conversation
         .path
@@ -1198,25 +1311,30 @@ fn stripped_semantic_conversation(
         path,
         index: conversation.index,
         timestamp: conversation.timestamp,
-        preview: String::new(),
-        preview_first: String::new(),
-        preview_last: String::new(),
-        full_text: String::new(),
-        agent_search_text: String::new(),
-        semantic_route_text: String::new(),
-        semantic_turns,
+        preview: Arc::from(""),
+        preview_first: Arc::from(""),
+        preview_last: Arc::from(""),
+        full_text: Arc::from(""),
+        own_text: "".into(),
+        agent_search_text: Arc::from(""),
+        semantic_route_text: Arc::from(""),
+        semantic_turns: semantic_turns.into(),
         semantic_turn_ranges,
-        search_text_lower: String::new(),
         project_name: None,
         project_path: None,
         cwd: None,
+        cwds: Vec::new(),
         message_count: conversation.message_count,
+        prompt_count: conversation.prompt_count,
+        tool_call_count: conversation.tool_call_count,
         parse_errors: Vec::new(),
         summary: None,
         custom_title: None,
         model: None,
         total_tokens: 0,
         duration_minutes: None,
+        provenance: Default::default(),
+        parent: None,
     }
 }
 
@@ -1487,7 +1605,7 @@ fn agent_semantic_conversation<'a>(
         )
     })?;
     conversation.path = conversation.path.with_file_name(file_name);
-    conversation.semantic_turns = semantic_turns;
+    conversation.semantic_turns = semantic_turns.into();
     conversation.semantic_turn_ranges = semantic_turn_ranges;
     Some(conversation)
 }
@@ -1644,7 +1762,7 @@ impl AgentService {
         let keys = match keys {
             Some(keys) => keys,
             None => {
-                discovered = discover_agent_keys(&self.env, None)?.0;
+                discovered = discover_agent_keys(&self.env, None, None, true)?.0;
                 &discovered
             }
         };
@@ -1771,7 +1889,7 @@ impl AgentService {
         let keys = match keys {
             Some(keys) => keys,
             None => {
-                discovered = discover_agent_keys(&self.env, None)?.0;
+                discovered = discover_agent_keys(&self.env, None, None, true)?.0;
                 &discovered
             }
         };
@@ -1844,8 +1962,9 @@ pub(crate) fn resolve_agent_read_args(
     let keys = if let Some(keys) = keys {
         keys
     } else {
-        let conversations = history::load_all_conversations(env, false, None)?;
-        loaded_keys = agent::refs::conversation_keys_from_conversations(&conversations)?;
+        let conversations =
+            crate::store::load_conversations(env, false, None, crate::store::Contents::Cards)?;
+        loaded_keys = agent::refs::conversation_keys_from_conversations(env, &conversations)?;
         &loaded_keys
     };
     let resolved_refs = refs
@@ -1919,8 +2038,9 @@ pub(crate) fn resolve_agent_conversation_arg(
     let keys = if let Some(keys) = keys {
         keys
     } else {
-        let conversations = history::load_all_conversations(env, false, None)?;
-        loaded_keys = agent::refs::conversation_keys_from_conversations(&conversations)?;
+        let conversations =
+            crate::store::load_conversations(env, false, None, crate::store::Contents::Cards)?;
+        loaded_keys = agent::refs::conversation_keys_from_conversations(env, &conversations)?;
         &loaded_keys
     };
     agent::refs::resolve_conversation_ref(keys, reference)
@@ -1985,9 +2105,10 @@ mod tests {
         .build();
         conversation.full_text =
             "calibration isolation and per-device capability memory from bounded tool evidence"
-                .to_string();
+                .to_string()
+                .into();
         conversation.semantic_route_text =
-            history::semantic_route_text(&conversation.full_text, "");
+            history::semantic_route_text(&conversation.full_text, "").into();
 
         let route = agent_route_semantic_conversation(&conversation).unwrap();
 
@@ -2195,19 +2316,34 @@ mode = "hybrid"
 
         // The flat session directory feeds both the Pi and the OMP discovery
         // (upstream behavior), so the same file may yield one key per source.
-        let (local, _) = discover_agent_keys(&env, env.workspace().unwrap().as_ref()).unwrap();
+        let (local, _) = discover_agent_keys(
+            &env,
+            history::Workspace::of_env(&env).unwrap().as_ref(),
+            None,
+            false,
+        )
+        .unwrap();
         assert!(
             local
                 .iter()
-                .any(|key| key.source == history::Source::Pi && key.session_id == "local_scope_id"),
+                .any(|key| key.source == history::model::SourceKind::Pi
+                    && key.session_id == "local_scope_id"),
             "{local:?}"
         );
 
-        let other = WorkspaceScope::new(&elsewhere).unwrap();
-        let (keys, _) = discover_agent_keys(&env, Some(&other)).unwrap();
+        let at = |dir: &Path| {
+            history::Workspace::new(&crate::env::WorkspaceScope::new(dir).unwrap(), None)
+        };
+        let (keys, _) = discover_agent_keys(&env, Some(&at(&elsewhere)), None, false).unwrap();
         assert!(keys.is_empty(), "{keys:?}");
+        let (keys, _) =
+            discover_agent_keys(&env, Some(&at(&workspace.join("sub"))), None, false).unwrap();
+        assert!(keys.is_empty(), "{keys:?}");
+        // Upstream 82b355a: a workspace above the session's folder takes it in.
+        let (above, _) = discover_agent_keys(&env, Some(&at(home.path())), None, false).unwrap();
+        assert_eq!(above, local);
 
-        let (global, _) = discover_agent_keys(&env, None).unwrap();
+        let (global, _) = discover_agent_keys(&env, None, None, false).unwrap();
         assert_eq!(global, local);
     }
 
@@ -2517,6 +2653,79 @@ mode = "hybrid"
     }
 
     #[test]
+    fn d017_tui_exclude_projects_narrows_agent_search_but_not_read_or_outline() {
+        // `[tui] exclude_projects` holds project names (`hidden` also covers
+        // `hidden/<worktree>`); read and outline still reach them.
+        let home = tempfile::tempdir().unwrap();
+        let projects = home.path().join(".claude").join("projects");
+        let sessions = [
+            ("-tmp-keep", "11111111-1111-4111-8111-111111111111"),
+            ("-tmp-hidden", "22222222-2222-4222-8222-222222222222"),
+            (
+                "-tmp-hidden--worktrees-feature",
+                "33333333-3333-4333-8333-333333333333",
+            ),
+        ];
+        for (project, uuid) in sessions {
+            let dir = projects.join(project);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(format!("{uuid}.jsonl")),
+                [
+                    user_jsonl_line("shared needle question"),
+                    crate::agent::test_support::assistant_jsonl_line("shared needle answer"),
+                ]
+                .join(
+                    "
+",
+                ),
+            )
+            .unwrap();
+        }
+        let env = HistoryEnv::sandbox(home.path());
+        let config = ConfigFile {
+            tui: Some(crate::config::TuiConfig {
+                exclude_projects: vec!["hidden".to_string()],
+                ..crate::config::TuiConfig::default()
+            }),
+            ..ConfigFile::default()
+        };
+
+        let response = execute(
+            &env,
+            &config,
+            AgentRequest::Search(AgentSearchArgs::new("shared needle")),
+        );
+        assert!(response.is_success(), "{}", response.stderr);
+        assert!(response.warnings.is_empty(), "{:?}", response.warnings);
+        let Some(AgentResult::Search(result)) = &response.result else {
+            panic!("search result expected");
+        };
+        let uuids = result
+            .conversations
+            .iter()
+            .map(|conversation| conversation.uuid.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(uuids, vec![sessions[0].1.to_string()]);
+
+        for (_, uuid) in &sessions[1..] {
+            let read = execute(
+                &env,
+                &config,
+                AgentRequest::Read(AgentReadArgs::new([uuid.to_string()])),
+            );
+            assert!(read.is_success(), "{}", read.stderr);
+            assert!(read.stdout.contains("shared needle"), "{}", read.stdout);
+            let outline = execute(
+                &env,
+                &config,
+                AgentRequest::Outline(AgentOutlineArgs::new(uuid.to_string())),
+            );
+            assert!(outline.is_success(), "{}", outline.stderr);
+        }
+    }
+
+    #[test]
     fn a_cancelled_token_stops_a_search_before_loading_transcripts() {
         let (_home, env) = semantic_sandbox();
         let token = semantic::types::SemanticCancellationToken::new();
@@ -2547,6 +2756,35 @@ mode = "hybrid"
         )));
         assert!(response.is_success(), "{}", response.stderr);
         assert!(!response.is_cancelled());
+    }
+
+    /// K7 with upstream 16cc49c: a search waiting for the store's lock (the
+    /// GUI list's pass holds it) ends when its token is cancelled.
+    #[test]
+    fn a_search_waiting_for_the_store_lock_ends_when_cancelled() {
+        let (_home, env) = semantic_sandbox();
+        let root = crate::store::default_root(&env).unwrap();
+        let held = crate::store::generation::PublishLock::try_acquire(&root)
+            .unwrap()
+            .expect("the lock is free");
+        let token = semantic::types::SemanticCancellationToken::new();
+        let searching = {
+            let token = token.clone();
+            std::thread::spawn(move || {
+                let mut service =
+                    AgentService::new(env, ConfigFile::default()).with_cancellation(token);
+                service.respond(AgentRequest::Search(AgentSearchArgs::new(
+                    "semantic needle",
+                )))
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!searching.is_finished(), "the search waits for the lock");
+        token.cancel();
+        let response = searching.join().unwrap();
+        assert!(response.is_cancelled(), "{}", response.stderr);
+        assert_eq!(response.stderr, "Error: Semantic search cancelled\n");
+        drop(held);
     }
 
     #[test]

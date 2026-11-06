@@ -30,6 +30,13 @@
 # with the 20k-row load and a Deep search over every transcript, is reported).
 
 wait-loaded 180s
+# Store mode (upstream 358becb): the sandbox has no store yet, so the list is ready once the initial
+# reconcile pass published its first generation (the newest sessions), and `busy.load_end` times the
+# install of that generation; the pass then swaps in a generation every few seconds (the 20k-row
+# installs, core's share included, are gated by perf-list.qa's list.install_busy_max). Every step below, the X-007 idle window
+# included, waits until the pass has listed every session and its last generation is shown.
+wait-for list.total > 19999 600s
+wait-for list.reconciling == false 600s
 set-theme light
 expect list.total > 20000
 timing busy.load_end < 16ms

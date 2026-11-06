@@ -79,6 +79,9 @@ pub struct SessionSpec<'a> {
     pub spacing_minutes: i64,
     /// The session's working directory (default: under `synth::cwd_base()`).
     pub cwd: Option<PathBuf>,
+    /// The working directory of the messages after the first record (the
+    /// session changed directory; it stays stored under `cwd`'s project).
+    pub moved_to: Option<PathBuf>,
 }
 
 impl<'a> SessionSpec<'a> {
@@ -95,12 +98,20 @@ impl<'a> SessionSpec<'a> {
             start: None,
             spacing_minutes: 1,
             cwd: None,
+            moved_to: None,
         }
     }
 
     /// Use `cwd` as the working directory (it determines the project).
     pub fn cwd(mut self, cwd: PathBuf) -> Self {
         self.cwd = Some(cwd);
+        self
+    }
+
+    /// Record `dir` as the working directory of every message after the
+    /// first (upstream 82b355a's recorded cwds).
+    pub fn moves_to(mut self, dir: PathBuf) -> Self {
+        self.moved_to = Some(dir);
         self
     }
 
@@ -140,6 +151,10 @@ impl<'a> SessionSpec<'a> {
             .unwrap_or_else(|| synth::cwd_base().join(self.project));
         let uuid = synth::uuid(self.number);
         let cwd_json = serde_json::to_string(&cwd.display().to_string()).unwrap();
+        let moved_json = self
+            .moved_to
+            .as_ref()
+            .map(|dir| serde_json::to_string(&dir.display().to_string()).unwrap());
         let mut lines = Vec::new();
         if let Some(summary) = self.summary {
             lines.push(format!(
@@ -159,6 +174,10 @@ impl<'a> SessionSpec<'a> {
                 .format("%Y-%m-%dT%H:%M:%SZ")
                 .to_string();
             let text_json = serde_json::to_string(text).unwrap();
+            let cwd_json = match &moved_json {
+                Some(moved) if ix > 0 => moved,
+                _ => &cwd_json,
+            };
             let line = if *role == "user" {
                 format!(
                     r#"{{"type":"user","sessionId":"{uuid}","cwd":{cwd_json},"timestamp":"{stamp}","message":{{"role":"user","content":{text_json}}}}}"#
@@ -181,15 +200,61 @@ impl<'a> SessionSpec<'a> {
     }
 }
 
-/// Set a transcript's modification time (core's conversation timestamp and
-/// time filter both use it).
+/// Make a transcript last used at `at`: core dates a conversation by its
+/// newest message (ccec847), so the records' timestamps are shifted to end
+/// at `at` (their spacing is kept; records without a timestamp stay), and
+/// the file's modification time is set too (reconcile's change detection and
+/// the file-based tools use it).
 pub fn set_mtime(path: &std::path::Path, at: chrono::DateTime<chrono::Utc>) {
+    shift_records(path, at);
     let time: std::time::SystemTime = at.into();
     let file = std::fs::OpenOptions::new()
         .write(true)
         .open(path)
         .expect("open the transcript");
     file.set_modified(time).expect("set the modification time");
+}
+
+/// Shift the top-level `timestamp` of every JSONL record of `path` so that
+/// the newest one is `at`.
+fn shift_records(path: &std::path::Path, at: chrono::DateTime<chrono::Utc>) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let mut records: Vec<Result<serde_json::Value, &str>> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).map_err(|_| line))
+        .collect();
+    let stamp = |record: &serde_json::Value| {
+        record
+            .get("timestamp")
+            .and_then(|value| value.as_str())
+            .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+    };
+    let Some(newest) = records
+        .iter()
+        .filter_map(|record| record.as_ref().ok().and_then(stamp))
+        .max()
+    else {
+        return;
+    };
+    let delta = at.fixed_offset() - newest;
+    let mut out = String::new();
+    for record in &mut records {
+        match record {
+            Ok(value) => {
+                if let Some(old) = stamp(value) {
+                    let shifted =
+                        (old + delta).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                    value["timestamp"] = serde_json::Value::String(shifted);
+                }
+                out.push_str(&value.to_string());
+            }
+            Err(line) => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    std::fs::write(path, out).expect("rewrite the transcript");
 }
 
 /// A corpus with real workspace folders (`--workspace` needs an existing
@@ -289,10 +354,14 @@ impl ListFixture {
         self.wait_idle(cx);
     }
 
-    /// Wait until no search worker has pending work.
+    /// Wait until no search worker has pending work and the semantic worker
+    /// has finished its background indexing (which goes on after the search
+    /// or prewarm that started it was answered).
     pub fn wait_idle(&self, cx: &mut TestAppContext) {
         self.wait_until(cx, "the search workers to go idle", |list, _| {
-            !list.browser().has_search_work_in_flight() && !list.loader().is_running()
+            !list.browser().has_search_work_in_flight()
+                && !list.browser().semantic_worker_busy()
+                && !list.loader().is_running()
         });
     }
 

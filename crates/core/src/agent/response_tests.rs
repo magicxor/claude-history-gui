@@ -13,7 +13,7 @@ use crate::agent::transcript::AgentMessageRole;
 use crate::config::ConfigFile;
 use crate::env::HistoryEnv;
 use crate::error::Result;
-use crate::history::Source;
+use crate::history::model::SourceKind;
 use crate::semantic::embed::SemanticEmbedder;
 use std::path::{Path, PathBuf};
 
@@ -138,7 +138,7 @@ fn search_returns_ranked_conversations_with_paths() {
         result
             .conversations
             .iter()
-            .all(|c| c.source == Source::Claude)
+            .all(|c| c.source == SourceKind::Claude)
     );
     assert_search_consistent(&response);
 
@@ -383,7 +383,10 @@ fn pi_sessions_resolve_to_their_transcripts() {
         .iter()
         .find(|conversation| conversation.path == pi)
         .unwrap_or_else(|| panic!("{:?}", result.conversations));
-    assert!(matches!(conversation.source, Source::Pi | Source::Omp));
+    assert!(matches!(
+        conversation.source,
+        SourceKind::Pi | SourceKind::Omp
+    ));
     assert_eq!(conversation.uuid, "01912345-6789-7abc-8def-0123456789ab");
 }
 

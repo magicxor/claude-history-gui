@@ -12,13 +12,23 @@
 //!   [`save_gui_config_changes`] edits only the changed keys and keeps the
 //!   file's comments and formatting).
 //! * Precedence for every setting: `gui.toml` > `config.toml` > defaults
-//!   ([`load_layered_config`]).
+//!   ([`load_layered_config`]). The program that starts an agent (upstream
+//!   8a99ccc's `[resume] command`, `[resume.pi|omp|codex] command`) also
+//!   weighs the GUI-only `[gui] claude_path`, ...: `gui.toml`'s `command` >
+//!   `[gui] <agent>_path` > `config.toml`'s `command` > `PATH`
+//!   ([`agent_launcher`], [`LayeredConfig::launcher`]); upstream's
+//!   `ResumeConfig::{launcher, launch}` are not ported (one file there).
+//!   [`AgentCommand`] also serializes (a one-word command as a string), so
+//!   `gui.toml` can hold it.
 //!
 //! Key bindings use a neutral [`KeyChord`] (refactor R4) instead of
 //! crossterm key codes, with upstream's parsing rules, labels and errors.
+//! One default differs: `[keys] user_only` is Alt+U, not upstream's Ctrl+V,
+//! which pastes into the GUI's search field.
 
 use crate::env::{CLI_CONFIG_FILE_NAME, HistoryEnv, WorkspaceScope};
 use crate::error::{AppError, Result};
+use crate::history::actions::{ConfiguredAt, Launch, Launcher, config_table};
 use crate::search::mode::SearchMode;
 use crate::theme::ThemePreference;
 use serde::{Deserialize, Serialize};
@@ -51,6 +61,34 @@ pub struct ConfigFile {
     pub search: Option<SearchConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<AgentConfig>,
+    /// Upstream's background-daemon table (939c20b). Accepted so a shared
+    /// `config.toml` written for the CLI still loads; the GUI has no daemon
+    /// (decisions.md #22) and ignores it, and `gui.toml` has no such table.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic: Option<SemanticConfig>,
+}
+
+/// `[semantic]`: settings of upstream's opt-in background daemon. Parsed for
+/// compatibility only; the GUI neither starts a daemon nor reads these.
+#[derive(Clone, Copy, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticConfig {
+    /// Keep the caches warm in a background process that any launch starts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daemon: Option<bool>,
+    /// Whether the background process pauses embedding on battery power.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pause_on_battery: Option<bool>,
+}
+
+impl SemanticConfig {
+    pub fn daemon(&self) -> bool {
+        self.daemon.unwrap_or(false)
+    }
+
+    pub fn pause_on_battery(&self) -> bool {
+        self.pause_on_battery.unwrap_or(true)
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
@@ -128,6 +166,8 @@ where
 pub struct TuiConfig {
     #[serde(default)]
     pub exclude_projects: Vec<String>,
+    #[serde(default)]
+    pub exclude_paths: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_search: Option<bool>,
 }
@@ -155,8 +195,181 @@ pub struct DisplayConfig {
 #[derive(Clone, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ResumeConfig {
+    /// The command Claude Code is started with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<AgentCommand>,
+    /// Arguments Claude Code is resumed with.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_args: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pi: Option<LauncherConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub omp: Option<LauncherConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex: Option<AgentResumeConfig>,
+}
+
+/// How the conversations of another agent are resumed.
+#[derive(Clone, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentResumeConfig {
+    /// The command the agent is started with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<AgentCommand>,
+    /// Arguments the agent is resumed with, before its own subcommand.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_args: Option<Vec<String>>,
+}
+
+/// The command an agent is started with.
+#[derive(Clone, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LauncherConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<AgentCommand>,
+}
+
+/// A program and the arguments that precede the agent's own: a string
+/// names the program alone (never split on whitespace), an array the
+/// program and its arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentCommand(Vec<String>);
+
+impl AgentCommand {
+    /// Fork: the command of `words` (the program first), `None` when it
+    /// names no program (empty, or a blank first word), which a config file
+    /// rejects.
+    pub fn new(words: Vec<String>) -> Option<Self> {
+        words
+            .first()
+            .is_some_and(|program| !program.trim().is_empty())
+            .then_some(Self(words))
+    }
+
+    /// Fork: the program and its arguments.
+    pub fn words(&self) -> &[String] {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentCommand {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Program(String),
+            Command(Vec<String>),
+        }
+        let command = match Raw::deserialize(deserializer).map_err(|_| {
+            serde::de::Error::custom(
+                "command must be a program (\"my-claude\") or an array of a program and its arguments ([\"mise\", \"exec\", \"--\", \"claude\"])",
+            )
+        })? {
+            Raw::Program(program) => vec![program],
+            Raw::Command(command) => command,
+        };
+        if command
+            .first()
+            .is_none_or(|program| program.trim().is_empty())
+        {
+            return Err(serde::de::Error::custom("command must name a program"));
+        }
+        Ok(Self(command))
+    }
+}
+
+/// Fork (`gui.toml` is written): a program alone as a string, as a user
+/// would write it, else the array.
+impl Serialize for AgentCommand {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self.0.as_slice() {
+            [program] => serializer.serialize_str(program),
+            words => words.serialize(serializer),
+        }
+    }
+}
+
+impl ResumeConfig {
+    /// The configured arguments for resuming a conversation of `source`.
+    pub fn default_args(&self, source: crate::history::model::SourceKind) -> &[String] {
+        use crate::history::model::SourceKind;
+        let args = match source {
+            SourceKind::Claude => self.default_args.as_ref(),
+            SourceKind::Codex => self
+                .codex
+                .as_ref()
+                .and_then(|codex| codex.default_args.as_ref()),
+            SourceKind::Pi | SourceKind::Omp => None,
+        };
+        args.map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// The configured command that starts the agent of `source` (upstream
+    /// 8a99ccc's `ResumeConfig::launcher` reads the same keys; the fork
+    /// builds the launcher from both files with [`agent_launcher`]).
+    pub fn command(&self, source: crate::history::model::SourceKind) -> Option<&AgentCommand> {
+        use crate::history::model::SourceKind;
+        match source {
+            SourceKind::Claude => self.command.as_ref(),
+            SourceKind::Pi => self.pi.as_ref().and_then(|pi| pi.command.as_ref()),
+            SourceKind::Omp => self.omp.as_ref().and_then(|omp| omp.command.as_ref()),
+            SourceKind::Codex => self.codex.as_ref().and_then(|codex| codex.command.as_ref()),
+        }
+    }
+}
+
+/// The program that starts the agent of `source` (upstream 8a99ccc's
+/// `ResumeConfig::launcher`), from `config.toml` (`cli`) and `gui.toml`
+/// (`gui`). Fork (decision 17), first that is set:
+///
+/// 1. `command` under the agent's table (`[resume]`, `[resume.pi]`,
+///    `[resume.omp]`, `[resume.codex]`) of `gui.toml`;
+/// 2. the agent's program path under `[gui]` of `gui.toml` (`claude_path`,
+///    `pi_path`, `omp_path`, `codex_path`);
+/// 3. `command` under the agent's table of `config.toml`;
+/// 4. the agent's own binary on `PATH`.
+///
+/// GUI settings beat the CLI's shared file (a `config.toml` wrapper may be
+/// a shell script the GUI's platform cannot run), and a `[gui]` path is the
+/// GUI's spelling of a command that is one program. Relative paths and `~/`
+/// resolve with `env` ([`Launcher::configured`]); nothing is read from disk.
+pub fn agent_launcher(
+    env: &HistoryEnv,
+    cli: &ConfigFile,
+    gui: &GuiConfigFile,
+    source: crate::history::model::SourceKind,
+) -> Launcher {
+    let table = config_table(source);
+    if let Some(command) = gui
+        .resume
+        .as_ref()
+        .and_then(|resume| resume.command(source))
+    {
+        return Launcher::configured(env, command.words(), ConfiguredAt::Gui(table));
+    }
+    if let Some(settings) = &gui.gui
+        && let Some(path) = settings.program_path(source)
+    {
+        return Launcher::program_path(
+            env,
+            path,
+            ConfiguredAt::GuiPath(GuiSettings::program_path_key(source)),
+        );
+    }
+    if let Some(command) = cli
+        .resume
+        .as_ref()
+        .and_then(|resume| resume.command(source))
+    {
+        return Launcher::configured(env, command.words(), ConfiguredAt::Config(table));
+    }
+    Launcher::default_for(source)
 }
 
 #[derive(Clone, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
@@ -172,6 +385,10 @@ pub struct KeysConfig {
     pub delete: Option<KeyBinding>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh: Option<KeyBinding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub all_kinds: Option<KeyBinding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_only: Option<KeyBinding>,
 }
 
 // ---------------------------------------------------------------------------
@@ -396,6 +613,10 @@ pub struct KeyBindings {
     pub rename: KeyBinding,
     pub delete: KeyBinding,
     pub refresh: KeyBinding,
+    /// Lists or hides automated and child conversations
+    pub all_kinds: KeyBinding,
+    /// Searches only the user's own messages, or everything
+    pub user_only: KeyBinding,
 }
 
 impl Default for KeyBindings {
@@ -406,6 +627,10 @@ impl Default for KeyBindings {
             rename: KeyChord::plain(Key::F(2)),
             delete: KeyChord::ctrl('x'),
             refresh: KeyChord::ctrl('l'),
+            all_kinds: KeyChord::ctrl('g'),
+            // Fork: upstream binds Ctrl+V, which is paste in the GUI's search
+            // field (a reserved key, DESIGN §8.5).
+            user_only: KeyChord::alt('u'),
         }
     }
 }
@@ -421,12 +646,17 @@ impl KeyBindings {
                 rename: cfg.rename.unwrap_or(defaults.rename),
                 delete: cfg.delete.unwrap_or(defaults.delete),
                 refresh: cfg.refresh.unwrap_or(defaults.refresh),
+                all_kinds: cfg.all_kinds.unwrap_or(defaults.all_kinds),
+                user_only: cfg.user_only.unwrap_or(defaults.user_only),
             },
         }
     }
 
     /// Whether any action is bound to `Ctrl+T`. Upstream disables the
-    /// lexical/semantic toggle (Ctrl+T) in that case.
+    /// lexical/semantic toggle (Ctrl+T) in that case. `all_kinds` and
+    /// `user_only` count too (fork: upstream's `semantic_toggle_available`
+    /// does not list them, but their keys are checked before Ctrl+T, so the
+    /// toggle never runs either).
     pub fn conflicts_with_ctrl_t(&self) -> bool {
         let ctrl_t = (Key::Char('t'), KeyMods::CTRL);
         [
@@ -435,6 +665,8 @@ impl KeyBindings {
             self.resume,
             self.fork,
             self.refresh,
+            self.all_kinds,
+            self.user_only,
         ]
         .iter()
         .any(|binding| binding.matches(ctrl_t.0, ctrl_t.1))
@@ -471,6 +703,9 @@ pub struct GuiSettings {
     /// Explicit path of the `omp` executable (else resolved via PATH).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub omp_path: Option<PathBuf>,
+    /// Explicit path of the `codex` executable (else resolved via PATH).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex_path: Option<PathBuf>,
     /// Workspace directory to start with. It must be an absolute path; see
     /// [`GuiSettings::default_workspace_scope`].
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -499,6 +734,28 @@ impl GuiSettings {
             .unwrap_or(Self::DEFAULT_RESTORE_SESSION)
     }
 
+    /// The program path set for the agent of `source` (`claude_path`, ...).
+    pub fn program_path(&self, source: crate::history::model::SourceKind) -> Option<&Path> {
+        use crate::history::model::SourceKind;
+        match source {
+            SourceKind::Claude => self.claude_path.as_deref(),
+            SourceKind::Pi => self.pi_path.as_deref(),
+            SourceKind::Omp => self.omp_path.as_deref(),
+            SourceKind::Codex => self.codex_path.as_deref(),
+        }
+    }
+
+    /// The `[gui]` key of [`Self::program_path`].
+    pub fn program_path_key(source: crate::history::model::SourceKind) -> &'static str {
+        use crate::history::model::SourceKind;
+        match source {
+            SourceKind::Claude => "claude_path",
+            SourceKind::Pi => "pi_path",
+            SourceKind::Omp => "omp_path",
+            SourceKind::Codex => "codex_path",
+        }
+    }
+
     /// `default_workspace` as a validated, normalized [`WorkspaceScope`]
     /// (`Ok(None)` when unset). A relative path is an
     /// [`AppError::InvalidWorkspace`] error: there is no directory a GUI could
@@ -512,12 +769,15 @@ impl GuiSettings {
 }
 
 /// `[tui]` overrides in `gui.toml`. Unlike [`TuiConfig`], an explicitly
-/// empty `exclude_projects = []` is distinguishable from "not set".
+/// empty `exclude_projects = []` or `exclude_paths = []` is distinguishable
+/// from "not set".
 #[derive(Clone, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TuiOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exclude_projects: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclude_paths: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_search: Option<bool>,
 }
@@ -612,6 +872,7 @@ impl ConfigFile {
             tui,
             search,
             agent,
+            semantic,
         } = self;
 
         let display = match &gui.display {
@@ -628,12 +889,35 @@ impl ConfigFile {
                 })
             }
         };
+        // `command` overlays like any key here; which program starts an
+        // agent also depends on `[gui] *_path` (see `agent_launcher`).
         let resume = match &gui.resume {
             None => resume,
             Some(top) => {
                 let base = resume.unwrap_or_default();
+                let codex = match &top.codex {
+                    None => base.codex,
+                    Some(top_codex) => {
+                        let base_codex = base.codex.unwrap_or_default();
+                        Some(AgentResumeConfig {
+                            command: overlay(base_codex.command, &top_codex.command),
+                            default_args: overlay(base_codex.default_args, &top_codex.default_args),
+                        })
+                    }
+                };
+                let launcher =
+                    |base: Option<LauncherConfig>, top: &Option<LauncherConfig>| match top {
+                        None => base,
+                        Some(top) => Some(LauncherConfig {
+                            command: overlay(base.unwrap_or_default().command, &top.command),
+                        }),
+                    };
                 Some(ResumeConfig {
+                    command: overlay(base.command, &top.command),
                     default_args: overlay(base.default_args, &top.default_args),
+                    pi: launcher(base.pi, &top.pi),
+                    omp: launcher(base.omp, &top.omp),
+                    codex,
                 })
             }
         };
@@ -647,6 +931,8 @@ impl ConfigFile {
                     rename: overlay(base.rename, &top.rename),
                     delete: overlay(base.delete, &top.delete),
                     refresh: overlay(base.refresh, &top.refresh),
+                    all_kinds: overlay(base.all_kinds, &top.all_kinds),
+                    user_only: overlay(base.user_only, &top.user_only),
                 })
             }
         };
@@ -659,6 +945,7 @@ impl ConfigFile {
                         .exclude_projects
                         .clone()
                         .unwrap_or(base.exclude_projects),
+                    exclude_paths: top.exclude_paths.clone().unwrap_or(base.exclude_paths),
                     semantic_search: overlay(base.semantic_search, &top.semantic_search),
                 })
             }
@@ -706,6 +993,7 @@ impl ConfigFile {
             tui,
             search,
             agent,
+            semantic,
         }
     }
 }
@@ -721,6 +1009,33 @@ pub struct LayeredConfig {
     pub effective: ConfigFile,
     /// Effective GUI settings (`[gui]` with defaults applied).
     pub gui: GuiSettings,
+}
+
+impl LayeredConfig {
+    /// The program that starts the agent of `source`: [`agent_launcher`]
+    /// of both files.
+    pub fn launcher(
+        &self,
+        env: &HistoryEnv,
+        source: crate::history::model::SourceKind,
+    ) -> Launcher {
+        agent_launcher(env, &self.cli, &self.gui_file, source)
+    }
+
+    /// How to start the agent of `source` to resume or fork one of its
+    /// conversations (upstream `ResumeConfig::launch`): [`Self::launcher`]
+    /// and the effective `default_args`.
+    pub fn launch(&self, env: &HistoryEnv, source: crate::history::model::SourceKind) -> Launch {
+        Launch {
+            launcher: self.launcher(env, source),
+            default_args: self
+                .effective
+                .resume
+                .as_ref()
+                .map(|resume| resume.default_args(source).to_vec())
+                .unwrap_or_default(),
+        }
+    }
 }
 
 /// Load `config.toml` and `gui.toml` from the environment's locations and
@@ -1118,6 +1433,25 @@ exclude_projects = ["Hidden", "hidden", " spaced "]
     }
 
     #[test]
+    fn tui_exclude_paths_defaults_and_preserves_literal_prefixes() {
+        for input in ["", "[tui]", "[tui]\nexclude_paths = []"] {
+            let config: ConfigFile = toml::from_str(input).unwrap();
+            assert!(config.tui.unwrap_or_default().exclude_paths.is_empty());
+        }
+        let config: ConfigFile = toml::from_str(
+            r#"[tui]
+exclude_paths = ["/tmp/", "/private/tmp/", "", " spaced "]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.tui.unwrap().exclude_paths,
+            ["/tmp/", "/private/tmp/", "", " spaced "]
+        );
+        assert!(toml::from_str::<ConfigFile>("[tui]\nexclude_paths = [1]").is_err());
+    }
+
+    #[test]
     fn tui_semantic_search_parses_default_mode() {
         let config: ConfigFile = toml::from_str(
             r#"
@@ -1128,6 +1462,33 @@ semantic_search = true
         .unwrap();
 
         assert_eq!(config.tui.unwrap().semantic_search, Some(true));
+    }
+
+    #[test]
+    fn semantic_daemon_is_off_and_pauses_on_battery_by_default() {
+        let config: ConfigFile = toml::from_str("").unwrap();
+        let semantic = config.semantic.unwrap_or_default();
+        assert!(!semantic.daemon());
+        assert!(semantic.pause_on_battery());
+
+        let config: ConfigFile = toml::from_str(
+            "[semantic]
+daemon = true
+pause_on_battery = false
+",
+        )
+        .unwrap();
+        let semantic = config.semantic.unwrap();
+        assert!(semantic.daemon());
+        assert!(!semantic.pause_on_battery());
+        assert!(
+            toml::from_str::<ConfigFile>(
+                "[semantic]
+deamon = true
+"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1154,6 +1515,291 @@ mode = "vector"
         .expect_err("unknown search mode should fail");
 
         assert!(err.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn codex_resume_args_are_separate_from_claude_ones() {
+        let config: ConfigFile = toml::from_str(
+            r#"
+[resume]
+default_args = ["--dangerously-skip-permissions"]
+
+[resume.codex]
+default_args = ["--yolo"]
+"#,
+        )
+        .unwrap();
+        let resume = config.resume.unwrap();
+        use crate::history::model::SourceKind;
+        assert_eq!(
+            resume.default_args(SourceKind::Claude),
+            ["--dangerously-skip-permissions"]
+        );
+        assert_eq!(resume.default_args(SourceKind::Codex), ["--yolo"]);
+        assert!(resume.default_args(SourceKind::Pi).is_empty());
+        assert!(
+            ResumeConfig::default()
+                .default_args(SourceKind::Codex)
+                .is_empty()
+        );
+    }
+
+    /// Fork: `gui.toml` overrides `[resume.codex] default_args` on its own,
+    /// and `[gui] codex_path` is a GUI key.
+    #[test]
+    fn codex_resume_args_and_path_layer_like_the_other_keys() {
+        let cli: ConfigFile = toml::from_str(
+            "[resume]\ndefault_args = [\"--verbose\"]\n\n[resume.codex]\ndefault_args = [\"--yolo\"]\n",
+        )
+        .unwrap();
+        let gui: GuiConfigFile = toml::from_str(
+            "[resume.codex]\ndefault_args = [\"--full-auto\"]\n\n[gui]\ncodex_path = \"C:/tools/codex.exe\"\n",
+        )
+        .unwrap();
+        let resume = cli.clone().overlaid_with(&gui).resume.unwrap();
+        use crate::history::model::SourceKind;
+        assert_eq!(resume.default_args(SourceKind::Claude), ["--verbose"]);
+        assert_eq!(resume.default_args(SourceKind::Codex), ["--full-auto"]);
+        let untouched = cli.overlaid_with(&GuiConfigFile {
+            resume: Some(ResumeConfig::default()),
+            ..GuiConfigFile::default()
+        });
+        assert_eq!(
+            untouched.resume.unwrap().default_args(SourceKind::Codex),
+            ["--yolo"]
+        );
+        assert_eq!(
+            gui.gui_settings().codex_path,
+            Some(PathBuf::from("C:/tools/codex.exe"))
+        );
+        assert!(toml::from_str::<ConfigFile>("[resume.codex]\nmodel = \"x\"\n").is_err());
+    }
+
+    #[test]
+    fn semantic_daemon_table_from_the_cli_config_loads_and_survives_the_overlay() {
+        let cli: ConfigFile = toml::from_str(
+            "[semantic]
+daemon = true
+pause_on_battery = false
+",
+        )
+        .unwrap();
+        let gui: GuiConfigFile = toml::from_str(
+            "[display]
+plain = true
+",
+        )
+        .unwrap();
+        let effective = cli.clone().overlaid_with(&gui);
+        assert_eq!(effective.semantic, cli.semantic);
+        assert!(effective.semantic.unwrap().daemon());
+        // gui.toml has no `[semantic]` table: the GUI ignores the daemon.
+        assert!(
+            toml::from_str::<GuiConfigFile>(
+                "[semantic]
+daemon = false
+"
+            )
+            .is_err()
+        );
+    }
+
+    /// `config.toml` alone, as the layered configuration of a GUI without
+    /// `gui.toml`.
+    fn layered_cli(cli: ConfigFile) -> LayeredConfig {
+        LayeredConfig {
+            effective: cli.clone(),
+            cli,
+            gui_file: GuiConfigFile::default(),
+            gui: GuiSettings::default(),
+        }
+    }
+
+    #[test]
+    fn agent_commands_default_to_the_agent_binaries() {
+        use crate::history::model::SourceKind;
+        let env = HistoryEnv::sandbox(Path::new("/home/me"));
+        let config = layered_cli(ConfigFile {
+            resume: Some(ResumeConfig::default()),
+            ..ConfigFile::default()
+        });
+        for source in [
+            SourceKind::Claude,
+            SourceKind::Pi,
+            SourceKind::Omp,
+            SourceKind::Codex,
+        ] {
+            assert_eq!(config.launcher(&env, source), Launcher::default_for(source));
+            assert_eq!(
+                LayeredConfig::default().launch(&env, source),
+                Launch::default_for(source)
+            );
+        }
+    }
+
+    #[test]
+    fn agent_commands_are_configured_per_agent() {
+        use crate::history::model::SourceKind;
+        let config: ConfigFile = toml::from_str(
+            r#"
+[resume]
+command = "my claude"
+default_args = ["--verbose"]
+
+[resume.pi]
+command = ["mise", "exec", "--", "pi"]
+
+[resume.omp]
+command = "/opt/omp/bin/omp"
+
+[resume.codex]
+command = ["codex-wrapper", "--profile", "work"]
+default_args = ["--yolo"]
+"#,
+        )
+        .unwrap();
+        let config = layered_cli(config);
+        let env = HistoryEnv::sandbox(Path::new("/home/me"));
+
+        let claude = config.launch(&env, SourceKind::Claude);
+        assert_eq!(claude.launcher.program, PathBuf::from("my claude"));
+        assert!(claude.launcher.args.is_empty());
+        assert_eq!(
+            claude.launcher.configured_at,
+            Some(ConfiguredAt::Config("[resume]"))
+        );
+        assert_eq!(claude.default_args, ["--verbose"]);
+
+        let pi = config.launch(&env, SourceKind::Pi);
+        assert_eq!(pi.launcher.program, PathBuf::from("mise"));
+        assert_eq!(pi.launcher.args, ["exec", "--", "pi"]);
+        assert_eq!(
+            pi.launcher.configured_at,
+            Some(ConfiguredAt::Config("[resume.pi]"))
+        );
+        assert!(pi.default_args.is_empty());
+
+        let omp = config.launcher(&env, SourceKind::Omp);
+        assert_eq!(omp.program, PathBuf::from("/opt/omp/bin/omp"));
+        assert_eq!(
+            omp.configured_at,
+            Some(ConfiguredAt::Config("[resume.omp]"))
+        );
+
+        let codex = config.launch(&env, SourceKind::Codex);
+        assert_eq!(codex.launcher.program, PathBuf::from("codex-wrapper"));
+        assert_eq!(codex.launcher.args, ["--profile", "work"]);
+        assert_eq!(codex.default_args, ["--yolo"]);
+    }
+
+    #[test]
+    fn agent_commands_must_name_a_program() {
+        for command in [r#""""#, "[]", r#"[" "]"#, "1"] {
+            let error =
+                toml::from_str::<ConfigFile>(&format!("[resume.pi]\ncommand = {command}\n"))
+                    .expect_err(command);
+            assert!(error.to_string().contains("command must"), "{error}");
+        }
+        assert!(toml::from_str::<ConfigFile>("[resume.pi]\ndefault_args = []\n").is_err());
+        // Fork: gui.toml takes the same keys, and the model refuses an
+        // empty command too.
+        assert!(
+            toml::from_str::<GuiConfigFile>("[resume.omp]\ncommand = \"\"\n")
+                .unwrap_err()
+                .to_string()
+                .contains("command must name a program")
+        );
+        assert_eq!(AgentCommand::new(Vec::new()), None);
+        assert_eq!(AgentCommand::new(vec![" ".into(), "x".into()]), None);
+        assert_eq!(
+            AgentCommand::new(vec!["pi".into()]).unwrap().words(),
+            ["pi"]
+        );
+    }
+
+    /// Fork (decision 17): gui.toml's `command` > `[gui] <agent>_path` >
+    /// config.toml's `command` > the agent's binary; each agent on its own.
+    #[test]
+    fn agent_commands_of_gui_toml_and_program_paths_take_precedence() {
+        use crate::history::model::SourceKind;
+        let root = tempfile::tempdir().unwrap();
+        let env = HistoryEnv::sandbox(root.path());
+        let cli: ConfigFile = toml::from_str(
+            "[resume]\ncommand = \"cli-claude\"\n\n[resume.pi]\ncommand = \"cli-pi\"\n\n\
+             [resume.omp]\ncommand = [\"cli-omp\", \"--x\"]\n",
+        )
+        .unwrap();
+        let gui: GuiConfigFile = toml::from_str(
+            "[resume]\ncommand = [\"gui-claude\", \"--y\"]\n\n[gui]\nclaude_path = \"/opt/claude\"\n\
+             pi_path = \"~/bin/pi\"\ncodex_path = \"/opt/codex\"\n",
+        )
+        .unwrap();
+        let launcher = |source| agent_launcher(&env, &cli, &gui, source);
+
+        let claude = launcher(SourceKind::Claude);
+        assert_eq!(claude.program, Path::new("gui-claude"));
+        assert_eq!(claude.args, ["--y"]);
+        assert_eq!(claude.configured_at, Some(ConfiguredAt::Gui("[resume]")));
+        let pi = launcher(SourceKind::Pi);
+        assert_eq!(pi.program, root.path().join("bin/pi"));
+        assert!(pi.args.is_empty());
+        assert_eq!(pi.configured_at, Some(ConfiguredAt::GuiPath("pi_path")));
+        let omp = launcher(SourceKind::Omp);
+        assert_eq!(omp.words(), ["cli-omp", "--x"]);
+        assert_eq!(
+            omp.configured_at,
+            Some(ConfiguredAt::Config("[resume.omp]"))
+        );
+        let codex = launcher(SourceKind::Codex);
+        assert_eq!(codex.program, Path::new("/opt/codex"));
+        assert_eq!(
+            codex.configured_at.unwrap().to_string(),
+            "`codex_path` under [gui] in gui.toml"
+        );
+
+        // The overlay merges the commands key by key; the layered config
+        // applies the same precedence.
+        let layered = LayeredConfig {
+            effective: cli.clone().overlaid_with(&gui),
+            cli: cli.clone(),
+            gui: gui.gui_settings(),
+            gui_file: gui.clone(),
+        };
+        let effective = layered.effective.resume.as_ref().unwrap();
+        assert_eq!(
+            effective.command(SourceKind::Claude).unwrap().words(),
+            ["gui-claude", "--y"]
+        );
+        assert_eq!(
+            effective.command(SourceKind::Pi).unwrap().words(),
+            ["cli-pi"]
+        );
+        assert_eq!(layered.launcher(&env, SourceKind::Pi), pi);
+        assert_eq!(
+            layered.launcher(&env, SourceKind::Codex).configured_at,
+            Some(ConfiguredAt::GuiPath("codex_path"))
+        );
+    }
+
+    /// Fork: gui.toml stores a command as written: one program as a string,
+    /// a program with arguments as an array.
+    #[test]
+    fn agent_commands_round_trip_through_gui_toml() {
+        let gui = GuiConfigFile {
+            resume: Some(ResumeConfig {
+                command: AgentCommand::new(vec!["my-claude".into()]),
+                pi: Some(LauncherConfig {
+                    command: AgentCommand::new(vec!["mise".into(), "exec".into()]),
+                }),
+                ..ResumeConfig::default()
+            }),
+            ..GuiConfigFile::default()
+        };
+        let text = gui_config_to_string(&gui).unwrap();
+        assert!(text.contains("command = \"my-claude\""), "{text}");
+        assert!(text.contains("[resume.pi]"), "{text}");
+        assert!(text.contains("\"mise\""), "{text}");
+        assert_eq!(toml::from_str::<GuiConfigFile>(&text).unwrap(), gui);
     }
 
     #[test]
@@ -1232,6 +1878,31 @@ subagents = true
         }));
 
         assert!(keys.refresh.matches(Key::Char('u'), KeyMods::ALT));
+    }
+
+    #[test]
+    fn applies_all_kinds_key_config() {
+        // Upstream cb990e6: `[keys] all_kinds`, Ctrl+G by default.
+        assert_eq!(KeyBindings::default().all_kinds, KeyChord::ctrl('g'));
+        let config: ConfigFile = toml::from_str("[keys]\nall_kinds = \"alt+k\"\n").unwrap();
+        let keys = KeyBindings::from_config(config.keys);
+        assert!(keys.all_kinds.matches(Key::Char('k'), KeyMods::ALT));
+        assert_eq!(keys.refresh, KeyChord::ctrl('l'));
+        let config: ConfigFile = toml::from_str("[keys]\nall_kinds = \"ctrl+t\"\n").unwrap();
+        assert!(KeyBindings::from_config(config.keys).conflicts_with_ctrl_t());
+    }
+
+    #[test]
+    fn applies_user_only_key_config() {
+        // Upstream ae7ae39: `[keys] user_only` (upstream default Ctrl+V; the
+        // fork's is Alt+U, since Ctrl+V pastes into the search field).
+        assert_eq!(KeyBindings::default().user_only, KeyChord::alt('u'));
+        let config: ConfigFile = toml::from_str("[keys]\nuser_only = \"ctrl+v\"\n").unwrap();
+        let keys = KeyBindings::from_config(config.keys);
+        assert!(keys.user_only.matches(Key::Char('v'), KeyMods::CTRL));
+        assert_eq!(keys.all_kinds, KeyChord::ctrl('g'));
+        let config: ConfigFile = toml::from_str("[keys]\nuser_only = \"ctrl+t\"\n").unwrap();
+        assert!(KeyBindings::from_config(config.keys).conflicts_with_ctrl_t());
     }
 
     // --- KeyChord parity with upstream config.rs:261-402 -------------------
@@ -1523,6 +2194,36 @@ restore_session = false
         assert_eq!(tui.semantic_search, Some(false));
     }
 
+    /// `[tui] exclude_paths` (upstream 982aea9) layers like
+    /// `exclude_projects`: omitted in gui.toml keeps config.toml's prefixes,
+    /// a gui.toml list wins and `[]` clears them.
+    #[test]
+    fn gui_toml_overrides_exclude_paths_and_an_empty_list_clears_them() {
+        let cli: ConfigFile =
+            toml::from_str("[tui]\nexclude_paths = [\"/tmp/\"]\nexclude_projects = [\"x\"]\n")
+                .unwrap();
+        let gui: GuiConfigFile = toml::from_str("[tui]\nexclude_projects = []\n").unwrap();
+        let tui = cli.clone().overlaid_with(&gui).tui.unwrap();
+        assert_eq!(tui.exclude_paths, vec!["/tmp/"]);
+        assert!(tui.exclude_projects.is_empty());
+
+        let gui: GuiConfigFile =
+            toml::from_str("[tui]\nexclude_paths = ['C:\\Temp\\', \"/var/tmp/\"]\n").unwrap();
+        let tui = cli.clone().overlaid_with(&gui).tui.unwrap();
+        assert_eq!(tui.exclude_paths, vec![r"C:\Temp\", "/var/tmp/"]);
+        assert_eq!(tui.exclude_projects, vec!["x"]);
+
+        let gui: GuiConfigFile = toml::from_str("[tui]\nexclude_paths = []\n").unwrap();
+        assert!(
+            cli.overlaid_with(&gui)
+                .tui
+                .unwrap()
+                .exclude_paths
+                .is_empty()
+        );
+        assert!(toml::from_str::<GuiConfigFile>("[tui]\nexclude_paths = [1]").is_err());
+    }
+
     #[test]
     fn save_writes_only_gui_toml_and_round_trips() {
         let root = tempfile::tempdir().unwrap();
@@ -1542,6 +2243,7 @@ restore_session = false
             }),
             tui: Some(TuiOverrides {
                 exclude_projects: Some(Vec::new()),
+                exclude_paths: Some(vec!["/tmp/".to_string()]),
                 semantic_search: None,
             }),
             search: Some(SearchConfig {
@@ -1566,6 +2268,7 @@ restore_session = false
         assert!(text.contains("rename = \"alt+n\""), "{text}");
         assert!(text.contains("theme = \"light\""), "{text}");
         assert!(text.contains("exclude_projects = []"), "{text}");
+        assert!(text.contains("exclude_paths = [\"/tmp/\"]"), "{text}");
         assert!(
             !text.contains("no_tools"),
             "unset values are omitted: {text}"
@@ -1726,6 +2429,7 @@ terminal = \"wt -w 0\"
         edited.tui = Some(TuiOverrides {
             exclude_projects: Some(vec!["scratch".to_string()]),
             semantic_search: None,
+            ..Default::default()
         });
         save_gui_config_changes(&env, &base, &edited).unwrap();
 

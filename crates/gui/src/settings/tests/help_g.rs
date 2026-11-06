@@ -154,7 +154,7 @@ fn the_viewer_section_lists_the_tui_labels_with_live_keys(cx: &mut TestAppContex
         ("Jump to top", pair("g", "home")),
         ("Jump to bottom", pair("shift-g", "end")),
         ("Next / prev match", pair("n", "shift-n")),
-        ("Back to list", pair("q", "escape")),
+        ("Back", pair("q", "escape")),
     ] {
         assert_eq!(row(&rows, viewer, text).keys.as_ref(), keys, "{text}");
     }
@@ -218,7 +218,7 @@ fn a_single_file_window_says_close(cx: &mut TestAppContext) {
     assert!(
         !rows
             .iter()
-            .any(|r| r.section == viewer && r.label.as_ref() == "Back to list")
+            .any(|r| r.section == viewer && r.label.as_ref() == "Back")
     );
     for text in ["Resume", "Fork resume", "Delete"] {
         assert!(

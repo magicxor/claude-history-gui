@@ -2,7 +2,7 @@
 //! from the live keymap (§8.7). WP2.
 //!
 //! Left: the scroll indicator `[i/N]` (mono) and the toggle indicators
-//! `tools·sum|trn|all  think·on|off  info·on|off` (key letter accent, rest
+//! `tools·off|sum|cal|trn|all  think·on|off  info·on|off` (key letter accent, rest
 //! muted, each clickable). Right: key hints for the focused viewer only, in
 //! priority order — `/ search`, `e export`, `y yank`, Resume `resume`, Fork
 //! `fork`, Delete `del`, `q back` (single-file: `q close`, no Resume, Fork or

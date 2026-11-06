@@ -3,13 +3,15 @@
 //! rename in two halves, K4 `remove_paths`, K6 semantic suspend/resume and
 //! K18 refresh policies. Every file lives in a sandbox.
 
+use super::corpus::CorpusEdit;
 use super::test_helpers::*;
 use super::*;
-use crate::history::{LoaderMessage, Source};
+use crate::history::LoaderMessage;
+use crate::history::model::SourceKind;
 use crate::semantic::embed::SemanticEmbedder;
 use crate::semantic_worker::{SemanticSearchMessage, SemanticWorkerCommand};
 use chrono::{Duration as ChronoDuration, Local, TimeZone};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 const UUID_A: &str = "aaaaaaaa-1111-4111-8111-111111111111";
@@ -17,7 +19,7 @@ const UUID_B: &str = "bbbbbbbb-2222-4222-8222-222222222222";
 
 fn conversation(path: PathBuf, text: &str) -> Conversation {
     Conversation {
-        source: Source::Claude,
+        source: SourceKind::Claude,
         session_id: path
             .file_stem()
             .and_then(|name| name.to_str())
@@ -26,25 +28,30 @@ fn conversation(path: PathBuf, text: &str) -> Conversation {
         path,
         index: 0,
         timestamp: Local.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
-        preview: text.to_string(),
-        preview_first: text.to_string(),
-        preview_last: text.to_string(),
-        search_text_lower: search::normalize_for_search(text),
-        semantic_turns: vec![text.to_string()],
+        preview: text.to_string().into(),
+        preview_first: text.to_string().into(),
+        preview_last: text.to_string().into(),
+        semantic_turns: vec![text.to_string()].into(),
         semantic_turn_ranges: vec![crate::agent::refs::MessageRange::single(1)],
-        full_text: text.to_string(),
-        agent_search_text: String::new(),
-        semantic_route_text: String::new(),
+        full_text: text.to_string().into(),
+        own_text: "".into(),
+        agent_search_text: String::new().into(),
+        semantic_route_text: String::new().into(),
         project_name: Some("project".to_string()),
         project_path: None,
         cwd: None,
+        cwds: Vec::new(),
         message_count: 1,
+        prompt_count: 1,
+        tool_call_count: 0,
         parse_errors: Vec::new(),
         summary: None,
         custom_title: None,
         model: None,
         total_tokens: 0,
         duration_minutes: None,
+        provenance: Default::default(),
+        parent: None,
     }
 }
 
@@ -280,6 +287,77 @@ fn loader_prepares_off_thread_and_installs_on_a_later_poll() {
 }
 
 #[test]
+fn a_spent_drain_budget_leaves_the_next_batch_to_a_later_poll() {
+    // Upstream's TUI stops draining the loader channel after 8 ms so a
+    // frame can render between batches (93e17a5). A zero budget applies
+    // one batch per poll; other messages never wait, and the waker asks
+    // for the next poll.
+    assert_eq!(
+        LoaderOptions::default().drain_budget,
+        Some(DEFAULT_DRAIN_BUDGET)
+    );
+    let sandbox = Sandbox::new();
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let counter = wakes.clone();
+    let waker: Waker = Arc::new(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+    });
+    let options = LoaderOptions::default()
+        .with_waker(waker)
+        .with_drain_budget(Some(Duration::ZERO));
+    let batches = || {
+        vec![
+            LoaderMessage::Batch(vec![dated(sandbox.path().join("a.jsonl"), "a", 1)]),
+            LoaderMessage::ProjectError,
+            LoaderMessage::Batch(vec![dated(sandbox.path().join("b.jsonl"), "b", 2)]),
+            LoaderMessage::Batch(vec![dated(sandbox.path().join("c.jsonl"), "c", 3)]),
+            LoaderMessage::Done,
+        ]
+    };
+    let mut browser = Browser::new_loading(sandbox.options());
+    let mut loader = HistoryLoader::new(sandbox.env.clone(), options.clone());
+    injected(&mut loader, batches(), false);
+
+    for (round, loaded) in [(1, 1), (2, 2)] {
+        let poll = loader.poll(&mut browser);
+        assert_eq!(poll.batches, 1, "round {round}");
+        assert!(poll.pending && !poll.preparing && poll.event.is_none());
+        assert_eq!(wakes.load(Ordering::SeqCst), round, "the waker asks again");
+        assert_eq!(browser.conversations().len(), loaded);
+        assert!(browser.is_loading() && loader.is_running());
+    }
+    let last = loader.poll(&mut browser);
+    assert_eq!(last.batches, 1);
+    assert!(!last.pending && last.preparing);
+    assert!(matches!(
+        poll_until_event(&mut loader, &mut browser),
+        LoadEvent::Loaded {
+            conversations: 3,
+            project_errors: 1
+        }
+    ));
+
+    // A refresh only buffers its batches: the budget does not apply.
+    let mut refreshed = Browser::new(Vec::new(), sandbox.options());
+    let mut loader = HistoryLoader::new(sandbox.env.clone(), options);
+    injected(&mut loader, batches(), true);
+    let poll = loader.poll(&mut refreshed);
+    assert!(!poll.pending);
+    assert!(matches!(poll.event, Some(LoadEvent::RefreshIncomplete)));
+
+    // Without a budget one poll applies every batch.
+    let mut unbounded = Browser::new_loading(sandbox.options());
+    let mut loader = HistoryLoader::new(
+        sandbox.env.clone(),
+        LoaderOptions::default().with_drain_budget(None),
+    );
+    injected(&mut loader, batches(), false);
+    let poll = loader.poll(&mut unbounded);
+    assert_eq!(poll.batches, 3);
+    assert!(!poll.pending && poll.preparing);
+}
+
+#[test]
 fn poll_stays_fast_while_a_20k_corpus_is_prepared() {
     let sandbox = Sandbox::new();
     let body = "lorem ipsum dolor sit amet consectetur ".repeat(40);
@@ -482,6 +560,78 @@ fn rows_deleted_or_renamed_while_a_refresh_streams_are_replayed() {
 }
 
 #[test]
+fn only_the_newest_edit_of_a_path_keeps_its_body_during_a_load() {
+    // A second rename, or a delete, of a path during a tracked load
+    // releases the transcript of the earlier edits; the install replays
+    // the newest edit with the body it kept.
+    let sandbox = Sandbox::new();
+    let root = sandbox.projects_root();
+    let twice = root.join("-p").join(format!("{UUID_A}.jsonl"));
+    let gone = root.join("-p").join(format!("{UUID_B}.jsonl"));
+    write_claude_session(&twice, sandbox.path(), "one", "two");
+    write_claude_session(&gone, sandbox.path(), "three", "four");
+    let mut browser = Browser::new(
+        vec![
+            conversation(twice.clone(), "twice"),
+            conversation(gone.clone(), "gone"),
+        ],
+        sandbox.options(),
+    );
+    let mut loader = HistoryLoader::new(sandbox.env.clone(), LoaderOptions::default());
+    let (tx, rx) = mpsc::channel();
+    loader.start_with_receiver_for_test(rx, true);
+    tx.send(LoaderMessage::Batch(vec![
+        conversation(twice.clone(), "twice"),
+        conversation(gone.clone(), "gone"),
+    ]))
+    .unwrap();
+    let first = loader.poll(&mut browser);
+    assert!(first.event.is_none() && !first.preparing);
+
+    browser.rename_conversation(&twice, "first").unwrap();
+    browser.rename_conversation(&gone, "soon deleted").unwrap();
+    browser.rename_conversation(&twice, "second").unwrap();
+    assert_eq!(browser.remove_paths(std::slice::from_ref(&gone)), 1);
+
+    let bodies = |browser: &Browser, path: &Path| {
+        browser
+            .corpus_edits
+            .entries
+            .iter()
+            .filter_map(|(_, edit)| match edit {
+                CorpusEdit::Replaced(edited, body) if edited == path => Some(body.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let twice_bodies = bodies(&browser, &twice);
+    assert_eq!(twice_bodies.len(), 2);
+    assert!(
+        twice_bodies[0].is_none(),
+        "the superseded rename kept its body"
+    );
+    let newest = twice_bodies[1]
+        .clone()
+        .expect("the newest rename keeps its body");
+    let gone_bodies = bodies(&browser, &gone);
+    assert_eq!(gone_bodies.len(), 1);
+    assert!(
+        gone_bodies[0].is_none(),
+        "a delete released the rename's body"
+    );
+
+    tx.send(LoaderMessage::Done).unwrap();
+    poll_until_event(&mut loader, &mut browser);
+    assert!(browser.conversation_by_path(&gone).is_none());
+    let (position, kept) = browser.conversation_by_path(&twice).unwrap();
+    assert_eq!(kept.custom_title.as_deref(), Some("second"));
+    assert!(Arc::ptr_eq(
+        &browser.searchable[position].body_lower,
+        &newest
+    ));
+}
+
+#[test]
 fn edits_made_before_a_load_started_are_not_replayed() {
     // A rename made long before a refresh must not override what the
     // refresh read (for example a title another program set later), and a
@@ -609,6 +759,9 @@ fn the_search_worker_coalesces_to_the_latest_query() {
         mode: ListSearchMode::Lexical,
         conversations: app.corpus_snapshot(),
         searchable: app.searchable.clone(),
+        index: None,
+        user_only: false,
+        corpus_version: 1,
     };
     for (generation, query) in [(1, "n"), (2, "ne"), (3, "need")] {
         tx.send(command(generation, query)).unwrap();
@@ -708,7 +861,7 @@ fn uuid_resolution_prefers_a_session_loaded_meanwhile() {
         Some(UuidLookup::Pending { .. })
     ));
     // The session arrived in the corpus before the lookup finished.
-    app.push_conversation(conversation(path.clone(), "late"));
+    app.push_conversation(PreparedSession::new(conversation(path.clone(), "late")));
     app.corpus_changed();
     app.resolve_uuid_lookup(UUID_A, Some(conversation(path.clone(), "late")));
     assert_eq!(app.conversations().len(), 2, "no duplicate is appended");
@@ -849,7 +1002,10 @@ fn a_uuid_jump_survives_a_refresh_or_reload_without_its_session() {
             ..
         })
     ));
-    assert_eq!(app.selected_conversation().unwrap().preview, "loaded");
+    assert_eq!(
+        app.selected_conversation().unwrap().preview,
+        "loaded".into()
+    );
 
     // A session found in the corpus that a narrower reload drops stays.
     app.replace_conversations(vec![conversation(x.clone(), "x")]);
@@ -933,7 +1089,7 @@ fn apply_renamed_is_equivalent_to_rename_conversation() {
     let renamed = crate::history::rename_session(
         &sandbox_b.env,
         &target_b,
-        Source::Claude,
+        SourceKind::Claude,
         "  Renamed  ",
         false,
     )
@@ -978,7 +1134,8 @@ fn apply_renamed_reports_no_target_when_the_session_left_the_list() {
     let (conversations, target) = rename_fixture(&sandbox);
     let mut app = Browser::new(conversations, sandbox.options());
     let renamed =
-        crate::history::rename_session(&sandbox.env, &target, Source::Claude, "x", true).unwrap();
+        crate::history::rename_session(&sandbox.env, &target, SourceKind::Claude, "x", true)
+            .unwrap();
     app.remove_paths(std::slice::from_ref(&target));
     assert!(matches!(
         app.apply_renamed(&target, renamed),
@@ -988,10 +1145,69 @@ fn apply_renamed_reports_no_target_when_the_session_left_the_list() {
 }
 
 #[test]
-fn rename_clears_semantic_metadata_keeps_the_row_and_stamps_claude_time() {
+fn edits_reuse_the_body_normalized_off_the_ui_thread() {
+    // The text of a renamed or UUID-loaded session is normalized where the
+    // session is prepared (a background task); the browser's thread, a
+    // replayed edit and a carried UUID result reuse that body.
+    let sandbox = Sandbox::new();
+    let x = sandbox.path().join("x.jsonl");
+    let y = sandbox.path().join("y.jsonl");
+    let mut app = Browser::new(
+        vec![conversation(x.clone(), "x"), conversation(y.clone(), "y")],
+        sandbox.options(),
+    );
+
+    // A rename.
+    let mut renamed = Conversation::clone(&app.conversations()[0]);
+    renamed.full_text = "Renamed Body".into();
+    let session = PreparedSession::new(renamed);
+    let body = session.body_lower.clone();
+    assert_eq!(&*body, "renamed body");
+    app.apply_renamed_session(&x, session).unwrap();
+    assert!(Arc::ptr_eq(&app.searchable[0].body_lower, &body));
+
+    // A UUID jump to a session loaded from disk.
+    let z = sandbox.path().join(format!("{UUID_A}.jsonl"));
+    let session = PreparedSession::new(conversation(z, "Loaded Text"));
+    let loaded_body = session.body_lower.clone();
+    app.set_query(UUID_A);
+    app.resolve_uuid_lookup_session(UUID_A, Some(session));
+    assert_eq!(app.searchable.len(), 3);
+    assert!(Arc::ptr_eq(&app.searchable[2].body_lower, &loaded_body));
+
+    // A refresh that carries the UUID result and replays a rename made while
+    // it loaded.
+    let mut loader = HistoryLoader::new(sandbox.env.clone(), LoaderOptions::default());
+    let (tx, rx) = mpsc::channel();
+    loader.start_with_receiver_for_test(rx, true);
+    tx.send(LoaderMessage::Batch(vec![
+        conversation(x.clone(), "x"),
+        conversation(y.clone(), "y"),
+    ]))
+    .unwrap();
+    loader.poll(&mut app);
+    let mut renamed = Conversation::clone(&app.conversations()[1]);
+    renamed.full_text = "Renamed Again".into();
+    let session = PreparedSession::new(renamed);
+    let again = session.body_lower.clone();
+    app.apply_renamed_session(&y, session).unwrap();
+    tx.send(LoaderMessage::Done).unwrap();
+    poll_until_event(&mut loader, &mut app);
+    assert_eq!(app.searchable.len(), 3, "the carried session stays");
+    let position = app.position_of_path(&y).unwrap();
+    assert!(Arc::ptr_eq(&app.searchable[position].body_lower, &again));
+    let carried = app
+        .searchable
+        .iter()
+        .find(|entry| Arc::ptr_eq(&entry.body_lower, &loaded_body));
+    assert!(carried.is_some(), "the carried session keeps its body");
+}
+
+#[test]
+fn rename_clears_semantic_metadata_keeps_the_row_and_the_last_message_time() {
     // A-021: re-parse keeps index and project, the row does not move, the
-    // Claude timestamp becomes "now" (re-parsed without an mtime), semantic
-    // metadata is cleared.
+    // Claude timestamp stays the last message's (ccec847: not the file's
+    // mtime, which the rename moves), semantic metadata is cleared.
     let sandbox = Sandbox::new();
     let (conversations, target) = rename_fixture(&sandbox);
     let mut app = Browser::new(
@@ -1001,12 +1217,14 @@ fn rename_clears_semantic_metadata_keeps_the_row_and_stamps_claude_time() {
             .with_default_mode(ListSearchMode::Semantic),
     );
     app.semantic_search.results = HashMap::from([(1, test_semantic_metadata(1, "old evidence"))]);
-    let before = Local::now();
     app.rename_conversation(&target, "titled").unwrap();
     assert!(app.semantic_result_metadata(1).is_none());
     assert_eq!(app.filtered(), &[0, 1]);
     assert_eq!(app.selected_path(), Some(target.clone()));
-    assert!(app.conversations()[1].timestamp >= before - ChronoDuration::seconds(1));
+    assert_eq!(
+        app.conversations()[1].timestamp.to_utc().to_rfc3339(),
+        "2024-01-01T00:02:00+00:00"
+    );
 }
 
 #[test]
@@ -1037,7 +1255,8 @@ fn pi_rename_terminates_an_unterminated_last_line() {
     std::fs::write(&path, fixture.trim_end_matches('\n')).unwrap();
 
     let renamed =
-        crate::history::rename_session(&sandbox.env, &path, Source::Pi, "Pi title", true).unwrap();
+        crate::history::rename_session(&sandbox.env, &path, SourceKind::Pi, "Pi title", true)
+            .unwrap();
     assert_eq!(renamed.custom_title.as_deref(), Some("Pi title"));
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(text.ends_with('\n'));
@@ -1095,11 +1314,17 @@ fn remove_paths_removes_rows_keeps_the_selection_and_clears_metadata() {
 struct CountingEmbedder {
     passages: Arc<AtomicUsize>,
     drops: Arc<AtomicUsize>,
+    hold: Arc<AtomicBool>,
 }
 
 impl SemanticEmbedder for CountingEmbedder {
+    /// Counts the passages, then waits (≤ 30 s) while `hold` is set.
     fn embed_passages(&mut self, passages: &[String]) -> crate::error::Result<Vec<Vec<f32>>> {
         self.passages.fetch_add(passages.len(), Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while self.hold.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         Ok(passages.iter().map(|text| embedding(text)).collect())
     }
 
@@ -1126,22 +1351,27 @@ struct Counters {
     factory: SemanticEmbedderFactory,
     passages: Arc<AtomicUsize>,
     drops: Arc<AtomicUsize>,
+    /// While set, `embed_passages` calls wait.
+    hold: Arc<AtomicBool>,
 }
 
 fn counting_factory() -> Counters {
     let passages = Arc::new(AtomicUsize::new(0));
     let drops = Arc::new(AtomicUsize::new(0));
-    let (p, d) = (passages.clone(), drops.clone());
+    let hold = Arc::new(AtomicBool::new(false));
+    let (p, d, h) = (passages.clone(), drops.clone(), hold.clone());
     let factory: SemanticEmbedderFactory = Arc::new(move || {
         Ok(Box::new(CountingEmbedder {
             passages: p.clone(),
             drops: d.clone(),
+            hold: h.clone(),
         }) as Box<dyn SemanticEmbedder>)
     });
     Counters {
         factory,
         passages,
         drops,
+        hold,
     }
 }
 
@@ -1168,7 +1398,7 @@ fn wait_for_semantic(app: &mut Browser) {
 }
 
 #[test]
-fn suspend_joins_the_worker_and_drops_its_embedder() {
+fn suspend_and_join_end_the_worker_and_drop_its_embedder() {
     let sandbox = Sandbox::new();
     let counters = counting_factory();
     let mut app = semantic_app(&sandbox, counters.factory.clone());
@@ -1178,7 +1408,7 @@ fn suspend_joins_the_worker_and_drops_its_embedder() {
     assert_eq!(counters.drops.load(Ordering::SeqCst), 0);
     assert!(app.semantic_search.worker_thread.is_some());
 
-    app.suspend_semantic();
+    app.suspend_semantic().join();
     // Joined: the worker thread has ended and dropped its embedder.
     assert!(app.semantic_search.worker_thread.is_none());
     assert!(app.semantic_search.worker_tx.is_none());
@@ -1196,7 +1426,45 @@ fn suspend_joins_the_worker_and_drops_its_embedder() {
     assert_eq!(app.row(0).unwrap().session_id, "a");
     app.set_query("");
     assert!(app.semantic_search.worker_tx.is_none(), "no prewarm either");
-    app.suspend_semantic(); // no-op
+    // A no-op: nothing to join.
+    assert!(app.suspend_semantic().is_finished());
+}
+
+/// K6: suspending does not wait for a worker that is inside an embedder
+/// call (the GUI suspends on its UI thread); the exit it returns joins the
+/// worker once the call returns, and the worker stops there.
+#[test]
+fn suspend_does_not_wait_for_a_busy_worker_and_its_exit_joins_it() {
+    let sandbox = Sandbox::new();
+    let counters = counting_factory();
+    counters.hold.store(true, Ordering::SeqCst);
+    let mut app = semantic_app(&sandbox, counters.factory.clone());
+    app.set_query("beta");
+    // The worker's indexing is inside its first embedder call.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while counters.passages.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "the worker never embedded");
+        app.poll();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let embedding = counters.passages.load(Ordering::SeqCst);
+
+    let exit = app.suspend_semantic();
+    assert!(app.is_semantic_suspended());
+    assert_eq!(app.semantic_status_text().as_deref(), Some("sem paused"));
+    assert!(app.semantic_search.worker_thread.is_none());
+    assert!(!exit.is_finished(), "the worker is still in its call");
+    assert_eq!(counters.drops.load(Ordering::SeqCst), 0);
+
+    counters.hold.store(false, Ordering::SeqCst);
+    exit.join();
+    // The worker ended after the call it was in and dropped its embedder.
+    assert_eq!(counters.drops.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.passages.load(Ordering::SeqCst), embedding);
+    // Nothing from the stopped worker is applied.
+    wait_for_semantic(&mut app);
+    assert_eq!(app.semantic_progress(), &SemanticProgress::Suspended);
+    assert!(app.semantic_search.worker_tx.is_none());
 }
 
 #[test]
@@ -1204,7 +1472,7 @@ fn resume_reloads_a_cache_written_meanwhile() {
     let sandbox = Sandbox::new();
     let counters = counting_factory();
     let mut app = semantic_app(&sandbox, counters.factory.clone());
-    app.suspend_semantic();
+    app.suspend_semantic().join();
 
     // The exclusive operation: generate the cache for the same corpus.
     let corpus = app.into_conversations();
@@ -1225,7 +1493,7 @@ fn resume_reloads_a_cache_written_meanwhile() {
     assert!(sandbox.env.embedding_cache_file().unwrap().exists());
 
     let mut app = semantic_app(&sandbox, counters.factory.clone());
-    app.suspend_semantic();
+    app.suspend_semantic().join();
     app.set_query("beta");
     wait_for_semantic(&mut app);
     app.resume_semantic();
@@ -1246,7 +1514,7 @@ fn semantic_messages_from_a_suspended_worker_are_ignored() {
     let sandbox = Sandbox::new();
     let mut app = semantic_app(&sandbox, counting_factory().factory);
     let (_request_tx, _request_rx, response_tx) = connect_semantic_search_channels(&mut app);
-    app.suspend_semantic();
+    app.suspend_semantic().join();
     // The suspended browser dropped the worker's channel.
     let sent = response_tx.send(SemanticSearchMessage::Progress {
         generation: app.search_generation,
@@ -1350,15 +1618,15 @@ fn l045_pi_and_omp_rows_need_a_working_directory_inside_the_workspace() {
     let workspace = sandbox.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let mut inside = conversation(sandbox.path().join("pi-in.jsonl"), "in");
-    inside.source = Source::Pi;
+    inside.source = SourceKind::Pi;
     inside.project_path = Some(workspace.clone());
     let mut cwd_only = conversation(sandbox.path().join("omp-cwd.jsonl"), "cwd");
-    cwd_only.source = Source::Omp;
+    cwd_only.source = SourceKind::Omp;
     cwd_only.cwd = Some(workspace.join(".").join("..").join("workspace"));
     let mut no_cwd = conversation(sandbox.path().join("pi-none.jsonl"), "none");
-    no_cwd.source = Source::Pi;
+    no_cwd.source = SourceKind::Pi;
     let mut elsewhere = conversation(sandbox.path().join("omp-out.jsonl"), "out");
-    elsewhere.source = Source::Omp;
+    elsewhere.source = SourceKind::Omp;
     elsewhere.project_path = Some(sandbox.path().to_path_buf());
     let mut app = Browser::new(
         vec![inside, cwd_only, no_cwd, elsewhere],

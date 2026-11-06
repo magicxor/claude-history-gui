@@ -420,8 +420,8 @@ mod pure {
     fn v013_v014_label_lane_is_nine_cells_and_fits_names() {
         assert_eq!(items::LABEL_LANE_CELLS, 9);
         let items = items_for(
-            &[user("q"), pi_metadata("Branch summary", "summary text")],
-            prefs(ToolDisplayMode::Hidden, false, false),
+            &pi_note_session("q", "Branch summary", "summary text"),
+            prefs(ToolDisplayMode::Summary, false, false),
             80,
         );
         assert!(
@@ -434,10 +434,10 @@ mod pure {
     }
 
     #[test]
-    fn v022_pi_metadata_renders_dimmed_with_its_label() {
+    fn v022_notes_render_dimmed_with_their_label() {
         let items = items_for(
-            &[user("q"), pi_metadata("notice", "custom note")],
-            prefs(ToolDisplayMode::Hidden, false, false),
+            &pi_note_session("q", "notice", "custom note"),
+            prefs(ToolDisplayMode::Summary, false, false),
             80,
         );
         let meta = items
@@ -452,7 +452,7 @@ mod pure {
                 .iter()
                 .all(|(_, s)| s.contains(Style::DIMMED))
         );
-        assert_eq!(meta.nav_position, None, "Pi metadata is not navigable");
+        assert_eq!(meta.nav_position, None, "a note is not navigable");
     }
 
     #[test]
@@ -466,7 +466,7 @@ mod pure {
                     1,
                 ),
             ],
-            prefs(ToolDisplayMode::Hidden, true, false),
+            prefs(ToolDisplayMode::Summary, true, false),
             80,
         );
         let item = &items[1];
@@ -498,7 +498,7 @@ mod pure {
             ),
             skill_user("dimmed"),
         ];
-        let items = items_for(&lines, prefs(ToolDisplayMode::Hidden, false, true), 80);
+        let items = items_for(&lines, prefs(ToolDisplayMode::Summary, false, true), 80);
         let stamps: Vec<Option<&str>> = items
             .iter()
             .map(|item| item.lanes.timestamp.as_deref())
@@ -508,7 +508,7 @@ mod pure {
         assert!(stamps[2].is_none(), "second text block loses the stamp");
         assert!(stamps[3].is_none(), "dimmed blocks are never stamped");
         // Without timing no stamp at all.
-        let items = items_for(&lines, prefs(ToolDisplayMode::Hidden, false, false), 80);
+        let items = items_for(&lines, prefs(ToolDisplayMode::Summary, false, false), 80);
         assert!(items.iter().all(|i| i.lanes.timestamp.is_none()));
     }
 
@@ -522,7 +522,7 @@ mod pure {
             ),
             tool_result("a", "content", 1),
         ];
-        let items = items_for(&lines, prefs(ToolDisplayMode::Hidden, false, false), 80);
+        let items = items_for(&lines, prefs(ToolDisplayMode::Summary, false, false), 80);
         let summary = items
             .iter()
             .find(|i| i.kind == ItemKind::ToolSummary)
@@ -536,6 +536,139 @@ mod pure {
             }
         ));
         assert!(items::item_text(summary).contains("Read 1 file"));
+    }
+
+    /// Calls mode (upstream a60dfe9, a1c88f8): a group lists one clipped row
+    /// per call, each toggling its own call and keyed by its row id; the
+    /// label sits on the first row only.
+    #[test]
+    fn calls_mode_lists_one_row_per_call_each_with_its_own_toggle() {
+        let long = "x".repeat(200);
+        let lines = vec![
+            user("q"),
+            tool_call("g1", "Grep", r#"{"pattern":"one"}"#, 1),
+            tool_result("g1", "grep result", 1),
+            bash_call("b1", &format!("echo {long}"), 1),
+            tool_result("b1", "bash result", 1),
+        ];
+        let items = items_for(&lines, prefs(ToolDisplayMode::Calls, false, true), 60);
+        let rows: Vec<&items::ViewerItem> = items
+            .iter()
+            .filter(|i| i.kind == ItemKind::CallLine)
+            .collect();
+        assert_eq!(rows.len(), 2, "{items:#?}");
+        assert_eq!(items::item_text(rows[0]), r#"Grep: "one" in ."#);
+        let bash = items::item_text(rows[1]);
+        assert!(bash.starts_with("Bash: echo xxx"), "{bash}");
+        assert!(bash.ends_with('…'), "{bash}");
+        assert!(unicode_width::UnicodeWidthStr::width(bash.as_str()) <= 60);
+        assert!(rows[0].cols_dependent && rows[1].cols_dependent);
+        // Each row toggles its own call and is keyed by that row id.
+        for row in &rows {
+            let toggle = row.toggle.clone().expect("a clickable row");
+            assert!(toggle.0.contains(":kind:row:"), "{toggle:?}");
+            assert_eq!(row.id.key, ItemKey::Tool(toggle));
+        }
+        assert_ne!(rows[0].toggle, rows[1].toggle);
+        assert_ne!(rows[0].id, rows[1].id);
+        assert!(rows[0].first_of_message && !rows[1].first_of_message);
+        assert!(rows[0].lanes.label.is_some() && rows[1].lanes.label.is_none());
+        assert!(rows[0].lanes.timestamp.is_some() && rows[1].lanes.timestamp.is_none());
+        assert_eq!(rows[0].message_index, rows[1].message_index);
+        assert!(items::is_tool_item(rows[0]));
+        // No results in calls mode.
+        let text: String = items.iter().map(items::item_text).collect();
+        assert!(!text.contains("grep result") && !text.contains("bash result"));
+    }
+
+    /// A call row with a body (a multi-line command) ends with
+    /// ` (N more lines)` that survives clipping: the header gives way.
+    #[test]
+    fn calls_mode_row_keeps_the_hidden_lines_suffix_when_clipped() {
+        let long = "x".repeat(200);
+        let lines = vec![
+            user("q"),
+            bash_call("b1", &format!("echo {long}\n line2\n line3"), 1),
+            tool_result("b1", "bash result", 1),
+        ];
+        for cols in [60, 20] {
+            let items = items_for(&lines, prefs(ToolDisplayMode::Calls, false, true), cols);
+            let row = items
+                .iter()
+                .find(|i| i.kind == ItemKind::CallLine)
+                .expect("a call row");
+            let text = items::item_text(row);
+            assert!(text.starts_with("Bash"), "{text}");
+            assert!(text.ends_with("… (2 more lines)"), "{text}");
+            assert!(unicode_width::UnicodeWidthStr::width(text.as_str()) <= cols);
+        }
+    }
+
+    /// Calls mode: a mixed text + tools message lists its calls as rows that
+    /// do not toggle anything.
+    #[test]
+    fn calls_mode_mixed_message_rows_are_not_clickable() {
+        let lines = vec![
+            user("q"),
+            assistant_blocks(
+                r#"[{"type":"text","text":"Let me look."},{"type":"tool_use","id":"a","name":"Read","input":{"file_path":"x.rs"}},{"type":"tool_use","id":"b","name":"Read","input":{"file_path":"y.rs"}}]"#,
+                1,
+            ),
+            tool_result("a", "content", 1),
+        ];
+        let items = items_for(&lines, prefs(ToolDisplayMode::Calls, false, false), 80);
+        let rows: Vec<&items::ViewerItem> = items
+            .iter()
+            .filter(|i| i.kind == ItemKind::CallLine)
+            .collect();
+        let texts: Vec<String> = rows.iter().map(|row| items::item_text(row)).collect();
+        assert_eq!(texts, ["Read: x.rs", "Read: y.rs"]);
+        assert!(rows.iter().all(|row| row.toggle.is_none()));
+        let keys: Vec<&ItemKey> = rows.iter().map(|row| &row.id.key).collect();
+        assert!(matches!(
+            keys[..],
+            [
+                ItemKey::Text {
+                    kind: TextKind::CallLine,
+                    ordinal: 0,
+                    ..
+                },
+                ItemKey::Text {
+                    kind: TextKind::CallLine,
+                    ordinal: 1,
+                    ..
+                }
+            ]
+        ));
+        // The first row starts the tool run under the message's label.
+        assert!(rows[0].lanes.label.is_some() && rows[1].lanes.label.is_none());
+    }
+
+    #[test]
+    fn v051_single_unknown_call_summary_is_one_clipped_row() {
+        let long = "x".repeat(200);
+        let lines = vec![
+            user("q"),
+            assistant_blocks(
+                &format!(
+                    r#"[{{"type":"tool_use","id":"a","name":"clock__sleep","input":{{"note":"{long}"}}}}]"#
+                ),
+                1,
+            ),
+        ];
+        let items = items_for(&lines, prefs(ToolDisplayMode::Summary, false, false), 60);
+        let summary = items
+            .iter()
+            .find(|i| i.kind == ItemKind::ToolSummary)
+            .expect("summary item");
+        let text = items::item_text(summary);
+        assert!(text.starts_with("clock__sleep: { \"note\": "), "{text}");
+        assert!(text.ends_with('…'), "{text}");
+        assert!(
+            unicode_width::UnicodeWidthStr::width(text.as_str()) <= 60,
+            "{text}"
+        );
+        assert!(summary.cols_dependent);
     }
 
     #[test]
@@ -639,7 +772,7 @@ mod pure {
             r#"{"type":"assistant","parent_tool_use_id":"p1","message":{"role":"assistant","content":[{"type":"thinking","thinking":"sub thinking","signature":""},{"type":"text","text":"sub answer"}]}}"#
                 .to_string(),
         ];
-        let items = items_for(&lines, prefs(ToolDisplayMode::Hidden, true, false), 80);
+        let items = items_for(&lines, prefs(ToolDisplayMode::Summary, true, false), 80);
         let thinking: Vec<_> = items
             .iter()
             .filter(|i| i.kind == ItemKind::Thinking)
@@ -656,7 +789,8 @@ mod pure {
 
     #[test]
     fn v064_subagent_result_has_a_result_header_and_clipped_rows() {
-        // A block array pretty-prints to several JSON lines (quirk 4 kept).
+        // Four text blocks join with blank lines into seven lines (upstream
+        // 6afae1c), clipped to four with three hidden.
         let blocks: Vec<String> = (1..=4)
             .map(|i| format!(r#"{{"type":"text","text":"row {i} {}"}}"#, "z".repeat(100)))
             .collect();
@@ -678,7 +812,48 @@ mod pure {
         let body = &result.segments[1];
         assert!(body.line_count() <= 4);
         assert!(body.text.lines().all(|l| l.chars().count() <= 40));
-        assert!(result.more.is_some());
+        assert!(body.text.starts_with("row 1 z"), "{:?}", body.text);
+        assert_eq!(result.more, Some(3));
+    }
+
+    #[test]
+    fn v064_empty_subagent_result_shows_only_its_header() {
+        // A string result is its text (upstream 6afae1c), so an empty one
+        // has no body row, as in the ledger.
+        let lines = vec![
+            user("q"),
+            subagent_text("toolu_parent_abc", "sub", 1),
+            r#"{"type":"user","parent_tool_use_id":"toolu_parent_abc","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"r","content":""}]}}"#.to_string(),
+        ];
+        for mode in [ToolDisplayMode::Truncated, ToolDisplayMode::Full] {
+            let items = items_for(&lines, prefs(mode, true, false), 40);
+            let result = items
+                .iter()
+                .find(|i| i.kind == ItemKind::SubagentResult)
+                .expect("subagent result");
+            assert_eq!(result.segments.len(), 1, "{mode:?}");
+            assert_eq!(result.segments[0].text, "<Result>");
+            assert_eq!(result.more, None);
+        }
+    }
+
+    #[test]
+    fn v064_subagent_result_trailing_newline_adds_no_blank_row() {
+        let lines = vec![
+            user("q"),
+            subagent_text("toolu_parent_abc", "sub", 1),
+            r#"{"type":"user","parent_tool_use_id":"toolu_parent_abc","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"r","content":"a\nb\n"}]}}"#.to_string(),
+        ];
+        for mode in [ToolDisplayMode::Truncated, ToolDisplayMode::Full] {
+            let items = items_for(&lines, prefs(mode, true, false), 40);
+            let result = items
+                .iter()
+                .find(|i| i.kind == ItemKind::SubagentResult)
+                .expect("subagent result");
+            let rows: usize = result.segments[1..].iter().map(|s| s.line_count()).sum();
+            assert_eq!(rows, 2, "{mode:?}");
+            assert!(result.segments[1..].iter().all(|s| !s.text.ends_with('\n')));
+        }
     }
 
     #[test]
@@ -687,7 +862,7 @@ mod pure {
             user("q"),
             agent_progress("agent-abc1234567", "working on it"),
         ];
-        let items = items_for(&lines, prefs(ToolDisplayMode::Hidden, true, true), 80);
+        let items = items_for(&lines, prefs(ToolDisplayMode::Summary, true, true), 80);
         let progress = items
             .iter()
             .find(|i| i.lanes.label.as_deref().is_some_and(|l| l.starts_with('↳')))
@@ -745,7 +920,7 @@ mod pure {
     #[test]
     fn ids_are_stable_across_rebuilds() {
         let lines = roles_fixture();
-        let (_dir, mut model) = model_for(&lines, prefs(ToolDisplayMode::Hidden, false, false));
+        let (_dir, mut model) = model_for(&lines, prefs(ToolDisplayMode::Summary, false, false));
         let before = items_of(&model, 80);
         model.prefs.show_timing = true;
         let after = items_of(&model, 80);
@@ -770,7 +945,9 @@ mod pure {
             project_name: Some("proj".into()),
             custom_title: None,
             model: None,
-            message_count: 2,
+            message_count: 4,
+            prompt_count: 2,
+            tool_call_count: 0,
             duration_minutes: None,
             total_tokens: 0,
             timestamp: chrono::Local
@@ -778,21 +955,93 @@ mod pure {
                 .unwrap(),
             summary: None,
             parse_error_count: 0,
+            parse_errors_known: true,
             file_stem: "3f2a".into(),
+            family: Default::default(),
         }
+    }
+
+    /// V-106 (upstream 3c2ffeb): the family line names the parent, or says
+    /// it is gone, and counts the subagents and forks.
+    #[test]
+    fn v106_family_line_names_the_parent_and_counts_the_children() {
+        use crate::model::{ConversationTarget, FamilyMember};
+        let member = |label: &str, fork: bool| FamilyMember {
+            target: ConversationTarget::from_parsed_file(std::path::Path::new("/x/a.jsonl"), None),
+            label: label.to_string(),
+            fork,
+            message_count: 3,
+            timestamp: header_info().timestamp,
+        };
+        let mut info = header_info();
+        assert_eq!(header::family_line(Some(&info)), None);
+        assert_eq!(header::family_line(None), None);
+
+        info.family.parent_id = Some("12345678-9abc-def0-1234-56789abcdef0".to_string());
+        assert_eq!(
+            header::family_line(Some(&info)).unwrap().text(),
+            "↳ subagent of session 12345678-… (not found)"
+        );
+        info.family.is_fork = true;
+        info.family.parent = Some(member(&"walrus ".repeat(20), false));
+        let line = header::family_line(Some(&info)).unwrap();
+        let parent = line.parent.unwrap();
+        assert_eq!(parent.prefix, "↳ fork of ");
+        assert_eq!(
+            parent.label.unwrap().chars().count(),
+            header::FAMILY_LABEL_CHARS
+        );
+
+        info.family = Default::default();
+        info.family.children = vec![member("a", false), member("b", true), member("c", false)];
+        assert_eq!(
+            header::family_line(Some(&info)).unwrap().text(),
+            "2 subagents, 1 fork"
+        );
+        info.family.children.truncate(2);
+        info.family.children.remove(0);
+        assert_eq!(header::family_line(Some(&info)).unwrap().text(), "1 fork");
+        assert_eq!(
+            crate::viewer::family::row_meta(&info.family.children[0]),
+            "3 · 10-12 14:03"
+        );
     }
 
     #[test]
     fn v004_header_omission_rules_and_token_forms() {
         let mut info = header_info();
         let text = header::layout(Some(&info), "3f2a", 200).text();
-        assert_eq!(text, "proj · 2 messages · 2026-10-12 14:03");
-        info.message_count = 1;
+        assert_eq!(text, "proj · 2 prompts · 2026-10-12 14:03");
+        // Upstream e930cac: prompts, then tool calls when there are any, each
+        // its own part.
+        info.tool_call_count = 5;
+        let layout = header::layout(Some(&info), "3f2a", 200);
+        assert_eq!(
+            layout.text(),
+            "proj · 2 prompts · 5 tool calls · 2026-10-12 14:03"
+        );
+        assert_eq!(layout.parts[1].text, "2 prompts");
+        assert_eq!(layout.parts[2].text, "5 tool calls");
+        info.tool_call_count = 1;
         assert!(
             header::layout(Some(&info), "x", 200)
                 .text()
-                .contains("1 message ·")
+                .contains("· 1 tool call ·")
         );
+        info.tool_call_count = 0;
+        info.prompt_count = 1;
+        assert!(
+            header::layout(Some(&info), "x", 200)
+                .text()
+                .contains("1 prompt ·")
+        );
+        // A conversation without a typed prompt still shows its header.
+        info.prompt_count = 0;
+        assert_eq!(
+            header::layout(Some(&info), "x", 200).text(),
+            "proj · 0 prompts · 2026-10-12 14:03"
+        );
+        info.prompt_count = 1;
         info.total_tokens = 926_000;
         info.model = Some("claude-opus-4-5-20251101".into());
         info.duration_minutes = Some(65);
@@ -800,7 +1049,7 @@ mod pure {
         let wide = header::layout(Some(&info), "x", 200).text();
         assert_eq!(
             wide,
-            "proj · My title · opus-4.5 · 1 message · 1h 5m · 926k tokens · 2026-10-12 14:03"
+            "proj · My title · opus-4.5 · 1 prompt · 1h 5m · 926k tokens · 2026-10-12 14:03"
         );
         let narrow = header::layout(Some(&info), "x", 60).text();
         assert!(narrow.contains("· 926k ·"), "{narrow}");
@@ -810,6 +1059,19 @@ mod pure {
         let layout = header::layout(Some(&info), "x", 80);
         assert!(!layout.summary_inline, "the summary moves to line 2");
         assert!(layout.text().contains("\nA long summary"));
+        // The counts are measured in cells (their "·" is two bytes), and the
+        // tool calls add their width and a separator.
+        let inline_at = |info: &crate::model::HeaderInfo| {
+            (0..400)
+                .find(|&width| header::layout(Some(info), "x", width).summary_inline)
+                .unwrap()
+        };
+        let without_tools = inline_at(&info);
+        info.tool_call_count = 3;
+        assert_eq!(
+            inline_at(&info),
+            without_tools + " · 3 tool calls".chars().count()
+        );
     }
 
     #[test]
@@ -851,22 +1113,222 @@ mod pure {
         assert!(index.find(&items, &doc, "").is_empty());
     }
 
+    /// V-073 (d2c0f07): the list's keyword rules, with ranges in the
+    /// segment text.
     #[test]
-    fn search_texts_fold_case_and_map_ranges() {
-        let text = "Straße ΟΔΟΣ";
-        let st = segments::search_text_of(text);
-        let ranges = st.find(&segments::fold_query("οδος"), text);
-        assert_eq!(ranges.len(), 1);
-        assert_eq!(&text[ranges[0].clone()], "ΟΔΟΣ");
-        let ascii = segments::search_text_of("Hello World");
-        assert!(ascii.origin.is_none());
-        assert_eq!(ascii.find("world", "Hello World"), vec![6..11]);
+    fn search_follows_the_list_keyword_rules() {
+        let lines = vec![
+            user("Straße ΟΔΟΣ in İstanbul"),
+            assistant("the hidden needle_token appears; the fired plan"),
+            user("exact audio_generation and audio generation"),
+        ];
+        let (_dir, model) = model_for(&lines, prefs(ToolDisplayMode::Truncated, false, false));
+        let doc = model.document();
+        let items = items_of(&model, 80);
+        let mut index = SearchIndex::build(&items);
+        let mut found = |query: &str| -> Vec<String> {
+            index
+                .find(&items, &doc, query)
+                .into_iter()
+                .map(|m| items[m.item_ix].segments[m.segment_ix].text[m.range].to_string())
+                .collect()
+        };
+        assert_eq!(found("οδος"), ["ΟΔΟΣ"]);
+        assert_eq!(found("STRASSE"), ["Straße"]);
+        assert_eq!(found("istanbul"), ["İstanbul"]);
+        // Separator-joined words are one match; any word matches.
+        assert_eq!(found("needle token"), ["needle_token"]);
+        assert_eq!(found("needle zzz"), ["needle"]);
+        // Words match at word starts only.
+        assert!(found("ired").is_empty());
+        assert!(found("oken").is_empty());
+        // Quoted and `_` literals match exactly.
+        assert_eq!(found("\"audio_generation\""), ["audio_generation"]);
+        assert_eq!(found("audio_generation"), ["audio_generation"]);
+        assert_eq!(
+            found("audio generation"),
+            ["audio_generation", "audio generation"]
+        );
+        assert!(found(" - / ").is_empty());
     }
 
+    /// V-073 (5896b9e): a letter-digit switch starts a word; case changes do not.
     #[test]
-    fn v075_overlay_gives_the_current_match_its_own_style() {
-        use gpui_kit::{FontWeight, HighlightStyle, hsla};
-        let styles = render::MatchStyles {
+    fn search_starts_words_at_letter_digit_switches() {
+        let lines = vec![
+            user("tag v1.2.3 and encode H264"),
+            assistant("the AppConfig type"),
+        ];
+        let (_dir, model) = model_for(&lines, prefs(ToolDisplayMode::Truncated, false, false));
+        let doc = model.document();
+        let items = items_of(&model, 80);
+        let mut index = SearchIndex::build(&items);
+        let mut found = |query: &str| -> Vec<String> {
+            index
+                .find(&items, &doc, query)
+                .into_iter()
+                .map(|m| items[m.item_ix].segments[m.segment_ix].text[m.range].to_string())
+                .collect()
+        };
+        assert_eq!(found("1.2.3"), ["1.2.3"]);
+        assert_eq!(found("264"), ["264"]);
+        assert!(found("onfig").is_empty());
+        assert!(found("64").is_empty());
+    }
+
+    /// L-109 (upstream 411e227 `list_preview_anchors_on_the_first_match`):
+    /// the list hit is the first line matching the query, its match is the
+    /// hit (949ec4e), the other message's secondary; the semantic evidence
+    /// wins only among the matching lines (59195df), and decides alone only
+    /// when nothing matches.
+    #[test]
+    fn l109_list_hit_anchors_on_the_first_match_or_the_evidence() {
+        use claude_history_core::browser::ListHit;
+
+        use crate::viewer::hit;
+        use crate::viewer::search::Emphasis;
+
+        let lines = vec![
+            user("set up the tunnel"),
+            assistant("the tunnel is up"),
+            user("now rotate the token"),
+            assistant("rotated the token and restarted"),
+        ];
+        let (_dir, model) = model_for(&lines, prefs(ToolDisplayMode::Summary, false, false));
+        let doc = model.document();
+        let (items, info) = items::build_with_info(&doc, &model, 80, &|| false).unwrap();
+        let line_of = |anchor: &hit::HitAnchor| {
+            items[anchor.item].segments[anchor.segment].text[anchor.line.clone()].to_string()
+        };
+        let hit_of = |query: &str, evidence: Option<&str>| ListHit {
+            query: query.to_string(),
+            evidence: evidence.map(str::to_string),
+        };
+
+        let found = hit::find(&items, &info, &hit_of("token", None));
+        let anchor = found.anchor.clone().expect("a line matches");
+        assert_eq!(line_of(&anchor), "now rotate the token");
+        assert_eq!(anchor.position, Some(2));
+        let segment = &items[anchor.item].segments[anchor.segment].text;
+        assert_eq!(
+            anchor.byte,
+            segment.find("token").unwrap(),
+            "revealed at the match"
+        );
+        let all: Vec<(usize, usize, String, Emphasis)> = found
+            .matches
+            .iter()
+            .flat_map(|(item, matches)| {
+                matches.iter().map(|(segment, range, emphasis)| {
+                    let text = items[*item].segments[*segment].text[range.clone()].to_string();
+                    (*item, *segment, text, *emphasis)
+                })
+            })
+            .collect();
+        assert_eq!(all.len(), 2, "{all:?}");
+        assert!(all.iter().all(|(_, _, text, _)| text == "token"), "{all:?}");
+        let hits: Vec<usize> = all
+            .iter()
+            .filter(|(.., emphasis)| *emphasis == Emphasis::Hit)
+            .map(|(item, ..)| *item)
+            .collect();
+        assert_eq!(
+            hits,
+            [anchor.item],
+            "only the hit message's match is the hit"
+        );
+        assert!(
+            all.iter().all(
+                |(item, .., emphasis)| *item == anchor.item || *emphasis == Emphasis::Secondary
+            ),
+            "{all:?}"
+        );
+
+        // The semantic evidence names the passage the row shows.
+        let found = hit::find(
+            &items,
+            &info,
+            &hit_of("token", Some("…rotated the token and restarted…")),
+        );
+        let anchor = found.anchor.expect("the evidence's message");
+        assert_eq!(line_of(&anchor), "rotated the token and restarted");
+        assert_eq!(anchor.position, Some(3));
+
+        // Evidence on a message without the query does not move the anchor.
+        let found = hit::find(&items, &info, &hit_of("token", Some("…the tunnel is up…")));
+        let anchor = found.anchor.expect("a matching line");
+        assert_eq!(line_of(&anchor), "now rotate the token");
+
+        // Nothing matches: no anchor, nothing highlighted.
+        let found = hit::find(&items, &info, &hit_of("absent", None));
+        assert!(found.anchor.is_none());
+        assert!(found.matches.is_empty());
+    }
+
+    /// L-109 (upstream 949ec4e
+    /// `preview_fills_only_whole_query_matches_in_the_hit_message`): in the
+    /// hit's message the matches of the whole query are the hit and a match
+    /// of one word is secondary, as is every match in other messages;
+    /// matches widen to whole words (`tests`, `flakyness`).
+    #[test]
+    fn l109_list_hit_emphasizes_whole_query_matches_in_the_hit_message() {
+        use claude_history_core::browser::ListHit;
+
+        use crate::viewer::hit;
+        use crate::viewer::search::Emphasis;
+
+        let lines = vec![
+            user("set up the runner"),
+            assistant("failed on one flaky test: navigation\n3,125 tests passed"),
+            user("Fix the flakyness and a flaky test"),
+        ];
+        let (_dir, model) = model_for(&lines, prefs(ToolDisplayMode::Summary, false, false));
+        let doc = model.document();
+        let (items, info) = items::build_with_info(&doc, &model, 80, &|| false).unwrap();
+        let hit = ListHit {
+            query: "flaky test".to_string(),
+            evidence: None,
+        };
+
+        let found = hit::find(&items, &info, &hit);
+
+        let anchor = found.anchor.expect("a line matches");
+        let segment = &items[anchor.item].segments[anchor.segment].text;
+        assert_eq!(
+            &segment[anchor.line.clone()],
+            "failed on one flaky test: navigation"
+        );
+        assert_eq!(anchor.byte, segment.find("flaky test").unwrap());
+        let items = &items;
+        let mut all: Vec<(usize, usize, usize, String, Emphasis)> = found
+            .matches
+            .iter()
+            .flat_map(|(item, matches)| {
+                matches.iter().map(move |(segment, range, emphasis)| {
+                    let text = items[*item].segments[*segment].text[range.clone()].to_string();
+                    (*item, *segment, range.start, text, *emphasis)
+                })
+            })
+            .collect();
+        all.sort_by_key(|(item, segment, start, ..)| (*item, *segment, *start));
+        let shown: Vec<(&str, Emphasis)> = all
+            .iter()
+            .map(|(.., text, emphasis)| (text.as_str(), *emphasis))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("flaky test", Emphasis::Hit),
+                ("tests", Emphasis::Secondary),
+                ("flakyness", Emphasis::Secondary),
+                ("flaky test", Emphasis::Secondary),
+            ]
+        );
+    }
+
+    fn test_match_styles() -> render::MatchStyles {
+        use gpui_kit::{HighlightStyle, hsla};
+        render::MatchStyles {
             other: HighlightStyle {
                 background_color: Some(hsla(0.5, 0.5, 0.5, 0.25)),
                 color: Some(hsla(0.0, 0.0, 0.1, 1.0)),
@@ -877,7 +1339,19 @@ mod pure {
                 color: Some(hsla(0.0, 0.0, 0.0, 1.0)),
                 ..Default::default()
             },
-        };
+            secondary: HighlightStyle {
+                background_color: Some(hsla(0.5, 0.5, 0.5, 0.12)),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn v075_overlay_gives_the_current_match_its_own_style() {
+        use gpui_kit::{FontWeight, HighlightStyle, hsla};
+
+        use crate::viewer::search::Emphasis;
+        let styles = test_match_styles();
         // A bold, colored base run over the whole text "abc needle needle".
         let base_style = HighlightStyle {
             color: Some(hsla(0.6, 0.6, 0.6, 1.0)),
@@ -886,7 +1360,11 @@ mod pure {
         };
         let base = vec![(0..17, base_style)];
         // Matches of segment 0 (the second one current) and one of segment 1.
-        let matches = vec![(0, 4..10, false), (0, 11..17, true), (1, 0..3, false)];
+        let matches = vec![
+            (0, 4..10, Emphasis::Other),
+            (0, 11..17, Emphasis::Current),
+            (1, 0..3, Emphasis::Other),
+        ];
         let runs = render::overlay_matches(base.clone(), &matches, 0, styles);
         let style_at = |byte: usize| {
             runs.iter()
@@ -918,6 +1396,69 @@ mod pure {
             render::overlay_matches(base.clone(), &matches, 2, styles),
             base
         );
+    }
+
+    /// L-109 (upstream 949ec4e): the list hit's hit is drawn with the fill
+    /// of the `/` search's other matches, its secondary matches as a soft
+    /// wash (6755b3b) over the base (background only); the match's fields win over every
+    /// base run's, whatever the number of runs (the overlay does not depend
+    /// on `combine_highlights`' hash order), and text outside base runs is
+    /// styled too.
+    #[test]
+    fn l109_overlay_draws_the_hit_filled_and_secondary_matches_as_a_soft_wash() {
+        use gpui_kit::{FontStyle, HighlightStyle, hsla};
+
+        use crate::viewer::search::Emphasis;
+        let styles = test_match_styles();
+        assert_eq!(styles.style(Emphasis::Hit), styles.other);
+        assert_eq!(styles.style(Emphasis::Secondary), styles.secondary);
+        // Forty one-byte italic runs in alternating colors over bytes 0..40;
+        // bytes 40..50 have no base run.
+        let colors = [hsla(0.6, 0.6, 0.6, 1.0), hsla(0.9, 0.6, 0.4, 1.0)];
+        let base: Vec<_> = (0..40)
+            .map(|byte| {
+                let style = HighlightStyle {
+                    color: Some(colors[byte % 2]),
+                    font_style: Some(FontStyle::Italic),
+                    ..Default::default()
+                };
+                (byte..byte + 1, style)
+            })
+            .collect();
+        let matches: Vec<_> = (0..10)
+            .map(|ix| {
+                let emphasis = if ix % 2 == 0 {
+                    Emphasis::Secondary
+                } else {
+                    Emphasis::Hit
+                };
+                (0, ix * 5..ix * 5 + 3, emphasis)
+            })
+            .collect();
+        let runs = render::overlay_matches(base, &matches, 0, styles);
+        for (_, range, emphasis) in &matches {
+            let want = styles.style(*emphasis);
+            for byte in range.clone() {
+                let (_, style) = runs
+                    .iter()
+                    .find(|(run, _)| run.contains(&byte))
+                    .expect("styled byte");
+                // A match without a color (the secondary wash) keeps the
+                // base run's.
+                let color = want.color.or((byte < 40).then_some(colors[byte % 2]));
+                assert_eq!(style.color, color, "byte {byte}");
+                assert_eq!(style.background_color, want.background_color, "byte {byte}");
+                assert_eq!(style.font_weight, want.font_weight, "byte {byte}");
+                let italic = (byte < 40).then_some(FontStyle::Italic);
+                assert_eq!(style.font_style, italic, "byte {byte}: base flags stay");
+            }
+        }
+        // Between matches the base runs are untouched; the runs are disjoint
+        // and in order.
+        let (_, style) = runs.iter().find(|(run, _)| run.contains(&3)).unwrap();
+        assert_eq!(style.color, Some(colors[1]));
+        assert!(runs.windows(2).all(|w| w[0].0.end <= w[1].0.start));
+        assert!(!runs.iter().any(|(run, _)| run.contains(&43)));
     }
 
     fn id(n: u16) -> (ItemId, u64) {
@@ -1014,7 +1555,7 @@ mod pure {
     #[test]
     fn nav_helpers_map_items_and_positions() {
         let lines = long_conversation(6);
-        let (_dir, model) = model_for(&lines, prefs(ToolDisplayMode::Hidden, false, false));
+        let (_dir, model) = model_for(&lines, prefs(ToolDisplayMode::Summary, false, false));
         let doc = model.document();
         let (items, info) = items::build_with_info(&doc, &model, 80, &|| false).unwrap();
         assert_eq!(nav::indicator(&items, &info, 0), "[1/6]");
@@ -1268,9 +1809,13 @@ mod gui {
         std::fs::create_dir_all(&dir).unwrap();
         let viewer = open_in_main(cx, handle, &ws, &dir, true);
         let expected = failed_to_open(
-            &claude_history_core::view::ViewerModel::open(&dir, Default::default())
-                .unwrap_err()
-                .to_string(),
+            &claude_history_core::view::ViewerModel::open(
+                &claude_history_core::history::service::HistoryService::default(),
+                &dir,
+                Default::default(),
+            )
+            .unwrap_err()
+            .to_string(),
         );
         assert_eq!(read(cx, &viewer, |v| v.failure()), Some(expected.clone()));
         assert_eq!(cx.read(last_toast).as_ref(), expected);
@@ -1293,7 +1838,8 @@ mod gui {
         let (handle, viewer, path) = open_viewer(cx, &world, &lines, &[]);
         let before = read(cx, &viewer, |v| v.items().unwrap().len());
         std::fs::remove_file(&path).unwrap();
-        keys(cx, handle, &viewer, "t");
+        // Summary → Calls → Truncated (upstream a60dfe9).
+        keys(cx, handle, &viewer, "t t");
         read(cx, &viewer, |v| {
             assert!(v.failure().is_none());
             assert!(
@@ -1465,6 +2011,162 @@ mod gui {
         }
     }
 
+    /// Wait until the header's parse-error badge reads `errors`.
+    fn wait_parse_errors(cx: &mut TestAppContext, viewer: &Entity<ViewerPane>, errors: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while read(cx, viewer, |v| v.header_layout().unwrap().parse_errors) != errors {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the badge never read {errors}"
+            );
+            cx.executor().allow_parking();
+            std::thread::sleep(Duration::from_millis(10));
+            cx.run_until_parked();
+        }
+    }
+
+    /// Decodes run by the app's `HistoryService` (the viewer's builds and
+    /// recounts read files through it).
+    fn decodes(cx: &mut TestAppContext) -> usize {
+        cx.read(|cx| crate::globals::env_history(cx).service().decodes())
+    }
+
+    /// Let background work and corpus changes run for a while.
+    fn run_a_while(cx: &mut TestAppContext) {
+        for _ in 0..20 {
+            cx.executor().allow_parking();
+            std::thread::sleep(Duration::from_millis(5));
+            cx.run_until_parked();
+        }
+    }
+
+    /// Stamp `path` in the future like a file being written: the
+    /// `HistoryService` never reuses a transcript of it, so every read of
+    /// it is a decode.
+    fn stamp_unsettled(path: &std::path::Path) {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(3600))
+            .unwrap();
+    }
+
+    /// The standard corpus's transcript with a malformed line.
+    fn malformed_session(paths: &[std::path::PathBuf]) -> std::path::PathBuf {
+        paths
+            .iter()
+            .find(|p| {
+                p.to_string_lossy()
+                    .contains(&crate::test_support::synth::uuid(91))
+            })
+            .unwrap()
+            .clone()
+    }
+
+    /// V-008 in store mode (review fixes): a card's header does not know
+    /// its malformed lines, so the badge shows the count the open build took
+    /// from the transcript it decoded: one open decodes the file once (no
+    /// second decode beside the build); the headers that replace it at each
+    /// corpus change keep that count at once (no badge flicker) and read
+    /// nothing; a changed file is counted again.
+    #[gpui_kit::test]
+    fn v008_a_cards_parse_errors_are_counted_once_per_file_version(cx: &mut TestAppContext) {
+        let world = TestWorld::new();
+        let broken = malformed_session(&world.standard_corpus());
+        stamp_unsettled(&broken);
+        let (main, ws) = crate::test_support::open_main(cx, &world, &[]);
+        crate::test_support::wait_loaded(cx, &ws);
+        let before = decodes(cx);
+        let viewer = open_in_main(cx, main, &ws, &broken, true);
+        wait_parse_errors(cx, &viewer, 1);
+        run_a_while(cx);
+        assert_eq!(decodes(cx) - before, 1, "one open, one decode");
+
+        let list = cx.read(|cx| ws.read(cx).list().clone());
+        let header = cx
+            .read(|cx| list.read(cx).header_info(&broken))
+            .expect("the session is listed");
+        assert!(!header.parse_errors_known, "a card's header");
+        viewer.update(cx, |v, cx| v.set_header(Some(header.clone()), cx));
+        assert_eq!(
+            read(cx, &viewer, |v| v.header_layout().unwrap().parse_errors),
+            1,
+            "the count is kept at once"
+        );
+        run_a_while(cx);
+        assert_eq!(
+            decodes(cx) - before,
+            1,
+            "the unchanged file is not read again"
+        );
+
+        // A second malformed line (a later modification time, whatever the
+        // file system's resolution): the file is counted again.
+        let modified = std::fs::metadata(&broken).unwrap().modified().unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&broken)
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"{not json either\n").unwrap();
+        file.set_modified(modified + Duration::from_secs(2))
+            .unwrap();
+        drop(file);
+        viewer.update(cx, |v, cx| v.set_header(Some(header), cx));
+        wait_parse_errors(cx, &viewer, 2);
+        assert_eq!(decodes(cx) - before, 2, "the recount's decode");
+    }
+
+    /// V-101 with V-008 (review fix): of two card conversations opened in a
+    /// row, only the second is decoded (the first's open never reads the
+    /// file, and no count of it runs beside the builds); its header shows
+    /// its own count, not the first one's; each later open decodes once.
+    #[gpui_kit::test]
+    fn v101_a_superseded_card_open_decodes_nothing(cx: &mut TestAppContext) {
+        let world = TestWorld::new();
+        let paths = world.standard_corpus();
+        let broken = malformed_session(&paths);
+        let clean = paths[0].clone();
+        stamp_unsettled(&broken);
+        stamp_unsettled(&clean);
+        let (main, ws) = crate::test_support::open_main(cx, &world, &[]);
+        crate::test_support::wait_loaded(cx, &ws);
+        let viewer = cx.read(|cx| ws.read(cx).viewer().clone());
+        let (before, builds) = (decodes(cx), read(cx, &viewer, |v| v.completed_builds()));
+        cx.update_window(main, |_, window, cx| {
+            ws.update(cx, |ws, cx| {
+                for path in [&broken, &clean] {
+                    let target = ConversationTarget::from_parsed_file(path, None);
+                    ws.open_request(OpenRequest::new(target, false), false, window, cx);
+                }
+            })
+        })
+        .unwrap();
+        wait_viewer_ready(cx, main, &viewer);
+        run_a_while(cx);
+        assert_eq!(
+            read(cx, &viewer, |v| v.target().unwrap().path.clone()),
+            clean
+        );
+        let header = cx.read(|cx| ws.read(cx).list().read(cx).header_info(&clean));
+        assert!(
+            header.is_some_and(|header| !header.parse_errors_known),
+            "a card's header"
+        );
+        assert_eq!(
+            read(cx, &viewer, |v| v.header_layout().unwrap().parse_errors),
+            0,
+            "the second conversation's own count"
+        );
+        assert_eq!(decodes(cx) - before, 1, "only the second open decoded");
+        assert_eq!(read(cx, &viewer, |v| v.completed_builds()) - builds, 1);
+
+        open_in_main(cx, main, &ws, &broken, false);
+        wait_parse_errors(cx, &viewer, 1);
+        run_a_while(cx);
+        assert_eq!(decodes(cx) - before, 2, "one decode per open");
+    }
+
     // ----- status, toggles ---------------------------------------------------------
 
     /// V-009: the scroll indicator.
@@ -1499,10 +2201,16 @@ mod gui {
             read(cx, &viewer, |v| status::toggle_texts(&v.prefs().unwrap()))
         };
         assert_eq!(texts(cx)[0], "tools·sum");
+        // Upstream a60dfe9: summary → calls → truncated.
+        keys(cx, handle, &viewer, "t");
+        assert_eq!(texts(cx)[0], "tools·cal");
         keys(cx, handle, &viewer, "t");
         assert_eq!(texts(cx)[0], "tools·trn");
         keys(cx, handle, &viewer, "t");
         assert_eq!(texts(cx)[0], "tools·all");
+        // Upstream d0aca95: full → off → summary.
+        keys(cx, handle, &viewer, "t");
+        assert_eq!(texts(cx)[0], "tools·off");
         keys(cx, handle, &viewer, "t");
         assert_eq!(texts(cx)[0], "tools·sum");
         keys(cx, handle, &viewer, "shift-t");
@@ -1574,15 +2282,74 @@ mod gui {
     fn v048_tool_display_persists_across_conversations(cx: &mut TestAppContext) {
         let world = TestWorld::new();
         let (handle, ws, viewer, _) = open_main_viewer(cx, &world, &long_conversation(2), &[]);
+        // Summary → Calls (upstream a60dfe9).
         keys(cx, handle, &viewer, "t");
-        assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Truncated);
+        assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Calls);
         let other = write_transcript(
             &world.home().join("other"),
             "other.jsonl",
             &long_conversation(3),
         );
         let viewer = open_in_main(cx, handle, &ws, &other, true);
-        assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Truncated);
+        assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Calls);
+    }
+
+    /// V-048 / upstream d0aca95: cycling to Off removes the tool-only
+    /// messages (nothing of them is shown or navigable) and the focus moves
+    /// from the tool summary to the previous visible message.
+    #[gpui_kit::test]
+    fn v048_cycling_tools_to_off_keeps_focus_on_a_visible_message(cx: &mut TestAppContext) {
+        let world = TestWorld::new();
+        let lines = vec![
+            user("please check"),
+            bash_call("toolu_1", "cargo test", 1),
+            tool_result("toolu_1", "ok", 2),
+            assistant("all good"),
+        ];
+        let (handle, viewer, _) = open_viewer(cx, &world, &lines, &[]);
+        let nav_entries = |cx: &mut TestAppContext| {
+            read(cx, &viewer, |v| v.build_info().unwrap().nav_entries.clone())
+        };
+        let text = |cx: &mut TestAppContext| {
+            read(cx, &viewer, |v| {
+                v.items()
+                    .unwrap()
+                    .iter()
+                    .map(crate::viewer::items::item_text)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+        };
+        assert_eq!(nav_entries(cx), [0, 1, 3]);
+        assert!(text(cx).contains("Ran 1 shell command"), "{}", text(cx));
+        keys(cx, handle, &viewer, "shift-j");
+        assert_eq!(read(cx, &viewer, |v| v.nav().focused()), Some(1));
+
+        // Calls (upstream a60dfe9) keeps the group and lists its call.
+        keys(cx, handle, &viewer, "t");
+        assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Calls);
+        assert_eq!(nav_entries(cx), [0, 1, 3]);
+        assert!(text(cx).contains("Bash: cargo test"), "{}", text(cx));
+        assert_eq!(read(cx, &viewer, |v| v.nav().focused()), Some(1));
+
+        keys(cx, handle, &viewer, "t t t");
+        assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Off);
+        assert_eq!(nav_entries(cx), [0, 3]);
+        let shown = text(cx);
+        assert!(
+            shown.contains("please check") && shown.contains("all good"),
+            "{shown}"
+        );
+        assert!(
+            !shown.contains("cargo test") && !shown.contains("shell command"),
+            "{shown}"
+        );
+        assert_eq!(read(cx, &viewer, |v| v.nav().focused()), Some(0));
+        assert!(read(cx, &viewer, |v| v.nav().is_active()));
+
+        keys(cx, handle, &viewer, "t");
+        assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Summary);
+        assert!(text(cx).contains("Ran 1 shell command"));
     }
 
     /// V-062: `T` shows thinking.
@@ -1636,7 +2403,8 @@ mod gui {
     fn v056_v059_indicator_click_expands_and_focuses(cx: &mut TestAppContext) {
         let world = TestWorld::new();
         let (handle, viewer, _) = open_viewer(cx, &world, &truncated_fixture(), &[]);
-        keys(cx, handle, &viewer, "t");
+        // Summary → Calls → Truncated (upstream a60dfe9).
+        keys(cx, handle, &viewer, "t t");
         settle(cx, handle, &viewer);
         let call = item_index(cx, &viewer, |i| i.kind == ItemKind::ToolCall);
         let (more, hash) = read(cx, &viewer, |v| {
@@ -1663,7 +2431,8 @@ mod gui {
     fn v060_expanded_set_survives_toggles_not_reopen(cx: &mut TestAppContext) {
         let world = TestWorld::new();
         let (handle, ws, viewer, path) = open_main_viewer(cx, &world, &truncated_fixture(), &[]);
-        keys(cx, handle, &viewer, "t");
+        // Summary → Calls → Truncated (upstream a60dfe9).
+        keys(cx, handle, &viewer, "t t");
         let call = item_index(cx, &viewer, |i| i.kind == ItemKind::ToolCall);
         let id = read(cx, &viewer, |v| {
             v.items().unwrap()[call].toggle.clone().unwrap()
@@ -1692,6 +2461,149 @@ mod gui {
             .unwrap()
             .expanded
             .is_empty()));
+    }
+
+    /// Calls mode (upstream a1c88f8): the chevron of a call row expands just
+    /// that call and its result, the other rows stay on one line, and the
+    /// details chevron collapses it again. Expanding the group's first row
+    /// keeps that row where it was.
+    #[gpui_kit::test]
+    fn calls_row_chevron_expands_just_that_call(cx: &mut TestAppContext) {
+        let world = TestWorld::new();
+        let mut lines = vec![
+            user("q"),
+            tool_call("g1", "Grep", r#"{"pattern":"one"}"#, 1),
+            tool_result("g1", "grep result", 1),
+            tool_call("r1", "Read", r#"{"file_path":"x.rs"}"#, 1),
+            tool_result("r1", "read result", 1),
+        ];
+        // Enough below the group to scroll it to the top.
+        for ix in 0..30 {
+            lines.push(assistant_at(&format!("answer {ix}"), 2));
+            lines.push(user_at(&format!("question {ix}"), 2));
+        }
+        let (handle, viewer, _) = open_viewer(cx, &world, &lines, &[]);
+        let all_text = |cx: &mut TestAppContext| {
+            read(cx, &viewer, |v| {
+                v.items()
+                    .unwrap()
+                    .iter()
+                    .map(crate::viewer::items::item_text)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+        };
+        let call_rows = |cx: &mut TestAppContext| {
+            read(cx, &viewer, |v| {
+                v.items()
+                    .unwrap()
+                    .iter()
+                    .filter(|i| i.kind == ItemKind::CallLine)
+                    .map(|i| (i.key_hash, i.toggle.clone().unwrap()))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let click = |cx: &mut TestAppContext, name: &'static str, hash: u64| {
+            draw(cx, handle);
+            cx.update_window(handle, |_, window, cx| {
+                window.click(gpui_kit::ElementId::NamedInteger(name.into(), hash), cx)
+            })
+            .unwrap();
+            wait_viewer_ready(cx, handle, &viewer);
+        };
+        cx.update_window(handle, |_, window, cx| {
+            viewer.update(cx, |viewer, cx| {
+                viewer.handle_forwarded(&SetToolsCalls, window, cx)
+            })
+        })
+        .unwrap();
+        wait_viewer_ready(cx, handle, &viewer);
+        assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Calls);
+        let rows = call_rows(cx);
+        assert_eq!(rows.len(), 2);
+        assert_ne!(rows[0].1, rows[1].1);
+        assert!(!all_text(cx).contains("read result"));
+
+        // The second row's chevron: its call and result, the first row stays.
+        click(cx, "summary-chevron", rows[1].0);
+        let expanded = all_text(cx);
+        assert!(expanded.contains("read result"), "{expanded}");
+        assert!(!expanded.contains("grep result"), "{expanded}");
+        assert_eq!(call_rows(cx), rows[..1]);
+        let details = item_index(cx, &viewer, |i| i.group_toggle.is_some());
+        read(cx, &viewer, |v| {
+            let items = v.items().unwrap();
+            assert_eq!(items[details].group_toggle.as_ref(), Some(&rows[1].1));
+            assert_eq!(items[details].kind, ItemKind::ToolCall);
+            assert_eq!(items[details + 1].kind, ItemKind::ToolResult);
+        });
+        // The details chevron collapses it again.
+        let hash = read(cx, &viewer, |v| v.items().unwrap()[details].key_hash);
+        click(cx, "group-chevron", hash);
+        assert!(!all_text(cx).contains("read result"));
+        assert_eq!(call_rows(cx), rows);
+
+        // The first row's chevron: the row stays under the click.
+        let top_of = |cx: &mut TestAppContext, ix: usize| {
+            read(cx, &viewer, |v| {
+                let bounds = v.list_state().bounds_for_item(ix).expect("rendered");
+                f32::from(bounds.top() - v.list_state().viewport_bounds().top())
+            })
+        };
+        let first = item_index(cx, &viewer, |i| i.kind == ItemKind::CallLine);
+        let before = top_of(cx, first);
+        assert!(before > 0.0, "the user message sits above the group");
+        click(cx, "summary-chevron", rows[0].0);
+        assert!(all_text(cx).contains("grep result"));
+        let details = item_index(cx, &viewer, |i| i.group_toggle.is_some());
+        assert_eq!(details, first);
+        assert!((top_of(cx, details) - before).abs() < 0.5);
+    }
+
+    /// Mode change on a focused message whose first item (an expanded
+    /// group's first detail) is partly scrolled above the viewport: the
+    /// replacing row must not be scrolled into by the old offset.
+    #[gpui_kit::test]
+    fn mode_change_with_partly_scrolled_first_item_keeps_group_visible(cx: &mut TestAppContext) {
+        let world = TestWorld::new();
+        let mut lines = vec![
+            user("q"),
+            tool_call("g1", "Grep", r#"{"pattern":"one"}"#, 1),
+            tool_result("g1", &numbered_lines(12), 1),
+            tool_call("r1", "Read", r#"{"file_path":"x.rs"}"#, 1),
+            tool_result("r1", "content", 1),
+        ];
+        for ix in 0..30 {
+            lines.push(assistant_at(&format!("answer {ix}"), 2));
+            lines.push(user_at(&format!("question {ix}"), 2));
+        }
+        let (handle, viewer, _) = open_viewer(cx, &world, &lines, &[]);
+        let summary = item_index(cx, &viewer, |i| i.kind == ItemKind::ToolSummary);
+        let hash = read(cx, &viewer, |v| v.items().unwrap()[summary].key_hash);
+        cx.update_window(handle, |_, window, cx| {
+            window.click(
+                gpui_kit::ElementId::NamedInteger("summary-chevron".into(), hash),
+                cx,
+            )
+        })
+        .unwrap();
+        wait_viewer_ready(cx, handle, &viewer);
+        let details = item_index(cx, &viewer, |i| i.group_toggle.is_some());
+        viewer.update(cx, |v, _| {
+            v.list_state().scroll_to(gpui_kit::ListOffset {
+                item_ix: details,
+                offset_in_item: px(40.),
+            })
+        });
+        draw(cx, handle);
+        keys(cx, handle, &viewer, "t");
+        assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Calls);
+        let first = item_index(cx, &viewer, |i| i.kind == ItemKind::CallLine);
+        let visible = read(cx, &viewer, |v| {
+            v.list_state().item_is_above_viewport(first) == Some(false)
+                && v.list_state().item_is_below_viewport(first) == Some(false)
+        });
+        assert!(visible, "the group's first row is visible");
     }
 
     /// V-052: summary group chevrons.
@@ -1774,7 +2686,8 @@ mod gui {
             ),
         ];
         let (handle, viewer, _) = open_viewer(cx, &world, &lines, &[]);
-        keys(cx, handle, &viewer, "t");
+        // Summary → Calls → Truncated (upstream a60dfe9).
+        keys(cx, handle, &viewer, "t t");
         keys(cx, handle, &viewer, "shift-j");
         keys(cx, handle, &viewer, "x");
         let expanded =
@@ -1792,7 +2705,8 @@ mod gui {
         lines.push(bash_call("b", "cat big", 30));
         lines.push(tool_result("b", &"x".repeat(50_000), 30));
         let (handle, viewer, _) = open_viewer(cx, &world, &lines, &[]);
-        keys(cx, handle, &viewer, "t");
+        // Summary → Calls → Truncated (upstream a60dfe9).
+        keys(cx, handle, &viewer, "t t");
         settle(cx, handle, &viewer);
         let result = item_index(cx, &viewer, |i| i.kind == ItemKind::ToolResult);
         let (wide_more, wide_cols) = read(cx, &viewer, |v| {
@@ -1928,7 +2842,8 @@ mod gui {
             tool_result("b1", &numbered_lines(12), 1),
         ];
         let (handle, viewer, _) = open_viewer(cx, &world, &lines, &[]);
-        keys(cx, handle, &viewer, "t");
+        // Summary → Calls → Truncated (upstream a60dfe9).
+        keys(cx, handle, &viewer, "t t");
         settle(cx, handle, &viewer);
         let result = item_index(cx, &viewer, |i| i.kind == ItemKind::ToolResult);
         let (more, hash) = read(cx, &viewer, |v| {
@@ -2228,6 +3143,38 @@ mod gui {
         });
     }
 
+    /// V-073 (d2c0f07): Enter on a query without matches closes the find bar
+    /// and says so in a toast; matching follows the list's keyword rules.
+    #[gpui_kit::test]
+    fn v073_commit_without_matches_shows_a_toast(cx: &mut TestAppContext) {
+        let world = TestWorld::new();
+        let lines = vec![user("the fired plan"), assistant("a needle_token here")];
+        let (handle, viewer, _) = open_viewer(cx, &world, &lines, &[]);
+        keys(cx, handle, &viewer, "/");
+        cx.simulate_input(handle, "ired");
+        wait_viewer_ready(cx, handle, &viewer);
+        assert_eq!(
+            read(cx, &viewer, |v| v.view_search().count()),
+            0,
+            "no match inside a word"
+        );
+        keys(cx, handle, &viewer, "enter");
+        read(cx, &viewer, |v| {
+            assert_eq!(v.view_search().mode(), ViewSearchMode::Off);
+        });
+        assert_eq!(cx.read(last_toast).as_ref(), "No matches for /ired");
+
+        keys(cx, handle, &viewer, "/");
+        cx.simulate_input(handle, "needle token");
+        wait_viewer_ready(cx, handle, &viewer);
+        assert_eq!(read(cx, &viewer, |v| v.view_search().count()), 1);
+        keys(cx, handle, &viewer, "enter");
+        read(cx, &viewer, |v| {
+            assert_eq!(v.view_search().mode(), ViewSearchMode::Active);
+        });
+        assert_eq!(cx.read(last_toast).as_ref(), "No matches for /ired");
+    }
+
     /// V-074: n/N wrap; a visible match does not scroll.
     #[gpui_kit::test]
     fn v074_next_prev_wrap(cx: &mut TestAppContext) {
@@ -2298,7 +3245,8 @@ mod gui {
         lines.push(bash_call("b", "cat", 40));
         lines.push(tool_result("b", &body, 40));
         let (handle, viewer, _) = open_viewer(cx, &world, &lines, &[]);
-        keys(cx, handle, &viewer, "t");
+        // Summary → Calls → Truncated (upstream a60dfe9).
+        keys(cx, handle, &viewer, "t t");
         keys(cx, handle, &viewer, "/");
         cx.simulate_input(handle, "treasure");
         wait_viewer_ready(cx, handle, &viewer);
@@ -2327,7 +3275,8 @@ mod gui {
         ];
         let (handle, viewer, _) = open_viewer(cx, &world, &lines, &["--show-tools"]);
         keys(cx, handle, &viewer, "/");
-        cx.simulate_input(handle, "output line 2950");
+        // Quoted: unquoted, any word would match (every line has `output`).
+        cx.simulate_input(handle, "\"output line 2950\"");
         wait_viewer_ready(cx, handle, &viewer);
         draw(cx, handle);
         wait_viewer_ready(cx, handle, &viewer);
@@ -2666,7 +3615,8 @@ mod gui {
     fn v017_hover_marks_the_tool_output(cx: &mut TestAppContext) {
         let world = TestWorld::new();
         let (handle, viewer, _) = open_viewer(cx, &world, &truncated_fixture(), &[]);
-        keys(cx, handle, &viewer, "t");
+        // Summary → Calls → Truncated (upstream a60dfe9).
+        keys(cx, handle, &viewer, "t t");
         let call = item_index(cx, &viewer, |i| i.kind == ItemKind::ToolCall);
         let id = read(cx, &viewer, |v| v.items().unwrap()[call].toggle.clone());
         let over_call = text_position(cx, handle, &viewer, call, 0, 2);
@@ -2752,7 +3702,8 @@ mod gui {
         let world = TestWorld::new();
         let (handle, _ws, viewer, _) = open_main_viewer(cx, &world, &truncated_fixture(), &[]);
         cx.update(|cx| cx.set_reduce_motion(true));
-        keys(cx, handle, &viewer, "t");
+        // Summary → Calls → Truncated (upstream a60dfe9).
+        keys(cx, handle, &viewer, "t t");
         settle(cx, handle, &viewer);
         let call = item_index(cx, &viewer, |i| i.kind == ItemKind::ToolCall);
         let (more, hash) = read(cx, &viewer, |v| {
@@ -2821,6 +3772,8 @@ mod gui {
         let controls: Vec<(&str, Box<dyn gpui_kit::Action>)> = vec![
             ("tools-truncated", Box::new(SetToolsTruncated)),
             ("tools-full", Box::new(SetToolsFull)),
+            ("tools-off", Box::new(SetToolsOff)),
+            ("tools-calls", Box::new(SetToolsCalls)),
             ("tools-summary", Box::new(SetToolsSummary)),
             ("toggle-thinking", Box::new(ToggleThinking)),
             ("toggle-timing", Box::new(ToggleTiming)),
@@ -3184,10 +4137,7 @@ mod gui {
                 "source known after parsing"
             );
             let header = v.header_layout().unwrap().text();
-            assert!(
-                header.contains("2 messages") || header.contains("4 messages"),
-                "{header}"
-            );
+            assert!(header.contains(" · 2 prompts · "), "{header}");
         });
     }
 
@@ -3220,6 +4170,8 @@ mod gui {
         assert_eq!(probe(cx, "focus").as_deref(), Some("viewer"));
         assert_eq!(probe(cx, "window.kind").as_deref(), Some("single-file"));
         assert_eq!(probe(cx, "list.count"), None);
+        keys(cx, handle, &viewer, "t");
+        assert_eq!(probe(cx, "viewer.tool_display").as_deref(), Some("cal"));
         keys(cx, handle, &viewer, "t");
         assert_eq!(probe(cx, "viewer.tool_display").as_deref(), Some("trn"));
     }
@@ -3273,6 +4225,45 @@ mod gui {
         assert_eq!(
             cx.read(last_toast).as_ref(),
             "Message m999 is not shown in the viewer"
+        );
+    }
+
+    /// §9.9 with upstream d0aca95's off mode: a hint that needs tools shows
+    /// them truncated in this view only, as from summary mode.
+    #[gpui_kit::test]
+    fn reveal_with_a_tools_hint_leaves_off_mode(cx: &mut TestAppContext) {
+        let world = TestWorld::new();
+        let lines = vec![
+            user("please check"),
+            bash_call("toolu_1", "cargo test", 1),
+            tool_result("toolu_1", "ok", 2),
+            assistant("all good"),
+        ];
+        let (handle, _ws, viewer, path) = open_main_viewer(cx, &world, &lines, &[]);
+        cx.dispatch_action(handle, SetToolsOff);
+        wait_viewer_ready(cx, handle, &viewer);
+        assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Off);
+        let reveal = RevealRequest {
+            path,
+            full_ref: None,
+            kind: RevealKind::AgentOrdinal {
+                ordinal: 1,
+                hint: ContentVisibilityHint {
+                    tools: true,
+                    ..Default::default()
+                },
+            },
+        };
+        cx.update_window(handle, |_, window, cx| {
+            viewer.update(cx, |v, cx| assert!(v.reveal(reveal, window, cx)))
+        })
+        .unwrap();
+        wait_viewer_ready(cx, handle, &viewer);
+        assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Truncated);
+        assert_eq!(
+            cx.read(|cx| crate::globals::app_state(cx).view_defaults.tool_display),
+            ToolDisplayMode::Off,
+            "not remembered"
         );
     }
 
@@ -3367,6 +4358,8 @@ mod gui {
         let items = read(cx, &viewer, |v| v.items().unwrap().len());
         assert!(items >= 3000, "{items}");
         keys(cx, handle, &viewer, "shift-g");
+        keys(cx, handle, &viewer, "t");
+        assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Calls);
         keys(cx, handle, &viewer, "t");
         assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Truncated);
         let probe = |key: &str, cx: &mut TestAppContext| -> f64 {

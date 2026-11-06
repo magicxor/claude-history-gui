@@ -1,5 +1,6 @@
 //! Resume / fork planning and cross-project session copy (upstream
-//! `main.rs:1788-2020`).
+//! `main.rs:1788-2020`; since 9799550 the `resume` of upstream's Claude and Pi
+//! adapters).
 //!
 //! Upstream resolved what to run from the process cwd and then `exec`ed
 //! `claude`/`pi`/`omp` in the terminal it was running in. A GUI has neither a
@@ -12,6 +13,17 @@
 //! 2. [`execute_copy`] performs that copy (after the GUI confirmed it).
 //! 3. [`terminal`] turns the plan into a command that opens a terminal window
 //!    running it, and [`launch`] spawns that.
+//!
+//! Planning goes through the source adapter of the conversation (upstream
+//! 9799550): [`plan_resume_target`] refuses an action the conversation does
+//! not support (`history::actions::capabilities_of`: its source's adapter,
+//! and nothing for an orphaned conversation; upstream eea6d37's
+//! `actions::refusal` texts), takes the adapter of the target's source
+//! (`history::sources::Registry::for_source`) and has it plan: the Claude
+//! adapter with `plan_claude`, the Pi adapter (Pi and OMP) with
+//! `plan_native`, the Codex adapter with `plan_codex`. Unlike upstream, whose
+//! command builders moved into the adapters, the planners stay here with the
+//! plan types and their tests.
 //!
 //! # Claude semantics (GUI)
 //!
@@ -31,6 +43,11 @@
 //!   directory (the conversation's project directory, or the workspace when
 //!   it maps to the same projects directory).
 //! * `[resume].default_args` are appended for Claude only.
+//! * A sidecar (a subagent or `/btw` fork transcript, upstream 3c2ffeb)
+//!   resumes the session that holds it: that session's transcript is
+//!   planned in place of the sidecar (copy included); a sidecar whose session
+//!   file is gone is refused (`The session holding this transcript no longer
+//!   exists: <path>`). Forking one is refused by its capabilities.
 //!
 //! Upstream copied a session onto itself when the project directory was gone
 //! but the cwd already mapped to the session's directory (which truncates
@@ -46,14 +63,35 @@
 //! inherited upstream's cwd, which is the workspace here. Missing
 //! directories fall back (workspace, then project directory, then none) with
 //! a warning instead of failing to spawn.
+//!
+//! # Codex
+//!
+//! `codex [[resume.codex] default_args] resume <thread id>` and `codex [...]
+//! fork <thread id>` (upstream eea6d37) run in the thread's project
+//! directory, else (upstream: its process cwd) the workspace with a warning.
+//! The plan sets `CODEX_HOME` to the Codex home of the thread's rollout
+//! ([`ResumePlan::env`]), which every terminal launcher passes on
+//! ([`terminal`], "Environment variables").
+//!
+//! # The program (upstream 8a99ccc)
+//!
+//! Every plan carries a [`Launcher`]: the agent's own binary, or the user's
+//! `command` (`[resume] command`, `[resume.pi|omp|codex] command`, a
+//! wrapper such as `["mise", "exec", "--", "claude"]`) or `[gui]` program
+//! path, chosen by `config::agent_launcher`. Its arguments come before the
+//! agent's ([`ResumePlan::launch_spec`], [`ResumePlan::display_command`]),
+//! so `[resume] default_args` keep their place after the agent's own.
+//! Callers check the program before a session copy ([`Launcher::check`]);
+//! the GUI does it after the login-shell `PATH` probe.
 
 pub mod terminal;
 
-use crate::config::GuiSettings;
 use crate::env::{HistoryEnv, WorkspaceScope};
 use crate::error::{AppError, Result};
-use crate::history::{Conversation, Source};
-use crate::program::ResolvedProgram;
+use crate::history::actions::{self, Launch, Launcher, Target};
+use crate::history::model::SourceKind;
+use crate::history::sources::Registry;
+use crate::history::{Conversation, Provenance};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -68,16 +106,18 @@ pub const WORKSPACE_REQUIRED_RESUME: &str = "Choose a workspace folder to resume
 /// and none is selected.
 pub const WORKSPACE_REQUIRED_FORK: &str = "Choose a workspace folder to fork this session";
 
-/// Upstream's decision for Claude sessions (`main.rs:1795-1799`), kept for
-/// parity and tests. The GUI uses [`plan_resume`].
+/// Upstream's decision for Claude sessions (`ResumeAction` of
+/// `sources/claude.rs`, before 9799550 `main.rs:1795-1799`), kept for parity
+/// and tests. The GUI uses [`plan_resume`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClaudeResumeAction {
     Run { current_dir: PathBuf },
     CopyToCurrent { cwd_projects_dir: PathBuf },
 }
 
-/// Upstream `resolve_claude_resume_action` (`main.rs:1801-1834`), verbatim
-/// except that `cwd` is explicit and paths come from `env`.
+/// Upstream `resolve_resume_action` (`sources/claude.rs`, before 9799550
+/// `resolve_claude_resume_action` in `main.rs:1801-1834`), verbatim except
+/// that `cwd` is explicit and paths come from `env`.
 ///
 /// * the project path is missing or not a directory, or (`fork_session` and
 ///   the cwd's projects dir differs from the session's): copy into the cwd's
@@ -96,11 +136,12 @@ pub fn resolve_claude_resume_action(
     let cwd_projects_dir = env.claude_projects_dir_for(cwd)?;
     let project_dir = project_path.filter(|p| p.exists() && p.is_dir());
 
-    if project_dir.is_none() || (fork_session && cwd_projects_dir != conv_projects_dir) {
+    let same_projects_dir = |dir: &Path| crate::history::path::same_path(dir, conv_projects_dir);
+    if project_dir.is_none() || (fork_session && !same_projects_dir(&cwd_projects_dir)) {
         return Ok(ClaudeResumeAction::CopyToCurrent { cwd_projects_dir });
     }
 
-    if cwd_projects_dir == conv_projects_dir {
+    if same_projects_dir(&cwd_projects_dir) {
         return Ok(ClaudeResumeAction::Run {
             current_dir: cwd.to_path_buf(),
         });
@@ -108,7 +149,7 @@ pub fn resolve_claude_resume_action(
 
     let project_dir = project_dir.unwrap();
     let project_projects_dir = env.claude_projects_dir_for(project_dir)?;
-    if project_projects_dir == conv_projects_dir {
+    if same_projects_dir(&project_projects_dir) {
         Ok(ClaudeResumeAction::Run {
             current_dir: project_dir.clone(),
         })
@@ -149,66 +190,31 @@ pub enum ResumeStrategy {
     /// Claude: copy the session into the workspace's projects directory,
     /// then resume the copy there (never with `--fork-session`).
     CopyToWorkspace,
-    /// Pi / OMP: the agent's native resume or fork command.
+    /// Pi / OMP / Codex: the agent's native resume or fork command.
     Native,
 }
 
-/// Explicit executable paths (`gui.toml`: `claude_path`, `pi_path`,
-/// `omp_path`). `None` resolves the program through `PATH`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ProgramOverrides {
-    pub claude: Option<PathBuf>,
-    pub pi: Option<PathBuf>,
-    pub omp: Option<PathBuf>,
-}
-
-impl ProgramOverrides {
-    pub fn from_gui_settings(settings: &GuiSettings) -> Self {
-        Self {
-            claude: settings.claude_path.clone(),
-            pi: settings.pi_path.clone(),
-            omp: settings.omp_path.clone(),
-        }
-    }
-
-    pub fn for_source(&self, source: Source) -> Option<&Path> {
-        match source {
-            Source::Claude => self.claude.as_deref(),
-            Source::Pi => self.pi.as_deref(),
-            Source::Omp => self.omp.as_deref(),
-        }
-    }
-}
-
-/// The program name each source resumes with.
-pub fn program_name(source: Source) -> &'static str {
-    match source {
-        Source::Claude => "claude",
-        Source::Pi => "pi",
-        Source::Omp => "omp",
-    }
-}
-
-/// Resolve `name` (`claude`, `pi`, `omp`, ...) to a full path: the override
-/// when given (it must exist), else a `PATH` search with `PATHEXT` on
-/// Windows (W9). [`ResolvedProgram::kind`] tells whether it is a batch
-/// script that must run through `cmd.exe`; [`ResolvedProgram::command`]
-/// spawns either kind with its arguments intact.
-pub fn resolve_program(
-    env: &HistoryEnv,
-    name: &str,
-    override_path: Option<&Path>,
-) -> Result<ResolvedProgram> {
-    env.resolve_program(name, override_path)
-}
-
-/// What a session to resume is: its source, transcript path and recorded
-/// project directory (normally built from a [`Conversation`]).
+/// What a session to resume is: its source, transcript path, recorded
+/// project directory and provenance (normally built from a
+/// [`Conversation`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResumeTarget {
-    pub source: Source,
+    pub source: SourceKind,
     pub path: PathBuf,
     pub project_path: Option<PathBuf>,
+    /// An orphaned conversation cannot be resumed or forked (upstream
+    /// eea6d37).
+    pub provenance: Provenance,
+}
+
+impl ResumeTarget {
+    /// The conversation an adapter acts on.
+    pub fn target(&self) -> Target<'_> {
+        Target {
+            path: &self.path,
+            project: self.project_path.as_deref(),
+        }
+    }
 }
 
 impl From<&Conversation> for ResumeTarget {
@@ -217,6 +223,7 @@ impl From<&Conversation> for ResumeTarget {
             source: conversation.source,
             path: conversation.path.clone(),
             project_path: conversation.project_path.clone(),
+            provenance: conversation.provenance,
         }
     }
 }
@@ -261,16 +268,17 @@ pub struct CopyReport {
 /// A resume or fork, ready to launch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResumePlan {
-    pub source: Source,
+    pub source: SourceKind,
     pub kind: ResumeKind,
     pub strategy: ResumeStrategy,
     /// The session transcript.
     pub session_path: PathBuf,
-    /// Program name: `claude`, `pi` or `omp`.
-    pub program: String,
-    /// Explicit executable path (from [`ProgramOverrides`]).
-    pub program_override: Option<PathBuf>,
-    /// Arguments after the program.
+    /// What starts the agent: its own binary (`claude`, `pi`, `omp`,
+    /// `codex`), a `[gui]` program path or the user's `command` with the
+    /// arguments that precede the agent's (upstream 8a99ccc; the precedence
+    /// is `config::agent_launcher`'s).
+    pub launcher: Launcher,
+    /// The agent's arguments, after the launcher's.
     pub args: Vec<OsString>,
     /// Working directory to run in (`None`: the terminal's default).
     pub cwd: Option<PathBuf>,
@@ -278,17 +286,29 @@ pub struct ResumePlan {
     pub copy: Option<CopyPlan>,
     /// Non-fatal notes for the user (fallback directories, overwrites).
     pub warnings: Vec<String>,
+    /// Environment variables the program runs with (Codex: `CODEX_HOME`).
+    pub env: Vec<(OsString, OsString)>,
 }
 
 impl ResumePlan {
-    /// Resolve the program (override or `PATH`) and build what a terminal
-    /// has to run.
+    /// Resolve the launcher's program (a path, or on the env's `PATH`;
+    /// [`AppError::AgentLaunch`] naming it and where it was configured when
+    /// it is missing) and build what a terminal has to run: the launcher's
+    /// arguments, then the agent's.
     pub fn launch_spec(&self, env: &HistoryEnv) -> Result<LaunchSpec> {
-        let program = env.resolve_program(&self.program, self.program_override.as_deref())?;
+        let program = self.launcher.resolve(env, self.source)?;
+        let args = self
+            .launcher
+            .args
+            .iter()
+            .map(OsString::from)
+            .chain(self.args.iter().cloned())
+            .collect();
         Ok(LaunchSpec {
             program,
-            args: self.args.clone(),
+            args,
             cwd: self.cwd.clone(),
+            env: self.env.clone(),
         })
     }
 
@@ -297,10 +317,14 @@ impl ResumePlan {
         self.copy.as_ref().map(execute_copy).transpose()
     }
 
-    /// The command for display (`claude --resume <id> --fork-session`),
+    /// The command for display (`claude --resume <id> --fork-session`,
+    /// `mise exec -- claude --resume <id>` with a configured command),
     /// POSIX-quoted. Not meant to be executed.
     pub fn display_command(&self) -> String {
-        std::iter::once(self.program.clone())
+        self.launcher
+            .words()
+            .iter()
+            .map(|word| terminal::quote_posix(word))
             .chain(
                 self.args
                     .iter()
@@ -313,53 +337,86 @@ impl ResumePlan {
 
 /// Plan resuming (`fork = false`) or forking `conversation`.
 ///
-/// `workspace` replaces upstream's process cwd; `default_args` are
-/// `[resume].default_args` (Claude only); `programs` holds explicit
-/// executable paths. See the module docs for the decision rules.
+/// `workspace` replaces upstream's process cwd; `launch` is how the agent
+/// starts (upstream 8a99ccc: the launcher, and `[resume].default_args` for
+/// Claude or `[resume.codex].default_args` for Codex;
+/// `config::LayeredConfig::launch`). See the module docs for the decision
+/// rules. Planning does not look the program up: check it first
+/// ([`Launcher::check`], as upstream's CLI and TUI do before a session copy)
+/// or let [`ResumePlan::launch_spec`] report it.
 pub fn plan_resume(
     env: &HistoryEnv,
     conversation: &Conversation,
     workspace: Option<&WorkspaceScope>,
     fork: bool,
-    default_args: &[String],
-    programs: &ProgramOverrides,
+    launch: &Launch,
 ) -> Result<ResumePlan> {
     plan_resume_target(
         env,
         &ResumeTarget::from(conversation),
         workspace,
         fork,
-        default_args,
-        programs,
+        launch,
     )
 }
 
 /// [`plan_resume`] for a session given by path (for example a JSONL file
 /// that is not part of the loaded list).
+///
+/// The adapter of the target's source plans it (`Adapter::resume`), after
+/// checking that the conversation supports the action
+/// (`history::actions::capabilities_of`; otherwise upstream's `Failed to run
+/// Claude CLI: Resuming <source> sessions is not supported`, or `... is
+/// unavailable: ...` for an orphaned conversation).
 pub fn plan_resume_target(
     env: &HistoryEnv,
     target: &ResumeTarget,
     workspace: Option<&WorkspaceScope>,
     fork: bool,
-    default_args: &[String],
-    programs: &ProgramOverrides,
+    launch: &Launch,
 ) -> Result<ResumePlan> {
-    let kind = ResumeKind::from_fork(fork);
-    let program_override = programs.for_source(target.source).map(Path::to_path_buf);
-    match target.source {
-        Source::Claude => plan_claude(env, target, workspace, kind, default_args, program_override),
-        Source::Pi | Source::Omp => Ok(plan_native(target, workspace, kind, program_override)),
+    let source = target.source;
+    let capabilities = actions::capabilities_of(source, target.provenance);
+    if !(if fork {
+        capabilities.fork
+    } else {
+        capabilities.resume
+    }) {
+        let doing = if fork { "Forking" } else { "Resuming" };
+        return Err(AppError::ClaudeExecutionError(actions::refusal(
+            source,
+            target.provenance,
+            doing,
+        )));
     }
+    let adapter = Registry::from_env(env).for_path(source, &target.path);
+    adapter.resume(env, target.target(), workspace, fork, launch)
 }
 
-fn plan_claude(
+/// The Claude adapter's resume plan (see the module docs for its rules).
+pub(crate) fn plan_claude(
     env: &HistoryEnv,
-    target: &ResumeTarget,
+    target: Target<'_>,
     workspace: Option<&WorkspaceScope>,
     kind: ResumeKind,
-    default_args: &[String],
-    program_override: Option<PathBuf>,
+    launch: &Launch,
 ) -> Result<ResumePlan> {
+    let default_args = &launch.default_args;
+    // A sidecar (a subagent or `/btw` fork) is resumed through the session
+    // that holds it (upstream 3c2ffeb).
+    let parent = crate::history::sources::claude::parent_transcript(target.path);
+    if let Some(parent) = &parent
+        && !parent.is_file()
+    {
+        return Err(AppError::ClaudeExecutionError(format!(
+            "The session holding this transcript no longer exists: {}",
+            parent.display()
+        )));
+    }
+    let target = Target {
+        path: parent.as_deref().unwrap_or(target.path),
+        project: target.project,
+    };
     let conversation_id = target
         .path
         .file_stem()
@@ -371,14 +428,13 @@ fn plan_claude(
     // A stray `..jsonl` (stem `.`) or `abc..jsonl` (stem `abc.`, a Windows
     // alias of `abc`) is not a session: `--resume .` is meaningless and the
     // copy below would treat the whole project directory as the session's.
-    if !is_session_transcript(&target.path, &conversation_id) {
-        return Err(not_a_session_transcript(&target.path));
+    if !is_session_transcript(target.path, &conversation_id) {
+        return Err(not_a_session_transcript(target.path));
     }
     let conv_projects_dir = target.path.parent().ok_or_else(no_project_dir_error)?;
 
     let project_dir = target
-        .project_path
-        .as_deref()
+        .project
         .filter(|path| path.is_dir())
         .map(Path::to_path_buf);
     let project_maps = match &project_dir {
@@ -437,7 +493,7 @@ fn plan_claude(
     let copy = if strategy == ResumeStrategy::CopyToWorkspace {
         let target_dir = workspace_projects_dir.expect("strategy implies a workspace");
         let plan = plan_session_copy(
-            &target.path,
+            target.path,
             &conversation_id,
             conv_projects_dir,
             &target_dir,
@@ -461,68 +517,116 @@ fn plan_claude(
     args.extend(default_args.iter().map(OsString::from));
 
     Ok(ResumePlan {
-        source: Source::Claude,
+        source: SourceKind::Claude,
         kind,
         strategy,
-        session_path: target.path.clone(),
-        program: program_name(Source::Claude).to_string(),
-        program_override,
+        session_path: target.path.to_path_buf(),
+        launcher: launch.launcher.clone(),
         args,
         cwd: Some(cwd),
         copy,
         warnings,
+        env: Vec::new(),
     })
 }
 
-/// Upstream `build_pi_resume_command` / `build_omp_resume_command`
-/// (`main.rs:1860-1886`) as data. Resume runs in the session's project
-/// directory; fork inherited upstream's cwd, which is the workspace here.
-fn plan_native(
-    target: &ResumeTarget,
+/// The Pi adapter's resume plan for a `source` (Pi or OMP) session: upstream
+/// `build_pi_resume_command` / `build_omp_resume_command` (`sources/pi.rs`,
+/// before 9799550 `main.rs:1860-1886`) as data. Resume runs in the session's
+/// project directory; fork inherited upstream's cwd, which is the workspace
+/// here.
+pub(crate) fn plan_native(
+    source: SourceKind,
+    target: Target<'_>,
     workspace: Option<&WorkspaceScope>,
     kind: ResumeKind,
-    program_override: Option<PathBuf>,
+    launcher: &Launcher,
 ) -> ResumePlan {
-    let flag = match (target.source, kind) {
+    let flag = match (source, kind) {
         (_, ResumeKind::Fork) => "--fork",
-        (Source::Omp, ResumeKind::Resume) => "--resume",
+        (SourceKind::Omp, ResumeKind::Resume) => "--resume",
         (_, ResumeKind::Resume) => "--session",
     };
-    let existing_project = target.project_path.as_deref().filter(|path| path.is_dir());
-    let existing_workspace = workspace
-        .map(WorkspaceScope::dir)
-        .filter(|dir| dir.is_dir());
     let mut warnings = Vec::new();
     let cwd = match kind {
-        ResumeKind::Resume => {
-            if let Some(project) = existing_project {
-                Some(project.to_path_buf())
-            } else {
-                if let Some(project) = &target.project_path {
-                    warnings.push(format!(
-                        "Session directory {} does not exist",
-                        project.display()
-                    ));
-                }
-                existing_workspace.map(Path::to_path_buf)
-            }
-        }
-        ResumeKind::Fork => existing_workspace
-            .or(existing_project)
+        ResumeKind::Resume => project_or_workspace(target, workspace, &mut warnings),
+        ResumeKind::Fork => existing_dir(workspace.map(WorkspaceScope::dir))
+            .or(existing_dir(target.project))
             .map(Path::to_path_buf),
     };
     ResumePlan {
-        source: target.source,
+        source,
         kind,
         strategy: ResumeStrategy::Native,
-        session_path: target.path.clone(),
-        program: program_name(target.source).to_string(),
-        program_override,
-        args: vec![OsString::from(flag), target.path.clone().into_os_string()],
+        session_path: target.path.to_path_buf(),
+        launcher: launcher.clone(),
+        args: vec![OsString::from(flag), target.path.as_os_str().to_os_string()],
         cwd,
         copy: None,
         warnings,
+        env: Vec::new(),
     }
+}
+
+/// The Codex adapter's resume plan: upstream's `codex [default_args]
+/// resume|fork <thread id>` (`CodexAdapter::resume`, eea6d37) as data, with
+/// `CODEX_HOME` set to the Codex home of the thread's rollout (else `home`,
+/// the adapter's). Resume and fork both run in the thread's project
+/// directory, as upstream; when it is gone, in the workspace (upstream: its
+/// process cwd), with a warning.
+pub(crate) fn plan_codex(
+    target: Target<'_>,
+    home: &Path,
+    workspace: Option<&WorkspaceScope>,
+    kind: ResumeKind,
+    launch: &Launch,
+) -> Result<ResumePlan> {
+    let thread_id = crate::history::sources::codex::thread_id_of(target.path)?;
+    let mut warnings = Vec::new();
+    let cwd = project_or_workspace(target, workspace, &mut warnings);
+    let mut args: Vec<OsString> = launch.default_args.iter().map(OsString::from).collect();
+    args.push(OsString::from(if kind.is_fork() {
+        "fork"
+    } else {
+        "resume"
+    }));
+    args.push(OsString::from(thread_id));
+    Ok(ResumePlan {
+        source: SourceKind::Codex,
+        kind,
+        strategy: ResumeStrategy::Native,
+        session_path: target.path.to_path_buf(),
+        launcher: launch.launcher.clone(),
+        args,
+        cwd,
+        copy: None,
+        warnings,
+        env: crate::history::sources::codex::codex_env(target.path, home),
+    })
+}
+
+/// `dir`, when it is an existing directory.
+fn existing_dir(dir: Option<&Path>) -> Option<&Path> {
+    dir.filter(|dir| dir.is_dir())
+}
+
+/// The session's own directory when it exists, else the workspace (with a
+/// warning naming the missing directory), else none.
+fn project_or_workspace(
+    target: Target<'_>,
+    workspace: Option<&WorkspaceScope>,
+    warnings: &mut Vec<String>,
+) -> Option<PathBuf> {
+    if let Some(project) = existing_dir(target.project) {
+        return Some(project.to_path_buf());
+    }
+    if let Some(project) = target.project {
+        warnings.push(format!(
+            "Session directory {} does not exist",
+            project.display()
+        ));
+    }
+    existing_dir(workspace.map(WorkspaceScope::dir)).map(Path::to_path_buf)
 }
 
 /// Whether `path` is the transcript `<session id>.jsonl` of `session_id`
@@ -636,7 +740,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 /// Whether two directory paths name the same directory: equal as given, or
 /// equal once canonicalized (both must exist for the latter).
 fn same_dir(left: &Path, right: &Path) -> bool {
-    left == right || same_file(left, right)
+    crate::history::path::same_path(left, right) || same_file(left, right)
 }
 
 /// Whether two existing paths resolve to the same file system object.
@@ -674,7 +778,6 @@ pub struct LaunchReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsStr;
 
     const UUID: &str = "12345678-1234-4234-9234-123456789abc";
 
@@ -707,9 +810,10 @@ mod tests {
 
         fn target(&self, path: &Path, project: Option<&Path>) -> ResumeTarget {
             ResumeTarget {
-                source: Source::Claude,
+                source: SourceKind::Claude,
                 path: path.to_path_buf(),
                 project_path: project.map(Path::to_path_buf),
+                provenance: Provenance::default(),
             }
         }
 
@@ -721,14 +825,11 @@ mod tests {
             default_args: &[String],
         ) -> Result<ResumePlan> {
             let workspace = workspace.map(|dir| WorkspaceScope::new(dir).unwrap());
-            plan_resume_target(
-                &self.env,
-                target,
-                workspace.as_ref(),
-                fork,
-                default_args,
-                &ProgramOverrides::default(),
-            )
+            let launch = Launch {
+                launcher: Launcher::default_for(target.source),
+                default_args: default_args.to_vec(),
+            };
+            plan_resume_target(&self.env, target, workspace.as_ref(), fork, &launch)
         }
     }
 
@@ -746,7 +847,28 @@ mod tests {
         args.iter().map(OsString::from).collect()
     }
 
-    // --- Upstream tests (main.rs:1716-1785), with a sandbox env. ---
+    // --- Upstream tests (`sources/claude.rs`, before 9799550
+    // `main.rs:1716-1785`), with a sandbox env. ---
+
+    #[cfg(windows)]
+    #[test]
+    fn claude_resume_ignores_case_only_projects_dir_mismatch() {
+        let sandbox = Sandbox::new();
+        let cwd = sandbox.dir("cwd");
+        let selected_path = sandbox
+            .env
+            .claude_projects_dir_for(&cwd)
+            .unwrap()
+            .join(format!("{UUID}.jsonl"));
+        let upper = PathBuf::from(cwd.to_string_lossy().to_uppercase());
+        let action =
+            resolve_claude_resume_action(&sandbox.env, &selected_path, Some(&cwd), &upper, false)
+                .unwrap();
+        assert!(
+            matches!(action, ClaudeResumeAction::Run { .. }),
+            "{action:?}"
+        );
+    }
 
     #[test]
     fn resume_action_uses_cwd_when_it_maps_to_selected_project_dir() {
@@ -822,7 +944,8 @@ mod tests {
         );
     }
 
-    // --- Upstream Pi/OMP command tests (main.rs:568-605) as plans. ---
+    // --- Upstream Pi/OMP command tests (`sources/pi.rs`, before 9799550
+    // `main.rs:568-605`) as plans. ---
 
     #[test]
     fn pi_resume_and_fork_commands_use_native_paths_without_claude_defaults() {
@@ -834,14 +957,15 @@ mod tests {
             .join("pi sessions")
             .join("session.jsonl");
         let target = ResumeTarget {
-            source: Source::Pi,
+            source: SourceKind::Pi,
             path: path.clone(),
             project_path: Some(cwd.clone()),
+            provenance: Provenance::default(),
         };
         let defaults = vec!["--model".to_string(), "opus".to_string()];
 
         let resume = sandbox.plan(&target, None, false, &defaults).unwrap();
-        assert_eq!(resume.program, "pi");
+        assert_eq!(resume.launcher, Launcher::default_for(SourceKind::Pi));
         assert_eq!(
             resume.args,
             vec![OsString::from("--session"), path.clone().into_os_string()]
@@ -871,13 +995,14 @@ mod tests {
             .join("omp sessions")
             .join("session.jsonl");
         let target = ResumeTarget {
-            source: Source::Omp,
+            source: SourceKind::Omp,
             path: path.clone(),
             project_path: Some(cwd.clone()),
+            provenance: Provenance::default(),
         };
 
         let resume = sandbox.plan(&target, Some(&workspace), false, &[]).unwrap();
-        assert_eq!(resume.program, "omp");
+        assert_eq!(resume.launcher.program, Path::new("omp"));
         assert_eq!(
             resume.args,
             vec![OsString::from("--resume"), path.clone().into_os_string()]
@@ -899,9 +1024,10 @@ mod tests {
         let workspace = sandbox.dir("workspace");
         let gone = sandbox.root.path().join("gone");
         let target = ResumeTarget {
-            source: Source::Pi,
+            source: SourceKind::Pi,
             path: sandbox.root.path().join("s.jsonl"),
             project_path: Some(gone.clone()),
+            provenance: Provenance::default(),
         };
 
         let plan = sandbox.plan(&target, Some(&workspace), false, &[]).unwrap();
@@ -911,6 +1037,102 @@ mod tests {
 
         let plan = sandbox.plan(&target, None, false, &[]).unwrap();
         assert_eq!(plan.cwd, None);
+    }
+
+    /// Upstream eea6d37: `codex [[resume.codex] default_args] resume|fork
+    /// <thread id>` in the thread's project, with `CODEX_HOME` set to the
+    /// rollout's home.
+    #[test]
+    fn codex_threads_resume_and_fork_through_the_codex_cli() {
+        const THREAD: &str = "01a00000-0000-7000-8000-000000000002";
+        let sandbox = Sandbox::new();
+        let home = sandbox.root.path().join("codex home");
+        let day = home.join("sessions").join("2026").join("09").join("01");
+        std::fs::create_dir_all(&day).unwrap();
+        let rollout = day.join(format!("rollout-2026-09-01T10-00-00-{THREAD}.jsonl"));
+        std::fs::write(&rollout, "{}\n").unwrap();
+        let project = sandbox.dir("project");
+        let workspace = sandbox.dir("workspace");
+        let target = ResumeTarget {
+            source: SourceKind::Codex,
+            path: rollout.clone(),
+            project_path: Some(project.clone()),
+            provenance: Provenance::default(),
+        };
+        let codex_home = vec![(OsString::from("CODEX_HOME"), home.clone().into_os_string())];
+
+        let resume = sandbox
+            .plan(&target, Some(&workspace), false, &["--yolo".to_string()])
+            .unwrap();
+        assert_eq!(resume.launcher.program, Path::new("codex"));
+        assert_eq!(resume.args, os(&["--yolo", "resume", THREAD]));
+        assert_eq!(resume.cwd, Some(project.clone()));
+        assert_eq!(resume.strategy, ResumeStrategy::Native);
+        assert_eq!(resume.env, codex_home);
+        assert!(resume.copy.is_none() && resume.warnings.is_empty());
+        assert_eq!(
+            resume.display_command(),
+            format!("codex --yolo resume {THREAD}")
+        );
+
+        // Fork runs in the project too (upstream's command for both).
+        let fork = sandbox.plan(&target, Some(&workspace), true, &[]).unwrap();
+        assert_eq!(fork.args, os(&["fork", THREAD]));
+        assert_eq!(fork.cwd, Some(project));
+
+        // A project that is gone: the workspace, with a warning.
+        let gone = sandbox.root.path().join("gone");
+        let moved = ResumeTarget {
+            project_path: Some(gone.clone()),
+            ..target.clone()
+        };
+        let plan = sandbox.plan(&moved, Some(&workspace), false, &[]).unwrap();
+        assert_eq!(plan.cwd, Some(workspace.clone()));
+        assert_eq!(plan.warnings.len(), 1);
+        assert!(plan.warnings[0].contains(&gone.display().to_string()));
+
+        // `[gui] codex_path` and `CODEX_HOME` reach the launch spec.
+        let codex = sandbox.dir("bin").join("codex.exe");
+        executable(&codex, "");
+        let launch = Launch {
+            launcher: Launcher::program_path(
+                &sandbox.env,
+                &codex,
+                actions::ConfiguredAt::GuiPath("codex_path"),
+            ),
+            default_args: Vec::new(),
+        };
+        let plan = plan_resume_target(&sandbox.env, &target, None, false, &launch).unwrap();
+        let spec = plan.launch_spec(&sandbox.env).unwrap();
+        assert_eq!(spec.program.path, codex);
+        assert_eq!(spec.env, codex_home);
+
+        // An orphaned thread is refused, with upstream's text.
+        let orphaned = ResumeTarget {
+            provenance: Provenance {
+                orphaned: true,
+                ..Provenance::default()
+            },
+            ..target.clone()
+        };
+        for (fork, doing) in [(false, "Resuming"), (true, "Forking")] {
+            let error = sandbox.plan(&orphaned, None, fork, &[]).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Failed to run Claude CLI: {doing} is unavailable: CX no longer has this \
+                     conversation's current history"
+                )
+            );
+        }
+
+        // A file that is not a rollout.
+        let stray = ResumeTarget {
+            path: sandbox.root.path().join("notes.jsonl"),
+            ..target
+        };
+        let error = sandbox.plan(&stray, None, false, &[]).unwrap_err();
+        assert!(error.to_string().contains("not a Codex rollout"), "{error}");
     }
 
     // --- GUI semantics for Claude. ---
@@ -933,7 +1155,7 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(plan.strategy, ResumeStrategy::InProject);
-            assert_eq!(plan.program, "claude");
+            assert_eq!(plan.launcher.program, Path::new("claude"));
             assert_eq!(plan.cwd, Some(project.clone()));
             assert_eq!(plan.args, os(&["--resume", UUID, "--model", "opus"]));
             assert!(plan.copy.is_none());
@@ -1210,9 +1432,10 @@ mod tests {
         let sandbox = Sandbox::new();
         let workspace = sandbox.dir("workspace");
         let root_only = ResumeTarget {
-            source: Source::Claude,
+            source: SourceKind::Claude,
             path: PathBuf::from("/"),
             project_path: None,
+            provenance: Provenance::default(),
         };
         let error = sandbox
             .plan(&root_only, Some(&workspace), false, &[])
@@ -1300,42 +1523,202 @@ mod tests {
         assert!(!workspace_dir.join("other-session").exists());
     }
 
+    /// A file the launcher can run (the executable bit on Unix).
+    fn executable(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
     #[test]
-    fn program_overrides_flow_into_the_plan_and_launch_spec() {
+    fn program_paths_flow_into_the_plan_and_launch_spec() {
         let sandbox = Sandbox::new();
         let project = sandbox.dir("project");
         let session = sandbox.session_in(&project);
         let bin = sandbox.dir("bin");
         let claude = bin.join("claude.cmd");
-        std::fs::write(&claude, "@echo off\n").unwrap();
-        let programs = ProgramOverrides {
-            claude: Some(claude.clone()),
-            ..ProgramOverrides::default()
+        executable(&claude, "@echo off\n");
+        let launch = Launch {
+            launcher: Launcher::program_path(
+                &sandbox.env,
+                &claude,
+                actions::ConfiguredAt::GuiPath("claude_path"),
+            ),
+            default_args: Vec::new(),
         };
         let plan = plan_resume_target(
             &sandbox.env,
             &sandbox.target(&session, Some(&project)),
             None,
             false,
-            &[],
-            &programs,
+            &launch,
         )
         .unwrap();
-        assert_eq!(plan.program_override, Some(claude.clone()));
+        assert_eq!(plan.launcher.program, claude);
         let spec = plan.launch_spec(&sandbox.env).unwrap();
         assert_eq!(spec.program.path, claude);
         assert_eq!(spec.program.kind, crate::program::ProgramKind::BatchScript);
+        assert_eq!(spec.args, os(&["--resume", UUID]));
         assert_eq!(spec.cwd, Some(project));
 
-        // Without an override and with no PATH, resolution fails cleanly.
+        // The agent's own binary and no PATH: upstream 8a99ccc's error,
+        // which names the program and where to set a command.
         let plain = ResumePlan {
-            program_override: None,
+            launcher: Launcher::default_for(SourceKind::Claude),
             ..plan
         };
         let error = plain.launch_spec(&sandbox.env).unwrap_err();
+        assert!(matches!(error, AppError::AgentLaunch(_)), "{error:?}");
         assert!(
-            error.to_string().contains("Could not find 'claude'"),
+            error
+                .to_string()
+                .starts_with("Cannot start agent: `claude` was not found on PATH; "),
             "{error}"
+        );
+    }
+
+    /// Upstream 8a99ccc (`sources/claude.rs`): the configured command and
+    /// its arguments come first, the agent's arguments and `default_args`
+    /// after them.
+    #[test]
+    fn resume_runs_the_configured_command() {
+        let sandbox = Sandbox::new();
+        let project = sandbox.dir("project");
+        let session = sandbox.session_in(&project);
+        let bin = sandbox.dir("bin");
+        let nix = bin.join(if cfg!(windows) { "nix.exe" } else { "nix" });
+        executable(&nix, "");
+        let mut env = sandbox.env.clone();
+        env.path_var = Some(bin.clone().into_os_string());
+        let launch = Launch {
+            launcher: Launcher::configured(
+                &env,
+                &["nix", "run", ".#claude", "--"].map(String::from),
+                actions::ConfiguredAt::Config("[resume]"),
+            ),
+            default_args: vec!["--verbose".to_owned()],
+        };
+
+        let plan = plan_resume_target(
+            &env,
+            &sandbox.target(&session, Some(&project)),
+            None,
+            true,
+            &launch,
+        )
+        .unwrap();
+
+        assert!(plan.copy.is_none());
+        assert_eq!(
+            plan.args,
+            os(&["--resume", UUID, "--fork-session", "--verbose"])
+        );
+        let spec = plan.launch_spec(&env).unwrap();
+        assert_eq!(spec.program.path, nix);
+        assert_eq!(
+            spec.args,
+            os(&[
+                "run",
+                ".#claude",
+                "--",
+                "--resume",
+                UUID,
+                "--fork-session",
+                "--verbose"
+            ])
+        );
+        assert_eq!(
+            plan.display_command(),
+            format!("nix run '.#claude' -- --resume {UUID} --fork-session --verbose")
+        );
+
+        // A missing configured program names its key.
+        let missing = Launcher::configured(
+            &env,
+            &["not-installed".to_owned()],
+            actions::ConfiguredAt::Gui("[resume]"),
+        );
+        let error = missing.check(&env, SourceKind::Claude).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Cannot start agent: `not-installed` was not found on PATH; check `command` under \
+             [resume] in gui.toml"
+        );
+    }
+
+    /// Upstream 8a99ccc (`sources/pi.rs`, `sources/codex/tests.rs`): Pi,
+    /// OMP and Codex start through their launchers too, Codex's
+    /// `default_args` after the launcher's arguments.
+    #[test]
+    fn pi_omp_and_codex_resume_through_their_launchers() {
+        let sandbox = Sandbox::new();
+        let project = sandbox.dir("project");
+        let path = sandbox.root.path().join("session.jsonl");
+        let launch = |words: &[&str], table| Launch {
+            launcher: Launcher::configured(
+                &sandbox.env,
+                &words
+                    .iter()
+                    .map(|word| word.to_string())
+                    .collect::<Vec<_>>(),
+                actions::ConfiguredAt::Config(table),
+            ),
+            default_args: vec!["--ignored".to_owned()],
+        };
+        for (source, table, flag) in [
+            (SourceKind::Pi, "[resume.pi]", "--session"),
+            (SourceKind::Omp, "[resume.omp]", "--resume"),
+        ] {
+            let target = ResumeTarget {
+                source,
+                path: path.clone(),
+                project_path: Some(project.clone()),
+                provenance: Provenance::default(),
+            };
+            let plan = plan_resume_target(
+                &sandbox.env,
+                &target,
+                None,
+                false,
+                &launch(&["mise", "exec", "--", source.label()], table),
+            )
+            .unwrap();
+            assert_eq!(plan.launcher.args, ["exec", "--", source.label()]);
+            assert_eq!(
+                plan.args,
+                vec![OsString::from(flag), path.clone().into_os_string()]
+            );
+            assert_eq!(
+                plan.display_command()
+                    .split(' ')
+                    .take(5)
+                    .collect::<Vec<_>>(),
+                ["mise", "exec", "--", source.label(), flag]
+            );
+        }
+
+        const THREAD: &str = "01a00000-0000-7000-8000-000000000002";
+        let day = sandbox.root.path().join("codex/sessions/2026/09/01");
+        std::fs::create_dir_all(&day).unwrap();
+        let rollout = day.join(format!("rollout-2026-09-01T10-00-00-{THREAD}.jsonl"));
+        std::fs::write(&rollout, "{}\n").unwrap();
+        let target = ResumeTarget {
+            source: SourceKind::Codex,
+            path: rollout,
+            project_path: Some(project),
+            provenance: Provenance::default(),
+        };
+        let mut codex = launch(&["codex-wrapper", "--profile", "work"], "[resume.codex]");
+        codex.default_args = vec!["--yolo".to_owned()];
+        let fork = plan_resume_target(&sandbox.env, &target, None, true, &codex).unwrap();
+        assert_eq!(fork.launcher.program, Path::new("codex-wrapper"));
+        assert_eq!(fork.args, os(&["--yolo", "fork", THREAD]));
+        assert_eq!(
+            fork.display_command(),
+            format!("codex-wrapper --profile work --yolo fork {THREAD}")
         );
     }
 
@@ -1356,8 +1739,7 @@ mod tests {
             &conversation,
             None,
             false,
-            &[],
-            &ProgramOverrides::default(),
+            &Launch::default_for(SourceKind::Claude),
         )
         .unwrap();
         assert_eq!(plan.session_path, session);
@@ -1368,12 +1750,11 @@ mod tests {
     #[test]
     fn display_command_quotes_arguments() {
         let plan = ResumePlan {
-            source: Source::Pi,
+            source: SourceKind::Pi,
             kind: ResumeKind::Resume,
             strategy: ResumeStrategy::Native,
             session_path: PathBuf::from("/tmp/pi sessions/s.jsonl"),
-            program: "pi".to_string(),
-            program_override: None,
+            launcher: Launcher::default_for(SourceKind::Pi),
             args: vec![
                 OsString::from("--session"),
                 OsString::from("/tmp/pi sessions/it's.jsonl"),
@@ -1381,14 +1762,26 @@ mod tests {
             cwd: None,
             copy: None,
             warnings: Vec::new(),
+            env: Vec::new(),
         };
         assert_eq!(
             plan.display_command(),
             "pi --session '/tmp/pi sessions/it'\\''s.jsonl'"
         );
-        assert_eq!(
-            program_name(Source::Omp),
-            OsStr::new("omp").to_str().unwrap()
+        let wrapped = ResumePlan {
+            launcher: Launcher {
+                program: PathBuf::from("/opt/my tools/pi"),
+                args: vec!["--profile".into(), "a b".into()],
+                configured_at: None,
+            },
+            ..plan
+        };
+        assert!(
+            wrapped
+                .display_command()
+                .starts_with("'/opt/my tools/pi' --profile 'a b' --session "),
+            "{}",
+            wrapped.display_command()
         );
     }
 }

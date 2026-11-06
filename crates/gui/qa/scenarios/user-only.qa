@@ -1,0 +1,26 @@
+# user-only.qa (upstream ae7ae39): Alt+U limits list search to what the
+# person typed and keeps the query; the View menu action toggles it back
+# (FEATURES S-039, C-070). In the qa-home corpus "refresh" is in one user
+# message (the token refresh session) and in another session's assistant
+# reply only.
+wait-loaded 30s
+expect list.user_only == false
+type "refresh"
+wait 50ms
+wait-for list.searching == false 10s
+expect list.count == 2
+key alt-u
+wait 50ms
+wait-for list.searching == false 10s
+expect list.user_only == true
+expect list.query == "refresh"
+expect list.count == 1
+expect list.selected_title contains "Token refresh"
+shot list-user-only
+action history::ToggleUserOnly
+wait 50ms
+wait-for list.searching == false 10s
+expect list.user_only == false
+expect list.query == "refresh"
+expect list.count == 2
+quit 0

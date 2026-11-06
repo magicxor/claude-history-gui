@@ -6,7 +6,7 @@
 //! the §5.7 pattern and executes with `execute_session_delete`. The deleted
 //! transcripts are broadcast (§11.15).
 
-use claude_history_core::history::Source;
+use claude_history_core::history::model::SourceKind;
 use claude_history_core::maintenance::{
     DeletePlan, SessionCopyFiles, delete_by_uuid_message, execute_session_delete,
     find_session_copies, plan_session_delete,
@@ -195,7 +195,8 @@ impl DeleteByIdDialog {
         self.busy = true;
         let env = (*app_state(cx).env).clone();
         let rx = spawn_thread("delete-by-id-plan", move || {
-            plan_session_delete(&env, &first, Source::Claude).map_err(|error| error_text(&error))
+            plan_session_delete(&env, &first, SourceKind::Claude)
+                .map_err(|error| error_text(&error))
         });
         self._task = Some(cx.spawn_in(window, async move |this, cx| {
             if let Ok(result) = rx.recv().await {
@@ -235,8 +236,11 @@ impl DeleteByIdDialog {
                 gone.update(cx, |this, _| this.shown_confirm = None).ok();
             })
             .description(format!(
-                "These will be removed from disk ({copies} cop{}). This can't be undone.",
-                if copies == 1 { "y" } else { "ies" }
+                "These will be removed from disk ({copies} cop{}). {}This can't be undone.",
+                if copies == 1 { "y" } else { "ies" },
+                crate::ops::delete::kept_forks_note(&plan)
+                    .map(|note| format!("{note} "))
+                    .unwrap_or_default()
             ))
             .width_rem(40.0)
             .body(move |_, _| {

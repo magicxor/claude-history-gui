@@ -1,5 +1,5 @@
 use crate::agent::refs::MessageRange;
-use serde::{Deserialize, Serialize};
+use crate::semantic::matrix::{EmbeddingKey, EmbeddingMatrix};
 use std::collections::HashMap;
 use std::sync::{
     Arc,
@@ -9,11 +9,15 @@ use std::sync::{
 pub const DEFAULT_CHUNK_TARGET_CHARS: usize = 2_400;
 pub const DEFAULT_CHUNK_OVERLAP_CHARS: usize = 300;
 pub const DEFAULT_CHUNK_CONTEXT_TURNS: usize = 1;
-pub const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 32;
+/// Passages handed to the embedder per call, between progress reports and
+/// cancellation checks.
+pub const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 64;
+/// Passages per model inference batch.
+pub const MODEL_BATCH_SIZE: usize = 8;
 pub const MAX_GLOBAL_INTERACTIVE_PASSAGE_EMBEDDINGS: usize = 0;
 pub const MAX_WITHIN_INTERACTIVE_PASSAGE_EMBEDDINGS: usize = 32;
-pub const CACHE_SCHEMA_VERSION: u32 = 7;
-pub const MODEL_NAME: &str = "BGESmallENV15";
+pub const CACHE_SCHEMA_VERSION: u32 = 8;
+pub const MODEL_NAME: &str = "SnowflakeArcticEmbedXS";
 
 #[derive(Clone, Debug, Default)]
 pub struct SemanticCancellationToken {
@@ -89,7 +93,50 @@ pub struct EmbeddedChunk {
     pub chunk_index: usize,
     pub text: String,
     pub message_range: MessageRange,
-    pub embedding: Vec<f32>,
+    pub embedding: Embedding,
+}
+
+/// A passage embedding, either computed in this process or a row of the
+/// mapped embedding matrix.
+#[derive(Clone)]
+pub enum Embedding {
+    Owned(Arc<[f32]>),
+    Mapped(Arc<EmbeddingMatrix>, u32),
+}
+
+impl std::ops::Deref for Embedding {
+    type Target = [f32];
+
+    fn deref(&self) -> &[f32] {
+        match self {
+            Self::Owned(values) => values,
+            Self::Mapped(matrix, row) => matrix.vector(*row),
+        }
+    }
+}
+
+impl From<Vec<f32>> for Embedding {
+    fn from(values: Vec<f32>) -> Self {
+        Self::Owned(values.into())
+    }
+}
+
+impl PartialEq for Embedding {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl PartialEq<Vec<f32>> for Embedding {
+    fn eq(&self, other: &Vec<f32>) -> bool {
+        **self == **other
+    }
+}
+
+impl std::fmt::Debug for Embedding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -176,20 +223,17 @@ impl SemanticHit {
     }
 }
 
-#[derive(Serialize, Deserialize)]
 pub struct EmbeddingCache {
-    pub schema_version: u32,
-    pub model: String,
     pub chunk_target_chars: usize,
     pub chunk_overlap_chars: usize,
     pub chunk_context_turns: usize,
     pub access_counter: u64,
-    pub entries: HashMap<String, CachedChunk>,
+    pub entries: HashMap<EmbeddingKey, CachedChunk>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CachedChunk {
-    pub embedding: Vec<f32>,
+    pub embedding: Embedding,
     pub last_used: u64,
     pub protected: bool,
 }

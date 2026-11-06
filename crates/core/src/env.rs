@@ -2,7 +2,8 @@
 //! environment (refactor R1).
 //!
 //! Upstream `claude-history` read `HOME`/`USERPROFILE`, `CLAUDE_CONFIG_DIR`,
-//! the Pi/OMP variables and the process working directory from many places.
+//! the Pi/OMP and Codex variables and the process working directory from
+//! many places.
 //! In core every such read goes through a [`HistoryEnv`] value instead:
 //!
 //! * the GUI builds one with [`HistoryEnv::from_process_env`] in `main` and
@@ -10,7 +11,8 @@
 //!   GUI has no meaningful process cwd, so core never calls
 //!   `std::env::current_dir()`);
 //! * tests build one with [`HistoryEnv::sandbox`], which keeps every path
-//!   (Claude data, Pi/OMP sessions, caches, config, logs) under a temporary
+//!   (Claude data, Pi/OMP sessions, the Codex home, caches, config, logs)
+//!   under a temporary
 //!   directory. `from_process_env` panics under `cfg(test)` so a test can
 //!   never reach the real home directory by accident.
 //!
@@ -20,7 +22,8 @@
 //! | What | Default |
 //! |---|---|
 //! | Claude data | `$CLAUDE_CONFIG_DIR` (absolute only) or `~/.claude` |
-//! | caches (history, Pi/OMP, semantic embeddings, fastembed model) | `~/.cache/claude-history-gui` |
+//! | Codex home (read-only) | `$CODEX_HOME` or `~/.codex`; its state database in `config.toml`'s `sqlite_home`, else `$CODEX_SQLITE_HOME`, else the home |
+//! | caches (the list's store, semantic embeddings, fastembed model) | `~/.cache/claude-history-gui` |
 //! | CLI config (read-only, shared settings) | `~/.config/claude-history/config.toml` |
 //! | GUI config (GUI settings and overrides) | `~/.config/claude-history/gui.toml` |
 //! | debug log | `~/.local/state/claude-history-gui/debug.log` |
@@ -32,6 +35,9 @@ use std::path::{Component, Path, PathBuf, Prefix};
 
 /// Directory name of this crate's cache root under `~/.cache`.
 pub const CACHE_DIR_NAME: &str = "claude-history-gui";
+/// Directory name of the installed CLI's cache root under `~/.cache`, which
+/// core never deletes from ([`HistoryEnv::cli_cache_root`]).
+pub const CLI_CACHE_DIR_NAME: &str = "claude-history";
 /// Directory name of the debug-log state directory under `~/.local/state`.
 pub const STATE_DIR_NAME: &str = "claude-history-gui";
 /// Directory name of the (CLI-shared) config directory under `~/.config`.
@@ -40,8 +46,12 @@ pub const CONFIG_DIR_NAME: &str = "claude-history";
 pub const CLI_CONFIG_FILE_NAME: &str = "config.toml";
 /// File name of the GUI's own config file.
 pub const GUI_CONFIG_FILE_NAME: &str = "gui.toml";
-/// File name of the semantic embedding cache inside the semantic cache dir.
-pub const EMBEDDING_CACHE_FILE_NAME: &str = "embeddings-v1.bin";
+/// File name of the semantic embedding cache (the memory-mapped matrix,
+/// upstream 8919a76) inside the semantic cache dir.
+pub const EMBEDDING_CACHE_FILE_NAME: &str = "embeddings-v2.bin";
+/// File name of the embedding cache earlier versions kept (a bincode map)
+/// inside the semantic cache dir; converted into the matrix once.
+pub const LEGACY_EMBEDDING_CACHE_FILE_NAME: &str = "embeddings-v1.bin";
 /// Directory name of the fastembed model cache inside the semantic cache dir.
 pub const MODEL_DIR_NAME: &str = "fastembed";
 
@@ -54,8 +64,9 @@ pub struct HistoryEnv {
     /// Home directory (`home::home_dir()`, i.e. `%USERPROFILE%` on Windows).
     pub home_dir: Option<PathBuf>,
     /// Value of `CLAUDE_CONFIG_DIR`, taken verbatim (it also namespaces the
-    /// per-project history cache, as upstream did). A blank value counts as
-    /// unset and a relative one is an error ([`HistoryEnv::claude_dir`]).
+    /// store, [`HistoryEnv::cache_base_dir`], as upstream does). A blank
+    /// value counts as unset and a relative one is an error
+    /// ([`HistoryEnv::claude_dir`]).
     pub claude_config_dir: Option<PathBuf>,
     /// `PI_CODING_AGENT_DIR`
     pub pi_coding_agent_dir: Option<PathBuf>,
@@ -67,6 +78,12 @@ pub struct HistoryEnv {
     pub omp_profile: Option<OsString>,
     /// `PI_PROFILE`
     pub pi_profile: Option<OsString>,
+    /// `CODEX_HOME`: the Codex home ([`HistoryEnv::codex_home`]). A relative
+    /// value resolves like the `PI_*` paths.
+    pub codex_home: Option<PathBuf>,
+    /// `CODEX_SQLITE_HOME`: the directory of Codex's state database when the
+    /// home's `config.toml` names none ([`HistoryEnv::codex_sqlite_home`]).
+    pub codex_sqlite_home: Option<PathBuf>,
     /// `XDG_DATA_HOME` (OMP only). A relative value resolves like the
     /// `PI_*` paths ([`HistoryEnv::env_value_base_dir`]: the launch
     /// directory, as upstream resolved it against its cwd, else the
@@ -123,6 +140,13 @@ impl HistoryEnv {
             pi_config_dir: std::env::var_os("PI_CONFIG_DIR").map(PathBuf::from),
             omp_profile: std::env::var_os("OMP_PROFILE"),
             pi_profile: std::env::var_os("PI_PROFILE"),
+            // Upstream treats an empty value as unset.
+            codex_home: std::env::var_os("CODEX_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+            codex_sqlite_home: std::env::var_os("CODEX_SQLITE_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
             xdg_data_home: std::env::var_os("XDG_DATA_HOME")
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from),
@@ -148,7 +172,8 @@ impl HistoryEnv {
     /// An environment rooted entirely inside `root` (for tests and demos).
     ///
     /// `root` acts as the home directory, so Claude data lives in
-    /// `root/.claude`, Pi in `root/.pi`, OMP in `root/.omp`, caches in
+    /// `root/.claude`, Pi in `root/.pi`, OMP in `root/.omp`, Codex in
+    /// `root/.codex`, caches in
     /// `root/.cache/claude-history-gui`, config in `root/.config/...` and the
     /// debug log in `root/.local/state/...`. No process environment variable
     /// is consulted. Override individual fields (or use the `with_*`
@@ -188,6 +213,41 @@ impl HistoryEnv {
     pub fn with_cache_root(mut self, dir: impl Into<PathBuf>) -> Self {
         self.cache_root = Some(dir.into());
         self
+    }
+
+    /// Set `CODEX_HOME`.
+    pub fn with_codex_home(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.codex_home = Some(dir.into());
+        self
+    }
+
+    /// The Codex home (upstream `codex::home_from_env`): `CODEX_HOME`, else
+    /// `<home>/.codex`. A relative `CODEX_HOME` resolves against
+    /// [`HistoryEnv::env_value_base_dir`] (upstream: the process cwd), and
+    /// without one the default is used, as upstream does when it has no cwd.
+    /// An empty value counts as unset.
+    pub fn codex_home(&self) -> Option<PathBuf> {
+        self.env_value_path(self.codex_home.as_deref())
+            .or_else(|| self.home_dir.as_ref().map(|home| home.join(".codex")))
+    }
+
+    /// `CODEX_SQLITE_HOME`, resolved like [`HistoryEnv::codex_home`]: where
+    /// Codex keeps its state database when the home's `config.toml` names
+    /// no `sqlite_home` (`None`: in the home).
+    pub fn codex_sqlite_home(&self) -> Option<PathBuf> {
+        self.env_value_path(self.codex_sqlite_home.as_deref())
+    }
+
+    /// An environment-variable path: as is when absolute, else against
+    /// [`HistoryEnv::env_value_base_dir`] (`None` without one, or when the
+    /// value is empty).
+    fn env_value_path(&self, value: Option<&Path>) -> Option<PathBuf> {
+        let path = value.filter(|path| !path.as_os_str().is_empty())?;
+        if path.is_absolute() {
+            Some(path.to_path_buf())
+        } else {
+            self.env_value_base_dir().map(|base| base.join(path))
+        }
     }
 
     fn missing_home() -> AppError {
@@ -246,10 +306,13 @@ impl HistoryEnv {
         })
     }
 
-    /// Directory of the per-project Claude history caches. Namespaced by
-    /// `CLAUDE_CONFIG_DIR` exactly like upstream (`config-{hash}/projects`);
-    /// a blank value uses the default namespace, like [`Self::claude_dir`].
-    pub fn history_cache_dir(&self) -> Option<PathBuf> {
+    /// Cache directory of this Claude config root (upstream
+    /// `store::cache_base_dir`): the cache root, or a `config-{hash}`
+    /// directory inside it when `CLAUDE_CONFIG_DIR` is set, to avoid
+    /// cross-config cache collisions. A blank value uses the default
+    /// namespace, like [`Self::claude_dir`]. Holds the store
+    /// ([`crate::store::default_root`]).
+    pub fn cache_base_dir(&self) -> Option<PathBuf> {
         let base = self.cache_root()?;
         if let Some(config_dir) = self.claude_config_override() {
             // Upstream hashed the `String` value of CLAUDE_CONFIG_DIR; hashing
@@ -257,26 +320,27 @@ impl HistoryEnv {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             std::hash::Hash::hash(config_dir.to_string_lossy().as_ref(), &mut hasher);
             let hash = std::hash::Hasher::finish(&hasher);
-            Some(base.join(format!("config-{:016x}", hash)).join("projects"))
+            Some(base.join(format!("config-{:016x}", hash)))
         } else {
-            Some(base.join("projects"))
+            Some(base)
         }
     }
 
-    /// Cache file of a Pi/OMP session root:
-    /// `<cache root>/<source>/root-{hash}/sessions.bin`.
-    pub fn source_cache_path(&self, root: &Path, source: &str) -> Option<PathBuf> {
-        use std::hash::{Hash, Hasher};
+    /// The installed CLI's cache root (`<home>/.cache/claude-history`),
+    /// which this crate never deletes from, even when [`Self::cache_root`]
+    /// was pointed into it.
+    pub fn cli_cache_root(&self) -> Option<PathBuf> {
+        self.home_dir
+            .as_ref()
+            .map(|home| home.join(".cache").join(CLI_CACHE_DIR_NAME))
+    }
 
-        let resolved = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        resolved.hash(&mut hasher);
-        Some(
-            self.cache_root()?
-                .join(source)
-                .join(format!("root-{:016x}", hasher.finish()))
-                .join("sessions.bin"),
-        )
+    /// Whether `path` lies in the installed CLI's cache root
+    /// ([`Self::cli_cache_root`]), as written or once both are
+    /// canonicalized (a link into it).
+    pub fn is_in_cli_cache(&self, path: &Path) -> bool {
+        self.cli_cache_root()
+            .is_some_and(|cli_root| is_within(path, &cli_root))
     }
 
     /// Semantic cache directory (`<cache root>/semantic`): holds the
@@ -285,7 +349,9 @@ impl HistoryEnv {
         self.cache_root().map(|root| root.join("semantic"))
     }
 
-    /// The semantic embedding cache file (`<semantic dir>/embeddings-v1.bin`).
+    /// The semantic embedding cache file (`<semantic dir>/embeddings-v2.bin`,
+    /// a memory-mapped matrix; an `embeddings-v1.bin` beside it is converted
+    /// once, [`crate::semantic::cache::read_embedding_cache`]).
     pub fn embedding_cache_file(&self) -> Option<PathBuf> {
         self.semantic_cache_dir()
             .map(|dir| dir.join(EMBEDDING_CACHE_FILE_NAME))
@@ -437,12 +503,6 @@ impl WorkspaceScope {
     pub fn project_dir_name(&self) -> &str {
         &self.project_dir_name
     }
-
-    /// The workspace directory, canonicalized when possible (for path
-    /// equality checks against Pi/OMP session working directories).
-    pub fn canonical_dir(&self) -> PathBuf {
-        self.dir.canonicalize().unwrap_or_else(|_| self.dir.clone())
-    }
 }
 
 /// Claude's project directory name for a directory.
@@ -548,6 +608,16 @@ fn uppercase_drive_letter(path: &Path) -> PathBuf {
     }
 }
 
+/// Whether `path` is `dir` or lies inside it, as written or once both are
+/// canonicalized.
+pub fn is_within(path: &Path, dir: &Path) -> bool {
+    path.starts_with(dir)
+        || matches!(
+            (path.canonicalize(), dir.canonicalize()),
+            (Ok(path), Ok(dir)) if path.starts_with(&dir)
+        )
+}
+
 /// `X:\` or `X:/` at the start of the string.
 fn has_drive_prefix(text: &str) -> bool {
     let bytes = text.as_bytes();
@@ -575,15 +645,17 @@ mod tests {
             env.claude_dir().unwrap(),
             env.claude_projects_root().unwrap(),
             env.cache_root().unwrap(),
-            env.history_cache_dir().unwrap(),
-            env.source_cache_path(root.path(), "pi").unwrap(),
+            env.cache_base_dir().unwrap(),
+            crate::store::default_root(&env).unwrap(),
             env.semantic_cache_dir().unwrap(),
             env.embedding_cache_file().unwrap(),
             env.semantic_model_dir().unwrap(),
             env.config_file().unwrap(),
             env.gui_config_file().unwrap(),
             env.debug_log_file().unwrap(),
+            env.codex_home().unwrap(),
         ];
+        assert_eq!(env.codex_sqlite_home(), None);
         for path in paths {
             assert!(
                 path.starts_with(root.path()),
@@ -606,10 +678,24 @@ mod tests {
         );
         let cache = home.join(".cache").join("claude-history-gui");
         assert_eq!(env.cache_root().unwrap(), cache);
-        assert_eq!(env.history_cache_dir().unwrap(), cache.join("projects"));
+        assert_eq!(env.cache_base_dir().unwrap(), cache);
+        assert_eq!(
+            env.cli_cache_root().unwrap(),
+            home.join(".cache").join("claude-history")
+        );
+        assert!(!env.is_in_cli_cache(&cache));
+        let store = crate::store::default_root(&env).unwrap();
+        assert_eq!(store.parent().unwrap(), cache.join("v3"));
+        assert!(
+            store
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("roots-")
+        );
         assert_eq!(
             env.embedding_cache_file().unwrap(),
-            cache.join("semantic").join("embeddings-v1.bin")
+            cache.join("semantic").join("embeddings-v2.bin")
         );
         assert_eq!(
             env.semantic_model_dir().unwrap(),
@@ -655,12 +741,12 @@ mod tests {
         assert_eq!(env.config_file().unwrap(), PathBuf::from("c.toml"));
         assert_eq!(env.gui_config_file().unwrap(), PathBuf::from("g.toml"));
         assert_eq!(env.debug_log_file().unwrap(), PathBuf::from("d.log"));
-        // CLAUDE_CONFIG_DIR namespaces the history cache like upstream.
-        let history = env.history_cache_dir().unwrap();
-        assert!(history.starts_with("cache"));
-        assert!(history.ends_with("projects"));
-        let namespace = history
+        // CLAUDE_CONFIG_DIR namespaces the store like upstream.
+        let store = crate::store::default_root(&env).unwrap();
+        assert!(store.starts_with("cache"));
+        let namespace = store
             .parent()
+            .and_then(Path::parent)
             .and_then(Path::file_name)
             .and_then(|name| name.to_str())
             .unwrap();
@@ -689,7 +775,7 @@ mod tests {
                 env.claude_projects_root().unwrap(),
                 home.path().join(".claude").join("projects")
             );
-            assert_eq!(env.history_cache_dir(), default.history_cache_dir());
+            assert_eq!(env.cache_base_dir(), default.cache_base_dir());
         }
         for relative in ["rel", ".claude-work", "."] {
             let env = HistoryEnv::sandbox(home.path()).with_claude_config_dir(relative);
@@ -734,8 +820,12 @@ mod tests {
             ..HistoryEnv::default()
         };
         assert_eq!(
-            env.history_cache_dir().unwrap(),
-            PathBuf::from("cache").join(expected).join("projects")
+            env.cache_base_dir().unwrap(),
+            PathBuf::from("cache").join(&expected)
+        );
+        assert_eq!(
+            crate::store::default_root(&env).unwrap().parent().unwrap(),
+            PathBuf::from("cache").join(&expected).join("v3")
         );
     }
 
@@ -789,6 +879,42 @@ mod tests {
         );
         // The workspace scope is unaffected by the launch directory.
         assert_eq!(env.workspace_base_dir(), Some(PathBuf::from(workspace)));
+    }
+
+    #[test]
+    fn codex_paths_default_to_the_home_and_resolve_like_pi_paths() {
+        let (home, launch, codex) = if cfg!(windows) {
+            (r"C:\home", r"C:\launch", r"D:\codex")
+        } else {
+            ("/home", "/launch", "/codex")
+        };
+        let env = HistoryEnv {
+            home_dir: Some(PathBuf::from(home)),
+            ..HistoryEnv::default()
+        };
+        assert_eq!(env.codex_home(), Some(Path::new(home).join(".codex")));
+        assert_eq!(env.codex_sqlite_home(), None);
+        let absolute = env.clone().with_codex_home(codex);
+        assert_eq!(absolute.codex_home(), Some(PathBuf::from(codex)));
+        // An empty value is unset; a relative one needs a base, else the
+        // default home is used (as upstream does without a cwd).
+        assert_eq!(
+            env.clone().with_codex_home("").codex_home(),
+            Some(Path::new(home).join(".codex"))
+        );
+        let relative = HistoryEnv {
+            codex_sqlite_home: Some(PathBuf::from("db")),
+            ..env.clone().with_codex_home("rel")
+        };
+        assert_eq!(relative.codex_home(), Some(Path::new(home).join(".codex")));
+        assert_eq!(relative.codex_sqlite_home(), None);
+        let launched = relative.with_env_path_base(launch);
+        assert_eq!(launched.codex_home(), Some(Path::new(launch).join("rel")));
+        assert_eq!(
+            launched.codex_sqlite_home(),
+            Some(Path::new(launch).join("db"))
+        );
+        assert_eq!(HistoryEnv::default().codex_home(), None);
     }
 
     #[test]

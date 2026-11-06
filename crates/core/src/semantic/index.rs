@@ -41,6 +41,8 @@ pub struct SemanticIndexResponse {
     pub chunk_hits: Vec<SemanticHit>,
     pub indexed_chunk_count: usize,
     pub missing_chunk_count: usize,
+    /// Passages this call embedded.
+    pub embedded_chunk_count: usize,
     pub query_embedding_returned: bool,
     pub progress: SemanticIndexProgress,
     pub prewarm: bool,
@@ -173,7 +175,31 @@ impl SemanticIndexState {
         if self.resident.is_complete(request) {
             self.signature = Some(next_signature);
         }
-        Ok(self.refresh_response(request, missing_chunk_count))
+        let mut response = self.refresh_response(request, missing_chunk_count);
+        response.embedded_chunk_count = embedding_count;
+        Ok(response)
+    }
+
+    /// Embeds at most `budget` of the corpus passages that have no
+    /// embedding yet, in corpus order, and makes everything embedded so far
+    /// rankable. The response says how many it embedded and
+    /// how many remain.
+    pub fn index_slice(
+        &mut self,
+        request: &SemanticIndexRequest<'_>,
+        embedder: &mut dyn SemanticEmbedder,
+        cancellation: &SemanticCancellationToken,
+        budget: usize,
+        save_cache: impl FnMut(&EmbeddingCache),
+    ) -> Result<SemanticIndexResponse> {
+        self.refresh_passages_with_budget(
+            request,
+            embedder,
+            cancellation,
+            Some(budget),
+            |_| {},
+            save_cache,
+        )
     }
 
     pub fn rank_refreshed(
@@ -339,6 +365,7 @@ impl SemanticIndexState {
             chunk_hits,
             indexed_chunk_count: self.indexed_chunk_count(),
             missing_chunk_count: 0,
+            embedded_chunk_count: 0,
             query_embedding_returned,
             progress,
             prewarm,
@@ -479,7 +506,7 @@ mod tests {
         cache.entries.insert(
             crate::semantic::cache::embedding_cache_key(&text),
             CachedChunk {
-                embedding,
+                embedding: embedding.into(),
                 last_used: 0,
                 protected: false,
             },
@@ -628,7 +655,7 @@ mod tests {
     #[test]
     fn literal_filters_require_hit_local_text() {
         let mut first = conversation("/projects/project-a/session-a.jsonl", vec!["visible alpha"]);
-        first.full_text = "visible alpha conversation-level literal needle".to_string();
+        first.full_text = "visible alpha conversation-level literal needle".into();
         let conversations = vec![first];
         let all = candidates_from(&conversations);
         let literals = vec![Literal::new("literal needle".to_string())];
@@ -711,7 +738,7 @@ mod tests {
     fn literal_filter_no_match_is_not_empty_corpus() {
         let mut conversation =
             conversation("/projects/project-a/session-a.jsonl", vec!["visible alpha"]);
-        conversation.full_text = "missing literal".to_string();
+        conversation.full_text = "missing literal".into();
         let all = candidates_from(&[conversation]);
         let literals = vec![Literal::new("absent needle".to_string())];
         let query = "alpha".to_string();
@@ -1102,7 +1129,7 @@ mod tests {
 
     #[test]
     fn warm_full_corpus_reuses_embeddings_across_scope_toggles() {
-        let conversations = vec![
+        let conversations = [
             conversation("/projects/project-a/session-a.jsonl", vec!["visible alpha"]),
             conversation("/projects/project-a/session-b.jsonl", vec!["visible beta"]),
         ];

@@ -3,8 +3,9 @@
     python tools/qa/gen-qa-home.py            (from the repository root; the output is committed)
 
 The corpus is invented: three projects (one with a git worktree), tool calls, thinking, code, tables,
-an empty transcript, a transcript with one malformed line, and a Pi and an OMP session copied from
-core's fixtures. tools/qa/new-sandbox.ps1 copies it into a fresh sandbox home and adds the
+an empty transcript, a transcript with one malformed line, the oldest session with a subagent and a
+/btw fork beside it (upstream 3c2ffeb sidecars), and a Pi and an OMP session copied from core's
+fixtures. tools/qa/new-sandbox.ps1 copies it into a fresh sandbox home and adds the
 .qa-sandbox marker, so the folder itself never carries the marker.
 """
 
@@ -129,6 +130,38 @@ def main():
     write_lines(projects / encode(PROJ) / f"{uuid(90)}.jsonl", [])
     sid, lines = conversation(91, API, "Malformed line", 13, [("One good question.", [text("One good answer.")])])
     write_lines(projects / encode(API) / f"{sid}.jsonl", lines, malformed_at=1)
+
+    # The oldest session, with a subagent transcript and a /btw fork in its
+    # subagents directory (upstream 3c2ffeb). The session records the /btw
+    # question as a local command.
+    sid, lines = conversation(7, API, "Cache eviction review", 0, [
+        ("Review the cache eviction policy.", [
+            text("Looking for the cache users first."),
+            tool_use(71, "Agent", description="Find cache users", subagent_type="Explore")]),
+        ("Keep the LRU.", [text("Kept the LRU; the size is now configurable.")]),
+    ])
+    lines.insert(3, {"type": "system", "subtype": "local_command", "timestamp": stamp(0, 2),
+                     "content": "<command-name>/btw</command-name>\n<command-message>btw</command-message>\n"
+                                "<command-args>how large is the LRU?</command-args>"})
+    session_dir = projects / encode(API) / sid
+    write_lines(projects / encode(API) / f"{sid}.jsonl", lines)
+    sidecars = session_dir / "subagents"
+    write_lines(sidecars / "agent-a71c0de.jsonl", [
+        user(sid, API, stamp(0, 3), "Find every caller of the cache."),
+        assistant(sid, API, stamp(0, 4), [text("Three callers: the loader, the index and the viewer.")]),
+    ])
+    (sidecars / "agent-a71c0de.meta.json").write_text(
+        json.dumps({"agentType": "Explore", "description": "Find cache users", "toolUseId": "toolu_71"}),
+        encoding="utf-8", newline="\n")
+    write_lines(sidecars / "agent-afork0b7.jsonl", [
+        {"type": "fork-context-ref", "agentId": "afork0b7", "parentSessionId": sid},
+        user(sid, API, stamp(0, 5), "<fork-boilerplate>\nYou are a forked agent.\n</fork-boilerplate>\n\n"
+                                    "Your directive: how large is the LRU?"),
+        assistant(sid, API, stamp(0, 6), [text("It holds 512 entries.")]),
+    ])
+    (sidecars / "agent-afork0b7.meta.json").write_text(
+        json.dumps({"agentType": "fork", "isFork": True, "description": "Ask about the LRU size"}),
+        encoding="utf-8", newline="\n")
 
     # Pi and OMP sessions (core's fixtures).
     pi = OUT / ".pi" / "agent" / "sessions" / "--tmp-pi-project--"

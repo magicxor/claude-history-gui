@@ -337,50 +337,74 @@ fn test_render_options(tool_display: ToolDisplayMode) -> RenderOptions {
     }
 }
 
-fn tool_summary_entries() -> Vec<RenderableEntry> {
+/// A conversation of one Claude record, shown as the entry at
+/// `entry_index`. A record naming Pi as its agent reads as a Pi session.
+struct Owned {
+    entry_index: usize,
+    transcript: crate::history::model::Transcript,
+}
+
+fn entry(entry_index: usize, json: &str) -> Owned {
+    let record: serde_json::Value = serde_json::from_str(json).unwrap();
+    let mut transcript = crate::history::sources::claude::decode_test_reader(
+        Path::new("test.jsonl"),
+        record.to_string().as_bytes(),
+    )
+    .unwrap();
+    if json.contains(r#""agent":"Pi""#) {
+        transcript.source = crate::history::model::SourceKind::Pi;
+    }
+    Owned {
+        entry_index,
+        transcript,
+    }
+}
+
+fn renderable(entries: &[Owned]) -> Vec<RenderableEntry<'_>> {
+    entries
+        .iter()
+        .flat_map(|owned| {
+            view::entries(&owned.transcript)
+                .into_iter()
+                .map(|entry| RenderableEntry {
+                    entry_index: owned.entry_index,
+                    entry,
+                })
+        })
+        .collect()
+}
+
+fn tool_summary_entries() -> Vec<Owned> {
     vec![
-        RenderableEntry {
-            entry_index: 0,
-            entry: serde_json::from_str(
-                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Grep","input":{"pattern":"one"}}]}}"#,
-            )
-            .unwrap(),
-        },
-        RenderableEntry {
-            entry_index: 1,
-            entry: serde_json::from_str(
-                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"grep result"}]}}"#,
-            )
-            .unwrap(),
-        },
-        RenderableEntry {
-            entry_index: 2,
-            entry: serde_json::from_str(
-                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Read","input":{"file_path":"src/main.rs"}},{"type":"tool_use","id":"toolu_3","name":"Bash","input":{"command":"cargo test"}}]}}"#,
-            )
-            .unwrap(),
-        },
-        RenderableEntry {
-            entry_index: 3,
-            entry: serde_json::from_str(
-                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_3","content":"bash result"}]}}"#,
-            )
-            .unwrap(),
-        },
+        entry(
+            0,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Grep","input":{"pattern":"one"}}]}}"#,
+        ),
+        entry(
+            1,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"grep result"}]}}"#,
+        ),
+        entry(
+            2,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Read","input":{"file_path":"src/main.rs"}},{"type":"tool_use","id":"toolu_3","name":"Bash","input":{"command":"cargo test"}}]}}"#,
+        ),
+        entry(
+            3,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_3","content":"bash result"}]}}"#,
+        ),
     ]
 }
 
 #[test]
-fn hidden_tool_mode_renders_activity_summary() {
-    let entry = RenderableEntry {
-        entry_index: 0,
-        entry: serde_json::from_str(
-            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Grep","input":{"pattern":"one"}},{"type":"tool_use","id":"toolu_2","name":"Grep","input":{"pattern":"two"}},{"type":"tool_use","id":"toolu_3","name":"Read","input":{"file_path":"src/main.rs"}}]}}"#,
-        )
-        .unwrap(),
-    };
-    let rendered =
-        render_parsed_conversation(&[entry], &test_render_options(ToolDisplayMode::Hidden));
+fn summary_tool_mode_renders_activity_summary() {
+    let entry = entry(
+        0,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Grep","input":{"pattern":"one"}},{"type":"tool_use","id":"toolu_2","name":"Grep","input":{"pattern":"two"}},{"type":"tool_use","id":"toolu_3","name":"Read","input":{"file_path":"src/main.rs"}}]}}"#,
+    );
+    let rendered = render_parsed_conversation(
+        &renderable(&[entry]),
+        &test_render_options(ToolDisplayMode::Summary),
+    );
     let text = rendered_text(&rendered);
 
     assert!(text.contains("Searched for 2 patterns"));
@@ -390,10 +414,146 @@ fn hidden_tool_mode_renders_activity_summary() {
 }
 
 #[test]
-fn hidden_tool_mode_coalesces_tool_only_entries_across_results() {
+fn summary_tool_mode_shows_single_unknown_tool_call_inline() {
+    let entry = entry(
+        0,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"clock__sleep","input":{"duration_ms":20000}}]}}"#,
+    );
+    let rendered = render_parsed_conversation(
+        &renderable(&[entry]),
+        &test_render_options(ToolDisplayMode::Summary),
+    );
+    let text = rendered_text(&rendered);
+
+    assert!(text.contains(r#"clock__sleep: { "duration_ms": 20000 }"#));
+    assert!(!text.contains("Called 1 tool"));
+}
+
+#[test]
+fn summary_tool_mode_names_unknown_tools_in_group() {
+    let entry = entry(
+        0,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"mcp__docs__search","input":{"query":"x"}},{"type":"tool_use","id":"toolu_2","name":"clock__sleep","input":{"duration_ms":1}},{"type":"tool_use","id":"toolu_3","name":"clock__sleep","input":{"duration_ms":2}},{"type":"tool_use","id":"toolu_4","name":"Read","input":{"file_path":"src/main.rs"}}]}}"#,
+    );
+    let rendered = render_parsed_conversation(
+        &renderable(&[entry]),
+        &test_render_options(ToolDisplayMode::Summary),
+    );
+    let text = rendered_text(&rendered);
+
+    assert!(text.contains("Read 1 file, called mcp__docs__search, clock__sleep ×2"));
+}
+
+#[test]
+fn summary_tool_mode_coalesces_tool_calls_across_records_that_show_nothing() {
+    let entries = vec![
+        entry(
+            0,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]}}"#,
+        ),
+        entry(
+            1,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}}"#,
+        ),
+        entry(2, r#"{"type":"last-prompt","lastPrompt":"x"}"#),
+        entry(
+            3,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"next","signature":""}]}}"#,
+        ),
+        entry(
+            4,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Bash","input":{"command":"pwd"}}]}}"#,
+        ),
+    ];
+    let rendered = render_parsed_conversation(
+        &renderable(&entries),
+        &test_render_options(ToolDisplayMode::Summary),
+    );
+    let text = rendered_text(&rendered);
+
+    assert!(text.contains("Ran 2 shell commands"), "{text}");
+    assert!(!text.contains("Ran 1 shell command"), "{text}");
+}
+
+#[test]
+fn calls_tool_mode_lists_each_call_on_one_line_without_results() {
     let entries = tool_summary_entries();
-    let rendered =
-        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
+    let rendered = render_parsed_conversation(
+        &renderable(&entries),
+        &test_render_options(ToolDisplayMode::Calls),
+    );
+    let text = rendered_text(&rendered);
+
+    assert!(text.contains(r#"Grep: "one" in ."#), "{text}");
+    assert!(text.contains("Read: src/main.rs"), "{text}");
+    assert!(text.contains("Bash: cargo test"), "{text}");
+    assert!(!text.contains("Result"), "{text}");
+
+    let row_ids: Vec<_> = rendered
+        .lines
+        .iter()
+        .filter(|line| !line.spans.is_empty())
+        .map(|line| {
+            assert!(line.clickable);
+            line.tool_output_id.clone().unwrap()
+        })
+        .collect();
+    assert_eq!(row_ids.len(), 3);
+    assert_eq!(
+        row_ids.iter().collect::<BTreeSet<_>>().len(),
+        3,
+        "each call row expands on its own"
+    );
+
+    // Expanding the Bash row shows its result and leaves the others collapsed.
+    let mut options = test_render_options(ToolDisplayMode::Calls);
+    options.expanded_tool_outputs.insert(row_ids[2].clone());
+    let expanded = render_parsed_conversation(&renderable(&entries), &options);
+    let expanded_text = rendered_text(&expanded);
+    assert!(expanded_text.contains("bash result"), "{expanded_text}");
+    assert!(!expanded_text.contains("grep result"), "{expanded_text}");
+    assert!(
+        expanded_text.contains(r#"Grep: "one" in ."#),
+        "{expanded_text}"
+    );
+    let collapse_idx = expanded
+        .lines
+        .iter()
+        .position(|line| line.tool_output_id.as_ref() == Some(&row_ids[2]))
+        .unwrap();
+    assert!(expanded.lines[collapse_idx].clickable);
+    assert!(
+        !expanded.lines[collapse_idx - 1].spans.is_empty(),
+        "an expanded call stays directly below the row above it"
+    );
+}
+
+#[test]
+fn calls_tool_mode_counts_lines_a_call_row_hides() {
+    let entry = entry(
+        0,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"python3 - <<'EOF'\nprint(1)\nEOF"}},{"type":"tool_use","id":"toolu_2","name":"Bash","input":{"command":"ls"}}]}}"#,
+    );
+    let rendered = render_parsed_conversation(
+        &renderable(&[entry]),
+        &test_render_options(ToolDisplayMode::Calls),
+    );
+    let text = rendered_text(&rendered);
+
+    assert!(
+        text.contains("Bash: python3 - <<'EOF' (2 more lines)"),
+        "{text}"
+    );
+    assert!(text.contains("Bash: ls\n"), "{text}");
+}
+
+#[test]
+fn summary_tool_mode_coalesces_tool_only_entries_across_results() {
+    let entries = tool_summary_entries();
+    let rendered = render_parsed_conversation(
+        &renderable(&entries),
+        &test_render_options(ToolDisplayMode::Summary),
+    );
     let text = rendered_text(&rendered);
 
     assert!(text.contains("Searched for 1 pattern, read 1 file, ran 1 shell command"));
@@ -404,18 +564,17 @@ fn hidden_tool_mode_coalesces_tool_only_entries_across_results() {
 #[test]
 fn collapsed_tool_summary_uses_fixed_timestamp_format() {
     let timestamp = Local.with_ymd_and_hms(2026, 9, 4, 13, 59, 0).unwrap();
-    let entry = RenderableEntry {
-        entry_index: 0,
-        entry: serde_json::from_str(&format!(
+    let entry = entry(
+        0,
+        &format!(
             r#"{{"type":"assistant","timestamp":"{}","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_1","name":"Bash","input":{{"command":"pwd"}}}}]}}}}"#,
             timestamp.to_rfc3339()
-        ))
-        .unwrap(),
-    };
-    let mut options = test_render_options(ToolDisplayMode::Hidden);
+        ),
+    );
+    let mut options = test_render_options(ToolDisplayMode::Summary);
     options.show_timing = true;
 
-    let rendered = render_parsed_conversation(&[entry], &options);
+    let rendered = render_parsed_conversation(&renderable(&[entry]), &options);
 
     assert_eq!(rendered.lines[0].spans[0].0, " Sep 04 13:59 ");
     assert_eq!(rendered.lines[0].spans[0].0.len(), TIMESTAMP_WIDTH);
@@ -424,32 +583,28 @@ fn collapsed_tool_summary_uses_fixed_timestamp_format() {
 #[test]
 fn tool_summary_uses_source_agent_label() {
     let entries = vec![
-        RenderableEntry {
-            entry_index: 0,
-            entry: serde_json::from_str(
-                r#"{"type":"assistant","agent":"Pi","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"bash","input":{"command":"pwd"}}]}}"#,
-            )
-            .unwrap(),
-        },
-        RenderableEntry {
-            entry_index: 1,
-            entry: serde_json::from_str(
-                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"result"}]}}"#,
-            )
-            .unwrap(),
-        },
+        entry(
+            0,
+            r#"{"type":"assistant","agent":"Pi","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"bash","input":{"command":"pwd"}}]}}"#,
+        ),
+        entry(
+            1,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"result"}]}}"#,
+        ),
     ];
     let summary_id = make_tool_summary_output_id(0, None);
 
-    let collapsed =
-        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
+    let collapsed = render_parsed_conversation(
+        &renderable(&entries),
+        &test_render_options(ToolDisplayMode::Summary),
+    );
     let collapsed_text = rendered_text(&collapsed);
     assert!(collapsed_text.contains("Pi"));
     assert!(!collapsed_text.contains("Claude"));
 
-    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    let mut options = test_render_options(ToolDisplayMode::Summary);
     options.expanded_tool_outputs.insert(summary_id);
-    let expanded = render_parsed_conversation(&entries, &options);
+    let expanded = render_parsed_conversation(&renderable(&entries), &options);
     let expanded_text = rendered_text(&expanded);
     assert!(expanded_text.contains("Pi"));
     assert!(!expanded_text.contains("Claude"));
@@ -458,39 +613,29 @@ fn tool_summary_uses_source_agent_label() {
 #[test]
 fn hidden_pi_thinking_allows_clickable_grouped_tool_summary() {
     let entries = vec![
-        RenderableEntry {
-            entry_index: 0,
-            entry: serde_json::from_str(
-                r#"{"type":"assistant","agent":"Pi","message":{"role":"assistant","content":[{"type":"thinking","thinking":"inspect files","signature":""},{"type":"tool_use","id":"call_1","name":"bash","input":{"command":"pwd"}}]}}"#,
-            )
-            .unwrap(),
-        },
-        RenderableEntry {
-            entry_index: 1,
-            entry: serde_json::from_str(
-                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"/tmp/project"}]}}"#,
-            )
-            .unwrap(),
-        },
-        RenderableEntry {
-            entry_index: 2,
-            entry: serde_json::from_str(
-                r#"{"type":"assistant","agent":"Pi","message":{"role":"assistant","content":[{"type":"thinking","thinking":"inspect status","signature":""},{"type":"tool_use","id":"call_2","name":"bash","input":{"command":"git status"}}]}}"#,
-            )
-            .unwrap(),
-        },
-        RenderableEntry {
-            entry_index: 3,
-            entry: serde_json::from_str(
-                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_2","content":"clean"}]}}"#,
-            )
-            .unwrap(),
-        },
+        entry(
+            0,
+            r#"{"type":"assistant","agent":"Pi","message":{"role":"assistant","content":[{"type":"thinking","thinking":"inspect files","signature":""},{"type":"tool_use","id":"call_1","name":"bash","input":{"command":"pwd"}}]}}"#,
+        ),
+        entry(
+            1,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"/tmp/project"}]}}"#,
+        ),
+        entry(
+            2,
+            r#"{"type":"assistant","agent":"Pi","message":{"role":"assistant","content":[{"type":"thinking","thinking":"inspect status","signature":""},{"type":"tool_use","id":"call_2","name":"bash","input":{"command":"git status"}}]}}"#,
+        ),
+        entry(
+            3,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_2","content":"clean"}]}}"#,
+        ),
     ];
     let summary_id = make_tool_summary_output_id(0, None);
 
-    let collapsed =
-        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
+    let collapsed = render_parsed_conversation(
+        &renderable(&entries),
+        &test_render_options(ToolDisplayMode::Summary),
+    );
     let collapsed_text = rendered_text(&collapsed);
     assert_eq!(collapsed_text.matches("Pi").count(), 1);
     assert!(
@@ -500,9 +645,9 @@ fn hidden_pi_thinking_allows_clickable_grouped_tool_summary() {
             .any(|line| { line.clickable && line.tool_output_id.as_ref() == Some(&summary_id) })
     );
 
-    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    let mut options = test_render_options(ToolDisplayMode::Summary);
     options.expanded_tool_outputs.insert(summary_id);
-    let expanded = render_parsed_conversation(&entries, &options);
+    let expanded = render_parsed_conversation(&renderable(&entries), &options);
     let expanded_text = rendered_text(&expanded);
     assert!(expanded_text.contains("pwd"));
     assert!(expanded_text.contains("git status"));
@@ -513,11 +658,11 @@ fn hidden_pi_thinking_allows_clickable_grouped_tool_summary() {
 #[test]
 fn expanded_tool_summary_renders_truncated_details() {
     let entries = tool_summary_entries();
-    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    let mut options = test_render_options(ToolDisplayMode::Summary);
     options
         .expanded_tool_outputs
         .insert(make_tool_summary_output_id(0, None));
-    let rendered = render_parsed_conversation(&entries, &options);
+    let rendered = render_parsed_conversation(&renderable(&entries), &options);
     let text = rendered_text(&rendered);
 
     assert!(!text.contains("Searched for 1 pattern, read 1 file, ran 1 shell command"));
@@ -538,28 +683,22 @@ fn subagent_summary_label_parity() {
     // collapsed summary uses the nested ↳ label; the expanded detail
     // rows must use the same nested label, not the literal "Claude".
     let entries = vec![
-        RenderableEntry {
-            entry_index: 0,
-            entry: serde_json::from_str(
-                r#"{"type":"assistant","parent_tool_use_id":"toolu_parent_abc","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Grep","input":{"pattern":"one"}}]}}"#,
-            )
-            .unwrap(),
-        },
-        RenderableEntry {
-            entry_index: 1,
-            entry: serde_json::from_str(
-                r#"{"type":"user","parent_tool_use_id":"toolu_parent_abc","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"grep result"}]}}"#,
-            )
-            .unwrap(),
-        },
+        entry(
+            0,
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_parent_abc","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Grep","input":{"pattern":"one"}}]}}"#,
+        ),
+        entry(
+            1,
+            r#"{"type":"user","parent_tool_use_id":"toolu_parent_abc","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"grep result"}]}}"#,
+        ),
     ];
     let expected_label = "↳parent_";
     let summary_id = make_tool_summary_output_id(0, Some("toolu_parent_abc"));
 
     // Collapsed: subagent label appears, no literal "Claude".
-    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    let mut options = test_render_options(ToolDisplayMode::Summary);
     options.show_thinking = true;
-    let collapsed = render_parsed_conversation(&entries, &options);
+    let collapsed = render_parsed_conversation(&renderable(&entries), &options);
     let collapsed_text = rendered_text(&collapsed);
     assert!(
         collapsed_text.contains(expected_label),
@@ -573,10 +712,10 @@ fn subagent_summary_label_parity() {
     );
 
     // Expanded: detail rows must use the same nested label, not "Claude".
-    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    let mut options = test_render_options(ToolDisplayMode::Summary);
     options.show_thinking = true;
     options.expanded_tool_outputs.insert(summary_id);
-    let expanded = render_parsed_conversation(&entries, &options);
+    let expanded = render_parsed_conversation(&renderable(&entries), &options);
     let expanded_text = rendered_text(&expanded);
     assert!(
         expanded_text.contains("Grep: \"one\" in ."),
@@ -596,8 +735,110 @@ fn subagent_summary_label_parity() {
 }
 
 #[test]
-fn hidden_tool_mode_status_label_is_summary() {
-    assert_eq!(ToolDisplayMode::Hidden.status_label(), "sum");
+fn summary_tool_mode_status_label_is_summary() {
+    assert_eq!(ToolDisplayMode::Summary.status_label(), "sum");
+}
+
+#[test]
+fn off_tool_mode_status_label_is_off() {
+    assert_eq!(ToolDisplayMode::Off.status_label(), "off");
+}
+
+#[test]
+fn tool_display_mode_cycles_from_off_through_full() {
+    let mut mode = ToolDisplayMode::Off;
+    let mut seen = vec![mode];
+    for _ in 0..5 {
+        mode = mode.next();
+        seen.push(mode);
+    }
+    assert_eq!(
+        seen,
+        vec![
+            ToolDisplayMode::Off,
+            ToolDisplayMode::Summary,
+            ToolDisplayMode::Calls,
+            ToolDisplayMode::Truncated,
+            ToolDisplayMode::Full,
+            ToolDisplayMode::Off,
+        ]
+    );
+    assert!(!ToolDisplayMode::Off.is_visible());
+}
+
+fn conversation_with_tool_only_turns() -> Vec<Owned> {
+    let mut entries = vec![entry(
+        0,
+        r#"{"type":"user","message":{"role":"user","content":"please check the build"}}"#,
+    )];
+    entries.extend(tool_summary_entries().into_iter().map(|mut owned| {
+        owned.entry_index += 1;
+        owned
+    }));
+    entries.push(entry(
+        5,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Running the tests now."},{"type":"tool_use","id":"toolu_4","name":"Bash","input":{"command":"cargo build"}}]}}"#,
+    ));
+    entries.push(entry(
+        6,
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_4","content":"build output"}]}}"#,
+    ));
+    entries.push(entry(
+        7,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The build passes."}]}}"#,
+    ));
+    entries
+}
+
+#[test]
+fn off_tool_mode_hides_tool_calls_results_and_summaries() {
+    let entries = conversation_with_tool_only_turns();
+    let rendered = render_parsed_conversation(
+        &renderable(&entries),
+        &test_render_options(ToolDisplayMode::Off),
+    );
+    let text = rendered_text(&rendered);
+
+    assert!(text.contains("please check the build"));
+    assert!(text.contains("Running the tests now."));
+    assert!(text.contains("The build passes."));
+    for hidden in [
+        "Searched",
+        "Grep",
+        "Bash",
+        "cargo",
+        "grep result",
+        "bash result",
+        "build output",
+    ] {
+        assert!(!text.contains(hidden), "{hidden:?} leaked into:\n{text}");
+    }
+}
+
+#[test]
+fn off_tool_mode_leaves_no_empty_headers_or_gaps() {
+    let entries = conversation_with_tool_only_turns();
+    let rendered = render_parsed_conversation(
+        &renderable(&entries),
+        &test_render_options(ToolDisplayMode::Off),
+    );
+
+    // One user message and two assistant text messages; tool-only entries
+    // produce neither lines nor navigable ranges.
+    let entry_indices: Vec<usize> = rendered.messages.iter().map(|m| m.entry_index).collect();
+    assert_eq!(entry_indices, vec![0, 5, 7]);
+    for range in &rendered.messages {
+        assert!(!rendered.lines[range.start_line].spans.is_empty());
+    }
+    let blank_runs = rendered
+        .lines
+        .windows(2)
+        .filter(|pair| pair[0].spans.is_empty() && pair[1].spans.is_empty())
+        .count();
+    assert_eq!(blank_runs, 0);
+    let text = rendered_text(&rendered);
+    assert_eq!(text.matches("Claude").count(), 2, "{text}");
+    assert!(rendered.lines.iter().all(|line| !line.clickable));
 }
 
 #[test]
@@ -624,7 +865,7 @@ fn tool_output_ids_use_stable_literal_format() {
 }
 
 #[test]
-fn parse_conversation_file_preserves_entry_indices() {
+fn renderable_entries_number_the_shown_entries() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("conversation.jsonl");
     std::fs::write(
@@ -642,39 +883,36 @@ fn parse_conversation_file_preserves_entry_indices() {
     )
     .unwrap();
 
-    let entries = parse_conversation_file(&path).unwrap();
+    let transcript = crate::history::sources::decode_path(&path, None, false).unwrap();
+    let entries = renderable_entries(&transcript);
 
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].entry_index, 0);
-    assert_eq!(entries[1].entry_index, 2);
+    assert_eq!(entries[1].entry_index, 1);
 }
 
 #[test]
 fn show_thinking_controls_subagent_entries() {
     let entries = vec![
-        RenderableEntry {
-            entry_index: 0,
-            entry: serde_json::from_str(
-                r#"{"type":"assistant","parent_tool_use_id":"toolu_parent","message":{"role":"assistant","content":[{"type":"text","text":"subagent text"}]}}"#,
-            )
-            .unwrap(),
-        },
-        RenderableEntry {
-            entry_index: 1,
-            entry: serde_json::from_str(
-                r#"{"type":"progress","data":{"type":"agent_progress","agentId":"agent-abcdef123456","message":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"agent progress text"}]}}}}"#,
-            )
-            .unwrap(),
-        },
+        entry(
+            0,
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_parent","message":{"role":"assistant","content":[{"type":"text","text":"subagent text"}]}}"#,
+        ),
+        entry(
+            1,
+            r#"{"type":"progress","data":{"type":"agent_progress","agentId":"agent-abcdef123456","message":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"agent progress text"}]}}}}"#,
+        ),
     ];
-    let hidden =
-        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
+    let hidden = render_parsed_conversation(
+        &renderable(&entries),
+        &test_render_options(ToolDisplayMode::Summary),
+    );
     assert!(!rendered_text(&hidden).contains("subagent text"));
     assert!(!rendered_text(&hidden).contains("agent progress text"));
 
-    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    let mut options = test_render_options(ToolDisplayMode::Summary);
     options.show_thinking = true;
-    let shown = render_parsed_conversation(&entries, &options);
+    let shown = render_parsed_conversation(&renderable(&entries), &options);
     let text = rendered_text(&shown);
     assert!(text.contains("subagent text"));
     assert!(text.contains("agent progress text"));
@@ -741,25 +979,17 @@ fn test_format_timestamp() {
     let first = Local.with_ymd_and_hms(2026, 9, 4, 13, 59, 38).unwrap();
     let second = Local.with_ymd_and_hms(2026, 9, 5, 13, 59, 38).unwrap();
 
-    let first_formatted = format_timestamp(&first.to_rfc3339()).unwrap();
-    let second_formatted = format_timestamp(&second.to_rfc3339()).unwrap();
+    let first_formatted = format_timestamp(first.to_utc());
+    let second_formatted = format_timestamp(second.to_utc());
 
     assert_eq!(first_formatted, "Sep 04 13:59");
     assert_eq!(second_formatted, "Sep 05 13:59");
     assert_ne!(first_formatted, second_formatted);
     assert_eq!(format!(" {first_formatted} ").len(), TIMESTAMP_WIDTH);
 
-    let utc = "2026-02-04T19:46:38.440Z";
-    let expected_utc = chrono::DateTime::parse_from_rfc3339(utc)
-        .unwrap()
-        .with_timezone(&Local)
-        .format("%b %d %H:%M")
-        .to_string();
-    assert_eq!(format_timestamp(utc), Some(expected_utc));
-
-    // RFC 3339 timestamps with explicit offsets still convert to local time.
-    let offset = format_timestamp("2026-02-04T14:46:38-05:00");
-    assert!(offset.is_some(), "Should parse timestamp with offset");
+    let utc = chrono::DateTime::parse_from_rfc3339("2026-02-04T19:46:38.440Z").unwrap();
+    let expected_utc = utc.with_timezone(&Local).format("%b %d %H:%M").to_string();
+    assert_eq!(format_timestamp(utc.to_utc()), expected_utc);
 }
 
 // -----------------------------------------------------------------
@@ -779,7 +1009,7 @@ fn line_style_at<'a>(line: &'a RenderedLine, text: &str) -> &'a LineStyle {
         .1
 }
 
-fn user_entry(entry_index: usize, text: &str, timestamp: Option<&str>) -> RenderableEntry {
+fn user_entry(entry_index: usize, text: &str, timestamp: Option<&str>) -> Owned {
     let ts_field = match timestamp {
         Some(t) => format!(r#","timestamp":"{}""#, t),
         None => String::new(),
@@ -788,17 +1018,10 @@ fn user_entry(entry_index: usize, text: &str, timestamp: Option<&str>) -> Render
         r#"{{"type":"user","message":{{"role":"user","content":"{}"}}{}}}"#,
         text, ts_field
     );
-    RenderableEntry {
-        entry_index,
-        entry: serde_json::from_str(&json).unwrap(),
-    }
+    entry(entry_index, &json)
 }
 
-fn assistant_text_entry(
-    entry_index: usize,
-    text: &str,
-    timestamp: Option<&str>,
-) -> RenderableEntry {
+fn assistant_text_entry(entry_index: usize, text: &str, timestamp: Option<&str>) -> Owned {
     let ts_field = match timestamp {
         Some(t) => format!(r#","timestamp":"{}""#, t),
         None => String::new(),
@@ -807,10 +1030,7 @@ fn assistant_text_entry(
         r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"{}"}}]}}{}}}"#,
         text, ts_field
     );
-    RenderableEntry {
-        entry_index,
-        entry: serde_json::from_str(&json).unwrap(),
-    }
+    entry(entry_index, &json)
 }
 
 #[test]
@@ -819,8 +1039,10 @@ fn message_ranges_track_user_and_assistant_entries() {
         user_entry(0, "Hello", None),
         assistant_text_entry(1, "Hi there", None),
     ];
-    let rendered =
-        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
+    let rendered = render_parsed_conversation(
+        &renderable(&entries),
+        &test_render_options(ToolDisplayMode::Summary),
+    );
 
     // Two messages, each with one content line and one trailing blank.
     assert_eq!(rendered.messages.len(), 2);
@@ -845,14 +1067,13 @@ fn message_ranges_track_user_and_assistant_entries() {
 fn message_ranges_skip_non_message_entries() {
     // A summary-only entry produces no rendered output and no MessageRange.
     let entries = vec![
-        RenderableEntry {
-            entry_index: 0,
-            entry: serde_json::from_str(r#"{"type":"summary","summary":"ignored"}"#).unwrap(),
-        },
+        entry(0, r#"{"type":"summary","summary":"ignored"}"#),
         user_entry(1, "Hello", None),
     ];
-    let rendered =
-        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
+    let rendered = render_parsed_conversation(
+        &renderable(&entries),
+        &test_render_options(ToolDisplayMode::Summary),
+    );
 
     assert_eq!(rendered.messages.len(), 1);
     assert_eq!(rendered.messages[0].entry_index, 1);
@@ -863,10 +1084,10 @@ fn message_ranges_skip_non_message_entries() {
 fn timing_enabled_renders_timestamp_prefix_span() {
     let timestamp = Local.with_ymd_and_hms(2026, 9, 4, 12, 34, 56).unwrap();
     let entries = vec![user_entry(0, "Hello", Some(&timestamp.to_rfc3339()))];
-    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    let mut options = test_render_options(ToolDisplayMode::Summary);
     options.show_timing = true;
 
-    let rendered = render_parsed_conversation(&entries, &options);
+    let rendered = render_parsed_conversation(&renderable(&entries), &options);
     let first = &rendered.lines[0];
     let ts_span = &first.spans[0].0;
 
@@ -877,8 +1098,10 @@ fn timing_enabled_renders_timestamp_prefix_span() {
 #[test]
 fn timing_disabled_omits_timestamp_prefix_span() {
     let entries = vec![user_entry(0, "Hello", Some("2026-02-04T12:34:56Z"))];
-    let rendered =
-        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
+    let rendered = render_parsed_conversation(
+        &renderable(&entries),
+        &test_render_options(ToolDisplayMode::Summary),
+    );
     let first = &rendered.lines[0];
 
     // First span is the right-aligned name column, not a timestamp.
@@ -889,10 +1112,10 @@ fn timing_disabled_omits_timestamp_prefix_span() {
 fn invalid_timestamp_skips_timestamp_prefix() {
     // Even with show_timing=true, a non-RFC3339 timestamp produces no time prefix.
     let entries = vec![user_entry(0, "Hello", Some("not-a-timestamp"))];
-    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    let mut options = test_render_options(ToolDisplayMode::Summary);
     options.show_timing = true;
 
-    let rendered = render_parsed_conversation(&entries, &options);
+    let rendered = render_parsed_conversation(&renderable(&entries), &options);
     let first = &rendered.lines[0];
     assert_eq!(
         first.spans[0].0.trim(),
@@ -910,10 +1133,10 @@ fn assistant_continuation_line_aligns_under_timestamp() {
         "line one\\n\\nline two",
         Some("2026-02-04T12:34:56Z"),
     )];
-    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    let mut options = test_render_options(ToolDisplayMode::Summary);
     options.show_timing = true;
 
-    let rendered = render_parsed_conversation(&entries, &options);
+    let rendered = render_parsed_conversation(&renderable(&entries), &options);
     // Expect at least: header line + blank-paragraph + content line.
     let timestamp_span = &rendered.lines[0].spans[0].0;
     assert_eq!(timestamp_span.len(), TIMESTAMP_WIDTH);
@@ -937,11 +1160,11 @@ fn timing_enabled_wrapping_leaves_room_for_timestamp_prefix() {
         "one two three four five six seven eight nine ten eleven twelve",
         Some("2026-09-04T12:34:56Z"),
     )];
-    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    let mut options = test_render_options(ToolDisplayMode::Summary);
     options.show_timing = true;
     options.content_width = 32;
 
-    let rendered = render_parsed_conversation(&entries, &options);
+    let rendered = render_parsed_conversation(&renderable(&entries), &options);
     let max_line_width = 60 - GUTTER_WIDTH;
     assert!(
         rendered
@@ -960,8 +1183,10 @@ fn timing_enabled_wrapping_leaves_room_for_timestamp_prefix() {
 #[test]
 fn user_label_uses_text_primary_bold() {
     let entries = vec![user_entry(0, "Hello", None)];
-    let rendered =
-        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
+    let rendered = render_parsed_conversation(
+        &renderable(&entries),
+        &test_render_options(ToolDisplayMode::Summary),
+    );
     let line = &rendered.lines[0];
     let name_text = format!("{:>width$}", "You", width = NAME_WIDTH);
     let style = line_style_at(line, &name_text);
@@ -974,8 +1199,10 @@ fn user_label_uses_text_primary_bold() {
 #[test]
 fn assistant_label_uses_accent_bold() {
     let entries = vec![assistant_text_entry(0, "Hi", None)];
-    let rendered =
-        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
+    let rendered = render_parsed_conversation(
+        &renderable(&entries),
+        &test_render_options(ToolDisplayMode::Summary),
+    );
     let line = &rendered.lines[0];
     let name_text = format!("{:>width$}", "Claude", width = NAME_WIDTH);
     let style = line_style_at(line, &name_text);
@@ -986,17 +1213,14 @@ fn assistant_label_uses_accent_bold() {
 
 #[test]
 fn subagent_assistant_uses_nested_label_when_thinking_shown() {
-    let entries = vec![RenderableEntry {
-        entry_index: 0,
-        entry: serde_json::from_str(
-            r#"{"type":"assistant","parent_tool_use_id":"toolu_parent_abc","message":{"role":"assistant","content":[{"type":"text","text":"sub text"}]}}"#,
-        )
-        .unwrap(),
-    }];
-    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    let entries = vec![entry(
+        0,
+        r#"{"type":"assistant","parent_tool_use_id":"toolu_parent_abc","message":{"role":"assistant","content":[{"type":"text","text":"sub text"}]}}"#,
+    )];
+    let mut options = test_render_options(ToolDisplayMode::Summary);
     options.show_thinking = true;
 
-    let rendered = render_parsed_conversation(&entries, &options);
+    let rendered = render_parsed_conversation(&renderable(&entries), &options);
     let text = rendered_text(&rendered);
     assert!(text.contains("sub text"));
     assert!(
@@ -1008,15 +1232,14 @@ fn subagent_assistant_uses_nested_label_when_thinking_shown() {
 
 #[test]
 fn truncated_tool_call_header_carries_expected_tool_output_id() {
-    let entries = vec![RenderableEntry {
-        entry_index: 7,
-        entry: serde_json::from_str(
-            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_xyz","name":"Bash","input":{"command":"ls"}}]}}"#,
-        )
-        .unwrap(),
-    }];
-    let rendered =
-        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Truncated));
+    let entries = vec![entry(
+        7,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_xyz","name":"Bash","input":{"command":"ls"}}]}}"#,
+    )];
+    let rendered = render_parsed_conversation(
+        &renderable(&entries),
+        &test_render_options(ToolDisplayMode::Truncated),
+    );
 
     let expected = make_tool_output_id(7, None, 0, ToolOutputKind::ToolCall, Some("toolu_xyz"));
     assert_eq!(
@@ -1034,15 +1257,14 @@ fn truncated_tool_call_header_carries_expected_tool_output_id() {
 
 #[test]
 fn full_tool_mode_lines_are_not_clickable() {
-    let entries = vec![RenderableEntry {
-        entry_index: 0,
-        entry: serde_json::from_str(
-            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"one\ntwo\nthree\nfour\nfive"}}]}}"#,
-        )
-        .unwrap(),
-    }];
-    let rendered =
-        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Full));
+    let entries = vec![entry(
+        0,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"one\ntwo\nthree\nfour\nfive"}}]}}"#,
+    )];
+    let rendered = render_parsed_conversation(
+        &renderable(&entries),
+        &test_render_options(ToolDisplayMode::Full),
+    );
 
     assert!(
         rendered.lines.iter().all(|line| !line.clickable),
@@ -1057,23 +1279,19 @@ fn full_tool_mode_lines_are_not_clickable() {
 #[test]
 fn tool_result_string_content_renders_as_text() {
     let entries = vec![
-        RenderableEntry {
-            entry_index: 0,
-            entry: serde_json::from_str(
-                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"echo hi"}}]}}"#,
-            )
-            .unwrap(),
-        },
-        RenderableEntry {
-            entry_index: 1,
-            entry: serde_json::from_str(
-                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"hello-world-output"}]}}"#,
-            )
-            .unwrap(),
-        },
+        entry(
+            0,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"echo hi"}}]}}"#,
+        ),
+        entry(
+            1,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"hello-world-output"}]}}"#,
+        ),
     ];
-    let rendered =
-        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Truncated));
+    let rendered = render_parsed_conversation(
+        &renderable(&entries),
+        &test_render_options(ToolDisplayMode::Truncated),
+    );
 
     let text = rendered_text(&rendered);
     assert!(
@@ -1083,30 +1301,27 @@ fn tool_result_string_content_renders_as_text() {
     );
 }
 
-fn assistant_with_reordered_blocks_entry() -> RenderableEntry {
+fn assistant_with_reordered_blocks_entry() -> Owned {
     // Source order is intentionally the reverse of the rendered
     // ordering contract (thinking → tool_use → text). The renderer
     // must reorder to text → tool/summary → thinking.
-    RenderableEntry {
-        entry_index: 0,
-        entry: serde_json::from_str(
-            r#"{"type":"assistant","message":{"role":"assistant","content":[
+    entry(
+        0,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[
                 {"type":"thinking","thinking":"THINK_BLOCK","signature":"sig"},
                 {"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"echo hi"}},
                 {"type":"text","text":"TEXT_BLOCK"}
             ]}}"#,
-        )
-        .unwrap(),
-    }
+    )
 }
 
 #[test]
 fn assistant_block_order_hidden_mode_text_then_summary_then_thinking() {
     let entries = vec![assistant_with_reordered_blocks_entry()];
-    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    let mut options = test_render_options(ToolDisplayMode::Summary);
     options.show_thinking = true;
 
-    let rendered = render_parsed_conversation(&entries, &options);
+    let rendered = render_parsed_conversation(&renderable(&entries), &options);
     let text = rendered_text(&rendered);
 
     let pos_text = text.find("TEXT_BLOCK").expect("text block rendered");
@@ -1135,7 +1350,7 @@ fn assistant_block_order_truncated_mode_text_then_tools_then_thinking() {
     let mut options = test_render_options(ToolDisplayMode::Truncated);
     options.show_thinking = true;
 
-    let rendered = render_parsed_conversation(&entries, &options);
+    let rendered = render_parsed_conversation(&renderable(&entries), &options);
     let text = rendered_text(&rendered);
 
     let pos_text = text.find("TEXT_BLOCK").expect("text block rendered");
@@ -1160,7 +1375,7 @@ fn assistant_block_order_full_mode_text_then_tools_then_thinking() {
     let mut options = test_render_options(ToolDisplayMode::Full);
     options.show_thinking = true;
 
-    let rendered = render_parsed_conversation(&entries, &options);
+    let rendered = render_parsed_conversation(&renderable(&entries), &options);
     let text = rendered_text(&rendered);
 
     let pos_text = text.find("TEXT_BLOCK").expect("text block rendered");
@@ -1190,8 +1405,8 @@ fn fixture_file_round_trip_renders_user_and_assistant() {
     )
     .unwrap();
 
-    let rendered =
-        render_conversation(&path, &test_render_options(ToolDisplayMode::Hidden)).unwrap();
+    let transcript = crate::history::sources::decode_path(&path, None, false).unwrap();
+    let rendered = render_conversation(&transcript, &test_render_options(ToolDisplayMode::Summary));
     let text = rendered_text(&rendered);
     assert!(text.contains("hello"));
     assert!(text.contains("world"));
@@ -1374,15 +1589,14 @@ fn message_range_helper_returns_none_when_only_trailing_blank() {
 fn pending_summary_flushes_at_eof() {
     // A trailing tool-only assistant entry with no following user
     // result still flushes at EOF and produces a message range.
-    let entries = vec![RenderableEntry {
-        entry_index: 0,
-        entry: serde_json::from_str(
-            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Grep","input":{"pattern":"x"}}]}}"#,
-        )
-        .unwrap(),
-    }];
-    let rendered =
-        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
+    let entries = vec![entry(
+        0,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Grep","input":{"pattern":"x"}}]}}"#,
+    )];
+    let rendered = render_parsed_conversation(
+        &renderable(&entries),
+        &test_render_options(ToolDisplayMode::Summary),
+    );
 
     let text = rendered_text(&rendered);
     assert!(text.contains("Searched for 1 pattern"));
@@ -1396,17 +1610,16 @@ fn pending_summary_flushes_before_non_tool_message() {
     // pending summary must flush before the user message renders,
     // and both must produce distinct, non-overlapping ranges.
     let entries = vec![
-        RenderableEntry {
-            entry_index: 0,
-            entry: serde_json::from_str(
-                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Grep","input":{"pattern":"x"}}]}}"#,
-            )
-            .unwrap(),
-        },
+        entry(
+            0,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Grep","input":{"pattern":"x"}}]}}"#,
+        ),
         user_entry(1, "follow up", None),
     ];
-    let rendered =
-        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
+    let rendered = render_parsed_conversation(
+        &renderable(&entries),
+        &test_render_options(ToolDisplayMode::Summary),
+    );
 
     assert_eq!(rendered.messages.len(), 2);
     assert_eq!(rendered.messages[0].entry_index, 0);
@@ -1422,8 +1635,10 @@ fn consecutive_blank_lines_collapse_and_remap_ranges() {
     // Two adjacent user messages each emit a trailing blank; the dedup pass
     // collapses any double-blank that would arise from this sequence.
     let entries = vec![user_entry(0, "first", None), user_entry(1, "second", None)];
-    let rendered =
-        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
+    let rendered = render_parsed_conversation(
+        &renderable(&entries),
+        &test_render_options(ToolDisplayMode::Summary),
+    );
 
     // No two consecutive empty lines should remain.
     for pair in rendered.lines.windows(2) {
@@ -1457,20 +1672,17 @@ fn first_index(text: &str, needle: &str) -> Option<usize> {
 fn assistant_template_order_is_text_then_tool_then_thinking() {
     // Raw JSON order: thinking, tool_use, text. Template ordering
     // (text → tool → thinking) must override that.
-    let entries = vec![RenderableEntry {
-        entry_index: 0,
-        entry: serde_json::from_str(
-            r#"{"type":"assistant","message":{"role":"assistant","content":[
+    let entries = vec![entry(
+        0,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[
                 {"type":"thinking","thinking":"deep thought","signature":"sig"},
                 {"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}},
                 {"type":"text","text":"text reply"}
             ]}}"#,
-        )
-        .unwrap(),
-    }];
+    )];
     let mut options = test_render_options(ToolDisplayMode::Truncated);
     options.show_thinking = true;
-    let rendered = render_parsed_conversation(&entries, &options);
+    let rendered = render_parsed_conversation(&renderable(&entries), &options);
     let text = rendered_text(&rendered);
 
     let i_text = first_index(&text, "text reply").expect("text block rendered");
@@ -1487,15 +1699,14 @@ fn assistant_template_order_is_text_then_tool_then_thinking() {
 
 #[test]
 fn skill_marker_user_message_renders_dimmed_but_top_level() {
-    let entries = vec![RenderableEntry {
-        entry_index: 0,
-        entry: serde_json::from_str(
-            r#"{"type":"user","message":{"role":"user","content":"Base directory for this skill: /tmp/x"}}"#,
-        )
-        .unwrap(),
-    }];
-    let rendered =
-        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
+    let entries = vec![entry(
+        0,
+        r#"{"type":"user","message":{"role":"user","content":"Base directory for this skill: /tmp/x"}}"#,
+    )];
+    let rendered = render_parsed_conversation(
+        &renderable(&entries),
+        &test_render_options(ToolDisplayMode::Summary),
+    );
     let line = &rendered.lines[0];
     let name_text = format!("{:>width$}", "You", width = NAME_WIDTH);
     let style = line_style_at(line, &name_text);
@@ -1510,19 +1721,16 @@ fn skill_marker_user_message_renders_dimmed_but_top_level() {
 fn agent_progress_user_with_text_and_result_keeps_template_order() {
     // agent_progress user blocks aggregate text then render tool
     // results. Both must appear, in that order.
-    let entries = vec![RenderableEntry {
-        entry_index: 0,
-        entry: serde_json::from_str(
-            r#"{"type":"progress","data":{"type":"agent_progress","agentId":"agent-abc1234","message":{"type":"user","message":{"role":"user","content":[
+    let entries = vec![entry(
+        0,
+        r#"{"type":"progress","data":{"type":"agent_progress","agentId":"agent-abc1234","message":{"type":"user","message":{"role":"user","content":[
                 {"type":"text","text":"agent says hi"},
                 {"type":"tool_result","tool_use_id":"toolu_1","content":"result body"}
             ]}}}}"#,
-        )
-        .unwrap(),
-    }];
+    )];
     let mut options = test_render_options(ToolDisplayMode::Truncated);
     options.show_thinking = true;
-    let rendered = render_parsed_conversation(&entries, &options);
+    let rendered = render_parsed_conversation(&renderable(&entries), &options);
     let text = rendered_text(&rendered);
 
     let i_text = first_index(&text, "agent says hi").expect("text rendered");
@@ -1536,18 +1744,13 @@ fn excluded_entry_kinds_produce_no_lines() {
     // entries are inert — they render nothing and do not produce
     // message ranges.
     let entries = vec![
-        RenderableEntry {
-            entry_index: 0,
-            entry: serde_json::from_str(r#"{"type":"summary","summary":"x"}"#).unwrap(),
-        },
-        RenderableEntry {
-            entry_index: 1,
-            entry: serde_json::from_str(r#"{"type":"system","subtype":"info","message":"sys"}"#)
-                .unwrap(),
-        },
+        entry(0, r#"{"type":"summary","summary":"x"}"#),
+        entry(1, r#"{"type":"system","subtype":"info","message":"sys"}"#),
     ];
-    let rendered =
-        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
+    let rendered = render_parsed_conversation(
+        &renderable(&entries),
+        &test_render_options(ToolDisplayMode::Summary),
+    );
     assert!(rendered.lines.is_empty());
     assert!(rendered.messages.is_empty());
 }
@@ -1571,17 +1774,14 @@ fn content_width_reserves_timestamp_prefix_when_timing_is_on() {
 fn agent_progress_label_slices_non_ascii_agent_ids_by_character() {
     // W18: upstream sliced the agent id by bytes and panicked inside a
     // multi-byte character.
-    let entries = vec![RenderableEntry {
-        entry_index: 0,
-        entry: serde_json::from_str(
-            r#"{"type":"progress","data":{"type":"agent_progress","agentId":"агент-12345","message":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"progress"}]}}}}"#,
-        )
-        .unwrap(),
-    }];
-    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    let entries = vec![entry(
+        0,
+        r#"{"type":"progress","data":{"type":"agent_progress","agentId":"агент-12345","message":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"progress"}]}}}}"#,
+    )];
+    let mut options = test_render_options(ToolDisplayMode::Summary);
     options.show_thinking = true;
 
-    let rendered = render_parsed_conversation(&entries, &options);
+    let rendered = render_parsed_conversation(&renderable(&entries), &options);
     let text = rendered_text(&rendered);
     assert!(text.contains("↳агент-1"), "{text}");
     assert!(text.contains("progress"));

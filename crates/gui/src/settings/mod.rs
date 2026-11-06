@@ -8,8 +8,9 @@
 //! * Save (disabled while gui.toml cannot be parsed) writes only the changed
 //!   keys through core's change-set save (K12, config.toml is never written),
 //!   reloads both files into `AppState`, applies the changes live (key
-//!   bindings, theme, excluded projects, previews) and toasts
-//!   `Settings saved to <path>`; errors stay inline and keep the draft.
+//!   bindings, theme, excluded projects and working directories, previews)
+//!   and toasts `Settings saved to <path>`; errors stay inline and keep the
+//!   draft.
 //! * Cancel discards the draft and writes nothing.
 
 pub mod draft;
@@ -49,17 +50,20 @@ pub const DIALOG_WIDTH_REM: f32 = 56.0;
 pub const CONTENT_HEIGHT_REM: f32 = 34.0;
 
 /// Fields edited with a single-line input.
-pub const TEXT_FIELDS: [Field; 14] = [
+pub const TEXT_FIELDS: [Field; 17] = [
     Field::Terminal,
     Field::ClaudePath,
     Field::PiPath,
     Field::OmpPath,
+    Field::CodexPath,
     Field::DefaultWorkspace,
     Field::Key(KeyAction::Resume),
     Field::Key(KeyAction::Fork),
     Field::Key(KeyAction::Rename),
     Field::Key(KeyAction::Delete),
     Field::Key(KeyAction::Refresh),
+    Field::Key(KeyAction::AllKinds),
+    Field::Key(KeyAction::UserOnly),
     Field::AgentOutputChars,
     Field::AgentTop,
     Field::AgentWithinTop,
@@ -67,9 +71,15 @@ pub const TEXT_FIELDS: [Field; 14] = [
 ];
 
 /// Fields edited as one item per line.
-pub const LIST_FIELDS: [Field; 3] = [
+pub const LIST_FIELDS: [Field; 9] = [
     Field::ExcludeProjects,
+    Field::ExcludePaths,
+    Field::ClaudeCommand,
     Field::ResumeArgs,
+    Field::PiCommand,
+    Field::OmpCommand,
+    Field::CodexCommand,
+    Field::CodexResumeArgs,
     Field::AgentExclude,
 ];
 
@@ -291,10 +301,8 @@ impl SettingsDialog {
                 .as_ref()
                 .map(|workspace| workspace.dir().to_path_buf())
                 .or_else(|| state.env.home_dir.clone()),
-            programs: probe::PROGRAM_FIELDS
-                .iter()
-                .map(|(field, name)| (*field, self.draft.value(*field), *name))
-                .collect(),
+            cli: self.config.cli.clone(),
+            draft: self.draft.edited.clone(),
             paths: self
                 .pending_paths
                 .iter()
@@ -308,6 +316,7 @@ impl SettingsDialog {
         if field == Field::Terminal
             || self.pending_paths.contains_key(&field)
             || probe::PROGRAM_FIELDS.iter().any(|(f, _)| *f == field)
+            || field.command_agent().is_some()
         {
             self.schedule_probe(cx);
         }
@@ -502,7 +511,11 @@ impl SettingsDialog {
                 Ok(())
             }
             // Existence is checked in the background (`apply_probe`).
-            Field::ClaudePath | Field::PiPath | Field::OmpPath | Field::DefaultWorkspace => {
+            Field::ClaudePath
+            | Field::PiPath
+            | Field::OmpPath
+            | Field::CodexPath
+            | Field::DefaultWorkspace => {
                 if text.trim().is_empty() {
                     self.pending_paths.remove(&field);
                     self.set_or_reset(field, text, |t| Value::Text(t.to_string()));
@@ -526,7 +539,15 @@ impl SettingsDialog {
                         .map(|number| self.draft.set(field, Value::Number(number)))
                 }
             }
-            Field::ExcludeProjects | Field::ResumeArgs | Field::AgentExclude => {
+            Field::ExcludeProjects
+            | Field::ExcludePaths
+            | Field::ClaudeCommand
+            | Field::ResumeArgs
+            | Field::PiCommand
+            | Field::OmpCommand
+            | Field::CodexCommand
+            | Field::CodexResumeArgs
+            | Field::AgentExclude => {
                 let list = lines_to_list(text);
                 if list.is_empty() {
                     self.draft.reset(field);
@@ -704,8 +725,9 @@ fn finish_save(
 }
 
 /// The live effects of a saved change (§11.18): key bindings, excluded
-/// projects, preview refresh. (Theme: the caller; terminal, programs,
-/// `[agent]`, view defaults: read from `AppState` when they are used.)
+/// projects and working directories, preview refresh. (Theme: the caller;
+/// terminal, programs, `[agent]`, view defaults: read from `AppState` when
+/// they are used.)
 fn apply_saved(fields: &[Field], cx: &mut App) {
     let settings = app_state(cx).settings.clone();
     if fields.iter().any(|field| matches!(field, Field::Key(_))) {
@@ -716,6 +738,10 @@ fn apply_saved(fields: &[Field], cx: &mut App) {
         if fields.contains(&Field::ExcludeProjects) {
             let excluded = settings.exclude_projects.clone();
             list.update(cx, |list, cx| list.set_exclude_projects(excluded, cx));
+        }
+        if fields.contains(&Field::ExcludePaths) {
+            let excluded = settings.exclude_paths.clone();
+            list.update(cx, |list, cx| list.set_exclude_paths(excluded, cx));
         }
         if fields.contains(&Field::PreviewLast) {
             list.update(cx, |list, cx| list.set_show_last(settings.show_last, cx));
@@ -739,9 +765,9 @@ fn install_keys(cx: &mut App) {
 
 /// The live effects of a config retry in the startup error dialog (C-023):
 /// the files were re-read into `AppState` ([`reload_config`]); the key
-/// bindings, the excluded projects, the preview mode and an explicit
-/// gui.toml theme now take effect without a restart. `before` is the
-/// effective settings from before the reload.
+/// bindings, the excluded projects and working directories, the preview
+/// mode and an explicit gui.toml theme now take effect without a restart.
+/// `before` is the effective settings from before the reload.
 pub fn apply_reloaded(
     before: &claude_history_core::settings::EffectiveSettings,
     window: &mut Window,
@@ -764,6 +790,10 @@ pub fn apply_reloaded(
         if settings.exclude_projects != before.exclude_projects {
             let excluded = settings.exclude_projects.clone();
             list.update(cx, |list, cx| list.set_exclude_projects(excluded, cx));
+        }
+        if settings.exclude_paths != before.exclude_paths {
+            let excluded = settings.exclude_paths.clone();
+            list.update(cx, |list, cx| list.set_exclude_paths(excluded, cx));
         }
         if settings.show_last != before.show_last {
             list.update(cx, |list, cx| list.set_show_last(settings.show_last, cx));

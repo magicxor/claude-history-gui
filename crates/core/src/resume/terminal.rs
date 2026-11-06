@@ -32,6 +32,20 @@
 //! shell after upstream's `exec`). On Windows `<command>` is a `cmd.exe`
 //! command line and `/K` keeps the window open (`/C` without `keep_open`).
 //!
+//! # Environment variables
+//!
+//! A [`LaunchSpec`] may carry environment variables for the program (Codex:
+//! `CODEX_HOME`, upstream eea6d37). A new terminal window does not always
+//! inherit the GUI's environment (Terminal.app, `osascript`, a Windows
+//! Terminal that is already running), so they are part of the command the
+//! terminal runs: `env 'NAME=value' '<program>' ...` in `<line>` (and before
+//! the program of a Unix template's `{args}`), `set "NAME=value" && ` before
+//! `<command>` on Windows. They are also set on the spawned launcher process
+//! ([`TerminalCommand::env`]), which is all a Windows template's `{args}` (a
+//! terminal that starts the program directly) gets. A value cannot contain a
+//! line break (nor a `"` on Windows); a `%` in a Windows value is not escaped,
+//! like one in the working directory.
+//!
 //! # Windows program lookup
 //!
 //! `cmd.exe`, and its `start`, look a bare program name up in the current
@@ -165,6 +179,10 @@ pub struct LaunchSpec {
     pub args: Vec<OsString>,
     /// Working directory (`None`: the terminal's default).
     pub cwd: Option<PathBuf>,
+    /// Environment variables the program runs with, besides the inherited
+    /// ones (Codex: `CODEX_HOME`; see "Environment variables" in the module
+    /// docs).
+    pub env: Vec<(OsString, OsString)>,
 }
 
 /// Linux terminal emulators, in detection order.
@@ -483,6 +501,10 @@ pub struct TerminalCommand {
     /// Windows: start the helper process without a console window
     /// (`CREATE_NO_WINDOW`).
     pub hide_console: bool,
+    /// Environment variables set on the spawned process: the
+    /// [`LaunchSpec::env`] it launches (see "Environment variables" in the
+    /// module docs).
+    pub env: Vec<(OsString, OsString)>,
 }
 
 impl TerminalCommand {
@@ -647,6 +669,36 @@ fn spec_strings(spec: &LaunchSpec) -> Result<(String, Vec<String>, Option<String
     Ok((program, args, cwd))
 }
 
+/// The environment variables of `spec` as `NAME=value` assignments, checked:
+/// a plain name, a value without a line break (or a `"` on `platform`
+/// Windows, where it is quoted for `set`).
+fn env_assignments(spec: &LaunchSpec, platform: Platform) -> Result<Vec<String>> {
+    spec.env
+        .iter()
+        .map(|(name, value)| {
+            let name = utf8(name, "environment variable name")?;
+            let value = utf8(value, "environment variable value")?;
+            let plain_name = !name.is_empty()
+                && name
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+            if !plain_name {
+                return Err(launch_error(format!(
+                    "not a plain environment variable name: {name:?}"
+                )));
+            }
+            reject_cmd_unsafe(value, "environment variable value")?;
+            if platform.is_windows() && value.contains('"') {
+                return Err(launch_error(format!(
+                    "the value of {name} contains a quote, which cannot be passed through \
+                     cmd.exe: {value:?}"
+                )));
+            }
+            Ok(format!("{name}={value}"))
+        })
+        .collect()
+}
+
 /// Build the command that opens a terminal running `spec`.
 pub fn build_terminal_command(
     launcher: &TerminalLauncher,
@@ -654,6 +706,7 @@ pub fn build_terminal_command(
     options: &BuildOptions,
 ) -> Result<TerminalCommand> {
     let (program, args, cwd) = spec_strings(spec)?;
+    let assignments = env_assignments(spec, options.platform)?;
     let name = launcher.name();
     let command = |program: OsString, args: TerminalArgs| TerminalCommand {
         launcher: name.clone(),
@@ -662,10 +715,11 @@ pub fn build_terminal_command(
         cwd: spec.cwd.clone(),
         script: None,
         hide_console: false,
+        env: spec.env.clone(),
     };
     match launcher {
         TerminalLauncher::WindowsTerminal { program: wt } => {
-            let inner = windows_cmd_command(&program, &args)?;
+            let inner = windows_cmd_line(&program, &args, &assignments)?;
             let shell = system_cmd_text()?;
             // `-w new`: always a new window, never a tab of a window that
             // happens to be open.
@@ -689,7 +743,7 @@ pub fn build_terminal_command(
             Ok(command)
         }
         TerminalLauncher::WindowsConsole => {
-            let inner = windows_cmd_command(&program, &args)?;
+            let inner = windows_cmd_line(&program, &args, &assignments)?;
             let shell = system_cmd_text()?;
             let mut raw = String::from("/C start \"\"");
             if let Some(cwd) = &cwd {
@@ -718,12 +772,18 @@ pub fn build_terminal_command(
                 .ok_or_else(|| launch_error("no location for the launch script"))?;
             let (line, tail) = if options.keep_open {
                 (
-                    posix_line(&program, &args, cwd.as_deref(), LineEnd::Plain),
+                    posix_line(
+                        &program,
+                        &args,
+                        &assignments,
+                        cwd.as_deref(),
+                        LineEnd::Plain,
+                    ),
                     "\nexec \"${SHELL:-/bin/sh}\" -l\n",
                 )
             } else {
                 (
-                    posix_line(&program, &args, cwd.as_deref(), LineEnd::Exec),
+                    posix_line(&program, &args, &assignments, cwd.as_deref(), LineEnd::Exec),
                     "\n",
                 )
             };
@@ -745,7 +805,13 @@ pub fn build_terminal_command(
             Ok(command)
         }
         TerminalLauncher::MacOsascript => {
-            let mut line = posix_line(&program, &args, cwd.as_deref(), LineEnd::Plain);
+            let mut line = posix_line(
+                &program,
+                &args,
+                &assignments,
+                cwd.as_deref(),
+                LineEnd::Plain,
+            );
             if !options.keep_open {
                 line.push_str("; exit");
             }
@@ -775,7 +841,14 @@ pub fn build_terminal_command(
         } => {
             let mut argv: Vec<String> = leading.clone();
             argv.push("-e".into());
-            argv.extend(inner_argv(spec, &program, &args, cwd.as_deref(), options)?);
+            argv.extend(inner_argv(
+                spec,
+                &program,
+                &args,
+                &assignments,
+                cwd.as_deref(),
+                options,
+            )?);
             Ok(command(terminal.clone().into_os_string(), to_argv(argv)))
         }
         TerminalLauncher::Linux {
@@ -783,7 +856,14 @@ pub fn build_terminal_command(
             program: terminal_program,
         } => {
             let mut argv = terminal.prefix(cwd.as_deref());
-            argv.extend(inner_argv(spec, &program, &args, cwd.as_deref(), options)?);
+            argv.extend(inner_argv(
+                spec,
+                &program,
+                &args,
+                &assignments,
+                cwd.as_deref(),
+                options,
+            )?);
             Ok(command(
                 terminal_program.clone().into_os_string(),
                 to_argv(argv),
@@ -794,6 +874,7 @@ pub fn build_terminal_command(
             spec,
             &program,
             &args,
+            &assignments,
             cwd.as_deref(),
             options,
             name.clone(),
@@ -815,6 +896,7 @@ fn inner_argv(
     spec: &LaunchSpec,
     program: &str,
     args: &[String],
+    assignments: &[String],
     cwd: Option<&str>,
     options: &BuildOptions,
 ) -> Result<Vec<String>> {
@@ -822,7 +904,7 @@ fn inner_argv(
         if let Some(cwd) = cwd {
             reject_batch_script_in(spec, cwd)?;
         }
-        return direct_argv(spec);
+        return direct_argv(spec, assignments, options.platform);
     }
     Ok(vec![
         "sh".to_string(),
@@ -830,6 +912,7 @@ fn inner_argv(
         posix_line(
             program,
             args,
+            assignments,
             cwd,
             LineEnd::for_keep_open(options.keep_open),
         ),
@@ -838,13 +921,24 @@ fn inner_argv(
 
 /// The program and its arguments as separate words; a Windows batch script
 /// runs through `cmd /C` (W9), which refuses arguments `cmd` would mangle
-/// ([`ResolvedProgram::argv`]).
-fn direct_argv(spec: &LaunchSpec) -> Result<Vec<String>> {
-    spec.program
-        .argv(&spec.args)?
-        .iter()
-        .map(|arg| utf8(arg, "argument").map(str::to_string))
-        .collect()
+/// ([`ResolvedProgram::argv`]). On Unix the environment variables go first,
+/// through `env`; Windows has no such program, so there they reach the
+/// program only through the launcher's own environment
+/// ([`TerminalCommand::env`]).
+fn direct_argv(
+    spec: &LaunchSpec,
+    assignments: &[String],
+    platform: Platform,
+) -> Result<Vec<String>> {
+    let mut words = Vec::new();
+    if !platform.is_windows() && !assignments.is_empty() {
+        words.push("env".to_string());
+        words.extend(assignments.iter().cloned());
+    }
+    for arg in spec.program.argv(&spec.args)? {
+        words.push(utf8(&arg, "argument")?.to_string());
+    }
+    Ok(words)
 }
 
 /// How a POSIX command line ends.
@@ -869,9 +963,26 @@ impl LineEnd {
 }
 
 /// `cd -- '<cwd>' && '<program>' '<arg>'...`, with `exec` or a trailing
-/// `; exec "${SHELL:-/bin/sh}"` depending on `end`.
-fn posix_line(program: &str, args: &[String], cwd: Option<&str>, end: LineEnd) -> String {
-    let command = std::iter::once(program)
+/// `; exec "${SHELL:-/bin/sh}"` depending on `end`. Environment
+/// `assignments` (`NAME=value`) run the program through `env`:
+/// `env 'NAME=value' '<program>' ...`.
+fn posix_line(
+    program: &str,
+    args: &[String],
+    assignments: &[String],
+    cwd: Option<&str>,
+    end: LineEnd,
+) -> String {
+    let env_words = if assignments.is_empty() {
+        Vec::new()
+    } else {
+        std::iter::once("env")
+            .chain(assignments.iter().map(String::as_str))
+            .collect()
+    };
+    let command = env_words
+        .into_iter()
+        .chain(std::iter::once(program))
         .chain(args.iter().map(String::as_str))
         .map(quote_posix)
         .collect::<Vec<_>>()
@@ -897,6 +1008,7 @@ fn build_template(
     spec: &LaunchSpec,
     program: &str,
     args: &[String],
+    assignments: &[String],
     cwd: Option<&str>,
     options: &BuildOptions,
     name: String,
@@ -943,13 +1055,13 @@ fn build_template(
     // them so (a batch script then runs through `cmd /C`, see
     // `ResolvedProgram::argv`).
     let direct = if !uses_command || words.iter().any(|word| word == "{args}") {
-        direct_argv(spec)?
+        direct_argv(spec, assignments, options.platform)?
     } else {
         Vec::new()
     };
     // The single shell string of `{cmd}` (and of `{args}` inside a word).
     let shell_command = if windows {
-        let mut command = windows_cmd_command(program, args)?;
+        let mut command = windows_cmd_line(program, args, assignments)?;
         if let Some(cwd) = cwd {
             command = format!("cd /d \"{cwd}\" && {command}");
         }
@@ -958,6 +1070,7 @@ fn build_template(
         posix_line(
             program,
             args,
+            assignments,
             cwd,
             LineEnd::for_keep_open(options.keep_open),
         )
@@ -1034,6 +1147,7 @@ fn build_template(
         cwd: process_cwd,
         script: None,
         hide_console: false,
+        env: spec.env.clone(),
     })
 }
 
@@ -1258,6 +1372,19 @@ pub fn windows_cmd_command(program: &str, args: &[String]) -> Result<String> {
     Ok(command)
 }
 
+/// [`windows_cmd_command`] after the environment `assignments`
+/// (`NAME=value`, checked by `env_assignments`): `set "NAME=value" && ...`.
+/// Inside the quotes `cmd.exe` takes the value literally (except a `%`, see
+/// the module docs).
+fn windows_cmd_line(program: &str, args: &[String], assignments: &[String]) -> Result<String> {
+    let mut line = String::new();
+    for assignment in assignments {
+        line.push_str(&format!("set \"{assignment}\" && "));
+    }
+    line.push_str(&windows_cmd_command(program, args)?);
+    Ok(line)
+}
+
 /// One argument of a `cmd.exe` command line: MSVC-quoted (always when it
 /// contains a `cmd.exe` special character), then `^`-escaped.
 fn cmd_escaped_arg(arg: &str) -> String {
@@ -1384,6 +1511,7 @@ fn spawn_child(command: &TerminalCommand) -> std::io::Result<std::process::Child
     if let Some(cwd) = command.cwd.as_ref().filter(|cwd| cwd.is_dir()) {
         process.current_dir(cwd);
     }
+    process.envs(command.env.iter().map(|(name, value)| (name, value)));
     process
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -1395,6 +1523,69 @@ fn spawn_child(command: &TerminalCommand) -> std::io::Result<std::process::Child
         process.creation_flags(CREATE_NO_WINDOW);
     }
     process.spawn()
+}
+
+/// What a program run by [`run_to_completion`] reported.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunOutput {
+    pub success: bool,
+    /// The exit status as the standard library shows it (`exit status: 1`).
+    pub status: String,
+    /// Everything the program wrote to stderr (lossy UTF-8).
+    pub stderr: String,
+}
+
+/// Run `spec` without a terminal and wait for it to exit: stdin is empty,
+/// stdout is discarded and stderr captured, and on Windows no console
+/// window opens (`CREATE_NO_WINDOW`). A batch script runs through `cmd.exe`
+/// ([`ResolvedProgram::command`]). Blocks until the program exits: call it
+/// off the UI thread. (Fork: upstream eea6d37 runs `codex delete` with
+/// `std::process::Command`; core spawns processes only here and in
+/// `program`.)
+///
+/// Under `cfg(test)` and the `hermetic` feature it refuses with
+/// [`std::io::ErrorKind::Unsupported`]: no test runs an agent's CLI.
+pub fn run_to_completion(spec: &LaunchSpec) -> std::io::Result<RunOutput> {
+    run_child(spec)
+}
+
+#[cfg(any(test, feature = "hermetic"))]
+fn run_child(spec: &LaunchSpec) -> std::io::Result<RunOutput> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!(
+            "hermetic build: refusing to run {}",
+            spec.program.path.display()
+        ),
+    ))
+}
+
+#[cfg(not(any(test, feature = "hermetic")))]
+fn run_child(spec: &LaunchSpec) -> std::io::Result<RunOutput> {
+    let mut process = spec
+        .program
+        .command(&spec.args)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    if let Some(cwd) = spec.cwd.as_ref().filter(|cwd| cwd.is_dir()) {
+        process.current_dir(cwd);
+    }
+    process.envs(spec.env.iter().map(|(name, value)| (name, value)));
+    process
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        process.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = process.output()?;
+    Ok(RunOutput {
+        success: output.status.success(),
+        status: output.status.to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
 }
 
 #[cfg_attr(any(test, feature = "hermetic"), allow(dead_code))]
@@ -1635,6 +1826,7 @@ mod tests {
             },
             args: args.iter().map(OsString::from).collect(),
             cwd: cwd.map(PathBuf::from),
+            env: Vec::new(),
         }
     }
 
@@ -2499,6 +2691,7 @@ mod tests {
             },
             args: vec![OsString::from("--resume"), OsString::from("x")],
             cwd: Some(session.clone()),
+            env: Vec::new(),
         };
         let mut opts = options(Platform::Windows);
         opts.keep_open = false;
@@ -3024,8 +3217,192 @@ mod tests {
             cwd: None,
             script: None,
             hide_console: false,
+            env: Vec::new(),
         };
         assert_eq!(command.display(), "xterm -e 'a b'");
+    }
+
+    /// The environment of a [`LaunchSpec`] (Codex: `CODEX_HOME`, upstream
+    /// eea6d37) reaches the program through every kind of launcher, and the
+    /// launcher process gets it too.
+    #[test]
+    fn environment_variables_reach_the_program_through_every_launcher() {
+        let home = r"C:\Users\John Doe\.codex & co (1)";
+        let mut win = spec(
+            WIN_PROGRAM,
+            ProgramKind::BatchScript,
+            &["resume", "abc"],
+            Some(WIN_CWD),
+        );
+        win.env = vec![(OsString::from("CODEX_HOME"), OsString::from(home))];
+        let set = format!("set \"CODEX_HOME={home}\" && ");
+        let expected: Vec<String> = [WIN_PROGRAM, "resume", "abc"].map(str::to_string).to_vec();
+        let sys = sys_cmd();
+
+        // Windows Terminal: wt.exe, then the /K cmd.exe sets the variable.
+        let command = build_terminal_command(
+            &TerminalLauncher::WindowsTerminal {
+                program: PathBuf::from("wt.exe"),
+            },
+            &win,
+            &options(Platform::Windows),
+        )
+        .unwrap();
+        assert_eq!(command.env, win.env);
+        let (_, child) = wt_child_command_line(raw(&command));
+        let prefix = format!("{sys} /S /K ");
+        let inner = cmd_s_strip(&child[prefix.len()..]);
+        let rest = inner.strip_prefix(&set).expect(&inner);
+        assert_eq!(parse_windows_command_line(&cmd_phase2(rest)), expected);
+
+        // The console fallback: through both cmd.exe layers.
+        let command = build_terminal_command(
+            &TerminalLauncher::WindowsConsole,
+            &win,
+            &options(Platform::Windows),
+        )
+        .unwrap();
+        assert_eq!(command.env, win.env);
+        let raw = raw(&command);
+        let start = format!("/C start \"\" /D \"{WIN_CWD}\" \"{sys}\" /S /K ");
+        let outer = cmd_phase2(raw);
+        let inner = cmd_s_strip(&outer[start.len()..]);
+        let rest = inner.strip_prefix(&set).expect(&inner);
+        assert_eq!(parse_windows_command_line(&cmd_phase2(rest)), expected);
+
+        // A `cmd` template's `{cmd}`, and a template starting the program
+        // directly, which only has the launcher's environment.
+        let command = build_terminal_command(
+            &TerminalLauncher::Template("cmd /S /K {cmd}".into()),
+            &win,
+            &options(Platform::Windows),
+        )
+        .unwrap();
+        assert!(
+            raw_text(&command).contains(&format!("&& {set}")),
+            "{}",
+            raw_text(&command)
+        );
+        let mut exe = win.clone();
+        exe.program.kind = ProgramKind::Executable;
+        let command = build_terminal_command(
+            &TerminalLauncher::Template("wezterm start --cwd {cwd} -- {args}".into()),
+            &exe,
+            &options(Platform::Windows),
+        )
+        .unwrap();
+        assert_eq!(command.env, win.env);
+        assert!(!raw_text(&command).contains("CODEX_HOME"));
+
+        // Unix: `env NAME=value` before the program.
+        let mut unix = spec(
+            "/home/me/bin/codex",
+            ProgramKind::Executable,
+            &["resume", "abc"],
+            Some("/home/me/a b"),
+        );
+        unix.env = vec![(
+            OsString::from("CODEX_HOME"),
+            OsString::from("/home/me/.codex dir"),
+        )];
+        let run = "env 'CODEX_HOME=/home/me/.codex dir' /home/me/bin/codex resume abc";
+        let command = build_terminal_command(
+            &TerminalLauncher::Linux {
+                terminal: LinuxTerminal::Xterm,
+                program: PathBuf::from("/usr/bin/xterm"),
+            },
+            &unix,
+            &options(Platform::Linux),
+        )
+        .unwrap();
+        assert_eq!(command.env, unix.env);
+        let words = argv(&command);
+        assert_eq!(words[..3], ["-e", "sh", "-c"]);
+        assert!(
+            words[3].starts_with(&format!("cd -- '/home/me/a b' && {run}; exec ")),
+            "{}",
+            words[3]
+        );
+        let command = build_terminal_command(
+            &TerminalLauncher::MacTerminal,
+            &unix,
+            &BuildOptions {
+                keep_open: false,
+                ..options(Platform::MacOs)
+            },
+        )
+        .unwrap();
+        let script = command.script.unwrap();
+        assert!(
+            script.contents.contains(&format!("&& exec {run}\n")),
+            "{}",
+            script.contents
+        );
+        let command = build_terminal_command(
+            &TerminalLauncher::MacOsascript,
+            &unix,
+            &options(Platform::MacOs),
+        )
+        .unwrap();
+        assert!(argv(&command)[5].contains(run), "{:?}", argv(&command));
+        let command = build_terminal_command(
+            &TerminalLauncher::Template("kitty --directory {cwd} {args}".into()),
+            &unix,
+            &options(Platform::Linux),
+        )
+        .unwrap();
+        assert_eq!(
+            argv(&command)[2..],
+            [
+                "env",
+                "CODEX_HOME=/home/me/.codex dir",
+                "/home/me/bin/codex",
+                "resume",
+                "abc"
+            ]
+        );
+
+        // Values cmd.exe cannot carry, and names that are not plain.
+        for (name, value, platform) in [
+            ("CODEX_HOME", "a\"b", Platform::Windows),
+            ("CODEX_HOME", "a\nb", Platform::Linux),
+            ("NOT A NAME", "x", Platform::Linux),
+            ("", "x", Platform::Linux),
+        ] {
+            let mut bad = win.clone();
+            bad.env = vec![(OsString::from(name), OsString::from(value))];
+            let launcher = if platform.is_windows() {
+                TerminalLauncher::WindowsConsole
+            } else {
+                TerminalLauncher::Linux {
+                    terminal: LinuxTerminal::Xterm,
+                    program: PathBuf::from("/usr/bin/xterm"),
+                }
+            };
+            assert!(
+                build_terminal_command(&launcher, &bad, &options(platform)).is_err(),
+                "{name:?}={value:?}"
+            );
+        }
+    }
+
+    /// The text of any command's arguments.
+    fn raw_text(command: &TerminalCommand) -> String {
+        match &command.args {
+            TerminalArgs::WindowsRaw(raw) => raw.clone(),
+            TerminalArgs::Argv(args) => args
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(" "),
+        }
+    }
+
+    #[test]
+    fn programs_are_never_run_to_completion_in_tests() {
+        let spec = spec("/usr/bin/true", ProgramKind::Executable, &[], None);
+        let error = run_to_completion(&spec).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
     }
 
     #[cfg(unix)]

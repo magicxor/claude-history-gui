@@ -48,12 +48,13 @@ $sandboxEnv = [ordered]@{
     'HOME'                = $ProfileDir
     'CLAUDE_CONFIG_DIR'   = (Join-Path $ProfileDir '.claude')
     'PI_CODING_AGENT_DIR' = (Join-Path $ProfileDir ".pi${sep}agent")
+    'CODEX_HOME'          = (Join-Path $ProfileDir '.codex')
     'XDG_DATA_HOME'       = (Join-Path $ProfileDir ".local${sep}share")
     'XDG_CONFIG_HOME'     = (Join-Path $ProfileDir '.config')
     'XDG_CACHE_HOME'      = (Join-Path $ProfileDir '.cache')
     'XDG_STATE_HOME'      = (Join-Path $ProfileDir ".local${sep}state")
 }
-$removeEnv = 'PI_CODING_AGENT_SESSION_DIR', 'PI_CONFIG_DIR', 'OMP_PROFILE', 'PI_PROFILE', 'TERMINAL', 'CHG_ALLOW_REAL_HOME', 'CHG_ALLOW_REAL_LAUNCH', 'CLAUDE_HISTORY_CLIPBOARD'
+$removeEnv = 'PI_CODING_AGENT_SESSION_DIR', 'PI_CONFIG_DIR', 'CODEX_SQLITE_HOME', 'OMP_PROFILE', 'PI_PROFILE', 'TERMINAL', 'CHG_ALLOW_REAL_HOME', 'CHG_ALLOW_REAL_LAUNCH', 'CLAUDE_HISTORY_CLIPBOARD'
 $saved = @{}
 foreach ($n in @($sandboxEnv.Keys) + $removeEnv) { $saved[$n] = [Environment]::GetEnvironmentVariable($n, 'Process') }
 foreach ($n in $sandboxEnv.Keys) { [Environment]::SetEnvironmentVariable($n, $sandboxEnv[$n], 'Process') }

@@ -7,8 +7,9 @@
     USERPROFILE, HOME            = <Sandbox>
     CLAUDE_CONFIG_DIR            = <Sandbox>\.claude
     PI_CODING_AGENT_DIR          = <Sandbox>\.pi\agent
+    CODEX_HOME                   = <Sandbox>\.codex
     XDG_DATA_HOME / XDG_CONFIG_HOME / XDG_CACHE_HOME / XDG_STATE_HOME = <Sandbox>\.local\share / .config / .cache / .local\state
-    PI_CODING_AGENT_SESSION_DIR, PI_CONFIG_DIR, OMP_PROFILE, PI_PROFILE, TERMINAL,
+    PI_CODING_AGENT_SESSION_DIR, PI_CONFIG_DIR, CODEX_SQLITE_HOME, OMP_PROFILE, PI_PROFILE, TERMINAL,
     CHG_ALLOW_REAL_HOME, CHG_ALLOW_REAL_LAUNCH = removed
   The variables are set for the child only; this shell's environment is not changed.
   With -Scenario the (qa-feature) exe runs that scenario and the report is printed; with -Shots
@@ -67,13 +68,14 @@ $set = @{
     'HOME'                = $sandbox
     'CLAUDE_CONFIG_DIR'   = (Join-Path $sandbox '.claude')
     'PI_CODING_AGENT_DIR' = (Join-Path $sandbox ".pi${sep}agent")
+    'CODEX_HOME'          = (Join-Path $sandbox '.codex')
     'XDG_DATA_HOME'       = (Join-Path $sandbox ".local${sep}share")
     'XDG_CONFIG_HOME'     = (Join-Path $sandbox '.config')
     'XDG_CACHE_HOME'      = (Join-Path $sandbox '.cache')
     'XDG_STATE_HOME'      = (Join-Path $sandbox ".local${sep}state")
 }
 foreach ($name in $set.Keys) { $env_[$name] = $set[$name] }
-foreach ($name in 'PI_CODING_AGENT_SESSION_DIR', 'PI_CONFIG_DIR', 'OMP_PROFILE', 'PI_PROFILE', 'TERMINAL', 'CHG_ALLOW_REAL_HOME', 'CHG_ALLOW_REAL_LAUNCH', 'CLAUDE_HISTORY_CLIPBOARD') {
+foreach ($name in 'PI_CODING_AGENT_SESSION_DIR', 'PI_CONFIG_DIR', 'CODEX_SQLITE_HOME', 'OMP_PROFILE', 'PI_PROFILE', 'TERMINAL', 'CHG_ALLOW_REAL_HOME', 'CHG_ALLOW_REAL_LAUNCH', 'CLAUDE_HISTORY_CLIPBOARD') {
     if ($env_.ContainsKey($name)) { $env_.Remove($name) | Out-Null }
 }
 if ($StdoutFile) { $psi.RedirectStandardOutput = $true }

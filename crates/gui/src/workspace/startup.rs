@@ -9,6 +9,11 @@
 //!   frame notices), [`reload_config`];
 //! * the workspace (PD3): [`resolve_workspace`] and the pieces it is built
 //!   from ([`is_meaningful_cwd`], [`workspace_from_recorded_cwd`]);
+//!   [`startup_workspace`] adds the sandbox gate's workspace rule (§15.4),
+//!   which runtime changes ask [`workspace_refusal`] about;
+//! * the sandbox gate's rule for files opened by path (§15.4): checked in
+//!   [`dispatch`] (`FILE`, `--render FILE`), [`opened_file_refusal`] for
+//!   File → Open JSONL file…;
 //! * the initial view (PD17, C-066): [`resolve_initial_view`];
 //! * the headless paths (§11.23): [`run_agent`], [`run_show_dir`],
 //!   [`run_render`];
@@ -36,7 +41,7 @@ use claude_history_core::settings::{
     EffectiveSettings, GuiLaunchArgs, LaunchArgsError, LaunchCommand, help_text, parse_launch_args,
 };
 use claude_history_core::time_filter::TimeFilter;
-use claude_history_core::view::{ToolDisplayMode, ViewPrefs};
+use claude_history_core::view::ViewPrefs;
 use claude_history_core::{AppError, HistoryEnv, WorkspaceScope};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{Icon, IconName, WindowExt as _, h_flex};
@@ -44,10 +49,11 @@ use gpui_kit::{App, Global, SharedString, Task, Window};
 use gpui_kit::{ParentElement as _, Styled as _};
 
 use crate::exit::{EXIT_ERROR, EXIT_OK, EXIT_REFUSED, EXIT_USAGE};
-use crate::globals::{app_state, same_path, update_app_state};
+use crate::globals::{AppState, app_state, same_path, update_app_state};
 use crate::model::{ConfigErrors, LaunchContext, QaArgs, StartupTool, StdoutKind};
 use crate::notify::Toast;
-use crate::persist::{RememberedSearchMode, RememberedToolDisplay, UiState};
+use crate::persist::{RememberedSearchMode, UiState};
+use crate::qa::gate;
 use crate::services::{PlatformServices, services};
 
 /// The program name in help, usage and version texts.
@@ -88,6 +94,7 @@ pub fn to_launch_context(
         time_filter,
         qa,
         terminal_var: None,
+        sandbox_gate: false,
     }
 }
 
@@ -229,6 +236,11 @@ pub struct ProcessInfo {
     pub launch_cwd: Option<PathBuf>,
     /// QA runner arguments (`--features qa` builds).
     pub qa: Option<QaArgs>,
+    /// The process enforces the sandbox gate (`qa::gate::enforced`): every
+    /// workspace applied and every file opened by path is checked too (§15.4
+    /// rules 6 and 7). The launch context carries it into the GUI
+    /// ([`LaunchContext::sandbox_gate`]).
+    pub sandbox_gate: bool,
 }
 
 /// What `main` does next.
@@ -286,6 +298,13 @@ pub fn dispatch(
                 Ok(env) => env,
                 Err(message) => return refused(out, &message),
             };
+            // The workspace of the agent commands is the launch directory
+            // (`run_agent`): the gate's workspace rule (§15.4) applies to it.
+            if process.sandbox_gate
+                && let Err(reason) = gate::check_workspace(&env, launch_cwd.as_deref())
+            {
+                return refused(out, &gate::refusal_message(&reason));
+            }
             return Flow::Exit(run_agent(env, launch_cwd, request, out));
         }
     };
@@ -296,6 +315,22 @@ pub fn dispatch(
             return Flow::Exit(EXIT_ERROR);
         }
     };
+    if let Some(path) = args.dump_semantic_turns.clone() {
+        let env = match prepare_env() {
+            Ok(env) => env,
+            Err(message) => return refused(out, &message),
+        };
+        // Querying the stream kind attaches to the parent console on Windows,
+        // which the stderr line needs.
+        let _ = out.stdout_kind();
+        return Flow::Exit(run_dump_semantic_turns(
+            &env,
+            &args,
+            &path,
+            launch_cwd.as_deref(),
+            out,
+        ));
+    }
     // Only the headless paths need the stream kind: querying it attaches to the
     // parent console on Windows, which a plain GUI launch must not do (§14.3).
     let stdout = if args.show_dir || args.render.is_some() {
@@ -315,6 +350,10 @@ pub fn dispatch(
             Ok(env) => env,
             Err(message) => return refused(out, &message),
         };
+        let resolved = against_launch_cwd(file, launch_cwd.as_deref());
+        if let Some(flow) = gate_opened_file(process, &env, &resolved, out) {
+            return flow;
+        }
         return Flow::Exit(run_render(
             env,
             &args,
@@ -331,7 +370,41 @@ pub fn dispatch(
     if tool.is_some() {
         launch.startup_tool = tool;
     }
+    launch.sandbox_gate = process.sandbox_gate;
+    // `[FILE]` (or `--render FILE` shown in a window) opens by path.
+    if let Some(flow) = launch
+        .file
+        .as_deref()
+        .and_then(|file| gate_opened_file(process, &env, file, out))
+    {
+        return flow;
+    }
     Flow::Gui(Box::new(launch), Box::new(env))
+}
+
+/// `file` (from the command line) against the launch directory when it is
+/// relative, as the GUI and `run_render` open it.
+fn against_launch_cwd(file: &Path, launch_cwd: Option<&Path>) -> PathBuf {
+    match launch_cwd {
+        Some(cwd) if file.is_relative() => cwd.join(file),
+        _ => file.to_path_buf(),
+    }
+}
+
+/// The sandbox gate's rule for a file opened by path (§15.4 rule 7,
+/// `qa::gate::check_opened_file`) at startup: refused like the gate (exit 3)
+/// when the process enforces it.
+fn gate_opened_file(
+    process: &ProcessInfo,
+    env: &HistoryEnv,
+    file: &Path,
+    out: &dyn PlatformServices,
+) -> Option<Flow> {
+    if !process.sandbox_gate {
+        return None;
+    }
+    let reason = gate::check_opened_file(env, file).err()?;
+    Some(refused(out, &gate::refusal_message(&reason)))
 }
 
 fn print_text(out: &dyn PlatformServices, text: &str) -> Flow {
@@ -401,6 +474,45 @@ pub fn run_show_dir(
     }
 }
 
+/// `--dump-semantic-turns PATH` (hidden): the whole corpus from the store with
+/// full contents, newest first, written as JSON lines to PATH
+/// (`semantic_ops::dump_turns`); the summary line goes to stderr. No window.
+pub fn run_dump_semantic_turns(
+    env: &HistoryEnv,
+    args: &GuiLaunchArgs,
+    path: &Path,
+    launch_cwd: Option<&Path>,
+    out: &dyn PlatformServices,
+) -> i32 {
+    let (config, errors) = load_config(env);
+    if let Some(error) = errors.cli.or(errors.gui) {
+        out.write_stderr(&format!("Error: {error}\n"));
+        return EXIT_ERROR;
+    }
+    let path = match launch_cwd {
+        Some(cwd) if path.is_relative() => cwd.join(path),
+        _ => path.to_path_buf(),
+    };
+    let show_last = args.settings(&config.effective).show_last;
+    let result = claude_history_core::maintenance::load_sorted_conversations(
+        env,
+        show_last,
+        None,
+        &TimeFilter::default(),
+    )
+    .and_then(|conversations| claude_history_core::semantic_ops::dump_turns(&conversations, &path));
+    match result {
+        Ok(line) => {
+            out.write_stderr(&format!("{line}\n"));
+            EXIT_OK
+        }
+        Err(error) => {
+            out.write_stderr(&format!("Error: {error}\n"));
+            EXIT_ERROR
+        }
+    }
+}
+
 /// `--render FILE` with stdout redirected: the Ledger export (no ANSI) of
 /// FILE with the startup display options, to stdout.
 pub fn run_render(
@@ -432,7 +544,12 @@ pub fn run_render(
         show_tools: settings.show_tools,
         show_thinking: settings.show_thinking,
     };
-    match generate_export(&file, ExportFormat::Ledger, options) {
+    // `--render` decodes the file through the environment's instances, as
+    // upstream's `display::render_to_terminal` does through its service.
+    let history = claude_history_core::history::service::HistoryService::from_env(&env);
+    let rendered = claude_history_core::view::open_conversation(&history, &file)
+        .and_then(|transcript| generate_export(&transcript, ExportFormat::Ledger, options));
+    match rendered {
         Ok(text) => match out.write_stdout(&text) {
             Ok(()) => EXIT_OK,
             Err(error) => {
@@ -817,7 +934,7 @@ fn cli_workspace(
 /// 5. the last used workspace of state.json when `[gui] restore_session`;
 /// 6. none.
 ///
-/// Rule 3 (c), a directory recorded by Pi/OMP sessions, needs the loaded
+/// Rule 3 (c), a directory recorded by Pi/OMP/Codex sessions, needs the loaded
 /// corpus: [`workspace_from_recorded_cwd`] applies it after the first batch.
 pub fn resolve_workspace(
     launch: &LaunchContext,
@@ -853,9 +970,80 @@ pub fn resolve_workspace_with(
     None
 }
 
+/// Step 4 of `app::init` (§7.3): the startup workspace
+/// ([`checked_startup_workspace`]). When the sandbox gate refuses it, the
+/// refusal goes to the real stderr (in a QA run too) and the process exits 3
+/// before any window opens, as `main` does when the gate refuses.
+pub fn startup_workspace(
+    launch: &LaunchContext,
+    env: &HistoryEnv,
+    gui: &GuiSettings,
+    ui: &UiState,
+) -> Option<WorkspaceScope> {
+    checked_startup_workspace(launch, env, gui, ui).unwrap_or_else(|refusal| exit_refused(&refusal))
+}
+
+/// The startup workspace ([`resolve_workspace`]) under the sandbox gate's
+/// workspace rule (§15.4 rule 6, `qa::gate::check_workspace`): when
+/// `launch.sandbox_gate` is set and the data locations the app reads with
+/// that workspace (its Pi settings) lead outside the sandbox home, `Err` is
+/// the refusal text.
+pub fn checked_startup_workspace(
+    launch: &LaunchContext,
+    env: &HistoryEnv,
+    gui: &GuiSettings,
+    ui: &UiState,
+) -> Result<Option<WorkspaceScope>, String> {
+    let workspace = resolve_workspace(launch, env, gui, ui);
+    if launch.sandbox_gate {
+        gate::check_workspace(env, workspace.as_ref().map(WorkspaceScope::dir))
+            .map_err(|reason| gate::refusal_message(&reason))?;
+    }
+    Ok(workspace)
+}
+
+/// The sandbox gate refused at startup, after `main` handed over (§15.4):
+/// the refusal on the real stderr and exit 3. (Tests panic instead: a refusal
+/// there is a test bug, and exiting would end the test run.)
+fn exit_refused(refusal: &str) -> ! {
+    #[cfg(test)]
+    panic!("the sandbox gate refused at startup: {refusal}");
+    #[cfg(not(test))]
+    {
+        crate::ops::console::write_stderr(&format!("{refusal}\n"));
+        std::process::exit(EXIT_REFUSED);
+    }
+}
+
+/// Why the sandbox gate refuses `workspace` (§15.4 rule 6,
+/// `qa::gate::check_workspace`: the data locations the app reads with it,
+/// its Pi settings, lead outside the sandbox home); `None` when they do not,
+/// or when this process does not enforce the gate
+/// ([`LaunchContext::sandbox_gate`]). A runtime workspace change (the
+/// picker, PD3 rule 3 (c)) asks first and keeps the current workspace when
+/// refused.
+pub fn workspace_refusal(state: &AppState, workspace: &WorkspaceScope) -> Option<String> {
+    if !state.launch.sandbox_gate {
+        return None;
+    }
+    gate::check_workspace(&state.env, Some(workspace.dir())).err()
+}
+
+/// Why the sandbox gate refuses to open `file` by path (§15.4 rule 7,
+/// `qa::gate::check_opened_file`: a Codex rollout whose Codex home or state
+/// database lies outside the sandbox home); `None` when it does not, or when
+/// this process does not enforce the gate. File → Open JSONL file… asks
+/// first and does not open a refused file.
+pub fn opened_file_refusal(state: &AppState, file: &Path) -> Option<String> {
+    if !state.launch.sandbox_gate {
+        return None;
+    }
+    gate::check_opened_file(&state.env, file).err()
+}
+
 /// PD3 rule 3 (c): after the first load batch, when no workspace was chosen
 /// by rules 1–5 and the launch directory is not excluded (root, home, the
-/// executable's directory) and equals the cwd recorded by at least one Pi/OMP
+/// executable's directory) and equals the cwd recorded by at least one Pi/OMP/Codex
 /// session, that directory becomes the workspace.
 pub fn workspace_from_recorded_cwd<'a>(
     launch_cwd: Option<&Path>,
@@ -899,13 +1087,16 @@ pub fn workspace_from_recorded_cwd_with<'a>(
 }
 
 /// The app-level entry for PD3 rule 3 (c): the list calls this once after its
-/// first load batch with the cwds the batch's Pi/OMP sessions recorded. When
-/// the rule picks a workspace, `AppState` takes it and `true` is returned (the
-/// caller then re-scopes and reloads its list); otherwise nothing changes.
+/// first load batch with the cwds the batch's Pi/OMP/Codex sessions recorded. When
+/// the rule picks a workspace, `AppState` takes it and `Ok(true)` is returned (the
+/// caller then re-scopes and reloads its list); otherwise nothing changes. When
+/// the sandbox gate refuses the workspace (§15.4 rule 6, [`workspace_refusal`])
+/// nothing changes either and `Err` is the reason, for the caller's error
+/// toast.
 pub fn apply_recorded_cwd_workspace<'a>(
     cx: &mut App,
     recorded: impl IntoIterator<Item = &'a Path>,
-) -> bool {
+) -> Result<bool, String> {
     let state = app_state(cx);
     let Some(scope) = workspace_from_recorded_cwd(
         state.launch.launch_cwd.as_deref(),
@@ -913,10 +1104,13 @@ pub fn apply_recorded_cwd_workspace<'a>(
         &state.env,
         recorded,
     ) else {
-        return false;
+        return Ok(false);
     };
+    if let Some(reason) = workspace_refusal(state, &scope) {
+        return Err(reason);
+    }
     update_app_state(cx, |state, _| state.set_workspace(Some(scope)));
-    true
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -947,12 +1141,8 @@ pub fn resolve_initial_view(
 
     let tool_display = if args.show_tools || args.no_tools || display.no_tools.is_some() {
         settings.tool_display.into()
-    } else if remembered(&|ui| ui.view.tool_display.is_some()) {
-        match ui.view.tool_display {
-            Some(RememberedToolDisplay::Full) => ToolDisplayMode::Full,
-            Some(RememberedToolDisplay::Truncated) => ToolDisplayMode::Truncated,
-            _ => ToolDisplayMode::Hidden,
-        }
+    } else if let Some(tools) = ui.view.tool_display.filter(|_| restore) {
+        tools.into()
     } else {
         settings.tool_display.into()
     };

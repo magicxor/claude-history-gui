@@ -355,7 +355,7 @@ fn a_hit_reveals_its_focus_ordinal_in_its_conversation() {
     assert_eq!(target.path, corpus.retry);
     assert_eq!(
         target.source,
-        Some(claude_history_core::history::Source::Claude)
+        Some(claude_history_core::history::model::SourceKind::Claude)
     );
     assert_eq!(reveal.path, corpus.retry);
     assert_eq!(reveal.full_ref.as_deref(), Some(hit.full_ref.as_str()));

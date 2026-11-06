@@ -1,6 +1,36 @@
+//! The fastembed embedder (upstream `semantic/fastembed.rs`).
+//!
+//! Differences from upstream:
+//!
+//! * The model is loaded from a directory the caller passes
+//!   ([`FastembedEmbedder::new_in`], normally
+//!   [`crate::env::HistoryEnv::semantic_model_dir`]), fetched with hf-hub
+//!   directly (see `new_in`), and refused in tests and `hermetic` builds
+//!   ([`HERMETIC_REFUSAL`]).
+//! * [`EmbedPriority`] (upstream 8322afe, 9ee0a03) sizes the inference
+//!   threads and, as upstream, a process whose first embedder is a
+//!   background one runs ONNX Runtime's inference threads in one global pool
+//!   whose threads lower their own priority (`init_onnx_runtime`).
+//!   Upstream's `new_quiet(Background)` also lowered the scheduling priority
+//!   of the thread making the embedder, which takes part in inference; the
+//!   GUI's one shared model may be made on the agent worker or a Tools
+//!   thread, so the semantic worker lowers its own thread instead
+//!   ([`lower_background_thread_priority`]), and so do the store's
+//!   reconcile and scan pools (upstream ran reconcile in a child process at
+//!   nice 10).
+//!   Lowering also covers Windows (`THREAD_PRIORITY_BELOW_NORMAL`), which
+//!   upstream left out; the worker and reconcile threads skip it in tests
+//!   and `hermetic` builds (which never load the model).
+//! * ONNX Runtime's background threads (`BackgroundThreads`) get an 8 MiB
+//!   stack, and on Windows their join waits for the thread handle rather
+//!   than using std's join, which panics, aborting the process, for the
+//!   threads Windows ends before ort releases the environment at exit.
+//! * [`verify_onnx_runtime`] (the release self-test) sets ONNX Runtime up
+//!   for background embedding, as the GUI's shared embedder does.
+
 use crate::error::{AppError, Result};
 use crate::semantic::embed::SemanticEmbedder;
-use crate::semantic::types::DEFAULT_EMBEDDING_BATCH_SIZE;
+use crate::semantic::types::MODEL_BATCH_SIZE;
 use fastembed::{
     EmbeddingModel, InitOptionsUserDefined, TextEmbedding, TokenizerFiles,
     UserDefinedEmbeddingModel,
@@ -8,12 +38,14 @@ use fastembed::{
 use hf_hub::Cache;
 use hf_hub::api::sync::{ApiBuilder, ApiRepo};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 #[cfg(feature = "release-dynamic-ort")]
-use std::{path::Path, sync::OnceLock};
+use std::path::Path;
 
-/// The embedding model (upstream: `EmbeddingModel::BGESmallENV15`).
-const MODEL: EmbeddingModel = EmbeddingModel::BGESmallENV15;
+/// The embedding model: snowflake-arctic-embed-xs (6 layers, 384 dims,
+/// 512-token window; upstream 2e618bd, replacing bge-small-en-v1.5).
+const MODEL: EmbeddingModel = EmbeddingModel::SnowflakeArcticEmbedXS;
 /// The Hugging Face endpoint. fastembed honored `HF_ENDPOINT`; core does
 /// not read the process environment outside [`crate::env::HistoryEnv`].
 const HF_ENDPOINT: &str = "https://huggingface.co";
@@ -22,8 +54,30 @@ pub struct FastembedEmbedder {
     model: TextEmbedding,
 }
 
+/// How much of the machine embedding may use.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmbedPriority {
+    /// A command the person is waiting on: every core.
+    Foreground,
+    /// Indexing behind the list: half the cores at a lower scheduling
+    /// priority (the inference threads, and the semantic worker's own
+    /// thread; see the module notes), so the list and lexical search stay
+    /// responsive.
+    Background,
+}
+
+impl EmbedPriority {
+    fn threads(self) -> usize {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        match self {
+            Self::Foreground => cores,
+            Self::Background => (cores / 2).max(1),
+        }
+    }
+}
+
 impl FastembedEmbedder {
-    /// Load (downloading on first use) the BGE-small model into `model_dir`
+    /// Load (downloading on first use) the snowflake-arctic-embed-xs model into `model_dir`
     /// (normally [`crate::env::HistoryEnv::semantic_model_dir`]).
     ///
     /// The files are fetched with hf-hub directly instead of fastembed's
@@ -31,25 +85,39 @@ impl FastembedEmbedder {
     /// (so `clear_semantic_cache` missed it), honored `HF_ENDPOINT`, read
     /// the real `~/.cache/huggingface/token` (sending it as a bearer token)
     /// and panicked without a home directory. The cache layout under
-    /// `model_dir` (`models--Xenova--bge-small-en-v1.5/...`) is unchanged,
-    /// so earlier downloads are reused; the model is built exactly as
+    /// `model_dir` (`models--snowflake--snowflake-arctic-embed-xs/...`) is fastembed's,
+    /// so a pre-downloaded model is reused; the model is built exactly as
     /// `try_new` builds it (same files, pooling, quantization and output).
     ///
     /// GUI callers must pass `show_download_progress = false`: `true` makes
     /// hf-hub draw an indicatif progress bar on stderr (upstream CLI only).
+    /// `priority` sizes the inference thread pool, and the first embedder of
+    /// the process sets ONNX Runtime up for its priority (upstream 9ee0a03):
+    /// with `Background`, one global pool of half the cores at a lower
+    /// scheduling priority, which every later embedder of the process
+    /// shares. It never changes the calling thread's scheduling priority
+    /// (see the module notes).
     ///
     /// Guard rail (K13): in this crate's tests and in every `hermetic` build
     /// (the GUI's tests) it fails with [`HERMETIC_REFUSAL`] before touching
     /// `model_dir` or the network, also when a caller bypasses the default
     /// embedder factories.
-    pub fn new_in(model_dir: PathBuf, show_download_progress: bool) -> Result<Self> {
+    pub fn new_in(
+        model_dir: PathBuf,
+        show_download_progress: bool,
+        priority: EmbedPriority,
+    ) -> Result<Self> {
         refuse_in_hermetic_builds()?;
-        Self::load_in(model_dir, show_download_progress)
+        Self::load_in(model_dir, show_download_progress, priority)
     }
 
     /// The loader behind [`FastembedEmbedder::new_in`], without its guard.
-    fn load_in(model_dir: PathBuf, show_download_progress: bool) -> Result<Self> {
-        init_onnx_runtime()?;
+    fn load_in(
+        model_dir: PathBuf,
+        show_download_progress: bool,
+        priority: EmbedPriority,
+    ) -> Result<Self> {
+        init_onnx_runtime(priority)?;
         let info = TextEmbedding::get_model_info(&MODEL).map_err(to_config_error)?;
         if !info.additional_files.is_empty() {
             // External weight files must sit next to an on-disk model; the
@@ -58,7 +126,7 @@ impl FastembedEmbedder {
                 "{MODEL:?} needs external model files, which are not supported"
             )));
         }
-        let repo = model_api_builder(model_dir, show_download_progress)
+        let repo = model_api_builder(model_dir.clone(), show_download_progress)
             .build()
             .map_err(to_config_error)?
             .model(info.model_code.clone());
@@ -69,9 +137,10 @@ impl FastembedEmbedder {
         user_defined.output_key = info.output_key.clone();
         let model = TextEmbedding::try_new_from_user_defined(
             user_defined,
-            InitOptionsUserDefined::new().with_intra_threads(1),
+            InitOptionsUserDefined::new().with_intra_threads(priority.threads()),
         )
         .map_err(to_config_error)?;
+        crate::semantic::cache::remove_superseded_models(&model_dir);
         Ok(Self { model })
     }
 }
@@ -79,11 +148,15 @@ impl FastembedEmbedder {
 /// The production embedder in `model_dir`, quiet (no hf-hub progress bar
 /// on stderr). Every default embedder (semantic worker, agent service,
 /// semantic operations) goes through here, so in tests and `hermetic`
-/// builds it refuses like [`FastembedEmbedder::new_in`].
+/// builds it refuses like [`FastembedEmbedder::new_in`]. Upstream's
+/// `new_quiet(priority)`, without lowering the calling thread's priority.
 pub(crate) fn quiet_embedder_in(
     model_dir: PathBuf,
+    priority: EmbedPriority,
 ) -> Result<Box<dyn crate::semantic::embed::SemanticEmbedder>> {
-    Ok(Box::new(FastembedEmbedder::new_in(model_dir, false)?))
+    Ok(Box::new(FastembedEmbedder::new_in(
+        model_dir, false, priority,
+    )?))
 }
 
 /// The error of [`FastembedEmbedder::new_in`] in tests and `hermetic`
@@ -107,7 +180,7 @@ fn refuse_in_hermetic_builds() -> Result<()> {
 /// (`#[ignore]` plus `CLAUDE_HISTORY_NETWORK_TESTS=1`).
 #[cfg(test)]
 pub(crate) fn real_model_for_network_test(model_dir: PathBuf) -> Result<FastembedEmbedder> {
-    FastembedEmbedder::load_in(model_dir, false)
+    FastembedEmbedder::load_in(model_dir, false, EmbedPriority::Background)
 }
 
 /// The hf-hub API over the cache in `model_dir` only: the fixed public
@@ -146,65 +219,209 @@ fn read_model_files(repo: &ApiRepo, model_file: &str) -> Result<ModelFiles> {
 }
 
 impl SemanticEmbedder for FastembedEmbedder {
+    /// Embeds `passages` in small batches of similar length: a batch is
+    /// padded to its longest passage, so mixing lengths wastes inference on
+    /// padding, and small batches keep the activation memory small.
     fn embed_passages(&mut self, passages: &[String]) -> Result<Vec<Vec<f32>>> {
-        self.model
-            .embed(
-                prefixed_passages(passages),
-                Some(DEFAULT_EMBEDDING_BATCH_SIZE),
-            )
-            .map_err(to_config_error)
+        let order = length_order(passages);
+        let sorted = order
+            .iter()
+            .map(|&index| passages[index].as_str())
+            .collect::<Vec<_>>();
+        let embeddings = self
+            .model
+            .embed(prefixed_passages(&sorted), Some(MODEL_BATCH_SIZE))
+            .map_err(to_config_error)?;
+        Ok(unsort(&order, embeddings))
     }
 
     fn embed_query(&mut self, query: &str) -> Result<Option<Vec<f32>>> {
         let embeddings = self
             .model
-            .embed(
-                vec![prefixed_query(query)],
-                Some(DEFAULT_EMBEDDING_BATCH_SIZE),
-            )
+            .embed(vec![prefixed_query(query)], Some(MODEL_BATCH_SIZE))
             .map_err(to_config_error)?;
         Ok(embeddings.first().cloned())
     }
 }
 
+/// Indices of `passages` from shortest to longest.
+fn length_order(passages: &[String]) -> Vec<usize> {
+    let mut order = (0..passages.len()).collect::<Vec<_>>();
+    order.sort_by_key(|&index| passages[index].len());
+    order
+}
+
+/// Puts `values`, computed for the passages in `order`, back in passage
+/// order.
+fn unsort<T: Default>(order: &[usize], values: Vec<T>) -> Vec<T> {
+    let mut out = (0..values.len()).map(|_| T::default()).collect::<Vec<_>>();
+    for (&index, value) in order.iter().zip(values) {
+        out[index] = value;
+    }
+    out
+}
+
+/// Lowers the calling thread's scheduling priority for background work
+/// (the semantic worker, the store's reconcile and scan pools), with
+/// [`lower_current_thread_priority`].
+///
+/// Guard rail: in this crate's tests and in `hermetic` builds (the GUI's
+/// tests) the thread keeps its priority. A worker below the test threads'
+/// priority could wait seconds for a core on a busy machine and make
+/// timing-bound tests flaky; upstream's tests never lowered one either
+/// (only the real embedder's constructor did).
+pub(crate) fn lower_background_thread_priority() {
+    if !cfg!(any(test, feature = "hermetic")) {
+        lower_current_thread_priority();
+    }
+}
+
+/// Lowers the scheduling priority of the calling thread: the utility QoS
+/// class on macOS, nice 10 on Linux, and (fork) `THREAD_PRIORITY_BELOW_NORMAL`
+/// on Windows. Threads the calling thread creates afterwards inherit it on
+/// Linux only, so ONNX Runtime's background threads lower their own
+/// ([`BackgroundThreads`]).
+fn lower_current_thread_priority() {
+    #[cfg(target_os = "macos")]
+    // SAFETY: changes only the calling thread's QoS class.
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
+    }
+    #[cfg(target_os = "linux")]
+    // SAFETY: changes only the calling thread's nice value; Linux applies
+    // PRIO_PROCESS with a thread id to that thread alone.
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+        libc::setpriority(libc::PRIO_PROCESS, tid, 10);
+    }
+    #[cfg(windows)]
+    // SAFETY: `GetCurrentThread` is the calling thread's pseudo handle, so
+    // only that thread's priority changes. Below normal, not
+    // THREAD_MODE_BACKGROUND_BEGIN, which would also lower the priority of
+    // the thread's file I/O (the embedding cache writes).
+    unsafe {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+        };
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+}
+
+/// The query instruction snowflake-arctic-embed was trained with; passages
+/// take none.
 pub fn prefixed_query(query: &str) -> String {
     format!("Represent this sentence for searching relevant passages: {query}")
 }
 
-pub fn prefixed_passages(passages: &[String]) -> Vec<String> {
-    passages.to_vec()
+pub fn prefixed_passages(passages: &[&str]) -> Vec<String> {
+    passages
+        .iter()
+        .map(|passage| (*passage).to_owned())
+        .collect()
 }
 
-#[cfg(feature = "release-dynamic-ort")]
-fn init_onnx_runtime() -> Result<()> {
+/// Sets up the ONNX Runtime environment, once per process, for embedders of
+/// `priority`; later embedders share it.
+fn init_onnx_runtime(priority: EmbedPriority) -> Result<()> {
     static INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
-    match INIT.get_or_init(initialize_bundled_onnx_runtime) {
+    match INIT.get_or_init(|| initialize_onnx_runtime(priority)) {
         Ok(()) => Ok(()),
         Err(message) => Err(AppError::ConfigError(message.clone())),
     }
 }
 
-#[cfg(not(feature = "release-dynamic-ort"))]
-fn init_onnx_runtime() -> Result<()> {
+fn initialize_onnx_runtime(priority: EmbedPriority) -> std::result::Result<(), String> {
+    #[cfg(feature = "release-dynamic-ort")]
+    let builder = bundled_onnx_runtime()?;
+    #[cfg(not(feature = "release-dynamic-ort"))]
+    let builder = ort::init();
+    let builder = match priority {
+        EmbedPriority::Foreground => builder,
+        EmbedPriority::Background => builder.with_global_thread_pool(
+            background_thread_pool(priority.threads())
+                .map_err(|error| format!("Failed to configure ONNX Runtime threads: {error}"))?,
+        ),
+    };
+    if !builder.commit() {
+        return Err(
+            "Failed to initialize ONNX Runtime: an environment is already configured".to_string(),
+        );
+    }
     Ok(())
 }
 
+/// A pool of `threads` inference threads at background priority, which
+/// sessions use instead of creating their own. Its threads sleep rather
+/// than spin when out of work, since background embedding comes in bursts.
+fn background_thread_pool(
+    threads: usize,
+) -> ort::Result<ort::environment::GlobalThreadPoolOptions> {
+    ort::environment::GlobalThreadPoolOptions::default()
+        .with_intra_threads(threads)?
+        .with_inter_threads(1)?
+        .with_spin_control(false)?
+        .with_thread_manager(BackgroundThreads)
+}
+
+/// Spawns ONNX Runtime's threads with lowered scheduling priority. Threads
+/// it creates do not inherit the QoS class of the thread creating them on
+/// macOS, so each lowers its own. Fork: nor the priority on Windows, where
+/// [`lower_current_thread_priority`] sets below normal; it is called
+/// directly, not through [`lower_background_thread_priority`], since tests
+/// never load the model.
+struct BackgroundThreads;
+
+impl ort::environment::ThreadManager for BackgroundThreads {
+    type Thread = std::thread::JoinHandle<()>;
+
+    fn create(&self, work: impl FnOnce() + Send + 'static) -> ort::Result<Self::Thread> {
+        std::thread::Builder::new()
+            .name("semantic-embed".to_string())
+            // Fork: the 8 MiB of every named thread (DESIGN §7.5); ONNX
+            // Runtime's own threads got the executable's default, which is
+            // 8 MB in the GUI on Windows.
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                lower_current_thread_priority();
+                work();
+            })
+            .map_err(|error| ort::Error::new(error.to_string()))
+    }
+
+    #[cfg(not(windows))]
+    fn join(thread: Self::Thread) -> ort::Result<()> {
+        let _ = thread.join();
+        Ok(())
+    }
+
+    /// Fork: ort releases the environment, and with it this pool, when the
+    /// process exits, after Windows has ended every other thread. Joining
+    /// such a thread through std panics (its result never arrived), and a
+    /// panic in ONNX Runtime's callback aborts the exiting process, so this
+    /// waits for the thread's handle instead and then lets it go.
+    #[cfg(windows)]
+    fn join(thread: Self::Thread) -> ort::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+        // SAFETY: the handle belongs to `thread`, which keeps it open until
+        // it is dropped after the wait.
+        unsafe {
+            WaitForSingleObject(thread.as_raw_handle(), INFINITE);
+        }
+        drop(thread);
+        Ok(())
+    }
+}
+
 #[cfg(feature = "release-dynamic-ort")]
-fn initialize_bundled_onnx_runtime() -> std::result::Result<(), String> {
+fn bundled_onnx_runtime() -> std::result::Result<ort::environment::EnvironmentBuilder, String> {
     let path = bundled_onnx_runtime_path().ok_or_else(missing_runtime_message)?;
-    let builder = ort::init_from(&path).map_err(|error| {
+    ort::init_from(&path).map_err(|error| {
         format!(
             "Failed to load bundled ONNX Runtime from {}: {error}",
             path.display()
         )
-    })?;
-    if !builder.commit() {
-        return Err(format!(
-            "Failed to initialize bundled ONNX Runtime from {}: an ONNX Runtime environment is already configured",
-            path.display()
-        ));
-    }
-    Ok(())
+    })
 }
 
 #[cfg(feature = "release-dynamic-ort")]
@@ -273,11 +490,15 @@ fn is_versioned_runtime_name(path: &Path, unversioned_name: &str) -> bool {
     }
 }
 
-/// Load the bundled ONNX Runtime library now (a no-op without the
-/// `release-dynamic-ort` feature). Release verify steps call this, so a missing
-/// or incompatible library fails before the first semantic search does.
+/// Set ONNX Runtime up now as the GUI's shared embedder does
+/// ([`EmbedPriority::Background`]): with the `release-dynamic-ort` feature
+/// this loads the bundled library and configures the background thread pool
+/// through it. Release verify steps call this, so a missing or incompatible
+/// library fails before the first semantic search does. It decides the
+/// process's ONNX Runtime environment, so only a process that exits
+/// afterwards (the self-test) or embeds in the background may call it.
 pub fn verify_onnx_runtime() -> Result<()> {
-    init_onnx_runtime()
+    init_onnx_runtime(EmbedPriority::Background)
 }
 
 fn to_config_error(err: impl std::fmt::Display) -> AppError {
@@ -302,27 +523,109 @@ mod tests {
         // (DESIGN §7.6); a test that reaches it must not download.
         let temp = tempfile::tempdir().unwrap();
         let model_dir = temp.path().join("semantic").join("fastembed");
-        for progress in [false, true] {
-            let error = match FastembedEmbedder::new_in(model_dir.clone(), progress) {
+        for priority in [EmbedPriority::Foreground, EmbedPriority::Background] {
+            for progress in [false, true] {
+                let error = match FastembedEmbedder::new_in(model_dir.clone(), progress, priority) {
+                    Ok(_) => panic!("the real model must not load in tests"),
+                    Err(error) => error.to_string(),
+                };
+                assert!(error.contains(HERMETIC_REFUSAL), "{error}");
+            }
+            let error = match quiet_embedder_in(model_dir.clone(), priority) {
                 Ok(_) => panic!("the real model must not load in tests"),
                 Err(error) => error.to_string(),
             };
             assert!(error.contains(HERMETIC_REFUSAL), "{error}");
         }
-        let error = match quiet_embedder_in(model_dir.clone()) {
-            Ok(_) => panic!("the real model must not load in tests"),
-            Err(error) => error.to_string(),
-        };
-        assert!(error.contains(HERMETIC_REFUSAL), "{error}");
         assert!(!temp.path().join("semantic").exists(), "nothing created");
     }
 
     #[test]
     fn leaves_passages_unprefixed_for_fastembed() {
         assert_eq!(
-            prefixed_passages(&["one".to_string(), "two".to_string()]),
+            prefixed_passages(&["one", "two"]),
             vec!["one".to_string(), "two".to_string()]
         );
+    }
+
+    #[test]
+    fn length_order_round_trips() {
+        let passages = vec!["ccc".to_string(), "a".to_string(), "bb".to_string()];
+        let order = length_order(&passages);
+        assert_eq!(order, vec![1, 2, 0]);
+        let computed = order.iter().map(|&index| passages[index].len()).collect();
+        assert_eq!(unsort(&order, computed), vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn background_embedding_uses_half_the_cores() {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        assert_eq!(EmbedPriority::Foreground.threads(), cores);
+        assert_eq!(EmbedPriority::Background.threads(), (cores / 2).max(1));
+    }
+
+    /// The calling thread's scheduling priority as the OS reports it: its
+    /// nice value.
+    #[cfg(target_os = "linux")]
+    fn current_thread_priority() -> i32 {
+        // SAFETY: reads the calling thread's nice value.
+        unsafe {
+            let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+            libc::getpriority(libc::PRIO_PROCESS, tid)
+        }
+    }
+
+    /// The calling thread's scheduling priority as the OS reports it.
+    #[cfg(windows)]
+    fn current_thread_priority() -> i32 {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
+        // SAFETY: reads the calling thread's priority through its pseudo
+        // handle.
+        unsafe { GetThreadPriority(GetCurrentThread()) }
+    }
+
+    /// Not read on other systems.
+    #[cfg(not(any(target_os = "linux", windows)))]
+    fn current_thread_priority() -> i32 {
+        0
+    }
+
+    /// Fork: the helper lowers only the calling thread, on Windows too. It
+    /// is called directly: the background call sites skip it in tests.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn lowering_the_priority_changes_only_the_calling_thread() {
+        let before = current_thread_priority();
+        let lowered = std::thread::spawn(|| {
+            lower_current_thread_priority();
+            current_thread_priority()
+        })
+        .join()
+        .unwrap();
+        #[cfg(target_os = "linux")]
+        assert!(lowered >= 10, "nice {lowered}");
+        #[cfg(windows)]
+        assert_eq!(
+            lowered,
+            windows_sys::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL
+        );
+        assert_eq!(
+            current_thread_priority(),
+            before,
+            "this thread is unchanged"
+        );
+    }
+
+    #[test]
+    fn background_threads_keep_their_priority_in_tests() {
+        let (before, after) = std::thread::spawn(|| {
+            let before = current_thread_priority();
+            lower_background_thread_priority();
+            (before, current_thread_priority())
+        })
+        .join()
+        .unwrap();
+        assert_eq!(before, after);
     }
 
     #[test]
@@ -358,7 +661,7 @@ mod tests {
         let model_dir = temp.path().join("fastembed");
         let info = TextEmbedding::get_model_info(&MODEL).unwrap();
         let repo_dir = model_dir.join(format!("models--{}", info.model_code.replace('/', "--")));
-        assert!(repo_dir.ends_with("models--Xenova--bge-small-en-v1.5"));
+        assert!(repo_dir.ends_with("models--snowflake--snowflake-arctic-embed-xs"));
         std::fs::create_dir_all(repo_dir.join("refs")).unwrap();
         std::fs::write(repo_dir.join("refs").join("main"), "abc123").unwrap();
         let snapshot = repo_dir.join("snapshots").join("abc123");
@@ -392,14 +695,56 @@ mod tests {
             read.tokenizer.tokenizer_config_file,
             b"<tokenizer_config.json>"
         );
-        // The BGE-small model needs no external weight files.
+        // The model needs no external weight files.
         assert!(info.additional_files.is_empty());
     }
 
     #[cfg(not(feature = "release-dynamic-ort"))]
     #[test]
-    fn non_release_runtime_initialization_is_a_noop() {
-        assert!(init_onnx_runtime().is_ok());
+    fn non_release_runtime_initialization_needs_no_bundled_runtime() {
+        assert!(init_onnx_runtime(EmbedPriority::Foreground).is_ok());
+    }
+
+    /// Fork: the options of the background pool are accepted by the linked
+    /// ONNX Runtime (nothing is committed, no thread is started).
+    #[cfg(not(feature = "release-dynamic-ort"))]
+    #[test]
+    fn background_thread_pool_options_are_accepted() {
+        assert!(background_thread_pool(EmbedPriority::Background.threads()).is_ok());
+    }
+
+    /// Fork: ONNX Runtime's background threads are named and lower their
+    /// own priority before they run its work, on Windows too; the creating
+    /// thread keeps its priority, and joining one waits until it is done.
+    #[test]
+    fn background_inference_threads_lower_their_own_priority() {
+        use ort::environment::ThreadManager;
+        let before = current_thread_priority();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let thread = BackgroundThreads
+            .create(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let name = std::thread::current().name().map(str::to_owned);
+                sender.send((name, current_thread_priority())).unwrap();
+            })
+            .unwrap();
+        BackgroundThreads::join(thread).unwrap();
+        let (name, lowered) = receiver.try_recv().expect("the join waited for the work");
+        assert_eq!(name.as_deref(), Some("semantic-embed"));
+        #[cfg(target_os = "linux")]
+        assert!(lowered >= 10, "nice {lowered}");
+        #[cfg(windows)]
+        assert_eq!(
+            lowered,
+            windows_sys::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL
+        );
+        #[cfg(not(any(target_os = "linux", windows)))]
+        let _ = lowered;
+        assert_eq!(
+            current_thread_priority(),
+            before,
+            "this thread is unchanged"
+        );
     }
 
     #[cfg(feature = "release-dynamic-ort")]

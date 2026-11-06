@@ -10,7 +10,8 @@
 //! 1. `debug_sink::install` (WP7);
 //! 2. `startup::load_config` (WP7) — config.toml and gui.toml independently;
 //! 3. `persist::load` (WP6);
-//! 4. `startup::resolve_workspace` (WP7, PD3);
+//! 4. `startup::startup_workspace` (WP7, PD3; with the sandbox gate's
+//!    workspace rule, §15.4: a refusal exits 3 before any window opens);
 //! 5. `startup::resolve_initial_view` (WP7, PD17);
 //! 6. `AppState`, `SemanticGate`, `MainPanes`, `ActivePane`, `OpenTargets`,
 //!    `LastToast`, `CorpusBus`; `ops::resume::TerminalVar` (`$TERMINAL` as
@@ -115,14 +116,16 @@ fn install_global_handlers(cx: &mut App) {
 fn install_state(cx: &mut App, launch: LaunchContext, env: HistoryEnv) {
     let (config, config_errors) = workspace::startup::load_config(&env);
     let ui = persist::load(&env);
-    let workspace_scope = workspace::startup::resolve_workspace(&launch, &env, &config.gui, &ui);
+    let workspace_scope = workspace::startup::startup_workspace(&launch, &env, &config.gui, &ui);
     let settings = launch.args.settings(&config.effective);
     // `$TERMINAL` as `main` read it, for the launcher detection (§11.10 step 6).
     crate::ops::resume::set_terminal_var(cx, launch.terminal_var.clone());
     let (view_defaults, list_mode) =
         workspace::startup::resolve_initial_view(&launch, &config, &settings, &ui);
+    let env = Arc::new(env);
     let mut state = AppState {
-        env: Arc::new(env),
+        history: crate::globals::EnvHistory::new(env.clone()),
+        env,
         config,
         config_errors,
         launch,
@@ -204,6 +207,12 @@ pub fn init_for_test(
         cx.set_global(crate::test_support::KitInitialized);
     }
     cx.set_global(persist::PersistWrites(false));
+    // The list comes from the store under the world's cache root, as in the
+    // app (upstream 358becb); tests of the in-memory path turn it off
+    // (`test_support::use_memory_list`). The loader joins its threads when
+    // the window goes, before the world's temporary directory.
+    cx.set_global(crate::list::ListSnapshots(true));
+    cx.set_global(crate::test_support::WorldDir(world.tmp.clone()));
     let services = Services::recording(recording);
     // The debug sink and the core theme are process-wide: tests that need
     // them install them under `test_support::global_lock`.

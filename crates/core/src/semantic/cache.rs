@@ -1,13 +1,37 @@
+//! The passage embedding cache (upstream `semantic/cache.rs`): the
+//! memory-mapped matrix `embeddings-v2.bin` ([`crate::semantic::matrix`],
+//! upstream 8919a76) in the semantic cache directory, merged on every save,
+//! and the one-time conversion of `embeddings-v1.bin`.
+//!
+//! Differences from upstream:
+//!
+//! * The cache file comes from the caller ([`crate::env::HistoryEnv::embedding_cache_file`]);
+//!   upstream resolved `~/.cache/claude-history/semantic` itself and returned
+//!   no directory under `cfg(test)`. The v1 file is the sibling
+//!   [`crate::env::LEGACY_EMBEDDING_CACHE_FILE_NAME`].
+//! * Writers serialize on `embeddings.lock` (K6, [`lock_semantic_cache_dir`]),
+//!   waiting at most [`CACHE_LOCK_WAIT`], instead of a blocking flock on
+//!   `LOCK`. A save that cannot get the lock is skipped with a Warn debug
+//!   line, as before; a conversion that cannot get it uses the v1 file
+//!   without converting it this time.
+//! * Clearing ([`clear_semantic_cache_files`]) empties the directory and
+//!   keeps the lock file and never follows links.
+//! * A matrix write that fails logs a Warn debug line; upstream ignores it.
+//! * `legacy_cache_path`, `inspect_matrix` and `inspect_legacy` give
+//!   `semantic_ops::semantic_status` a read-only look at the v2 and v1 files
+//!   without converting or pruning anything.
+
 use crate::error::{AppError, Result};
 use crate::semantic::embed::SemanticEmbedder;
+use crate::semantic::matrix::{EmbeddingKey, EmbeddingMatrix, MatrixRow, MatrixSettings};
 use crate::semantic::types::{
     CACHE_SCHEMA_VERSION, CachedChunk, ChunkConfig, DEFAULT_EMBEDDING_BATCH_SIZE, EmbeddedChunk,
-    EmbeddingCache, MODEL_NAME, SemanticChunk,
+    Embedding, EmbeddingCache, MODEL_NAME, SemanticChunk,
 };
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
 pub(crate) const MAX_CACHE_ENTRIES: usize = 50_000;
 
@@ -42,7 +66,7 @@ pub fn embed_chunks_with_budget_and_save(
     cache.access_counter = access;
     let mut embedded = Vec::with_capacity(chunks.len());
     let mut misses = Vec::<Vec<SemanticChunk>>::new();
-    let mut miss_indices = HashMap::<String, usize>::new();
+    let mut miss_indices = HashMap::<EmbeddingKey, usize>::new();
 
     for chunk in chunks {
         if cancellation.is_cancelled() {
@@ -87,6 +111,7 @@ pub fn embed_chunks_with_budget_and_save(
 
         for (chunks, embedding) in batch.iter().zip(embeddings) {
             let key = embedding_cache_key(&chunks[0].text);
+            let embedding = Embedding::from(embedding);
             cache.entries.insert(
                 key,
                 CachedChunk {
@@ -160,7 +185,7 @@ fn prune_cache_to_limit(cache: &mut EmbeddingCache, max_entries: usize) {
     let mut oldest = cache
         .entries
         .iter()
-        .map(|(key, entry)| (entry.protected, entry.last_used, key.clone()))
+        .map(|(key, entry)| (entry.protected, entry.last_used, *key))
         .collect::<Vec<_>>();
     oldest.sort_unstable();
     for (_, _, key) in oldest.into_iter().take(excess) {
@@ -168,7 +193,7 @@ fn prune_cache_to_limit(cache: &mut EmbeddingCache, max_entries: usize) {
     }
 }
 
-fn embedded_chunk(chunk: &SemanticChunk, embedding: Vec<f32>) -> EmbeddedChunk {
+fn embedded_chunk(chunk: &SemanticChunk, embedding: Embedding) -> EmbeddedChunk {
     EmbeddedChunk {
         conversation_index: chunk.conversation_index,
         source: chunk.source,
@@ -212,8 +237,8 @@ pub fn cache_miss_count(chunks: &[SemanticChunk], cache: &EmbeddingCache) -> usi
         .len()
 }
 
-pub fn embedding_cache_key(text: &str) -> String {
-    blake3::hash(text.as_bytes()).to_hex().to_string()
+pub fn embedding_cache_key(text: &str) -> EmbeddingKey {
+    EmbeddingKey::of(text)
 }
 
 pub fn cache_contains_text(cache: &EmbeddingCache, text: &str) -> bool {
@@ -230,27 +255,210 @@ pub fn read_embedding_cache(path: Option<&Path>, config: ChunkConfig) -> Embeddi
     read_embedding_cache_from_path(path, config)
 }
 
+/// Reads the embedding matrix at `path`. When there is none yet, converts
+/// `embeddings-v1.bin` beside it, the serialized map earlier versions kept,
+/// into one and removes it, so its embeddings are kept.
 pub fn read_embedding_cache_from_path(path: &Path, config: ChunkConfig) -> EmbeddingCache {
-    let Ok(data) = std::fs::read(path) else {
-        return empty_embedding_cache(config);
-    };
-    let Ok(mut cache) = bincode::deserialize::<EmbeddingCache>(&data) else {
-        return empty_embedding_cache(config);
-    };
-    if cache_matches_config(&cache, config) {
+    if let Some(cache) = read_matrix(path, config) {
         if cache.entries.len() > MAX_CACHE_ENTRIES {
+            let mut cache = cache;
             prune_cache(&mut cache);
             write_embedding_cache_to_path(&cache, path);
+            return cache;
         }
-        cache
-    } else {
-        empty_embedding_cache(config)
+        return cache;
     }
+    let Some((dir, legacy)) = path.parent().zip(legacy_cache_path(path)) else {
+        return empty_embedding_cache(config);
+    };
+    if !legacy.exists() {
+        return empty_embedding_cache(config);
+    }
+    let _lock = match lock_semantic_cache_dir(dir, CACHE_LOCK_WAIT) {
+        Ok(Some(lock)) => lock,
+        // Fork: the lock waits at most `CACHE_LOCK_WAIT`. Another writer is
+        // busy (perhaps converting the same file): use what is there now
+        // without converting it; a later read converts it.
+        other => {
+            let reason = match other {
+                Err(error) => format!("cannot lock {}: {error}", dir.display()),
+                _ => format!("{} is locked by another writer", dir.display()),
+            };
+            crate::debug::warn(
+                Some(crate::debug::DebugLevel::Warn),
+                &format!("Semantic cache conversion skipped: {reason}"),
+            );
+            return read_matrix(path, config)
+                .or_else(|| read_legacy(&legacy, config))
+                .unwrap_or_else(|| empty_embedding_cache(config));
+        }
+    };
+    if let Some(cache) = read_matrix(path, config) {
+        return cache;
+    }
+    let Some(mut cache) = read_legacy(&legacy, config) else {
+        return empty_embedding_cache(config);
+    };
+    prune_cache(&mut cache);
+    if write_matrix(&cache, path).is_ok() {
+        let _ = std::fs::remove_file(&legacy);
+        remove_stale_temp_files(dir);
+    }
+    read_matrix(path, config).unwrap_or(cache)
 }
 
-/// Atomically write the embedding cache to `path` (temp file + rename),
-/// holding the cache lock ([`lock_semantic_cache_dir`]). Failures are
-/// ignored, as upstream; a write that cannot get the lock within
+/// `embeddings-v1.bin`, the file earlier versions kept, beside the matrix at
+/// `path`.
+pub(crate) fn legacy_cache_path(path: &Path) -> Option<PathBuf> {
+    path.parent().map(|dir| dir.join(LEGACY_FILE))
+}
+
+fn read_matrix(path: &Path, config: ChunkConfig) -> Option<EmbeddingCache> {
+    let matrix = Arc::new(EmbeddingMatrix::open(path)?);
+    if matrix.settings() != matrix_settings(config) {
+        return None;
+    }
+    let mut cache = empty_embedding_cache(config);
+    cache.access_counter = matrix.access_counter();
+    cache.entries = mapped_entries(&matrix).collect();
+    Some(cache)
+}
+
+fn mapped_entries(
+    matrix: &Arc<EmbeddingMatrix>,
+) -> impl Iterator<Item = (EmbeddingKey, CachedChunk)> + '_ {
+    matrix.keys().iter().enumerate().map(|(row, key)| {
+        let row = row as u32;
+        (
+            *key,
+            CachedChunk {
+                embedding: Embedding::Mapped(matrix.clone(), row),
+                last_used: matrix.last_used(row),
+                protected: matrix.protected(row),
+            },
+        )
+    })
+}
+
+/// A read-only look at the matrix at `path` for
+/// [`crate::semantic_ops::semantic_status`] (fork): `Err` when it cannot be
+/// opened or is not a valid matrix, `Ok(None)` when it was written with other
+/// settings, else its entries. Never converts, prunes or writes anything.
+pub(crate) fn inspect_matrix(
+    path: &Path,
+    config: ChunkConfig,
+) -> std::result::Result<Option<EmbeddingCache>, String> {
+    std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let matrix = EmbeddingMatrix::open(path).ok_or("not a valid embedding matrix")?;
+    if matrix.settings() != matrix_settings(config) {
+        return Ok(None);
+    }
+    let matrix = Arc::new(matrix);
+    let mut cache = empty_embedding_cache(config);
+    cache.access_counter = matrix.access_counter();
+    cache.entries = mapped_entries(&matrix).collect();
+    Ok(Some(cache))
+}
+
+/// `embeddings-v1.bin` as earlier versions serialized it.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct LegacyCache {
+    schema_version: u32,
+    model: String,
+    chunk_target_chars: usize,
+    chunk_overlap_chars: usize,
+    chunk_context_turns: usize,
+    access_counter: u64,
+    entries: HashMap<String, LegacyChunk>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct LegacyChunk {
+    embedding: Vec<f32>,
+    last_used: u64,
+    protected: bool,
+}
+
+fn read_legacy(path: &Path, config: ChunkConfig) -> Option<EmbeddingCache> {
+    inspect_legacy(path, config).ok().flatten()
+}
+
+/// Upstream's `read_legacy`, telling an unreadable file (`Err`) from one
+/// written with other settings (`Ok(None)`), for
+/// [`crate::semantic_ops::semantic_status`] (fork).
+pub(crate) fn inspect_legacy(
+    path: &Path,
+    config: ChunkConfig,
+) -> std::result::Result<Option<EmbeddingCache>, String> {
+    let data = std::fs::read(path).map_err(|error| error.to_string())?;
+    let legacy = bincode::deserialize::<LegacyCache>(&data).map_err(|error| error.to_string())?;
+    let mut cache = empty_embedding_cache(config);
+    let matches = legacy.schema_version == CACHE_SCHEMA_VERSION
+        && legacy.model == MODEL_NAME
+        && legacy.chunk_target_chars == config.target_chars
+        && legacy.chunk_overlap_chars == config.overlap_chars
+        && legacy.chunk_context_turns == config.context_turns;
+    if !matches {
+        return Ok(None);
+    }
+    cache.access_counter = legacy.access_counter;
+    let dims = legacy
+        .entries
+        .values()
+        .next()
+        .map(|entry| entry.embedding.len());
+    cache.entries = legacy
+        .entries
+        .into_iter()
+        .filter(|(_, entry)| Some(entry.embedding.len()) == dims)
+        .filter_map(|(key, entry)| {
+            Some((
+                EmbeddingKey::from_hex(&key)?,
+                CachedChunk {
+                    embedding: entry.embedding.into(),
+                    last_used: entry.last_used,
+                    protected: entry.protected,
+                },
+            ))
+        })
+        .collect();
+    Ok(Some(cache))
+}
+
+/// The bytes of an `embeddings-v1.bin` with the default chunking, written
+/// for `schema_version`, holding `texts` (test helper for other modules).
+#[cfg(test)]
+pub(crate) fn legacy_cache_bytes(schema_version: u32, texts: &[&str]) -> Vec<u8> {
+    let config = ChunkConfig::default();
+    bincode::serialize(&LegacyCache {
+        schema_version,
+        model: MODEL_NAME.to_string(),
+        chunk_target_chars: config.target_chars,
+        chunk_overlap_chars: config.overlap_chars,
+        chunk_context_turns: config.context_turns,
+        access_counter: 1,
+        entries: texts
+            .iter()
+            .map(|text| {
+                (
+                    blake3::hash(text.as_bytes()).to_hex().to_string(),
+                    LegacyChunk {
+                        embedding: vec![1.0, 0.0],
+                        last_used: 1,
+                        protected: true,
+                    },
+                )
+            })
+            .collect(),
+    })
+    .unwrap()
+}
+
+/// Write `cache` as the matrix at `path` under the cache lock
+/// ([`lock_semantic_cache_dir`]): embeddings another writer saved since this
+/// one read the matrix are kept, then the result is pruned to
+/// `MAX_CACHE_ENTRIES` and written to a temporary file renamed into place.
+/// Failures are logged as Warn debug lines and otherwise ignored; a write that cannot get the lock within
 /// [`CACHE_LOCK_WAIT`] is skipped with a Warn debug line.
 pub fn write_embedding_cache(path: &Path, cache: &EmbeddingCache) {
     write_embedding_cache_to_path(cache, path);
@@ -273,6 +481,21 @@ pub const CACHE_LOCK_FILE_NAME: &str = "embeddings.lock";
 
 /// How long a cache write (or clear) waits for the cache lock.
 pub const CACHE_LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// Model downloads earlier versions used, in fastembed's cache layout.
+const SUPERSEDED_MODELS: &[&str] = &["models--Xenova--bge-small-en-v1.5"];
+
+/// Removes downloads of models this version no longer uses from the model
+/// directory `dir` (only the exact superseded repo directories). Failures
+/// are ignored; the files are only wasted space.
+pub fn remove_superseded_models(dir: &Path) {
+    for name in SUPERSEDED_MODELS {
+        let path = dir.join(name);
+        if path.is_dir() {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
 
 /// An exclusive lock on `<semantic dir>/embeddings.lock`, held until it is
 /// dropped. It makes every embedding-cache writer of this process and of
@@ -426,24 +649,103 @@ pub(crate) fn write_embedding_cache_locked(
             return false;
         }
     };
-    let Ok(data) = bincode::serialize(cache) else {
-        return false;
+    // Upstream's `write_embedding_cache_in`, under the lock taken above.
+    let config = ChunkConfig {
+        target_chars: cache.chunk_target_chars,
+        overlap_chars: cache.chunk_overlap_chars,
+        context_turns: cache.chunk_context_turns,
     };
-    let Ok(mut tmp) = tempfile::NamedTempFile::new_in(parent) else {
-        return false;
+    let mut merged = EmbeddingCache {
+        entries: cache.entries.clone(),
+        ..empty_embedding_cache(config)
     };
-    if tmp.write_all(&data).is_err() {
-        return false;
+    merged.access_counter = cache.access_counter;
+    if let Some(disk) = EmbeddingMatrix::open(path)
+        .filter(|matrix| matrix.settings() == matrix_settings(config))
+        .map(Arc::new)
+    {
+        merged.access_counter = merged.access_counter.max(disk.access_counter());
+        for (key, entry) in mapped_entries(&disk) {
+            merged.entries.entry(key).or_insert(entry);
+        }
     }
-    let written = tmp.persist(path).is_ok();
+    prune_cache(&mut merged);
+    let written = match write_matrix(&merged, path) {
+        Ok(()) => true,
+        Err(error) => {
+            crate::debug::warn(
+                Some(crate::debug::DebugLevel::Warn),
+                &format!("Semantic cache write failed: {}: {error}", path.display()),
+            );
+            false
+        }
+    };
     drop(lock);
     written
 }
 
+fn write_matrix(cache: &EmbeddingCache, path: &Path) -> std::io::Result<()> {
+    let dims = cache
+        .entries
+        .values()
+        .next()
+        .map_or(0, |entry| entry.embedding.len());
+    let rows = cache
+        .entries
+        .iter()
+        .map(|(key, entry)| MatrixRow {
+            key: *key,
+            last_used: entry.last_used,
+            protected: entry.protected,
+            vector: &entry.embedding,
+        })
+        .collect();
+    let settings = matrix_settings(ChunkConfig {
+        target_chars: cache.chunk_target_chars,
+        overlap_chars: cache.chunk_overlap_chars,
+        context_turns: cache.chunk_context_turns,
+    });
+    EmbeddingMatrix::write(path, settings, cache.access_counter, dims, rows)
+}
+
+fn matrix_settings(config: ChunkConfig) -> MatrixSettings {
+    let model = format!("{MODEL_NAME}\0{CACHE_SCHEMA_VERSION}");
+    let hash = blake3::hash(model.as_bytes());
+    MatrixSettings {
+        model_hash: u64::from_le_bytes(hash.as_bytes()[..8].try_into().expect("8 bytes")),
+        chunk_target_chars: config.target_chars as u32,
+        chunk_overlap_chars: config.overlap_chars as u32,
+        chunk_context_turns: config.context_turns as u32,
+        _pad: 0,
+    }
+}
+
+/// Removes temporary files that writers in `dir` left behind when they
+/// stopped before renaming them into place. Callers hold the directory lock,
+/// and live writers finish well within the age limit.
+fn remove_stale_temp_files(dir: &Path) {
+    const STALE_AFTER: Duration = Duration::from_secs(60 * 60);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let is_temp = entry.file_name().to_string_lossy().starts_with(".tmp");
+        let stale = entry
+            .metadata()
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > STALE_AFTER);
+        if is_temp && stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 pub fn empty_embedding_cache(config: ChunkConfig) -> EmbeddingCache {
     EmbeddingCache {
-        schema_version: CACHE_SCHEMA_VERSION,
-        model: MODEL_NAME.to_string(),
         chunk_target_chars: config.target_chars,
         chunk_overlap_chars: config.overlap_chars,
         chunk_context_turns: config.context_turns,
@@ -452,13 +754,9 @@ pub fn empty_embedding_cache(config: ChunkConfig) -> EmbeddingCache {
     }
 }
 
-fn cache_matches_config(cache: &EmbeddingCache, config: ChunkConfig) -> bool {
-    cache.schema_version == CACHE_SCHEMA_VERSION
-        && cache.model == MODEL_NAME
-        && cache.chunk_target_chars == config.target_chars
-        && cache.chunk_overlap_chars == config.overlap_chars
-        && cache.chunk_context_turns == config.context_turns
-}
+#[cfg(test)]
+const MATRIX_FILE: &str = crate::env::EMBEDDING_CACHE_FILE_NAME;
+const LEGACY_FILE: &str = crate::env::LEGACY_EMBEDDING_CACHE_FILE_NAME;
 
 #[cfg(test)]
 mod tests {
@@ -515,7 +813,7 @@ mod tests {
 
     fn cached() -> CachedChunk {
         CachedChunk {
-            embedding: vec![0.5, 0.5],
+            embedding: vec![0.5, 0.5].into(),
             last_used: 0,
             protected: false,
         }
@@ -523,6 +821,17 @@ mod tests {
 
     fn cache_text(cache: &mut EmbeddingCache, text: &str) {
         cache.entries.insert(embedding_cache_key(text), cached());
+    }
+
+    /// Upstream's `read_embedding_cache_in(dir, config)`: the fork passes the
+    /// matrix path.
+    fn read_embedding_cache_in(dir: &Path, config: ChunkConfig) -> EmbeddingCache {
+        read_embedding_cache_from_path(&dir.join(MATRIX_FILE), config)
+    }
+
+    /// Upstream's `write_embedding_cache_in(cache, dir)`.
+    fn write_embedding_cache_in(cache: &EmbeddingCache, dir: &Path) {
+        write_embedding_cache(&dir.join(MATRIX_FILE), cache);
     }
 
     #[test]
@@ -541,7 +850,7 @@ mod tests {
             cache.entries.insert(
                 embedding_cache_key(text),
                 CachedChunk {
-                    embedding: vec![last_used as f32],
+                    embedding: vec![last_used as f32].into(),
                     last_used,
                     protected: false,
                 },
@@ -727,7 +1036,10 @@ mod tests {
         )
         .expect("embedding succeeds");
 
-        assert_eq!(embedder.calls, 10);
+        assert_eq!(
+            embedder.calls,
+            300usize.div_ceil(DEFAULT_EMBEDDING_BATCH_SIZE)
+        );
         assert_eq!(saved_entry_counts, vec![256, 300]);
     }
 
@@ -739,7 +1051,7 @@ mod tests {
         let mut embedder = CancellingEmbedder {
             cancellation: cancellation.clone(),
         };
-        let chunks = (0..33)
+        let chunks = (0..=DEFAULT_EMBEDDING_BATCH_SIZE)
             .map(|index| chunk(&format!("session:{index}"), &format!("text {index}")))
             .collect();
         let mut saved_entry_counts = Vec::new();
@@ -754,7 +1066,7 @@ mod tests {
         );
 
         assert!(matches!(result, Err(AppError::SemanticSearchCancelled)));
-        assert_eq!(saved_entry_counts, vec![32]);
+        assert_eq!(saved_entry_counts, vec![DEFAULT_EMBEDDING_BATCH_SIZE]);
     }
 
     #[test]
@@ -784,29 +1096,123 @@ mod tests {
         assert!(cache_contains_text(&cache, "old text"));
     }
 
-    #[test]
-    fn cache_config_mismatch_invalidates_cache() {
-        let config = ChunkConfig::default();
-        let mut cache = empty_embedding_cache(config);
-        cache.chunk_target_chars += 1;
-
-        assert!(!cache_matches_config(&cache, config));
+    fn legacy_cache(config: ChunkConfig, texts: &[&str]) -> LegacyCache {
+        LegacyCache {
+            schema_version: CACHE_SCHEMA_VERSION,
+            model: MODEL_NAME.to_string(),
+            chunk_target_chars: config.target_chars,
+            chunk_overlap_chars: config.overlap_chars,
+            chunk_context_turns: config.context_turns,
+            access_counter: 9,
+            entries: texts
+                .iter()
+                .enumerate()
+                .map(|(index, text)| {
+                    (
+                        blake3::hash(text.as_bytes()).to_hex().to_string(),
+                        LegacyChunk {
+                            embedding: vec![index as f32, 1.0],
+                            last_used: index as u64,
+                            protected: index == 0,
+                        },
+                    )
+                })
+                .collect(),
+        }
     }
 
     #[test]
-    fn wrong_schema_cache_is_ignored() {
+    fn legacy_cache_migrates_to_the_matrix() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("cache.bin");
         let config = ChunkConfig::default();
-        let mut cache = empty_embedding_cache(config);
-        cache.schema_version = CACHE_SCHEMA_VERSION - 1;
-        cache_text(&mut cache, "stale");
-        write_embedding_cache_to_path(&cache, &path);
+        let legacy = legacy_cache(config, &["first", "second"]);
+        std::fs::write(
+            dir.path().join(LEGACY_FILE),
+            bincode::serialize(&legacy).unwrap(),
+        )
+        .unwrap();
+        let stale = dir.path().join(".tmpstale");
+        std::fs::write(&stale, b"partial").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let fresh = dir.path().join(".tmpfresh");
+        std::fs::write(&fresh, b"in progress").unwrap();
 
-        let restored = read_embedding_cache_from_path(&path, config);
+        let restored = read_embedding_cache_in(dir.path(), config);
 
-        assert_eq!(restored.schema_version, CACHE_SCHEMA_VERSION);
+        assert!(!dir.path().join(LEGACY_FILE).exists());
+        assert!(dir.path().join(MATRIX_FILE).exists());
+        assert!(!stale.exists());
+        assert!(fresh.exists());
+        assert_eq!(restored.access_counter, 9);
+        let second = &restored.entries[&embedding_cache_key("second")];
+        assert!(matches!(second.embedding, Embedding::Mapped(..)));
+        assert_eq!(second.embedding, vec![1.0, 1.0]);
+        assert_eq!((second.last_used, second.protected), (1, false));
+        let first = &restored.entries[&embedding_cache_key("first")];
+        assert_eq!(first.embedding, vec![0.0, 1.0]);
+        assert!(first.protected);
+
+        let reread = read_embedding_cache_in(dir.path(), config);
+        assert_eq!(reread.entries, restored.entries);
+        // Fork: the lock file stays beside the matrix (K6).
+        assert!(dir.path().join(CACHE_LOCK_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn legacy_cache_with_another_schema_is_not_migrated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = ChunkConfig::default();
+        let mut legacy = legacy_cache(config, &["stale"]);
+        legacy.schema_version -= 1;
+        std::fs::write(
+            dir.path().join(LEGACY_FILE),
+            bincode::serialize(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let restored = read_embedding_cache_in(dir.path(), config);
+
         assert!(restored.entries.is_empty());
+        assert!(!dir.path().join(MATRIX_FILE).exists());
+    }
+
+    #[test]
+    fn legacy_cache_is_used_unconverted_while_another_writer_holds_the_lock() {
+        // Fork: the cache lock waits at most `CACHE_LOCK_WAIT`; a reader
+        // that cannot get it in time still gets the old embeddings and
+        // leaves the conversion to a later read.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = ChunkConfig::default();
+        let legacy = legacy_cache(config, &["first"]);
+        std::fs::write(
+            dir.path().join(LEGACY_FILE),
+            bincode::serialize(&legacy).unwrap(),
+        )
+        .unwrap();
+        let held = lock_semantic_cache_dir(dir.path(), Duration::ZERO)
+            .unwrap()
+            .unwrap();
+        let reader = std::thread::spawn({
+            let dir = dir.path().to_path_buf();
+            move || read_embedding_cache_in(&dir, config)
+        });
+        let restored = reader.join().unwrap();
+        let first = &restored.entries[&embedding_cache_key("first")];
+        assert!(matches!(first.embedding, Embedding::Owned(_)));
+        assert_eq!(first.embedding, vec![0.0, 1.0]);
+        assert!(dir.path().join(LEGACY_FILE).exists());
+        assert!(!dir.path().join(MATRIX_FILE).exists());
+
+        drop(held);
+        let converted = read_embedding_cache_in(dir.path(), config);
+        assert_eq!(converted.entries, restored.entries);
+        assert!(!dir.path().join(LEGACY_FILE).exists());
     }
 
     #[test]
@@ -831,7 +1237,6 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("cache.bin");
         let config = ChunkConfig::default();
         let previous = PreviousCache {
             schema_version: CACHE_SCHEMA_VERSION - 1,
@@ -850,38 +1255,40 @@ mod tests {
                 },
             )]),
         };
-        std::fs::write(&path, bincode::serialize(&previous).unwrap()).unwrap();
+        std::fs::write(
+            dir.path().join(LEGACY_FILE),
+            bincode::serialize(&previous).unwrap(),
+        )
+        .unwrap();
 
-        let restored = read_embedding_cache_from_path(&path, config);
+        let restored = read_embedding_cache_in(dir.path(), config);
 
-        assert_eq!(restored.schema_version, CACHE_SCHEMA_VERSION);
         assert!(restored.entries.is_empty());
     }
 
     #[test]
     fn corrupt_cache_is_ignored() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("cache.bin");
         let config = ChunkConfig::default();
-        std::fs::write(&path, b"not bincode").expect("write corrupt cache");
+        std::fs::write(dir.path().join(MATRIX_FILE), b"not a matrix").unwrap();
 
-        let restored = read_embedding_cache_from_path(&path, config);
+        let restored = read_embedding_cache_in(dir.path(), config);
 
-        assert_eq!(restored.schema_version, CACHE_SCHEMA_VERSION);
         assert!(restored.entries.is_empty());
     }
 
     #[test]
     fn mismatched_config_cache_is_ignored_when_read() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("cache.bin");
         let config = ChunkConfig::default();
-        let mut cache = empty_embedding_cache(config);
-        cache.chunk_overlap_chars += 1;
+        let mut cache = empty_embedding_cache(ChunkConfig {
+            overlap_chars: config.overlap_chars + 1,
+            ..config
+        });
         cache_text(&mut cache, "stale");
-        write_embedding_cache_to_path(&cache, &path);
+        write_embedding_cache_in(&cache, dir.path());
 
-        let restored = read_embedding_cache_from_path(&path, config);
+        let restored = read_embedding_cache_in(dir.path(), config);
 
         assert_eq!(restored.chunk_overlap_chars, config.overlap_chars);
         assert!(restored.entries.is_empty());
@@ -890,15 +1297,95 @@ mod tests {
     #[test]
     fn cache_round_trips_when_config_matches() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("cache.bin");
         let config = ChunkConfig::default();
         let mut cache = empty_embedding_cache(config);
         cache_text(&mut cache, "cached text");
 
-        write_embedding_cache_to_path(&cache, &path);
-        let restored = read_embedding_cache_from_path(&path, config);
+        write_embedding_cache_in(&cache, dir.path());
+        let restored = read_embedding_cache_in(dir.path(), config);
 
         assert!(cache_contains_text(&restored, "cached text"));
+        assert_eq!(restored.entries, cache.entries);
+    }
+
+    #[test]
+    fn writes_keep_embeddings_another_process_saved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = ChunkConfig::default();
+        let mut first = read_embedding_cache_in(dir.path(), config);
+        let mut second = read_embedding_cache_in(dir.path(), config);
+        cache_text(&mut second, "from second");
+        write_embedding_cache_in(&second, dir.path());
+        cache_text(&mut first, "from first");
+        write_embedding_cache_in(&first, dir.path());
+
+        let restored = read_embedding_cache_in(dir.path(), config);
+
+        assert!(cache_contains_text(&restored, "from first"));
+        assert!(cache_contains_text(&restored, "from second"));
+    }
+
+    #[test]
+    fn a_write_replaces_a_matrix_that_readers_still_map() {
+        // Fork (Windows): every save after the first replaces the file that
+        // this process's cache and the merge map. The rename must succeed
+        // and old maps must stay readable.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(MATRIX_FILE);
+        let config = ChunkConfig::default();
+        let mut cache = empty_embedding_cache(config);
+        cache.entries.insert(
+            embedding_cache_key("kept"),
+            CachedChunk {
+                embedding: vec![0.25, 0.75].into(),
+                last_used: 1,
+                protected: false,
+            },
+        );
+        assert!(write_embedding_cache_locked(&cache, &path, CACHE_LOCK_WAIT));
+
+        let mut mapped = read_embedding_cache(Some(&path), config);
+        let kept = mapped.entries[&embedding_cache_key("kept")].clone();
+        assert!(matches!(kept.embedding, Embedding::Mapped(..)));
+        let other_reader = read_embedding_cache(Some(&path), config);
+        for round in 0..3 {
+            cache_text(&mut mapped, &format!("added {round}"));
+            assert!(
+                write_embedding_cache_locked(&mapped, &path, CACHE_LOCK_WAIT),
+                "write {round} replaced the mapped matrix"
+            );
+            let restored = read_embedding_cache(Some(&path), config);
+            assert!(cache_contains_text(&restored, "kept"));
+            assert!(cache_contains_text(&restored, &format!("added {round}")));
+            mapped = restored;
+        }
+        assert_eq!(kept.embedding, vec![0.25, 0.75], "the old map is intact");
+        assert_eq!(
+            other_reader.entries[&embedding_cache_key("kept")].embedding,
+            vec![0.25, 0.75]
+        );
+    }
+
+    #[test]
+    fn clear_removes_a_matrix_that_readers_still_map() {
+        // Fork (Windows): Clear while another instance still maps the matrix.
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("semantic");
+        let path = dir.join(MATRIX_FILE);
+        let config = ChunkConfig::default();
+        let mut cache = empty_embedding_cache(config);
+        cache_text(&mut cache, "mapped");
+        assert!(write_embedding_cache_locked(&cache, &path, CACHE_LOCK_WAIT));
+        let reader = read_embedding_cache(Some(&path), config);
+
+        assert!(clear_semantic_cache_files(Some(&dir)).unwrap());
+
+        assert_eq!(entry_names(&dir), vec![CACHE_LOCK_FILE_NAME]);
+        assert_eq!(
+            reader.entries[&embedding_cache_key("mapped")].embedding,
+            vec![0.5, 0.5]
+        );
+        assert!(read_embedding_cache(Some(&path), config).entries.is_empty());
     }
 
     #[test]
@@ -926,7 +1413,7 @@ mod tests {
 
         assert_eq!(
             env.embedding_cache_file().unwrap(),
-            Path::new("/home/example/.cache/claude-history-gui/semantic/embeddings-v1.bin")
+            Path::new("/home/example/.cache/claude-history-gui/semantic/embeddings-v2.bin")
         );
         assert_eq!(
             env.semantic_model_dir().unwrap(),
@@ -955,6 +1442,22 @@ mod tests {
         let missing = root.path().join("missing");
         assert!(!clear_semantic_cache_files(Some(&missing)).unwrap());
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn remove_superseded_models_removes_only_the_old_model_download() {
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("models--Xenova--bge-small-en-v1.5");
+        let other = root.path().join("models--other--model");
+        std::fs::create_dir_all(old.join("snapshots")).unwrap();
+        std::fs::write(old.join("snapshots").join("model.onnx"), b"x").unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+
+        remove_superseded_models(root.path());
+        remove_superseded_models(&root.path().join("missing"));
+
+        assert!(!old.exists());
+        assert!(other.exists());
     }
 
     fn entry_names(dir: &Path) -> Vec<String> {
@@ -1024,7 +1527,7 @@ mod tests {
         // A link inside a real semantic directory: unlinked, target kept.
         std::fs::create_dir_all(&semantic).unwrap();
         dir_link(&elsewhere, &semantic.join("fastembed"));
-        std::fs::write(semantic.join("embeddings-v1.bin"), b"cache").unwrap();
+        std::fs::write(semantic.join(MATRIX_FILE), b"cache").unwrap();
         assert!(clear_semantic_cache_files(Some(&semantic)).unwrap());
         assert_eq!(entry_names(&semantic), vec![CACHE_LOCK_FILE_NAME]);
         assert_eq!(
@@ -1042,7 +1545,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("semantic");
         write_embedding_cache(
-            &dir.join("embeddings-v1.bin"),
+            &dir.join(MATRIX_FILE),
             &empty_embedding_cache(ChunkConfig::default()),
         );
         // The queued writer has the lock file open, waiting for its turn.
@@ -1052,7 +1555,7 @@ mod tests {
             .open(dir.join(CACHE_LOCK_FILE_NAME))
             .unwrap();
         assert!(clear_semantic_cache_files(Some(&dir)).unwrap());
-        assert!(!dir.join("embeddings-v1.bin").exists());
+        assert!(!dir.join(MATRIX_FILE).exists());
         // Its turn comes ...
         queued.try_lock().unwrap();
         // ... and nobody else can take the lock meanwhile.
@@ -1094,10 +1597,10 @@ mod tests {
         // in time is skipped and leaves the existing file intact.
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("semantic");
-        let path = dir.join("embeddings-v1.bin");
+        let path = dir.join(MATRIX_FILE);
         let config = ChunkConfig::default();
         let mut first = empty_embedding_cache(config);
-        first.entries.insert("first".to_string(), cached());
+        first.entries.insert(embedding_cache_key("first"), cached());
         assert!(write_embedding_cache_locked(&first, &path, CACHE_LOCK_WAIT));
         let before = std::fs::read(&path).unwrap();
 
@@ -1112,7 +1615,9 @@ mod tests {
                 .is_none()
         );
         let mut second = empty_embedding_cache(config);
-        second.entries.insert("second".to_string(), cached());
+        second
+            .entries
+            .insert(embedding_cache_key("second"), cached());
         let started = std::time::Instant::now();
         assert!(!write_embedding_cache_locked(
             &second,
@@ -1122,7 +1627,7 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(50));
         assert_eq!(std::fs::read(&path).unwrap(), before, "not corrupted");
         let restored = read_embedding_cache(Some(&path), config);
-        assert!(restored.entries.contains_key("first"));
+        assert!(cache_contains_text(&restored, "first"));
 
         drop(held);
         assert!(write_embedding_cache_locked(
@@ -1130,10 +1635,11 @@ mod tests {
             &path,
             Duration::from_millis(50)
         ));
+        let restored = read_embedding_cache(Some(&path), config);
+        assert!(cache_contains_text(&restored, "second"));
         assert!(
-            read_embedding_cache(Some(&path), config)
-                .entries
-                .contains_key("second")
+            cache_contains_text(&restored, "first"),
+            "the save kept what the earlier writer saved"
         );
     }
 
@@ -1141,7 +1647,7 @@ mod tests {
     fn a_cache_write_waits_for_a_lock_released_in_time() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("semantic");
-        let path = dir.join("embeddings-v1.bin");
+        let path = dir.join(MATRIX_FILE);
         let held = lock_semantic_cache_dir(&dir, Duration::ZERO)
             .unwrap()
             .unwrap();
@@ -1150,7 +1656,7 @@ mod tests {
             drop(held);
         });
         let mut cache = empty_embedding_cache(ChunkConfig::default());
-        cache.entries.insert("late".to_string(), cached());
+        cache.entries.insert(embedding_cache_key("late"), cached());
         assert!(write_embedding_cache_locked(&cache, &path, CACHE_LOCK_WAIT));
         releaser.join().unwrap();
         assert_eq!(
@@ -1166,7 +1672,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("semantic");
         write_embedding_cache(
-            &dir.join("embeddings-v1.bin"),
+            &dir.join(MATRIX_FILE),
             &empty_embedding_cache(ChunkConfig::default()),
         );
         let held = lock_semantic_cache_dir(&dir, Duration::ZERO)
@@ -1175,7 +1681,7 @@ mod tests {
         let error =
             clear_semantic_cache_files_waiting(Some(&dir), Duration::from_millis(30)).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
-        assert!(dir.join("embeddings-v1.bin").exists(), "nothing removed");
+        assert!(dir.join(MATRIX_FILE).exists(), "nothing removed");
         drop(held);
         assert!(clear_semantic_cache_files(Some(&dir)).unwrap());
         assert_eq!(entry_names(&dir), vec![CACHE_LOCK_FILE_NAME]);
@@ -1184,10 +1690,10 @@ mod tests {
     #[test]
     fn writer_callback_round_trips_through_reader() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("semantic").join("embeddings-v1.bin");
+        let path = root.path().join("semantic").join(MATRIX_FILE);
         let config = ChunkConfig::default();
         let mut cache = empty_embedding_cache(config);
-        cache.entries.insert("key".to_string(), cached());
+        cache.entries.insert(embedding_cache_key("key"), cached());
 
         let mut save = embedding_cache_writer(Some(path.clone()));
         save(&cache);

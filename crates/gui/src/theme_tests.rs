@@ -76,6 +76,36 @@ fn search_match_text_is_legible_in_both_themes(cx: &mut TestAppContext) {
                 "{mode:?} {name}: {ratio:.2}:1 (text {text:?} on {fill:?})"
             );
         }
+        // The list hit's secondary matches (L-109, 6755b3b) are a soft wash
+        // that keeps the text's own color: every text role drawn in the
+        // viewer is legible on the opaque wash over the transcript (it
+        // replaces the tint of the focused message, a hovered message or a
+        // code block it covers).
+        let wash = styles
+            .secondary
+            .background_color
+            .expect("a secondary match sets a wash");
+        assert!(styles.secondary.color.is_none());
+        for (name, text) in [
+            ("text_primary", roles.text_primary),
+            ("text_secondary", roles.text_secondary),
+            ("heading", roles.heading),
+            ("code", roles.code),
+            ("tool_text", roles.tool_text),
+            ("thinking", roles.thinking),
+            ("quote", roles.quote),
+            ("dimmed", roles.dimmed),
+            ("link", roles.link),
+            ("diff_add", roles.diff_add),
+            ("diff_remove", roles.diff_remove),
+            ("accent", roles.accent),
+        ] {
+            let ratio = contrast_ratio(text, wash, roles.background);
+            assert!(
+                ratio >= MIN_CONTRAST,
+                "{mode:?} secondary match, {name}: {ratio:.2}:1"
+            );
+        }
     }
     // The guard itself: a foreground that passes stays, one that fails is
     // replaced by the better of near-black and white.

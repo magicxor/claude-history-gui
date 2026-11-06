@@ -9,7 +9,10 @@
 //! 1. `[lane] TITLE ······ time` — the title is the custom title, else the
 //!    summary, else the project (AD20); the time is mono and carries the
 //!    recency color;
-//! 2. `project · N msgs · duration · score · summary-tail`;
+//! 2. `[kind ·] project · N prompts · duration · score · summary-tail`
+//!    (the prompts the person typed, upstream e930cac), where
+//!    `kind` is `auto` or `sub` for an automated or subagent conversation
+//!    (listed only on request, upstream cb990e6);
 //! 3. the preview with the query highlighted;
 //! 4. (literal mode) the literal context snippet.
 //!
@@ -171,11 +174,15 @@ pub struct RowModel {
     pub selected: bool,
     /// `CC` / `Pi` / `OMP`, only when the corpus has more than one source.
     pub source_label: Option<&'static str>,
+    /// `auto` / `sub` for an automated or child (subagent) conversation
+    /// (core `Provenance::list_label`).
+    pub kind_label: Option<&'static str>,
     pub title: HighlightedText,
     pub title_kind: TitleKind,
     /// Line 2: the project when it is not the title.
     pub project: Option<HighlightedText>,
-    pub message_count: String,
+    /// `1 prompt` / `N prompts` (core `RowHeader::prompt_count`).
+    pub prompt_count: String,
     pub duration: Option<String>,
     /// Hybrid score (Semantic mode with metadata, rows wide enough).
     pub score: Option<String>,
@@ -193,13 +200,17 @@ pub struct RowModel {
 }
 
 impl RowModel {
-    /// The text of line 2: `project - 42 msgs - 1h 5m - 0.87 - summary`.
+    /// The text of line 2: `[kind -] project - 42 prompts - 1h 5m - 0.87 -
+    /// summary`.
     pub fn meta_text(&self) -> String {
         let mut parts: Vec<&str> = Vec::new();
+        if let Some(kind) = self.kind_label {
+            parts.push(kind);
+        }
         if let Some(project) = &self.project {
             parts.push(&project.text);
         }
-        parts.push(&self.message_count);
+        parts.push(&self.prompt_count);
         if let Some(duration) = &self.duration {
             parts.push(duration);
         }
@@ -254,9 +265,10 @@ pub fn build_row_model(browser: &Browser, pos: usize, ctx: &RowContext<'_>) -> O
     let conversation = browser.row(pos)?;
     // The header is built for an unbounded width: every field is present and
     // the layout truncates with an ellipsis (AD20). The source label is its
-    // own lane.
+    // own lane, the kind tag its own run.
     let mut header_input = browser.row_header_input(pos, ctx.query, usize::MAX / 4, ctx.now)?;
     header_input.show_source_label = false;
+    header_input.show_kind_label = false;
     let header = build_row_header(&header_input);
     let preview_input = browser.row_preview_input(pos, ctx.query, ctx.preview_chars())?;
     let preview = build_row_preview(&preview_input);
@@ -285,14 +297,19 @@ pub fn build_row_model(browser: &Browser, pos: usize, ctx: &RowContext<'_>) -> O
         .project_name
         .clone()
         .unwrap_or_else(|| stem.clone());
-    let mut tooltip = format!("{project_label} \u{b7} {}", title.text);
+    let kind_label = conversation.provenance.list_label();
+    let tagged_project = match kind_label {
+        Some(kind) => format!("{kind} \u{b7} {project_label}"),
+        None => project_label,
+    };
+    let mut tooltip = format!("{tagged_project} \u{b7} {}", title.text);
     if let Some(summary) = &summary_tail {
         tooltip.push_str(" \u{b7} ");
         tooltip.push_str(&summary.text);
     }
     tooltip.push('\n');
     tooltip.push_str(&conversation.path.display().to_string());
-    let accessibility_label = format!("{} \u{b7} {project_label} \u{b7} {timestamp}", title.text);
+    let accessibility_label = format!("{} \u{b7} {tagged_project} \u{b7} {timestamp}", title.text);
     let source_label = ctx
         .multiple_sources
         .then(|| conversation.source.list_label().trim());
@@ -313,10 +330,11 @@ pub fn build_row_model(browser: &Browser, pos: usize, ctx: &RowContext<'_>) -> O
         stem,
         selected: browser.selected() == Some(pos),
         source_label,
+        kind_label,
         title,
         title_kind,
         project,
-        message_count: header.message_count,
+        prompt_count: header.prompt_count,
         duration: header.duration,
         score: header.semantic_score.filter(|_| ctx.show_score()),
         summary_tail,
@@ -458,14 +476,18 @@ pub fn render_row(model: RowModel, style: &RowStyle) -> AnyElement {
         },
     );
 
-    // Line 2: project · N msgs · duration · score · summary.
+    // Line 2: [kind ·] project · N prompts · duration · score · summary.
     let separator = color_style(roles.dot_separator);
     let mut meta = Runs::new();
+    if let Some(kind) = model.kind_label {
+        meta.push(kind, color_style(roles.source_label));
+        meta.push(" · ", separator);
+    }
     if let Some(project) = &model.project {
         meta.push_field(project, color_style(roles.text_secondary));
         meta.push(" · ", separator);
     }
-    meta.push(&model.message_count, color_style(roles.msg_count));
+    meta.push(&model.prompt_count, color_style(roles.msg_count));
     if let Some(duration) = &model.duration {
         meta.push(" · ", separator);
         meta.push(duration, color_style(roles.duration));

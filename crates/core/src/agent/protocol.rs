@@ -114,7 +114,7 @@ pub struct ReadMessage {
     /// `mN` message number.
     pub ordinal: usize,
     pub role: AgentMessageRole,
-    pub timestamp: Option<String>,
+    pub timestamp: Option<chrono::DateTime<chrono::Utc>>,
     /// Line of the record in the JSONL file.
     pub jsonl_line: usize,
     /// Durable anchor of the message.
@@ -167,7 +167,7 @@ pub fn read_messages(
             conversation_full_ref: rendered.conversation.reference.full_ref(),
             ordinal: rendered.message.ordinal,
             role: rendered.message.role,
-            timestamp: rendered.message.timestamp.clone(),
+            timestamp: rendered.message.timestamp,
             jsonl_line: rendered.message.jsonl_line,
             anchor: rendered
                 .transcript
@@ -792,9 +792,11 @@ fn omitted_message_ranges(messages: &[RenderedMessage<'_>], selected: &[usize]) 
                 let last = index - 1;
                 let first_message = &messages[first];
                 let last_message = &messages[last];
-                let prefix = qualify
-                    .then(|| format!("{}:", first_message.conversation.reference.canonical()))
-                    .unwrap_or_default();
+                let prefix = if qualify {
+                    format!("{}:", first_message.conversation.reference.canonical())
+                } else {
+                    String::new()
+                };
                 if first_message.conversation.reference.full_ref()
                     == last_message.conversation.reference.full_ref()
                 {
@@ -1120,7 +1122,7 @@ fn snippet(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
+    use crate::agent::refs::AgentConversationKey;
     use crate::agent::test_support::{source, text_message};
     use serde_json::json;
     use std::path::PathBuf;
@@ -1129,7 +1131,7 @@ mod tests {
         let key =
             AgentConversationKey::new("project with space", filename, PathBuf::from(filename));
         ResolvedConversation {
-            reference: AgentConversationRef::from_parts("project with space", filename),
+            reference: key.conversation_ref(),
             key,
         }
     }

@@ -165,7 +165,7 @@ fn clear_asks_first(cx: &mut TestAppContext) {
     let world = TestWorld::new();
     let dir = world.env.semantic_cache_dir().unwrap();
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("embeddings-v1.bin"), "cache").unwrap();
+    std::fs::write(dir.join("embeddings-v2.bin"), "cache").unwrap();
     let (_f, handle) = main_window(cx, &world, &[]);
     run(cx, handle, StartupTool::ClearSemanticCache);
     settle(cx, handle);
@@ -174,12 +174,12 @@ fn clear_asks_first(cx: &mut TestAppContext) {
         "clear-semantic-cache"
     );
     assert!(
-        dir.join("embeddings-v1.bin").exists(),
+        dir.join("embeddings-v2.bin").exists(),
         "nothing is deleted before the confirmation"
     );
     cx.simulate_keystrokes(handle, "n");
     cx.run_until_parked();
-    assert!(dir.join("embeddings-v1.bin").exists(), "n cancels");
+    assert!(dir.join("embeddings-v2.bin").exists(), "n cancels");
 }
 
 /// C-015 / T-001: delete-empty with `local` preselects the workspace.

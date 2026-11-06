@@ -95,6 +95,8 @@ fn the_level_reaches_the_lists_refresh(cx: &mut TestAppContext) {
     let _lock = global_lock();
     let world = TestWorld::new();
     world.standard_corpus();
+    // Store off: the in-memory loader writes the Debug lines.
+    crate::test_support::use_memory_list(cx, &world, &[]);
     let f = ListFixture::open_loaded(cx, &world, &[]);
     cx.update(|cx| crate::debug_sink::install(cx, None));
     cx.update(|cx| debug_buffer(cx).clear());

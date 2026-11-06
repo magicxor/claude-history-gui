@@ -776,3 +776,75 @@ fn hit_rows_carry_score_ref_and_accessible_name(cx: &mut TestAppContext) {
     };
     assert!(semantic.score_text().ends_with("sem 0.500 lex 0.250"));
 }
+
+/// D-037 (upstream cb990e6): "Include exec and subagent runs" searches the
+/// automated and subagent Codex threads too (`agent search --all-kinds`).
+#[gpui_kit::test]
+fn include_exec_and_subagent_runs_searches_the_hidden_threads(cx: &mut TestAppContext) {
+    const EXEC: &str = "01a00000-0000-7000-8000-000000000006";
+    let world = TestWorld::new();
+    world.add_fixture(
+        ".codex/sessions/2026/09/02/rollout-2026-09-02T11-00-00-01a00000-0000-7000-8000-000000000006.jsonl",
+        include_bytes!(
+            "../../../../core/tests/fixtures/codex/sessions/2026/09/02/rollout-2026-09-02T11-00-00-01a00000-0000-7000-8000-000000000006.jsonl"
+        ),
+    );
+    let f = DeepFixture::open(cx, &world, &[]);
+    f.with(cx, |pane, _, cx| pane.set_mode(ModeChoice::Lexical, cx));
+    f.search(cx, "iguana report");
+    assert!(!f.response(cx).text().contains(EXEC));
+    assert_eq!(f.probe(cx, "deep.all_kinds"), "false");
+
+    f.with(cx, |pane, _, cx| pane.set_all_kinds(true, cx));
+    assert_eq!(f.probe(cx, "deep.all_kinds"), "true");
+    f.search(cx, "iguana report");
+    let text = f.response(cx);
+    assert!(
+        text.text().contains(&format!("uuid={EXEC}")),
+        "{}",
+        text.text()
+    );
+    let mut args = AgentSearchArgs::new("iguana report");
+    args.search_mode = claude_history_core::agent::args::AgentSearchModeArgs::explicit(
+        claude_history_core::search::mode::SearchMode::Lexical,
+    );
+    args.all_kinds = true;
+    let want = expected(&world, args);
+    assert_eq!(text.text(), want.text());
+}
+
+/// D-039 (upstream dcd3978): "Only my messages" takes hits from what the
+/// person typed (`agent search --user-only`); a word only the assistant
+/// wrote is not found.
+#[gpui_kit::test]
+fn only_my_messages_searches_what_the_person_typed(cx: &mut TestAppContext) {
+    let world = TestWorld::new();
+    agent_corpus(&world);
+    let f = DeepFixture::open(cx, &world, &[]);
+    f.with(cx, |pane, _, cx| pane.set_mode(ModeChoice::Lexical, cx));
+    f.search(cx, "dereferences");
+    assert!(
+        f.response(cx).text().contains("\nhit "),
+        "{}",
+        f.response(cx).text()
+    );
+    assert_eq!(f.probe(cx, "deep.user_only"), "false");
+
+    f.with(cx, |pane, _, cx| pane.set_user_only(true, cx));
+    assert_eq!(f.probe(cx, "deep.user_only"), "true");
+    f.search(cx, "dereferences");
+    assert!(
+        !f.response(cx).text().contains("\nhit "),
+        "{}",
+        f.response(cx).text()
+    );
+    f.search(cx, "crashes");
+    let text = f.response(cx);
+    assert!(text.text().contains("\nhit "), "{}", text.text());
+    let mut args = AgentSearchArgs::new("crashes");
+    args.search_mode = claude_history_core::agent::args::AgentSearchModeArgs::explicit(
+        claude_history_core::search::mode::SearchMode::Lexical,
+    );
+    args.user_only = true;
+    assert_eq!(text.text(), expected(&world, args).text());
+}

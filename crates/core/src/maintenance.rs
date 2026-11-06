@@ -8,21 +8,27 @@
 //! * `--delete <uuid>`: [`find_session_copies`] (what would be removed) and
 //!   [`delete_session_by_uuid`];
 //! * deleting a listed conversation (any source) in two steps around the
-//!   confirmation: [`plan_session_delete`] and [`execute_session_delete`];
+//!   confirmation: [`plan_session_delete`] and [`execute_session_delete`]
+//!   ([`execute_session_delete_with`]: a Codex thread through the Codex CLI
+//!   run by the caller);
 //! * `--show-dir`: [`show_dir`];
 //! * `--debug-search`: [`debug_search_report`] (scoring breakdown per result
 //!   plus the CLI's stderr text);
 //! * `--debug` parse-error log: [`parse_error_report`] and
 //!   [`log_parse_errors`].
 //!
-//! All of them write only where upstream wrote (Claude transcripts for the
-//! deletions, the debug log); every location comes from the
-//! [`HistoryEnv`].
+//! All of them write only where upstream wrote (Claude, Pi and OMP
+//! transcripts for the deletions, the debug log; a Codex thread is deleted by
+//! the Codex CLI); every location comes from the [`HistoryEnv`].
 
 use crate::debug::DebugLevel;
 use crate::env::{HistoryEnv, WorkspaceScope};
 use crate::error::{AppError, Result};
-use crate::history::{self, Conversation, ParseError, Source};
+use crate::history::actions::Launcher;
+use crate::history::model::SourceKind;
+use crate::history::sources::{Registry, codex};
+use crate::history::{self, Conversation, ParseError};
+use crate::resume::terminal::{LaunchSpec, RunOutput, run_to_completion};
 use crate::search;
 use crate::search::literal::CaseMode;
 use crate::time_filter::TimeFilter;
@@ -36,16 +42,44 @@ pub const DEBUG_SEARCH_TOP: usize = 30;
 
 /// Load every conversation (Claude, Pi, OMP), keep those inside
 /// `time_filter`, newest first: the corpus upstream's one-shot flags
-/// (`--debug-search`, the semantic flags) worked on.
+/// (`--debug-search`, the semantic flags) worked on. Like upstream (16cc49c)
+/// it comes from the store with full text and semantic data
+/// ([`crate::store::load_conversations`]: a reconcile pass first, waiting
+/// for the one another thread or process runs), or from the session files
+/// when the store cannot be used.
 pub fn load_sorted_conversations(
     env: &HistoryEnv,
     show_last: bool,
     debug: Option<DebugLevel>,
     time_filter: &TimeFilter,
 ) -> Result<Vec<Conversation>> {
-    let mut conversations = history::load_all_conversations(env, show_last, debug)?;
+    let mut conversations =
+        crate::store::load_conversations(env, show_last, debug, crate::store::Contents::Full)?;
     conversations.retain(|conversation| time_filter.matches(conversation.timestamp));
-    conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    conversations.sort_by_key(|a| std::cmp::Reverse(a.timestamp));
+    Ok(conversations)
+}
+
+/// [`load_sorted_conversations`] that gives up soon after `cancelled()`
+/// returns true (fork: the load may wait for the GUI list's reconcile pass;
+/// see [`crate::store::load_conversations_cancellable`]). The error is then an
+/// `Interrupted` I/O error.
+pub fn load_sorted_conversations_cancellable(
+    env: &HistoryEnv,
+    show_last: bool,
+    debug: Option<DebugLevel>,
+    time_filter: &TimeFilter,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<Vec<Conversation>> {
+    let mut conversations = crate::store::load_conversations_cancellable(
+        env,
+        show_last,
+        debug,
+        crate::store::Contents::Full,
+        cancelled,
+    )?;
+    conversations.retain(|conversation| time_filter.matches(conversation.timestamp));
+    conversations.sort_by_key(|a| std::cmp::Reverse(a.timestamp));
     Ok(conversations)
 }
 
@@ -403,19 +437,27 @@ pub fn delete_session_by_uuid(env: &HistoryEnv, uuid: &str) -> Result<DeleteByUu
 pub struct DeletePlan {
     /// The source of the conversation the plan was made for (addendum A2:
     /// never the live selection's).
-    pub source: Source,
+    pub source: SourceKind,
     /// The listed conversation the plan was made for: the path of the
     /// upstream debug-log line when the delete fails, whichever item failed.
     pub path: PathBuf,
     /// Claude: the transcript's file stem; Pi/OMP: the session header id
-    /// (the file stem when the header has none).
+    /// (the file stem when the header has none); Codex: the thread id.
     pub session_id: String,
     /// Transcripts to remove: every copy of a Claude session across project
-    /// directories (cross-project forks), else the one file.
+    /// directories (cross-project forks), every rollout of a Codex thread,
+    /// else the one file.
     pub files: Vec<PathBuf>,
     /// Directories to remove: the existing `<project>/<uuid>/` session
     /// directories (Claude) or the artifact directory (OMP).
     pub dirs: Vec<PathBuf>,
+    /// Other files to remove with the transcript: the metadata file of a
+    /// Claude sidecar (`agent-<id>.meta.json`, upstream 3c2ffeb).
+    pub metadata: Vec<PathBuf>,
+    /// Files inside `dirs` that stay: the `/btw` forks of a Claude session,
+    /// with their metadata, which are conversations of their own (upstream
+    /// 3c2ffeb). Listed so the confirmation can say so.
+    pub kept: Vec<PathBuf>,
 }
 
 /// What [`execute_session_delete`] did.
@@ -461,53 +503,99 @@ impl From<Box<SessionDeleteFailure>> for AppError {
 ///
 /// * Claude: every `<uuid>.jsonl` with `path`'s stem in all Claude project
 ///   directories ([`find_session_copies`]) plus their existing session
-///   directories. An invalid id or no copy is `SessionNotFound`, like
-///   upstream `--delete`;
+///   directories, except the `/btw` forks there ([`DeletePlan::kept`]). An
+///   invalid id or no copy is `SessionNotFound`, like upstream `--delete`.
+///   A sidecar (a subagent or `/btw` fork transcript, upstream 3c2ffeb) is
+///   deleted alone, with its metadata file;
 /// * Pi: `path`, if it is a `.jsonl` Pi session, else `SessionNotFound`;
 /// * OMP: `path`, if it is a `.jsonl` OMP session, plus its artifact
-///   directory when it exists.
+///   directory when it exists;
+/// * Codex: every rollout of the thread of `path`, a rollout of a Codex home
+///   (upstream eea6d37 deletes the thread with `codex delete --force <thread
+///   id>`, which removes them and the thread's state; the execution runs that
+///   command, see [`execute_session_delete_with`]).
 ///
-/// Nothing is removed.
-pub fn plan_session_delete(env: &HistoryEnv, path: &Path, source: Source) -> Result<DeletePlan> {
+/// A source whose adapter cannot delete (`Adapter::capabilities`, upstream
+/// 9799550) is refused with [`AppError::Unsupported`]. Nothing is removed.
+pub fn plan_session_delete(
+    env: &HistoryEnv,
+    path: &Path,
+    source: SourceKind,
+) -> Result<DeletePlan> {
+    if !Registry::from_env(env)
+        .for_path(source, path)
+        .capabilities()
+        .delete
+    {
+        return Err(AppError::Unsupported(history::actions::refusal(
+            source,
+            history::Provenance::default(),
+            "Deleting",
+        )));
+    }
     let not_found = || AppError::SessionNotFound(path.display().to_string());
     let is_jsonl = path.extension().and_then(|extension| extension.to_str()) == Some("jsonl");
     match source {
-        Source::Claude => {
+        SourceKind::Claude => {
+            if let Some(sidecar) = history::sources::claude::sidecar(path) {
+                if !path.is_file() {
+                    return Err(not_found());
+                }
+                let meta = history::sources::claude::meta_path(path);
+                return Ok(DeletePlan {
+                    source,
+                    path: path.to_path_buf(),
+                    session_id: sidecar.agent_id.to_string(),
+                    files: vec![path.to_path_buf()],
+                    dirs: Vec::new(),
+                    metadata: meta.is_file().then_some(meta).into_iter().collect(),
+                    kept: Vec::new(),
+                });
+            }
             let session_id = path
                 .file_stem()
                 .and_then(|stem| stem.to_str())
                 .unwrap_or_default()
                 .to_string();
             let copies = find_session_copies(env, &session_id)?;
+            let dirs: Vec<PathBuf> = copies
+                .iter()
+                .filter_map(|copy| copy.session_dir.clone())
+                .collect();
             Ok(DeletePlan {
                 source,
                 path: path.to_path_buf(),
                 files: copies.iter().map(|copy| copy.jsonl.clone()).collect(),
-                dirs: copies
-                    .into_iter()
-                    .filter_map(|copy| copy.session_dir)
+                kept: dirs
+                    .iter()
+                    .flat_map(|dir| history::sources::claude::kept_in_session_dir(dir))
                     .collect(),
+                dirs,
+                metadata: Vec::new(),
                 session_id,
             })
         }
-        Source::Pi => {
+        SourceKind::Pi => {
             if !is_jsonl || !history::pi::is_pi_file(path) {
                 return Err(not_found());
             }
-            let header = history::pi::parse_file(path)?.map(|projection| projection.header.id);
+            let header = history::pi::read_header(path, None)?.map(|(_, header)| header.id);
             Ok(DeletePlan {
                 source,
                 path: path.to_path_buf(),
                 session_id: plan_session_id(header, path),
                 files: vec![path.to_path_buf()],
                 dirs: Vec::new(),
+                metadata: Vec::new(),
+                kept: Vec::new(),
             })
         }
-        Source::Omp => {
+        SourceKind::Omp => {
             if !is_jsonl || !history::pi::is_omp_file(path) {
                 return Err(not_found());
             }
-            let header = history::pi::parse_omp_file(path)?.map(|projection| projection.header.id);
+            let header =
+                history::pi::read_header(path, Some(SourceKind::Omp))?.map(|(_, header)| header.id);
             Ok(DeletePlan {
                 source,
                 path: path.to_path_buf(),
@@ -517,6 +605,27 @@ pub fn plan_session_delete(env: &HistoryEnv, path: &Path, source: Source) -> Res
                     .filter(|dir| dir.is_dir())
                     .into_iter()
                     .collect(),
+                metadata: Vec::new(),
+                kept: Vec::new(),
+            })
+        }
+        SourceKind::Codex => {
+            let thread = codex::discover::rollout_of(path, false)
+                .filter(|_| codex::discover::home_of(path).is_some())
+                .ok_or_else(not_found)?
+                .thread_id;
+            let files = codex::thread_rollouts(path)?;
+            if files.is_empty() {
+                return Err(not_found());
+            }
+            Ok(DeletePlan {
+                source,
+                path: path.to_path_buf(),
+                session_id: thread,
+                files,
+                dirs: Vec::new(),
+                metadata: Vec::new(),
+                kept: Vec::new(),
             })
         }
     }
@@ -543,20 +652,55 @@ fn plan_session_id(header_id: Option<String>, path: &Path) -> String {
 /// removed:
 ///
 /// * Claude: only `<projects root>/<project>/<session_id>.jsonl` files and
-///   `<session_id>` directories beside one of them;
+///   `<session_id>` directories beside one of them, whose `/btw` forks stay;
+///   for a sidecar, exactly the listed sidecar and at most its metadata
+///   file;
 /// * Pi: exactly the listed file, a `.jsonl` Pi session (when it still
 ///   exists), and no directory;
 /// * OMP: exactly the listed file, a `.jsonl` OMP session (when it still
-///   exists), and at most its artifact directory.
+///   exists), and at most its artifact directory;
+/// * Codex: the thread id of the listed rollout, rollouts of that thread in
+///   its Codex home, and no directory.
+///
+/// A Codex plan runs `codex delete --force <thread id>` through
+/// [`run_to_completion`] (refused in tests and hermetic builds); see
+/// [`execute_session_delete_with`].
 pub fn execute_session_delete(
     env: &HistoryEnv,
     plan: &DeletePlan,
+) -> std::result::Result<DeleteReport, Box<SessionDeleteFailure>> {
+    execute_session_delete_with(
+        env,
+        plan,
+        &Launcher::default_for(SourceKind::Codex),
+        &mut |spec| run_to_completion(spec).map_err(|error| error.to_string()),
+    )
+}
+
+/// [`execute_session_delete`], with the Codex CLI a Codex plan runs: the
+/// program `codex_launcher` starts, with its leading arguments (upstream 8a99ccc:
+/// `config::LayeredConfig::launcher`, the `[resume.codex] command`, a
+/// `[gui] codex_path`, else `codex` on the env's `PATH`; a missing program
+/// fails with [`AppError::AgentLaunch`] before anything runs), run to
+/// completion by `run` (a GUI passes its platform services, which record it
+/// in tests). Upstream eea6d37 runs `codex delete --force <thread id>` with
+/// `CODEX_HOME` set to the thread's home and reports its stderr when it
+/// fails (`codex delete failed (<status>): <stderr>`). The report lists the
+/// planned rollouts that are gone afterwards as removed.
+pub fn execute_session_delete_with(
+    env: &HistoryEnv,
+    plan: &DeletePlan,
+    codex_launcher: &Launcher,
+    run: &mut dyn FnMut(&LaunchSpec) -> std::result::Result<RunOutput, String>,
 ) -> std::result::Result<DeleteReport, Box<SessionDeleteFailure>> {
     if let Err(error) = validate_delete_plan(env, plan) {
         return Err(Box::new(SessionDeleteFailure {
             error,
             partial: DeleteReport::default(),
         }));
+    }
+    if plan.source == SourceKind::Codex {
+        return execute_codex_delete(env, plan, codex_launcher, run);
     }
     let mut report = DeleteReport::default();
     for file in &plan.files {
@@ -573,8 +717,27 @@ pub fn execute_session_delete(
             }
         }
     }
+    for file in &plan.metadata {
+        match std::fs::remove_file(file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Box::new(SessionDeleteFailure {
+                    error: log_delete_failure(env, &plan.path, error.into()),
+                    partial: report,
+                }));
+            }
+        }
+    }
     for dir in &plan.dirs {
-        match std::fs::remove_dir_all(dir) {
+        // A Claude session directory keeps its `/btw` forks (upstream
+        // 3c2ffeb), whichever forks it holds by now.
+        let removed = if plan.source == SourceKind::Claude {
+            history::sources::claude::remove_session_dir(dir)
+        } else {
+            std::fs::remove_dir_all(dir)
+        };
+        match removed {
             Ok(()) => report.removed_dirs.push(dir.clone()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 report.missing.push(dir.clone());
@@ -590,15 +753,75 @@ pub fn execute_session_delete(
     Ok(report)
 }
 
+/// Runs a validated Codex `plan` (see [`execute_session_delete_with`]).
+fn execute_codex_delete(
+    env: &HistoryEnv,
+    plan: &DeletePlan,
+    codex_launcher: &Launcher,
+    run: &mut dyn FnMut(&LaunchSpec) -> std::result::Result<RunOutput, String>,
+) -> std::result::Result<DeleteReport, Box<SessionDeleteFailure>> {
+    let fail = |error: AppError, partial: DeleteReport| {
+        Box::new(SessionDeleteFailure {
+            error: log_delete_failure(env, &plan.path, error),
+            partial,
+        })
+    };
+    let spec = codex::delete_spec(env, &plan.path, Path::new(""), codex_launcher)
+        .map_err(|error| fail(error, DeleteReport::default()))?;
+    let output = run(&spec).map_err(|message| {
+        fail(
+            AppError::Io(std::io::Error::other(message)),
+            DeleteReport::default(),
+        )
+    })?;
+    let report = DeleteReport {
+        removed_files: plan
+            .files
+            .iter()
+            .filter(|file| std::fs::symlink_metadata(file).is_err())
+            .cloned()
+            .collect(),
+        ..DeleteReport::default()
+    };
+    match codex::delete_outcome(&output) {
+        Ok(()) => Ok(report),
+        Err(error) => Err(fail(error, report)),
+    }
+}
+
 fn validate_delete_plan(env: &HistoryEnv, plan: &DeletePlan) -> Result<()> {
     let refuse = || Err(AppError::SessionNotFound(plan.session_id.clone()));
     let jsonl =
         |path: &PathBuf| path.extension().and_then(|extension| extension.to_str()) == Some("jsonl");
-    if !plan.files.iter().all(jsonl) {
+    if plan.source != SourceKind::Codex && !plan.files.iter().all(jsonl) {
+        return refuse();
+    }
+    let sidecar = (plan.source == SourceKind::Claude)
+        .then(|| history::sources::claude::sidecar(&plan.path))
+        .flatten();
+    if sidecar.is_none() && !plan.metadata.is_empty() {
         return refuse();
     }
     match plan.source {
-        Source::Claude => {
+        SourceKind::Claude if sidecar.is_some() => {
+            // `<projects root>/<project>/<session>/subagents/agent-<id>.jsonl`
+            // alone, with at most its metadata file.
+            let sidecar = sidecar.expect("checked above");
+            let root = env.claude_projects_root()?;
+            let in_root = sidecar.project_dir.file_name().is_some()
+                && sidecar.project_dir.parent() == Some(root.as_path());
+            let meta = history::sources::claude::meta_path(&plan.path);
+            if !in_root
+                || plan.session_id != sidecar.agent_id
+                || plan.files != [plan.path.clone()]
+                || !plan.dirs.is_empty()
+                || plan.metadata.len() > 1
+                || plan.metadata.iter().any(|file| *file != meta)
+            {
+                return refuse();
+            }
+        }
+        SourceKind::Claude => {
             validate_uuid(&plan.session_id)?;
             let id = std::ffi::OsStr::new(&plan.session_id);
             let root = env.claude_projects_root()?;
@@ -621,7 +844,7 @@ fn validate_delete_plan(env: &HistoryEnv, plan: &DeletePlan) -> Result<()> {
                 return refuse();
             }
         }
-        Source::Pi | Source::Omp => {
+        SourceKind::Pi | SourceKind::Omp => {
             let [file] = plan.files.as_slice() else {
                 return refuse();
             };
@@ -630,7 +853,7 @@ fn validate_delete_plan(env: &HistoryEnv, plan: &DeletePlan) -> Result<()> {
             }
             // A file deleted meanwhile is reported missing, not refused.
             let exists = std::fs::symlink_metadata(file).is_ok();
-            let dirs_ok = if plan.source == Source::Pi {
+            let dirs_ok = if plan.source == SourceKind::Pi {
                 if exists && !history::pi::is_pi_file(file) {
                     return refuse();
                 }
@@ -643,6 +866,24 @@ fn validate_delete_plan(env: &HistoryEnv, plan: &DeletePlan) -> Result<()> {
                 plan.dirs.len() <= 1 && plan.dirs.iter().all(|dir| Some(dir) == artifacts.as_ref())
             };
             if !dirs_ok {
+                return refuse();
+            }
+        }
+        SourceKind::Codex => {
+            // `codex delete --force <id>` acts on the home of the listed
+            // rollout: the id must be its thread's, and every planned file a
+            // rollout of that thread in that home.
+            let home = codex::discover::home_of(&plan.path);
+            let thread_ok = home.is_some()
+                && codex::discover::rollout_of(&plan.path, false)
+                    .is_some_and(|rollout| rollout.thread_id == plan.session_id);
+            let files_ok = !plan.files.is_empty()
+                && plan.files.iter().all(|file| {
+                    codex::discover::home_of(file) == home
+                        && codex::discover::rollout_of(file, false)
+                            .is_some_and(|rollout| rollout.thread_id == plan.session_id)
+                });
+            if !thread_ok || !files_ok || !plan.dirs.is_empty() {
                 return refuse();
             }
         }
@@ -811,41 +1052,24 @@ pub fn format_debug_age(age: chrono::Duration) -> String {
     }
 }
 
-/// Whether a conversation belongs to the workspace, as upstream's
-/// `--debug-search --local` decided: Claude by worktree-aware project
-/// directory name, Pi/OMP by canonical working directory.
-pub fn conversation_in_workspace(conversation: &Conversation, workspace: &WorkspaceScope) -> bool {
-    if conversation.source != Source::Claude {
-        let current = workspace.canonical_dir();
-        return conversation
-            .project_path
-            .as_ref()
-            .or(conversation.cwd.as_ref())
-            .is_some_and(|path| path.canonicalize().unwrap_or_else(|_| path.clone()) == current);
-    }
-    conversation
-        .path
-        .parent()
-        .and_then(|p| p.file_name())
-        .is_some_and(|name| {
-            history::is_same_project(&name.to_string_lossy(), workspace.project_dir_name())
-        })
-}
-
 /// Lexical scoring breakdown for `query` (upstream `--debug-search`,
 /// `main.rs:244-335`). `conversations` should be newest first (see
-/// [`load_sorted_conversations`]); `workspace` restricts to the workspace
-/// (`--local`).
+/// [`load_sorted_conversations`]); `workspace` restricts to the
+/// conversations that belong to the workspace (`--local`,
+/// [`history::Workspace::contains`]: started there, or a recorded cwd at or
+/// below it, upstream 82b355a).
 pub fn debug_search_report(
     conversations: &[Conversation],
     query: &str,
     now: DateTime<Local>,
     workspace: Option<&WorkspaceScope>,
 ) -> DebugSearchReport {
+    let workspace = workspace.map(|scope| history::Workspace::new(scope, None));
     let searchable = search::precompute_search_text(conversations);
     let debug = search::debug_search(conversations, &searchable, query, now, |index| {
         workspace
-            .is_none_or(|workspace| conversation_in_workspace(&conversations[index], workspace))
+            .as_ref()
+            .is_none_or(|workspace| workspace.contains(&conversations[index]))
     });
     let total_results = debug.results.len();
     let rows = debug
@@ -1458,9 +1682,9 @@ mod tests {
         std::fs::create_dir_all(first.join(uuid).join("subagents")).unwrap();
         let listed = second.join(format!("{uuid}.jsonl"));
 
-        let mut plan = plan_session_delete(&sandbox.env, &listed, Source::Claude).unwrap();
+        let mut plan = plan_session_delete(&sandbox.env, &listed, SourceKind::Claude).unwrap();
         plan.files.sort();
-        assert_eq!(plan.source, Source::Claude);
+        assert_eq!(plan.source, SourceKind::Claude);
         assert_eq!(plan.path, listed);
         assert_eq!(plan.session_id, uuid);
         assert_eq!(
@@ -1487,18 +1711,103 @@ mod tests {
         );
 
         assert!(matches!(
-            plan_session_delete(&sandbox.env, &listed, Source::Claude),
+            plan_session_delete(&sandbox.env, &listed, SourceKind::Claude),
             Err(AppError::SessionNotFound(_))
         ));
         for invalid in ["a b.jsonl", "..jsonl", "x$.jsonl"] {
             assert!(
                 matches!(
-                    plan_session_delete(&sandbox.env, &first.join(invalid), Source::Claude),
+                    plan_session_delete(&sandbox.env, &first.join(invalid), SourceKind::Claude),
                     Err(AppError::SessionNotFound(_))
                 ),
                 "{invalid}"
             );
         }
+    }
+
+    /// Upstream 3c2ffeb: deleting a Claude session removes its subagent
+    /// transcripts but keeps its `/btw` forks, which the plan lists as kept;
+    /// a sidecar is deleted alone, with its metadata file, and never its
+    /// session. A tampered sidecar plan is refused.
+    #[test]
+    fn claude_sidecars_are_deleted_alone_and_a_session_delete_keeps_its_forks() {
+        let sandbox = Sandbox::new();
+        let uuid = "12345678-1234-4234-9234-123456789abc";
+        let project = sandbox.project("-a");
+        let session = project.join(format!("{uuid}.jsonl"));
+        let sidecars = project.join(uuid).join("subagents");
+        std::fs::create_dir_all(&sidecars).unwrap();
+        let fork = sidecars.join("agent-afork-1.jsonl");
+        let fork_meta = sidecars.join("agent-afork-1.meta.json");
+        let subagent = sidecars.join("agent-a2.jsonl");
+        let subagent_meta = sidecars.join("agent-a2.meta.json");
+        write(&session, &[user_jsonl_line("q")]);
+        write(&fork, &[user_jsonl_line("btw question")]);
+        std::fs::write(&fork_meta, r#"{"agentType":"fork","isFork":true}"#).unwrap();
+        write(&subagent, &[user_jsonl_line("explore")]);
+        std::fs::write(&subagent_meta, r#"{"agentType":"Explore","toolUseId":"t"}"#).unwrap();
+
+        let plan = plan_session_delete(&sandbox.env, &subagent, SourceKind::Claude).unwrap();
+        assert_eq!(plan.session_id, "a2");
+        assert_eq!(plan.files, vec![subagent.clone()]);
+        assert_eq!(plan.metadata, vec![subagent_meta.clone()]);
+        assert!(plan.dirs.is_empty() && plan.kept.is_empty());
+        let other = sidecars.join("agent-a3.jsonl");
+        write(&other, &[user_jsonl_line("other")]);
+        let tampered = [
+            DeletePlan {
+                files: vec![other.clone()],
+                ..plan.clone()
+            },
+            DeletePlan {
+                files: vec![subagent.clone(), session.clone()],
+                ..plan.clone()
+            },
+            DeletePlan {
+                metadata: vec![fork_meta.clone()],
+                ..plan.clone()
+            },
+            DeletePlan {
+                dirs: vec![sidecars.clone()],
+                ..plan.clone()
+            },
+            DeletePlan {
+                session_id: "a3".to_string(),
+                ..plan.clone()
+            },
+        ];
+        for tampered in tampered {
+            assert!(
+                matches!(
+                    execute_session_delete(&sandbox.env, &tampered),
+                    Err(failure) if matches!(failure.error, AppError::SessionNotFound(_))
+                ),
+                "{tampered:?}"
+            );
+        }
+        let report = execute_session_delete(&sandbox.env, &plan).unwrap();
+        assert_eq!(report.removed_files, vec![subagent.clone()]);
+        assert!(!subagent.exists() && !subagent_meta.exists());
+        assert!(session.exists() && fork.exists() && other.exists());
+
+        let plan = plan_session_delete(&sandbox.env, &session, SourceKind::Claude).unwrap();
+        assert_eq!(plan.files, vec![session.clone()]);
+        assert_eq!(plan.dirs, vec![project.join(uuid)]);
+        assert_eq!(plan.kept, vec![fork.clone(), fork_meta.clone()]);
+        assert!(plan.metadata.is_empty());
+        execute_session_delete(&sandbox.env, &plan).unwrap();
+        assert!(!session.exists() && !other.exists());
+        let mut left: Vec<PathBuf> = std::fs::read_dir(&sidecars)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec![fork.clone(), fork_meta.clone()]);
+
+        // The fork outlives its session and is deleted on its own.
+        let plan = plan_session_delete(&sandbox.env, &fork, SourceKind::Claude).unwrap();
+        execute_session_delete(&sandbox.env, &plan).unwrap();
+        assert!(std::fs::read_dir(&sidecars).unwrap().next().is_none());
     }
 
     #[test]
@@ -1522,11 +1831,13 @@ mod tests {
         let other_project_dir = sandbox.project("-other").join(uuid);
         std::fs::create_dir_all(&other_project_dir).unwrap();
         let plan = |files: Vec<PathBuf>, dirs: Vec<PathBuf>| DeletePlan {
-            source: Source::Claude,
+            source: SourceKind::Claude,
             path: transcript.clone(),
             session_id: uuid.to_string(),
             files,
             dirs,
+            metadata: Vec::new(),
+            kept: Vec::new(),
         };
         for plan in [
             plan(vec![transcript.clone(), bystander.clone()], Vec::new()),
@@ -1552,7 +1863,7 @@ mod tests {
             plan(vec![transcript.clone()], vec![other_project_dir.clone()]),
             // A Pi plan for a Claude transcript.
             DeletePlan {
-                source: Source::Pi,
+                source: SourceKind::Pi,
                 ..plan(vec![transcript.clone()], Vec::new())
             },
         ] {
@@ -1567,6 +1878,193 @@ mod tests {
         assert!(transcript.exists() && bystander.exists());
         assert!(outside_transcript.exists() && outside_dir.exists());
         assert!(in_root.exists() && other_project_dir.exists());
+    }
+
+    /// Upstream eea6d37: a Codex thread is deleted by `codex delete --force
+    /// <thread id>` on its home; the plan lists every rollout of the thread,
+    /// and the caller runs the command (a fake here).
+    #[test]
+    fn codex_threads_are_deleted_by_the_codex_cli() {
+        const REVERT: &str = "01a00000-0000-7000-8000-000000000004";
+        const TORN: &str = "01a00000-0000-7000-8000-000000000005";
+        let sandbox = Sandbox::new();
+        let home = codex::tests::home_copy(sandbox.root.path());
+        let rollouts = |thread: &str| -> Vec<PathBuf> {
+            let mut paths: Vec<PathBuf> = codex::discover::list(&home)
+                .unwrap()
+                .into_iter()
+                .filter(|rollout| rollout.thread_id == thread)
+                .map(|rollout| rollout.path)
+                .collect();
+            paths.sort();
+            paths
+        };
+        let listed = rollouts(REVERT).pop().unwrap();
+        let mut plan = plan_session_delete(&sandbox.env, &listed, SourceKind::Codex).unwrap();
+        plan.files.sort();
+        assert_eq!(plan.session_id, REVERT);
+        assert_eq!(plan.files, rollouts(REVERT));
+        assert_eq!(plan.files.len(), 2, "the reverted thread has two rollouts");
+        assert!(plan.dirs.is_empty());
+        assert!(matches!(
+            plan_session_delete(
+                &sandbox.env,
+                &sandbox.root.path().join("x.jsonl"),
+                SourceKind::Codex
+            ),
+            Err(AppError::SessionNotFound(_))
+        ));
+
+        // Tampered plans never reach the CLI.
+        let other = rollouts(TORN).pop().unwrap();
+        let elsewhere = sandbox
+            .root
+            .path()
+            .join("sessions")
+            .join(listed.file_name().unwrap());
+        let mut ran = Vec::new();
+        for tampered in [
+            DeletePlan {
+                session_id: TORN.to_string(),
+                ..plan.clone()
+            },
+            DeletePlan {
+                files: vec![other.clone()],
+                ..plan.clone()
+            },
+            DeletePlan {
+                files: vec![elsewhere],
+                ..plan.clone()
+            },
+            DeletePlan {
+                dirs: vec![home.clone()],
+                ..plan.clone()
+            },
+            DeletePlan {
+                files: Vec::new(),
+                ..plan.clone()
+            },
+            DeletePlan {
+                source: SourceKind::Codex,
+                path: sandbox.root.path().join("notes.jsonl"),
+                session_id: REVERT.to_string(),
+                files: vec![listed.clone()],
+                dirs: Vec::new(),
+                metadata: Vec::new(),
+                kept: Vec::new(),
+            },
+        ] {
+            let failure = execute_session_delete_with(
+                &sandbox.env,
+                &tampered,
+                &Launcher::default_for(SourceKind::Codex),
+                &mut |spec| {
+                    ran.push(spec.clone());
+                    Err("ran".to_string())
+                },
+            )
+            .unwrap_err();
+            assert!(
+                matches!(failure.error, AppError::SessionNotFound(_)),
+                "{tampered:?}"
+            );
+        }
+        assert!(ran.is_empty());
+
+        // A missing configured CLI is named before anything runs (upstream
+        // 8a99ccc).
+        let missing = Launcher::configured(
+            &sandbox.env,
+            &["not-installed-codex".to_string()],
+            crate::history::actions::ConfiguredAt::Gui("[resume.codex]"),
+        );
+        let failure = execute_session_delete_with(&sandbox.env, &plan, &missing, &mut |spec| {
+            ran.push(spec.clone());
+            Err("ran".to_string())
+        })
+        .unwrap_err();
+        assert!(matches!(failure.error, AppError::AgentLaunch(_)));
+        assert!(
+            failure
+                .error
+                .to_string()
+                .contains("check `command` under [resume.codex] in gui.toml"),
+            "{}",
+            failure.error
+        );
+        assert!(ran.is_empty());
+
+        // The configured CLI runs `codex delete --force <id>` on the home.
+        let codex = sandbox.root.path().join("bin").join("codex.exe");
+        std::fs::create_dir_all(codex.parent().unwrap()).unwrap();
+        std::fs::write(&codex, "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let codex_launcher = Launcher::program_path(
+            &sandbox.env,
+            &codex,
+            crate::history::actions::ConfiguredAt::GuiPath("codex_path"),
+        );
+        let failed =
+            execute_session_delete_with(&sandbox.env, &plan, &codex_launcher, &mut |spec| {
+                ran.push(spec.clone());
+                Ok(RunOutput {
+                    success: false,
+                    status: "exit status: 2".to_string(),
+                    stderr: "thread is busy\n".to_string(),
+                })
+            })
+            .unwrap_err();
+        assert_eq!(
+            failed.error.to_string(),
+            "I/O error: codex delete failed (exit status: 2): thread is busy"
+        );
+        assert!(failed.partial.removed_files.is_empty());
+        let log = std::fs::read_to_string(sandbox.env.debug_log_file().unwrap()).unwrap();
+        assert!(
+            log.contains(&format!("Failed to delete session {}", listed.display())),
+            "{log}"
+        );
+        let report =
+            execute_session_delete_with(&sandbox.env, &plan, &codex_launcher, &mut |spec| {
+                ran.push(spec.clone());
+                // What Codex does: remove every rollout of the thread.
+                for file in &plan.files {
+                    std::fs::remove_file(file).unwrap();
+                }
+                Ok(RunOutput {
+                    success: true,
+                    status: "exit status: 0".to_string(),
+                    stderr: String::new(),
+                })
+            })
+            .unwrap();
+        assert_eq!(report.removed_files, plan.files);
+        assert_eq!(ran.len(), 2);
+        let spec = &ran[1];
+        assert_eq!(spec.program.path, codex);
+        assert_eq!(
+            spec.args,
+            ["delete", "--force", REVERT]
+                .map(std::ffi::OsString::from)
+                .to_vec()
+        );
+        assert_eq!(
+            spec.env,
+            [(
+                std::ffi::OsString::from("CODEX_HOME"),
+                home.clone().into_os_string()
+            )]
+        );
+        assert!(other.is_file(), "other threads stay");
+
+        // Without a runner, core refuses to run the CLI in tests.
+        let plan = plan_session_delete(&sandbox.env, &other, SourceKind::Codex).unwrap();
+        assert!(execute_session_delete(&sandbox.env, &plan).is_err());
+        assert!(other.is_file());
     }
 
     #[test]
@@ -1587,18 +2085,20 @@ mod tests {
         let notes = dir.join("notes.jsonl");
         std::fs::write(&notes, "{}\n").unwrap();
 
-        let pi_plan = plan_session_delete(&sandbox.env, &pi, Source::Pi).unwrap();
-        let omp_plan = plan_session_delete(&sandbox.env, &omp, Source::Omp).unwrap();
+        let pi_plan = plan_session_delete(&sandbox.env, &pi, SourceKind::Pi).unwrap();
+        let omp_plan = plan_session_delete(&sandbox.env, &omp, SourceKind::Omp).unwrap();
         assert_eq!(pi_plan.path, pi);
         assert_eq!(omp_plan.path, omp);
         for plan in [
             // An arbitrary directory in an OMP plan without files.
             DeletePlan {
-                source: Source::Omp,
+                source: SourceKind::Omp,
                 path: omp.clone(),
                 session_id: "whatever".to_string(),
                 files: Vec::new(),
                 dirs: vec![unrelated.clone()],
+                metadata: Vec::new(),
+                kept: Vec::new(),
             },
             DeletePlan {
                 dirs: vec![unrelated.clone()],
@@ -1628,7 +2128,7 @@ mod tests {
             },
             // An OMP session in a Pi plan.
             DeletePlan {
-                source: Source::Pi,
+                source: SourceKind::Pi,
                 dirs: Vec::new(),
                 ..omp_plan.clone()
             },
@@ -1666,18 +2166,18 @@ mod tests {
         let artifacts = dir.join("omp");
         std::fs::create_dir_all(artifacts.join("tool")).unwrap();
 
-        let pi_plan = plan_session_delete(&sandbox.env, &pi, Source::Pi).unwrap();
+        let pi_plan = plan_session_delete(&sandbox.env, &pi, SourceKind::Pi).unwrap();
         assert_eq!(pi_plan.session_id, "custom_v1_id");
         assert_eq!(pi_plan.files, vec![pi.clone()]);
         assert!(pi_plan.dirs.is_empty());
-        let omp_plan = plan_session_delete(&sandbox.env, &omp, Source::Omp).unwrap();
+        let omp_plan = plan_session_delete(&sandbox.env, &omp, SourceKind::Omp).unwrap();
         assert_eq!(omp_plan.session_id, "omp_session_custom_id");
         assert_eq!(omp_plan.files, vec![omp.clone()]);
         assert_eq!(omp_plan.dirs, vec![artifacts.clone()]);
         let not_a_session = dir.join("notes.jsonl");
         std::fs::write(&not_a_session, "{}\n").unwrap();
         assert!(matches!(
-            plan_session_delete(&sandbox.env, &not_a_session, Source::Pi),
+            plan_session_delete(&sandbox.env, &not_a_session, SourceKind::Pi),
             Err(AppError::SessionNotFound(_))
         ));
 
@@ -1699,7 +2199,7 @@ mod tests {
         let uuid = "12345678-1234-4234-9234-123456789abc";
         let listed = sandbox.project("-a").join(format!("{uuid}.jsonl"));
         write(&listed, &[user_jsonl_line("q")]);
-        let mut plan = plan_session_delete(&sandbox.env, &listed, Source::Claude).unwrap();
+        let mut plan = plan_session_delete(&sandbox.env, &listed, SourceKind::Claude).unwrap();
         plan.session_id = "not-a-uuid".to_string();
         let failure = execute_session_delete(&sandbox.env, &plan).unwrap_err();
         assert_eq!(failure.partial, DeleteReport::default());
@@ -1725,7 +2225,7 @@ mod tests {
             &[user_jsonl_line("q")],
         );
         write(&blocked, &["not a directory".to_string()]);
-        let mut plan = plan_session_delete(&sandbox.env, &listed, Source::Claude).unwrap();
+        let mut plan = plan_session_delete(&sandbox.env, &listed, SourceKind::Claude).unwrap();
         plan.files.push(gone.clone());
         plan.dirs = vec![removable.clone(), blocked.clone()];
 
@@ -1752,7 +2252,7 @@ mod tests {
         // remove_file.
         let blocked = sandbox.project("-b").join(format!("{uuid}.jsonl"));
         std::fs::create_dir_all(&blocked).unwrap();
-        let mut plan = plan_session_delete(&sandbox.env, &listed, Source::Claude).unwrap();
+        let mut plan = plan_session_delete(&sandbox.env, &listed, SourceKind::Claude).unwrap();
         plan.files.sort();
         assert_eq!(plan.files, vec![listed.clone(), blocked.clone()]);
 
@@ -1818,7 +2318,6 @@ mod tests {
         crate::semantic::test_fixtures::SemanticConversationFixture::new(path, Vec::<String>::new())
             .with_title(text)
             .with_project("proj", "/projects/proj")
-            .with_normalized_search_text_lower()
             .build()
     }
 
@@ -1898,17 +2397,44 @@ mod tests {
     #[test]
     fn pi_conversations_match_the_workspace_by_directory() {
         let root = tempfile::tempdir().unwrap();
+        let in_workspace = |pi: &Conversation, dir: &Path| {
+            history::Workspace::new(&WorkspaceScope::new(dir).unwrap(), None).contains(pi)
+        };
         let mut pi = conversation("/sessions/x.jsonl", "pi");
-        pi.source = Source::Pi;
+        pi.source = SourceKind::Pi;
         pi.project_path = Some(root.path().to_path_buf());
-        assert!(conversation_in_workspace(
-            &pi,
-            &WorkspaceScope::new(root.path()).unwrap()
-        ));
-        assert!(!conversation_in_workspace(
-            &pi,
-            &WorkspaceScope::new(root.path().join("sub")).unwrap()
-        ));
+        assert!(in_workspace(&pi, root.path()));
+        assert!(!in_workspace(&pi, &root.path().join("sub")));
+        // Upstream 82b355a: a session of a folder below the workspace
+        // belongs to it too. The folder must exist: a project path is
+        // compared in its canonical spelling, and a temp dir's canonical
+        // spelling differs from `root.path()` on macOS (/var ->
+        // /private/var) and on Windows runners (8.3 names such as RUNNER~1).
+        let sub = root.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        pi.project_path = Some(sub);
+        assert!(in_workspace(&pi, root.path()));
+    }
+
+    /// Upstream 82b355a: `--debug-search --local` also takes in a Claude
+    /// session stored under another project that worked in the workspace.
+    #[test]
+    fn debug_search_report_scopes_by_recorded_cwds() {
+        let now = Local::now();
+        let mut moved = conversation("/p/-nowhere/moved.jsonl", "needle");
+        moved.cwds = vec![
+            PathBuf::from("/nowhere"),
+            PathBuf::from("/nowhere/proj/src"),
+        ];
+        moved.cwd = moved.cwds.first().cloned();
+        let mut sibling = conversation("/p/-nowhere/sibling.jsonl", "needle");
+        sibling.cwds = vec![PathBuf::from("/nowhere/proj-other")];
+        sibling.cwd = sibling.cwds.first().cloned();
+        let conversations = vec![moved, sibling];
+        let workspace = WorkspaceScope::from_parts("/nowhere/proj", "-nowhere-proj");
+        let report = debug_search_report(&conversations, "needle", now, Some(&workspace));
+        let sessions: Vec<&str> = report.rows.iter().map(|row| row.session.as_str()).collect();
+        assert_eq!(sessions, ["moved"]);
     }
 
     #[test]
@@ -1958,23 +2484,31 @@ mod tests {
     fn load_sorted_conversations_filters_and_sorts() {
         let sandbox = Sandbox::new();
         let project = sandbox.project("-tmp-p");
+        // Conversations are dated by their last message, not the file's mtime.
+        let message = |role: &str, content: serde_json::Value, days_ago: i64| {
+            serde_json::json!({
+                "type": role,
+                "timestamp": (chrono::Utc::now() - chrono::Duration::days(days_ago))
+                    .to_rfc3339(),
+                "message": {"role": role, "content": content}
+            })
+            .to_string()
+        };
+        let reply = serde_json::json!([{"type": "text", "text": "a"}]);
         write(
             &project.join("old.jsonl"),
-            &[user_jsonl_line("old"), assistant_jsonl_line("a")],
+            &[
+                message("user", "old".into(), 10),
+                message("assistant", reply.clone(), 10),
+            ],
         );
         write(
             &project.join("new.jsonl"),
-            &[user_jsonl_line("new"), assistant_jsonl_line("a")],
+            &[
+                message("user", "new".into(), 0),
+                message("assistant", reply, 0),
+            ],
         );
-        let old = std::fs::File::options()
-            .write(true)
-            .open(project.join("old.jsonl"))
-            .unwrap();
-        old.set_modified(
-            std::time::SystemTime::now() - std::time::Duration::from_secs(86_400 * 10),
-        )
-        .unwrap();
-        drop(old);
 
         let all =
             load_sorted_conversations(&sandbox.env, true, None, &TimeFilter::default()).unwrap();

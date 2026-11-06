@@ -67,8 +67,10 @@ timing viewer.frame_cpu_p95_100 >= 0
 expect viewer.indicator !contains "[1/"
 
 # Toggles keep the anchor and stay within 60 ms of UI time (handler + install; install alone 50 ms).
-key t
+# Full → Summary directly: `t` goes to Off first since upstream d0aca95.
+action history::SetToolsSummary
 wait-for viewer.loading == false 10s
+expect viewer.tool_display == sum
 timing viewer.toggle_ms < 60ms
 timing viewer.install_ms < 50ms
 timing viewer.toggle_total_ms < 60ms
@@ -77,7 +79,7 @@ wait-for viewer.loading == false 10s
 timing viewer.toggle_ms < 60ms
 timing viewer.install_ms < 50ms
 timing viewer.toggle_total_ms < 60ms
-key t t
+key t t t
 wait-for viewer.loading == false 10s
 expect viewer.tool_display == all
 

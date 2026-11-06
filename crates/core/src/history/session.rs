@@ -2,7 +2,9 @@
 //! applies to a [`crate::browser::Browser`]: the UUID jump's disk lookup
 //! (K2) and rename (K3).
 
-use super::{Conversation, Source, find_jsonl_by_uuid, format_short_name_from_path, pi};
+use super::model::SourceKind;
+use super::sources::Registry;
+use super::{Conversation, find_jsonl_by_uuid, format_short_name_from_path};
 use crate::browser::RenameError;
 use crate::env::HistoryEnv;
 use crate::error::Result;
@@ -15,7 +17,8 @@ use std::path::Path;
 /// preview chosen by `show_last` (addendum C1 fix: upstream always used
 /// the first messages). `Ok(None)` when there is no such file or it parses
 /// to nothing listable. Blocking; pass the result to
-/// [`crate::browser::Browser::resolve_uuid_lookup`].
+/// [`crate::browser::Browser::resolve_uuid_lookup_session`] (wrapped in a
+/// [`crate::browser::PreparedSession`] in the background).
 pub fn load_session_by_uuid(
     env: &HistoryEnv,
     uuid: &str,
@@ -42,31 +45,34 @@ pub fn load_session_by_uuid(
 }
 
 /// Rename the session at `path` (blocking; the GUI's background half of
-/// a rename, applied with [`crate::browser::Browser::apply_renamed`]).
+/// a rename, wrapped in a [`crate::browser::PreparedSession`] and applied
+/// with [`crate::browser::Browser::apply_renamed_session`]).
 ///
 /// `title = title.trim()`; an empty title clears the custom title. The
-/// rename is written in the session's own format: Claude `custom-title` +
+/// adapter of `source` writes the rename (`Adapter::rename`, upstream
+/// 9799550), in the session's own format: Claude `custom-title` +
 /// `agent-name` records, Pi a `session_info` entry, OMP the title slot plus
 /// a `title_change` record. A transcript that does not end with a newline
 /// gets one first (Claude and Pi; upstream's Pi rename appended to the
 /// last line). The file is then re-parsed; the preview follows `show_last`
 /// (quirk 9 fix). The returned conversation has no project name or path:
 /// the caller keeps the ones it has. `env` is the environment the session
-/// belongs to (not consulted by the current formats).
+/// belongs to (its registry of source adapters).
+/// [`RenameError::Unsupported`] when the adapter cannot rename (nothing is
+/// written).
 pub fn rename_session(
     env: &HistoryEnv,
     path: &Path,
-    source: Source,
+    source: SourceKind,
     title: &str,
     show_last: bool,
 ) -> std::result::Result<Conversation, RenameError> {
-    let _ = env;
     let title = title.trim();
-    let written = match source {
-        Source::Claude => super::append_session_rename(path, title),
-        Source::Pi => pi::append_session_rename(path, title),
-        Source::Omp => pi::append_omp_session_rename(path, title),
-    };
+    let adapter = Registry::from_env(env).for_path(source, path);
+    if !adapter.capabilities().rename {
+        return Err(RenameError::Unsupported(source));
+    }
+    let written = adapter.rename(path, title);
     match written.and_then(|()| super::process_conversation_file(path.to_path_buf(), None, None)) {
         Ok(Some(mut conversation)) => {
             apply_preview_mode(&mut conversation, show_last);

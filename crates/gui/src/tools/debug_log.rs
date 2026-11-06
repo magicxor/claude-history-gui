@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use claude_history_core::debug::DebugLevel;
-use claude_history_core::history::{Conversation, Source};
+use claude_history_core::history::Conversation;
 use claude_history_core::maintenance::{ParseErrorReport, log_parse_errors, parse_error_report};
 use gpui_kit::base::Root;
 use gpui_kit::component::button::{Button, ButtonGroup};
@@ -270,16 +270,15 @@ impl DebugLogDialog {
             return;
         }
         let path = target.path.clone();
-        let source = target.source;
+        // Through the instance whose root holds the file, so an OMP session
+        // decodes as one (upstream 9597669 removed the OMP-only parser).
+        let history = crate::globals::env_history(cx);
         let rx = spawn_thread("debug-log-parse", move || {
-            let result = if source == Some(Source::Omp) {
-                claude_history_core::history::parser::process_omp_conversation_file(
-                    path, None, None,
-                )
-            } else {
-                claude_history_core::history::process_conversation_file(path, None, None)
-            };
-            result.map_err(|error| error_text(&error))
+            history
+                .service()
+                .open_path(&path)
+                .map(|(_, transcript)| claude_history_core::history::index::index(&transcript).ok())
+                .map_err(|error| error_text(&error))
         });
         self._parse_task = Some(cx.spawn_in(window, async move |this, cx| {
             if let Ok(result) = rx.recv().await {

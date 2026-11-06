@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use claude_history_core::history::Source;
+use claude_history_core::history::model::SourceKind;
 use gpui_kit::{Action, AnyWindowHandle, AppContext as _, MenuItem, TestAppContext, point, px};
 
 use super::{click_row, has_dialog, probe, render, settle, shown_path, viewer_of, wait_for};
@@ -256,7 +256,7 @@ fn x002_a_pi_conversation_from_a_hit_deletes_with_the_pi_plan(cx: &mut TestAppCo
     assert_eq!(target.path, pi);
     assert_eq!(
         target.source,
-        Some(Source::Pi),
+        Some(SourceKind::Pi),
         "from AgentConversationInfo"
     );
     let results = cx.read(|cx| deep.read(cx).results().clone());

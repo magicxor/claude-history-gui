@@ -7,16 +7,31 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use claude_history_core::HistoryEnv;
+use claude_history_core::config::{ConfigFile, GuiConfigFile};
+use claude_history_core::history::model::SourceKind;
 
-use super::draft::{Field, Value, check_path_text};
+use super::draft::{Field, check_path_text};
 use super::pages::{program_status_for, terminal_preview_for};
 
-/// The program fields and the executable each one resolves.
-pub const PROGRAM_FIELDS: [(Field, &str); 3] = [
-    (Field::ClaudePath, "claude"),
-    (Field::PiPath, "pi"),
-    (Field::OmpPath, "omp"),
+/// The program path fields (General) and the agent each one starts; every
+/// agent's `command` field (Resume, upstream 8a99ccc) shows the same probe
+/// (`Field::command_of`).
+pub const PROGRAM_FIELDS: [(Field, SourceKind); 4] = [
+    (Field::ClaudePath, SourceKind::Claude),
+    (Field::PiPath, SourceKind::Pi),
+    (Field::OmpPath, SourceKind::Omp),
+    (Field::CodexPath, SourceKind::Codex),
 ];
+
+/// The agent whose program a program path or `command` field sets.
+pub fn program_agent(field: Field) -> Option<SourceKind> {
+    field.command_agent().or_else(|| {
+        PROGRAM_FIELDS
+            .iter()
+            .find(|(path_field, _)| *path_field == field)
+            .map(|(_, source)| *source)
+    })
+}
 
 /// What a probe needs, copied off the UI thread.
 #[derive(Clone)]
@@ -26,8 +41,10 @@ pub struct ProbeInput {
     pub terminal: Option<String>,
     /// The folder a sample resume would run in.
     pub cwd: Option<PathBuf>,
-    /// The program fields' path settings.
-    pub programs: Vec<(Field, Value, &'static str)>,
+    /// config.toml and the draft's gui.toml: what starts each agent
+    /// (`config::agent_launcher`).
+    pub cli: ConfigFile,
+    pub draft: GuiConfigFile,
     /// Typed path texts to check: `(field, text, must_be_dir)`.
     pub paths: Vec<(Field, String, bool)>,
 }
@@ -62,10 +79,18 @@ impl Default for Probes {
 
 /// Run a probe (blocking; background thread only).
 pub fn run(input: ProbeInput) -> ProbeResult {
-    let programs = input
-        .programs
+    let programs = PROGRAM_FIELDS
         .iter()
-        .map(|(field, own, name)| (*field, program_status_for(&input.env, own.clone(), name)))
+        .flat_map(|(path_field, source)| {
+            [
+                (*path_field, *source),
+                (Field::command_of(*source), *source),
+            ]
+        })
+        .map(|(field, source)| {
+            let status = program_status_for(&input.env, &input.cli, &input.draft, field, source);
+            (field, status)
+        })
         .collect();
     let paths = input
         .paths

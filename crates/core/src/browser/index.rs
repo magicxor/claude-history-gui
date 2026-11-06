@@ -10,12 +10,14 @@
 //! caller's thread: lookups hash one key, and an edit moves at most the
 //! corpus's pointers and row numbers.
 
-use crate::env::{WorkspaceScope, normalize_windows_path};
-use crate::history::{Conversation, Source};
+use crate::env::WorkspaceScope;
+use crate::history::model::SourceKind;
+use crate::history::path::project_is_excluded;
+use crate::history::{Conversation, Workspace};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 /// The 64-bit key of a path: a hash of its file name. Paths that are equal
@@ -208,22 +210,23 @@ impl KeyIndex {
 
 /// How many conversations of each source the corpus holds.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct SourceCounts([usize; 3]);
+pub(super) struct SourceCounts([usize; 4]);
 
 impl SourceCounts {
-    fn slot(source: Source) -> usize {
+    fn slot(source: SourceKind) -> usize {
         match source {
-            Source::Claude => 0,
-            Source::Pi => 1,
-            Source::Omp => 2,
+            SourceKind::Claude => 0,
+            SourceKind::Pi => 1,
+            SourceKind::Omp => 2,
+            SourceKind::Codex => 3,
         }
     }
 
-    fn add(&mut self, source: Source) {
+    fn add(&mut self, source: SourceKind) {
         self.0[Self::slot(source)] += 1;
     }
 
-    fn remove(&mut self, source: Source) {
+    fn remove(&mut self, source: SourceKind) {
         let count = &mut self.0[Self::slot(source)];
         *count = count.saturating_sub(1);
     }
@@ -234,12 +237,15 @@ impl SourceCounts {
     }
 }
 
-/// What decides whether a row is in scope: the excluded project names and,
-/// when the workspace scope is on, the workspace.
+/// What decides whether a row is in scope: the excluded project names, the
+/// excluded working-directory prefixes, when the workspace scope is on, the
+/// workspace, and whether automated and child conversations are listed.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct ScopeSettings {
     pub(super) excluded: HashSet<String>,
+    pub(super) excluded_paths: Vec<String>,
     pub(super) workspace: Option<WorkspaceScope>,
+    pub(super) all_kinds: bool,
 }
 
 /// The scope test of one conversation (upstream
@@ -248,30 +254,56 @@ pub(super) struct ScopeSettings {
 /// * A conversation is excluded when its project name is in the excluded
 ///   names, or is a worktree `parent/branch` whose parent is. Conversations
 ///   without a project name are never excluded.
-/// * With a workspace, Claude conversations are kept when their project
-///   directory is the same project as the workspace (worktree aware);
-///   Pi/OMP conversations when their project path (or cwd) is the workspace
-///   directory. Upstream compared with the process cwd.
+/// * A conversation whose recorded cwd starts with one of the excluded
+///   paths is excluded (upstream 982aea9: literal prefixes, case-insensitive on
+///   Windows, 59417d1;
+///   without a cwd it stays).
+/// * Automated and child conversations are listed only with `all_kinds`
+///   (upstream 8f60c5f, cb990e6).
+/// * With a workspace, a conversation is kept when it belongs to it
+///   ([`Workspace::contains`], upstream 82b355a): its project is the
+///   workspace (Claude: worktree aware) or a recorded cwd is the workspace
+///   or a folder below it. Upstream's workspace was the process cwd; here
+///   it is the [`WorkspaceScope`], resolved once per filter.
 pub(super) struct ScopeFilter<'a> {
     excluded: &'a HashSet<String>,
+    excluded_paths: &'a [String],
     workspace: Option<&'a WorkspaceScope>,
-    /// The workspace canonicalized once (upstream: once per row).
-    workspace_dir: Option<PathBuf>,
+    all_kinds: bool,
+    /// `workspace` resolved on the first row that needs it.
+    resolved: Option<Workspace>,
 }
 
 impl<'a> ScopeFilter<'a> {
     pub(super) fn new(
         excluded: &'a HashSet<String>,
+        excluded_paths: &'a [String],
         workspace: Option<&'a WorkspaceScope>,
+        all_kinds: bool,
     ) -> Self {
         Self {
             excluded,
+            excluded_paths,
             workspace,
-            workspace_dir: None,
+            all_kinds,
+            resolved: None,
         }
     }
 
+    /// The filter of `settings`.
+    pub(super) fn of(settings: &'a ScopeSettings) -> Self {
+        Self::new(
+            &settings.excluded,
+            &settings.excluded_paths,
+            settings.workspace.as_ref(),
+            settings.all_kinds,
+        )
+    }
+
     pub(super) fn passes(&mut self, conversation: &Conversation) -> bool {
+        if !self.all_kinds && conversation.provenance.hidden_by_default() {
+            return false;
+        }
         if conversation
             .project_name
             .as_deref()
@@ -279,48 +311,30 @@ impl<'a> ScopeFilter<'a> {
         {
             return false;
         }
+        if crate::history::path::cwd_is_excluded(conversation.cwd.as_deref(), self.excluded_paths) {
+            return false;
+        }
         let Some(workspace) = self.workspace else {
             return true;
         };
-        if conversation.source != Source::Claude {
-            let current = self
-                .workspace_dir
-                .get_or_insert_with(|| comparable_dir(&workspace.canonical_dir()));
-            return conversation
-                .project_path
-                .as_ref()
-                .or(conversation.cwd.as_ref())
-                .is_some_and(|path| comparable_canonical(path) == *current);
-        }
-        conversation
-            .path
-            .parent()
-            .and_then(|parent| parent.file_name())
-            .is_some_and(|name| {
-                crate::history::path::is_same_project(
-                    &name.to_string_lossy(),
-                    workspace.project_dir_name(),
-                )
-            })
+        self.resolved
+            .get_or_insert_with(|| Workspace::new(workspace, None))
+            .contains(conversation)
     }
 }
 
-/// `path` canonicalized when possible, in comparable form.
-fn comparable_canonical(path: &Path) -> PathBuf {
-    comparable_dir(&path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
-}
-
-/// Windows: compare `C:\x` and `\\?\C:\x` (canonical) equally (W1). A no-op
-/// for paths without a drive or verbatim prefix.
-fn comparable_dir(path: &Path) -> PathBuf {
-    normalize_windows_path(path)
-}
-
-fn project_is_excluded(project_name: &str, excluded_projects: &HashSet<String>) -> bool {
-    excluded_projects.contains(project_name)
-        || project_name
-            .split_once('/')
-            .is_some_and(|(parent, _)| excluded_projects.contains(parent))
+/// Card counterpart of the project filters of [`ScopeFilter`] (upstream
+/// `card_project_visible`): whether the excluded project names leave
+/// `project` visible. The workspace test of a card is
+/// [`crate::store::Snapshot::scope`]'s (upstream 82b355a), which also
+/// reads the card's recorded cwds.
+pub(super) fn card_project_visible(
+    project: &crate::store::ProjectView,
+    excluded: &HashSet<String>,
+) -> bool {
+    project
+        .name
+        .is_none_or(|name| !project_is_excluded(name, excluded))
 }
 
 /// The rows in scope for one corpus and one [`ScopeSettings`]: ascending
@@ -337,11 +351,34 @@ pub(super) struct ScopeIndex {
 impl ScopeIndex {
     /// Evaluate every conversation (O(n); off the UI thread for loads).
     pub(super) fn compute(conversations: &[Arc<Conversation>], settings: ScopeSettings) -> Self {
-        let mut filter = ScopeFilter::new(&settings.excluded, settings.workspace.as_ref());
+        let mut filter = ScopeFilter::of(&settings);
         let member = conversations
             .iter()
             .map(|conversation| filter.passes(conversation))
             .collect::<Vec<_>>();
+        let rows = member
+            .iter()
+            .enumerate()
+            .filter_map(|(position, &member)| member.then_some(position))
+            .collect();
+        Self {
+            valid: true,
+            settings,
+            rows: Arc::new(rows),
+            member,
+        }
+    }
+
+    /// Every one of `len` conversations in scope, without evaluating them:
+    /// for rows already chosen under `settings` (snapshot cards, picked by
+    /// [`crate::store::Snapshot::head`]).
+    pub(super) fn all(len: usize, settings: ScopeSettings) -> Self {
+        Self::from_members(vec![true; len], settings)
+    }
+
+    /// The scope with the membership of each conversation decided elsewhere
+    /// (snapshot cards: [`crate::store::Snapshot::scope`]).
+    pub(super) fn from_members(member: Vec<bool>, settings: ScopeSettings) -> Self {
         let rows = member
             .iter()
             .enumerate()
@@ -360,13 +397,17 @@ impl ScopeIndex {
     pub(super) fn is_current(
         &self,
         excluded: &HashSet<String>,
+        excluded_paths: &[String],
         workspace: Option<&WorkspaceScope>,
+        all_kinds: bool,
         len: usize,
     ) -> bool {
         self.valid
             && self.member.len() == len
+            && self.settings.all_kinds == all_kinds
             && self.settings.workspace.as_ref() == workspace
             && self.settings.excluded == *excluded
+            && self.settings.excluded_paths == excluded_paths
     }
 
     /// The positions in scope, ascending (shared with the semantic worker).
@@ -391,8 +432,7 @@ impl ScopeIndex {
             self.invalidate();
             return;
         }
-        let mut filter =
-            ScopeFilter::new(&self.settings.excluded, self.settings.workspace.as_ref());
+        let mut filter = ScopeFilter::of(&self.settings);
         let added = conversations[start..]
             .iter()
             .map(|conversation| filter.passes(conversation))
@@ -407,14 +447,24 @@ impl ScopeIndex {
         self.member.extend(added);
     }
 
+    /// Add a conversation appended at `position` that is in scope by
+    /// construction (a snapshot card a query on the cards' index returned).
+    fn push_member(&mut self, position: usize) {
+        if !self.valid || self.member.len() != position {
+            self.invalidate();
+            return;
+        }
+        self.member.push(true);
+        Arc::make_mut(&mut self.rows).push(position);
+    }
+
     /// Re-evaluate the conversation at `position` (it was replaced).
     fn update(&mut self, conversations: &[Arc<Conversation>], position: usize) {
         if !self.valid || self.member.len() != conversations.len() {
             self.invalidate();
             return;
         }
-        let mut filter =
-            ScopeFilter::new(&self.settings.excluded, self.settings.workspace.as_ref());
+        let mut filter = ScopeFilter::of(&self.settings);
         let member = filter.passes(&conversations[position]);
         if self.member[position] == member {
             return;
@@ -524,6 +574,13 @@ impl CorpusIndex {
         self.scope.extend(conversations, start);
     }
 
+    /// Index the conversation appended at `position`, in scope by
+    /// construction ([`ScopeIndex::push_member`]): no scope test runs.
+    pub(super) fn push_in_scope(&mut self, conversations: &[Arc<Conversation>], position: usize) {
+        self.add(&conversations[position], position);
+        self.scope.push_member(position);
+    }
+
     /// The conversation at `position` was replaced; `previous` is the one it
     /// replaced (same path).
     pub(super) fn replace(
@@ -617,6 +674,7 @@ impl CorpusIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn slots_keep_positions_ascending() {
@@ -721,15 +779,68 @@ mod tests {
     }
 
     #[test]
+    fn card_projects_follow_the_exclusions_and_the_workspace_keys() {
+        use crate::store::ProjectView;
+        fn project<'a>(name: Option<&'a str>, key: &'a str, key_is_path: bool) -> ProjectView<'a> {
+            ProjectView {
+                name,
+                workspace_key: key,
+                key_is_path,
+            }
+        }
+        let excluded: HashSet<String> = ["hidden".to_string()].into_iter().collect();
+        let visible = |project: ProjectView<'_>| card_project_visible(&project, &excluded);
+        assert!(visible(project(Some("app"), "-x-app", false)));
+        assert!(!visible(project(Some("hidden"), "-x-hidden", false)));
+        assert!(
+            !visible(project(Some("hidden/feature"), "-x-hidden", false)),
+            "a worktree of an excluded project"
+        );
+        assert!(visible(project(None, "", true)));
+
+        // The workspace half of the cards' test (`Snapshot::scope`).
+        let dir = if cfg!(windows) {
+            r"C:\no-such-dir\app"
+        } else {
+            "/no-such-dir/app"
+        };
+        let scope = WorkspaceScope::new(dir).unwrap();
+        let workspace = Workspace::new(&scope, None);
+        let encoded = scope.project_dir_name();
+        assert!(workspace.contains_project_key(encoded, false));
+        assert!(!workspace.contains_project_key("-elsewhere-api", false));
+        assert!(workspace.contains_project_key(dir, true));
+        assert!(
+            !workspace.contains_project_key("", true),
+            "a Pi/OMP project without a path"
+        );
+        #[cfg(windows)]
+        assert!(
+            workspace.contains_project_key(r"\\?\C:\no-such-dir\app", true),
+            "W1: the writer's canonical spelling matches"
+        );
+        #[cfg(windows)]
+        assert!(
+            workspace.contains_project_key(r"C:\No-Such-Dir\APP", true),
+            "a path-keyed project that differs only in case"
+        );
+        #[cfg(not(windows))]
+        assert!(
+            !workspace.contains_project_key("/No-Such-Dir/APP", true),
+            "paths are case sensitive off Windows"
+        );
+    }
+
+    #[test]
     fn source_counts_report_a_mix() {
         let mut counts = SourceCounts::default();
         assert!(!counts.mixed());
-        counts.add(Source::Claude);
-        counts.add(Source::Claude);
+        counts.add(SourceKind::Claude);
+        counts.add(SourceKind::Claude);
         assert!(!counts.mixed());
-        counts.add(Source::Pi);
+        counts.add(SourceKind::Pi);
         assert!(counts.mixed());
-        counts.remove(Source::Pi);
+        counts.remove(SourceKind::Pi);
         assert!(!counts.mixed());
     }
 }

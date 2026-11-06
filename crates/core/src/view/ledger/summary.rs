@@ -1,4 +1,7 @@
-use crate::claude::{ContentBlock, LogEntry, UserContent};
+use crate::history::model::{Message, Part, Role};
+use crate::history::view::{Entry, EntryKind};
+use chrono::{DateTime, Utc};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::ledger::{LedgerRow, NameCol, push_row};
 use super::style::assistant_label;
@@ -15,8 +18,8 @@ pub(super) struct PendingToolSummary {
     pub(super) first_parsed_idx: usize,
     pub(super) last_parsed_idx: usize,
     pub(super) parent_id: Option<String>,
-    pub(super) agent: Option<String>,
-    pub(super) timestamp: Option<String>,
+    pub(super) speaker: String,
+    pub(super) timestamp: Option<DateTime<Utc>>,
     pub(super) summary: ToolActivitySummary,
 }
 
@@ -31,22 +34,31 @@ pub(crate) struct ToolActivitySummary {
     agents: usize,
     fetched_urls: usize,
     web_searches: usize,
-    other_tools: usize,
+    /// Tools without their own summary wording, by name in first-call order,
+    /// with their call counts.
+    other_tools: Vec<(String, usize)>,
 }
 
 impl ToolActivitySummary {
     fn add_call(&mut self, name: &str) {
         match name {
-            "Bash" => self.shell_commands += 1,
-            "Read" => self.read_files += 1,
-            "Grep" => self.searched_patterns += 1,
-            "Glob" => self.searched_file_patterns += 1,
-            "Edit" => self.edited_files += 1,
-            "Write" => self.wrote_files += 1,
+            "Bash" | "bash" => self.shell_commands += 1,
+            "Read" | "read" => self.read_files += 1,
+            "Grep" | "grep" => self.searched_patterns += 1,
+            "Glob" | "find" => self.searched_file_patterns += 1,
+            "Edit" | "edit" => self.edited_files += 1,
+            "Write" | "write" => self.wrote_files += 1,
             "Task" => self.agents += 1,
-            "WebFetch" => self.fetched_urls += 1,
-            "WebSearch" => self.web_searches += 1,
-            _ => self.other_tools += 1,
+            "WebFetch" | "fetch_content" => self.fetched_urls += 1,
+            "WebSearch" | "web_search" => self.web_searches += 1,
+            _ => self.add_other_tool(name, 1),
+        }
+    }
+
+    fn add_other_tool(&mut self, name: &str, count: usize) {
+        match self.other_tools.iter_mut().find(|(seen, _)| seen == name) {
+            Some((_, seen_count)) => *seen_count += count,
+            None => self.other_tools.push((name.to_string(), count)),
         }
     }
 
@@ -60,10 +72,16 @@ impl ToolActivitySummary {
         self.agents += other.agents;
         self.fetched_urls += other.fetched_urls;
         self.web_searches += other.web_searches;
-        self.other_tools += other.other_tools;
+        for (name, count) in &other.other_tools {
+            self.add_other_tool(name, *count);
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
+        self.other_tools.is_empty() && self.known_tool_calls() == 0
+    }
+
+    fn known_tool_calls(&self) -> usize {
         self.searched_patterns
             + self.searched_file_patterns
             + self.read_files
@@ -73,8 +91,12 @@ impl ToolActivitySummary {
             + self.agents
             + self.fetched_urls
             + self.web_searches
-            + self.other_tools
-            == 0
+    }
+
+    /// Whether the group is one call to a tool without its own summary
+    /// wording, which reads better as the call itself than as "Called 1 tool".
+    fn is_single_other_tool(&self) -> bool {
+        matches!(self.other_tools.as_slice(), [(_, 1)]) && self.known_tool_calls() == 0
     }
 
     pub(crate) fn sentence(&self) -> String {
@@ -98,7 +120,17 @@ impl ToolActivitySummary {
         push_summary_item(&mut parts, self.agents, "started", "agent");
         push_summary_item(&mut parts, self.fetched_urls, "fetched", "URL");
         push_summary_item(&mut parts, self.web_searches, "searched", "web");
-        push_summary_item(&mut parts, self.other_tools, "called", "tool");
+        if !self.other_tools.is_empty() {
+            let names: Vec<String> = self
+                .other_tools
+                .iter()
+                .map(|(name, count)| match count {
+                    1 => name.clone(),
+                    _ => format!("{name} ×{count}"),
+                })
+                .collect();
+            parts.push(format!("called {}", names.join(", ")));
+        }
         capitalize_first(parts.join(", "))
     }
 }
@@ -125,116 +157,130 @@ pub(super) fn render_tool_activity_summary(
     label_color: (u8, u8, u8),
     dimmed: bool,
     timing: TimingSlot<'_>,
-    summary: &ToolActivitySummary,
+    rows: Vec<String>,
     tool_output_id: Option<&ToolOutputId>,
 ) {
-    if summary.is_empty() {
-        return;
-    }
-
-    let content = vec![(
-        summary.sentence(),
-        LineStyle {
-            fg: Some(th().tool_text),
-            dimmed: true,
-            ..Default::default()
-        },
-    )];
-    push_row(
-        lines,
-        LedgerRow {
-            timing,
-            name: NameCol::Label {
-                text: label,
-                color: label_color,
-                bold: false,
-                dimmed,
+    for (i, text) in rows.into_iter().enumerate() {
+        let content = vec![(
+            text,
+            LineStyle {
+                fg: Some(th().tool_text),
+                dimmed: true,
+                ..Default::default()
             },
-            separator_dimmed: dimmed,
-            tool_output_id,
-            clickable: tool_output_id.is_some(),
-        },
-        content,
-    );
+        )];
+        push_row(
+            lines,
+            LedgerRow {
+                timing: if i == 0 {
+                    timing
+                } else {
+                    timing.continuation()
+                },
+                name: NameCol::Label {
+                    text: label,
+                    color: label_color,
+                    bold: false,
+                    dimmed,
+                },
+                separator_dimmed: dimmed,
+                tool_output_id,
+                clickable: tool_output_id.is_some(),
+            },
+            content,
+        );
+    }
 }
 
-pub(crate) fn summarize_tool_calls(blocks: &[ContentBlock]) -> ToolActivitySummary {
+pub(crate) fn summarize_tool_calls(parts: &[Part]) -> ToolActivitySummary {
     let mut summary = ToolActivitySummary::default();
-    for block in blocks {
-        if let ContentBlock::ToolUse { name, .. } = block {
+    for part in parts {
+        if let Part::ToolCall { name, .. } = part {
             summary.add_call(name);
         }
     }
     summary
 }
 
-fn assistant_blocks_are_tool_only(blocks: &[ContentBlock], show_thinking: bool) -> bool {
-    blocks.iter().all(|block| {
-        matches!(block, ContentBlock::ToolUse { .. })
-            || (!show_thinking && matches!(block, ContentBlock::Thinking { .. }))
+fn assistant_parts_are_tool_only(parts: &[Part], show_thinking: bool) -> bool {
+    parts.iter().all(|part| {
+        matches!(part, Part::ToolCall { .. })
+            || (!show_thinking && matches!(part, Part::Thinking(_)))
     })
 }
 
-#[allow(clippy::type_complexity)] // upstream signature
-pub(crate) fn tool_only_assistant_summary<'a>(
-    entry: &'a LogEntry,
-    options: &RenderOptions,
-) -> Option<(
+/// The parent tool use id, speaker, timestamp and tool calls of an
+/// assistant message that only calls tools.
+pub(crate) type ToolOnlySummary<'a> = (
     Option<&'a str>,
-    Option<&'a str>,
-    Option<&'a str>,
+    &'a str,
+    Option<DateTime<Utc>>,
     ToolActivitySummary,
-)> {
-    let LogEntry::Assistant {
-        message,
-        agent,
-        timestamp,
-        parent_tool_use_id,
-        ..
-    } = entry
-    else {
+);
+
+pub(crate) fn tool_only_assistant_summary<'a>(
+    entry: &Entry<'a>,
+    options: &RenderOptions,
+) -> Option<ToolOnlySummary<'a>> {
+    let EntryKind::Message { message, speaker } = entry.kind else {
         return None;
     };
-
-    if parent_tool_use_id.is_some() && !options.show_thinking {
+    if message.role != Role::Assistant {
         return None;
     }
-    if message.content.is_empty()
-        || !assistant_blocks_are_tool_only(&message.content, options.show_thinking)
+
+    if message.parent_tool_use_id.is_some() && !options.show_thinking {
+        return None;
+    }
+    if message.parts.is_empty()
+        || !assistant_parts_are_tool_only(&message.parts, options.show_thinking)
     {
         return None;
     }
 
-    let summary = summarize_tool_calls(&message.content);
+    let summary = summarize_tool_calls(&message.parts);
     (!summary.is_empty()).then_some((
-        parent_tool_use_id.as_deref(),
-        agent.as_deref(),
-        timestamp.as_deref(),
+        message.parent_tool_use_id.as_deref(),
+        speaker,
+        entry.timestamp,
         summary,
     ))
 }
 
-pub(crate) fn user_entry_is_only_tool_results(entry: &LogEntry, options: &RenderOptions) -> bool {
-    let LogEntry::User {
-        message,
-        parent_tool_use_id,
-        ..
-    } = entry
-    else {
+/// Whether the entry renders nothing: a record with no display, or an
+/// assistant message of only thinking while thinking is hidden.
+pub(crate) fn entry_shows_nothing(entry: &Entry<'_>, options: &RenderOptions) -> bool {
+    match entry.kind {
+        EntryKind::Message { message, .. } => {
+            !options.show_thinking
+                && message.role == Role::Assistant
+                && !message.parts.is_empty()
+                && message
+                    .parts
+                    .iter()
+                    .all(|part| matches!(part, Part::Thinking(_)))
+        }
+        ref kind => kind.shows_nothing(),
+    }
+}
+
+pub(crate) fn user_entry_is_only_tool_results(entry: &Entry<'_>, options: &RenderOptions) -> bool {
+    let EntryKind::Message { message, .. } = entry.kind else {
         return false;
     };
-
-    if parent_tool_use_id.is_some() && !options.show_thinking {
+    if message.role != Role::User {
         return false;
     }
 
-    let UserContent::Blocks(blocks) = &message.content else {
+    if message.parent_tool_use_id.is_some() && !options.show_thinking {
         return false;
-    };
-    !blocks.is_empty()
-        && blocks
+    }
+
+    !message.parts.is_empty()
+        && message
+            .parts
             .iter()
-            .all(|block| matches!(block, ContentBlock::ToolResult { .. }))
+            .all(|part| matches!(part, Part::ToolResult { .. }))
 }
 
 fn render_summary_group_details(
@@ -246,16 +292,19 @@ fn render_summary_group_details(
     let first_line = lines.len();
     let mut rendered_any = false;
     let pad_timing = TimingSlot::from_show_timing(options.show_timing);
-    let label = assistant_label(pending.parent_id.as_deref(), pending.agent.as_deref());
+    let label = assistant_label(pending.parent_id.as_deref(), &pending.speaker);
     for parsed in &entries[pending.first_parsed_idx..=pending.last_parsed_idx] {
-        match &parsed.entry {
-            LogEntry::Assistant {
-                message,
-                parent_tool_use_id,
-                ..
-            } if parent_tool_use_id.as_deref() == pending.parent_id.as_deref() => {
-                for (block_idx, block) in message.content.iter().enumerate() {
-                    if let ContentBlock::ToolUse { id, name, input } = block {
+        let EntryKind::Message { message, .. } = parsed.entry.kind else {
+            continue;
+        };
+        let parent_tool_use_id = &message.parent_tool_use_id;
+        if parent_tool_use_id.as_deref() != pending.parent_id.as_deref() {
+            continue;
+        }
+        match message.role {
+            Role::Assistant => {
+                for (block_idx, block) in message.parts.iter().enumerate() {
+                    if let Part::ToolCall { id, name, input } = block {
                         if rendered_any {
                             lines.push(RenderedLine::new(vec![]));
                         }
@@ -286,19 +335,11 @@ fn render_summary_group_details(
                     }
                 }
             }
-            LogEntry::User {
-                message,
-                parent_tool_use_id,
-                ..
-            } if parent_tool_use_id.as_deref() == pending.parent_id.as_deref() => {
-                let UserContent::Blocks(blocks) = &message.content else {
-                    continue;
-                };
-                for (block_idx, block) in blocks.iter().enumerate() {
-                    if let ContentBlock::ToolResult {
-                        content,
-                        tool_use_id,
-                        ..
+            Role::User => {
+                for (block_idx, block) in message.parts.iter().enumerate() {
+                    if let Part::ToolResult {
+                        output: content,
+                        call_id: tool_use_id,
                     } = block
                     {
                         if rendered_any {
@@ -328,13 +369,304 @@ fn render_summary_group_details(
                     }
                 }
             }
-            _ => {}
         }
     }
     if let Some(line) = lines.get_mut(first_line) {
         line.tool_output_id = Some(pending.id.clone());
         line.clickable = true;
     }
+}
+
+/// The group's messages of `role` (the messages of `parsed_range` with the
+/// group's parent), with the entry index each came from.
+pub(crate) fn group_messages<'a>(
+    entries: &'a [RenderableEntry],
+    parsed_range: std::ops::RangeInclusive<usize>,
+    parent_id: Option<&'a str>,
+    role: Role,
+) -> impl Iterator<Item = (usize, &'a Message)> {
+    entries[parsed_range]
+        .iter()
+        .filter_map(move |parsed| match parsed.entry.kind {
+            EntryKind::Message { message, .. }
+                if message.role == role && message.parent_tool_use_id.as_deref() == parent_id =>
+            {
+                Some((parsed.entry_index, message))
+            }
+            _ => None,
+        })
+}
+
+/// The summary line for a pending group (the assistant parts of
+/// `parsed_range` with the group's parent); see [`summary_line`].
+pub(crate) fn group_summary_line(
+    entries: &[RenderableEntry],
+    parsed_range: std::ops::RangeInclusive<usize>,
+    parent_id: Option<&str>,
+    summary: &ToolActivitySummary,
+    width: usize,
+) -> String {
+    let parts = group_messages(entries, parsed_range, parent_id, Role::Assistant)
+        .flat_map(|(_, message)| &message.parts);
+    summary_line(summary, parts, width)
+}
+
+/// The result of the call `call_id` among the group's user messages: the
+/// entry index and block index it came from and its output.
+pub(crate) fn group_call_result<'a>(
+    entries: &'a [RenderableEntry],
+    parsed_range: std::ops::RangeInclusive<usize>,
+    parent_id: Option<&'a str>,
+    call_id: &str,
+) -> Option<(usize, usize, Option<&'a serde_json::Value>)> {
+    group_messages(entries, parsed_range, parent_id, Role::User).find_map(
+        |(entry_index, message)| {
+            message
+                .parts
+                .iter()
+                .enumerate()
+                .find_map(|(block_idx, part)| match part {
+                    Part::ToolResult {
+                        output,
+                        call_id: result_call_id,
+                    } if result_call_id == call_id => {
+                        Some((entry_index, block_idx, output.as_ref()))
+                    }
+                    _ => None,
+                })
+        },
+    )
+}
+
+/// Calls mode: each call of the group on its own clickable row. A clicked row
+/// expands into that call and its result; clicking the call's first line
+/// collapses it again.
+fn render_calls_group(
+    lines: &mut Vec<RenderedLine>,
+    entries: &[RenderableEntry],
+    pending: &PendingToolSummary,
+    label: &str,
+    timing: TimingSlot<'_>,
+    options: &RenderOptions,
+) {
+    let parent_id = pending.parent_id.as_deref();
+    let mut rendered_any = false;
+    let mut after_expanded = false;
+    let range = pending.first_parsed_idx..=pending.last_parsed_idx;
+    for (entry_index, message) in group_messages(entries, range, parent_id, Role::Assistant) {
+        for (block_idx, block) in message.parts.iter().enumerate() {
+            let Part::ToolCall { id, name, input } = block else {
+                continue;
+            };
+            let row_id = make_tool_output_id(
+                entry_index,
+                parent_id,
+                block_idx,
+                ToolOutputKind::CallRow,
+                Some(id),
+            );
+            let row_timing = if rendered_any {
+                timing.continuation()
+            } else {
+                timing
+            };
+            let expanded = options.expanded_tool_outputs.contains(&row_id);
+            if after_expanded {
+                lines.push(RenderedLine::new(vec![]));
+            }
+            if expanded {
+                let first_line = lines.len();
+                render_call_details(
+                    lines,
+                    entries,
+                    pending,
+                    (entry_index, block_idx, id, name, input),
+                    label,
+                    row_timing,
+                    options,
+                );
+                if let Some(line) = lines.get_mut(first_line) {
+                    line.tool_output_id = Some(row_id);
+                    line.clickable = true;
+                }
+            } else {
+                render_tool_activity_summary(
+                    lines,
+                    label,
+                    th().accent_dim,
+                    parent_id.is_some(),
+                    row_timing,
+                    vec![call_line(name, input, options.content_width)],
+                    Some(&row_id),
+                );
+            }
+            rendered_any = true;
+            after_expanded = expanded;
+        }
+    }
+}
+
+/// One call of a group in truncated form, followed by its result when the
+/// group holds it.
+fn render_call_details(
+    lines: &mut Vec<RenderedLine>,
+    entries: &[RenderableEntry],
+    pending: &PendingToolSummary,
+    (entry_index, block_idx, call_id, name, input): (usize, usize, &str, &str, &serde_json::Value),
+    label: &str,
+    timing: TimingSlot<'_>,
+    options: &RenderOptions,
+) {
+    let parent_id = pending.parent_id.as_deref();
+    let call_output_id = make_tool_output_id(
+        entry_index,
+        parent_id,
+        block_idx,
+        ToolOutputKind::ToolCall,
+        Some(call_id),
+    );
+    render_tool_call(
+        lines,
+        &ToolCallRenderSpec {
+            name,
+            input,
+            label,
+            label_color: th().accent_dim,
+            dimmed: true,
+            content_width: options.content_width,
+            timing,
+            tool_display: ToolDisplayMode::Truncated,
+            tool_output_id: &call_output_id,
+            expanded: options.expanded_tool_outputs.contains(&call_output_id),
+        },
+    );
+
+    let result = group_call_result(
+        entries,
+        pending.first_parsed_idx..=pending.last_parsed_idx,
+        parent_id,
+        call_id,
+    );
+    let Some((entry_index, block_idx, output)) = result else {
+        return;
+    };
+    let result_output_id = make_tool_output_id(
+        entry_index,
+        parent_id,
+        block_idx,
+        ToolOutputKind::ToolResult,
+        Some(call_id),
+    );
+    lines.push(RenderedLine::new(vec![]));
+    render_tool_result(
+        lines,
+        &ToolResultRenderSpec {
+            text: &tool_result_display_text(output),
+            content_width: options.content_width,
+            timing: timing.continuation(),
+            tool_display: ToolDisplayMode::Truncated,
+            tool_output_id: &result_output_id,
+            expanded: options.expanded_tool_outputs.contains(&result_output_id),
+        },
+    );
+}
+
+/// The collapsed rows for the calls among `parts`: each call on one line in
+/// calls mode, otherwise the single summary line. Rows are cut to
+/// `options.content_width` (`usize::MAX` leaves them whole).
+pub(crate) fn summary_rows<'a>(
+    summary: &ToolActivitySummary,
+    parts: impl Iterator<Item = &'a Part>,
+    options: &RenderOptions,
+) -> Vec<String> {
+    let width = options.content_width;
+    if options.tool_display != ToolDisplayMode::Calls {
+        return vec![summary_line(summary, parts, width)];
+    }
+    parts
+        .filter_map(|part| match part {
+            Part::ToolCall { name, input, .. } => Some(call_line(name, input, width)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A tool call as one formatted line cut to `width`. A call with more to
+/// show than its header, such as a multi-line command, ends with how many
+/// lines it hides.
+pub(crate) fn call_line(name: &str, input: &serde_json::Value, width: usize) -> String {
+    let (header, hidden) = call_header(name, input);
+    if hidden == 0 {
+        return truncate_end(&header, width);
+    }
+    let suffix = hidden_lines_suffix(hidden);
+    let header_width = width.saturating_sub(UnicodeWidthStr::width(suffix.as_str()));
+    format!("{}{suffix}", truncate_end(&header, header_width))
+}
+
+/// A call's whole header and the number of body lines a calls row hides.
+pub(crate) fn call_header(name: &str, input: &serde_json::Value) -> (String, usize) {
+    let formatted = crate::tool_format::format_tool_call(name, input, 0);
+    let hidden = formatted
+        .body
+        .as_deref()
+        .map_or(0, |body| body.lines().count());
+    (formatted.header, hidden)
+}
+
+/// ` (N more lines)`, the end of a calls row whose call has a body.
+pub(crate) fn hidden_lines_suffix(hidden: usize) -> String {
+    let noun = if hidden == 1 { "line" } else { "lines" };
+    format!(" ({hidden} more {noun})")
+}
+
+/// The calls among `parts` as (whole header, hidden body lines) pairs.
+pub(crate) fn call_rows<'a>(parts: impl Iterator<Item = &'a Part>) -> Vec<(String, usize)> {
+    parts
+        .filter_map(|part| match part {
+            Part::ToolCall { name, input, .. } => Some(call_header(name, input)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The summary text for the calls among `parts`. A single call to a tool
+/// without its own summary wording shows as the call itself on one line cut
+/// to `width` (`usize::MAX` leaves it whole), which says more than
+/// "Called clock__sleep". Any other text is cut to `width` too, since tool
+/// names make it unbounded.
+fn summary_line<'a>(
+    summary: &ToolActivitySummary,
+    mut parts: impl Iterator<Item = &'a Part>,
+    width: usize,
+) -> String {
+    let single_call = parts.find_map(|part| match part {
+        Part::ToolCall { name, input, .. } => Some((name, input)),
+        _ => None,
+    });
+    match single_call {
+        Some((name, input)) if summary.is_single_other_tool() => call_line(name, input, width),
+        _ => truncate_end(&summary.sentence(), width),
+    }
+}
+
+/// `text` cut to `max_width` columns, ending in `…` when cut.
+fn truncate_end(text: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut width = 0;
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width + 1 > max_width {
+            break;
+        }
+        out.push(ch);
+        width += ch_width;
+    }
+    out.push('…');
+    out
 }
 
 pub(super) fn flush_tool_summary(
@@ -349,9 +681,9 @@ pub(super) fn flush_tool_summary(
     };
 
     let start_line = lines.len();
-    let label = assistant_label(pending.parent_id.as_deref(), pending.agent.as_deref());
+    let label = assistant_label(pending.parent_id.as_deref(), &pending.speaker);
     let ts = if options.show_timing {
-        pending.timestamp.as_deref().and_then(format_timestamp)
+        pending.timestamp.map(format_timestamp)
     } else {
         None
     };
@@ -359,7 +691,9 @@ pub(super) fn flush_tool_summary(
         Some(ts) => TimingSlot::Stamp(ts),
         None => TimingSlot::Disabled,
     };
-    if options.expanded_tool_outputs.contains(&pending.id) {
+    if options.tool_display == ToolDisplayMode::Calls {
+        render_calls_group(lines, entries, &pending, &label, timing, options);
+    } else if options.expanded_tool_outputs.contains(&pending.id) {
         render_summary_group_details(lines, entries, &pending, options);
     } else {
         render_tool_activity_summary(
@@ -368,7 +702,13 @@ pub(super) fn flush_tool_summary(
             th().accent_dim,
             pending.parent_id.is_some(),
             timing,
-            &pending.summary,
+            vec![group_summary_line(
+                entries,
+                pending.first_parsed_idx..=pending.last_parsed_idx,
+                pending.parent_id.as_deref(),
+                &pending.summary,
+                options.content_width,
+            )],
             Some(&pending.id),
         );
     }

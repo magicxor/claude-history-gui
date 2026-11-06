@@ -5,15 +5,17 @@ use crate::search::literal::{
 };
 use crate::search::query::ParsedQuery;
 pub use crate::text_match::normalize_for_search;
+use crate::text_match::{starts_word, truncate_on_char_boundary};
 use chrono::{DateTime, Duration, Local};
 use rayon::prelude::*;
-use std::borrow::{Borrow, Cow};
+use std::borrow::Borrow;
+use std::sync::Arc;
 
 /// Precomputed search data for a conversation
 #[derive(Clone)]
 pub struct SearchableConversation {
-    /// Combined text for Stage 1 fast rejection (search_text_lower + project name)
-    pub text_lower: String,
+    /// Normalized body text, shared with the conversation when possible
+    pub body_lower: Arc<str>,
     /// Normalized custom_title only (small, typically <100 chars)
     pub title_lower: String,
     /// Normalized summary only (small, typically <500 chars)
@@ -32,7 +34,14 @@ impl SearchableConversation {
     /// The search data of one conversation at `index` (what
     /// [`precompute_search_text`] builds for each element).
     pub fn new(conversation: &Conversation, index: usize) -> Self {
-        searchable_conversation(conversation, index, false)
+        searchable_conversation(conversation, index, false, None)
+    }
+
+    /// Like [`SearchableConversation::new`], with the normalized body of
+    /// `conversation` already at hand (`body`, from an earlier entry of the
+    /// same text): only the title, summary and project are normalized.
+    pub fn with_body(conversation: &Conversation, index: usize, body: Arc<str>) -> Self {
+        searchable_conversation(conversation, index, false, Some(body))
     }
 }
 
@@ -53,28 +62,39 @@ pub fn is_uuid(query: &str) -> bool {
         .all(|(part, &len)| part.len() == len && part.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
-/// Build searchable index from conversations using pre-normalized search text.
-/// Only appends the (small) project name — the expensive full_text normalization
-/// was already done during parsing/cache load.
+/// Build searchable index from conversations, normalizing their text.
 ///
 /// `C` is `Conversation` or a shared `Arc<Conversation>`.
 pub fn precompute_search_text<C>(conversations: &[C]) -> Vec<SearchableConversation>
 where
     C: Borrow<Conversation> + Sync,
 {
-    precompute_search_text_with(conversations, false)
+    precompute_search_text_with(conversations, false, |_| None)
+}
+
+/// Like [`precompute_search_text`], taking each conversation's normalized body
+/// from `reuse` when it has one, so text normalized before is not redone.
+pub fn precompute_search_text_reusing<C>(
+    conversations: &[C],
+    reuse: impl Fn(&Conversation) -> Option<Arc<str>> + Sync,
+) -> Vec<SearchableConversation>
+where
+    C: Borrow<Conversation> + Sync,
+{
+    precompute_search_text_with(conversations, false, reuse)
 }
 
 pub fn precompute_agent_search_text<C>(conversations: &[C]) -> Vec<SearchableConversation>
 where
     C: Borrow<Conversation> + Sync,
 {
-    precompute_search_text_with(conversations, true)
+    precompute_search_text_with(conversations, true, |_| None)
 }
 
 fn precompute_search_text_with<C>(
     conversations: &[C],
     include_agent_text: bool,
+    reuse: impl Fn(&Conversation) -> Option<Arc<str>> + Sync,
 ) -> Vec<SearchableConversation>
 where
     C: Borrow<Conversation> + Sync,
@@ -82,7 +102,11 @@ where
     conversations
         .par_iter()
         .enumerate()
-        .map(|(idx, conv)| searchable_conversation(conv.borrow(), idx, include_agent_text))
+        .map(|(idx, conv)| {
+            let conv = conv.borrow();
+            let body = reuse(conv);
+            searchable_conversation(conv, idx, include_agent_text, body)
+        })
         .collect()
 }
 
@@ -90,6 +114,7 @@ fn searchable_conversation(
     conv: &Conversation,
     idx: usize,
     include_agent_text: bool,
+    body: Option<Arc<str>>,
 ) -> SearchableConversation {
     let title_lower = conv
         .custom_title
@@ -106,17 +131,9 @@ fn searchable_conversation(
         .as_ref()
         .map(|n| normalize_for_search(n))
         .unwrap_or_default();
-    let body_lower = body_search_text_lower(conv, include_agent_text);
-
-    // Combined for Stage 1: same as before, just append project name
-    let text_lower = if project_lower.is_empty() {
-        body_lower.into_owned()
-    } else {
-        format!("{} {}", body_lower, project_lower)
-    };
 
     SearchableConversation {
-        text_lower,
+        body_lower: body.unwrap_or_else(|| body_search_text_lower(conv, include_agent_text)),
         title_lower,
         summary_lower,
         project_lower,
@@ -124,16 +141,46 @@ fn searchable_conversation(
     }
 }
 
-fn body_search_text_lower(conversation: &Conversation, include_agent_text: bool) -> Cow<'_, str> {
+fn body_search_text_lower(conversation: &Conversation, include_agent_text: bool) -> Arc<str> {
+    let body = normalize_for_search(&conversation.full_text);
     if !include_agent_text || conversation.agent_search_text.is_empty() {
-        Cow::Borrowed(&conversation.search_text_lower)
+        body.into()
     } else {
-        Cow::Owned(format!(
+        format!(
             "{} {}",
-            conversation.search_text_lower,
+            body,
             normalize_for_search(&conversation.agent_search_text)
-        ))
+        )
+        .into()
     }
+}
+
+/// `conversations` reduced to what the person typed, for searching only
+/// their own messages: the body is `Conversation::own_text`, and title,
+/// summary, project and agent text are gone, so they neither match nor score.
+///
+/// `C` is `Conversation` or a shared `Arc<Conversation>` (fork: upstream takes
+/// `&[Conversation]`; the browser's corpus holds `Arc`s).
+pub fn user_only_view<C>(conversations: &[C]) -> Vec<Conversation>
+where
+    C: Borrow<Conversation> + Sync,
+{
+    conversations
+        .par_iter()
+        .map(|conversation| conversation.borrow())
+        .map(|conversation| Conversation {
+            full_text: conversation.own_text.clone(),
+            agent_search_text: "".into(),
+            semantic_route_text: "".into(),
+            semantic_turns: Arc::from(Vec::new()),
+            semantic_turn_ranges: Vec::new(),
+            parse_errors: Vec::new(),
+            project_name: None,
+            summary: None,
+            custom_title: None,
+            ..conversation.clone()
+        })
+        .collect()
 }
 
 /// Filter and score conversations based on query
@@ -302,7 +349,7 @@ where
         .collect()
 }
 
-fn identifier_literals(query: &str) -> Vec<Literal> {
+pub(crate) fn identifier_literals(query: &str) -> Vec<Literal> {
     query
         .split_whitespace()
         .filter(|term| term.contains('_'))
@@ -310,7 +357,7 @@ fn identifier_literals(query: &str) -> Vec<Literal> {
         .collect()
 }
 
-fn normalized_query_words(query: &str) -> String {
+pub(crate) fn normalized_query_words(query: &str) -> String {
     normalize_for_search(
         &query
             .split_whitespace()
@@ -388,14 +435,7 @@ where
         Some(build_literal_corpus(conversations))
     };
 
-    let adjacent_pairs: Vec<String> = if query_words.len() > 1 {
-        query_words
-            .windows(2)
-            .map(|w| format!("{} {}", w[0], w[1]))
-            .collect()
-    } else {
-        vec![]
-    };
+    let adjacent_pairs = adjacent_pairs(&query_words);
 
     let mut scored: Vec<(usize, ScoreDebug, DateTime<Local>)> = searchable
         .par_iter()
@@ -411,7 +451,6 @@ where
             let conversation = conversations[index].borrow();
             let debug = score_text_debug(
                 s.borrow(),
-                &body_search_text_lower(conversation, include_agent_text),
                 &query_words,
                 &adjacent_pairs,
                 conversation.timestamp,
@@ -434,11 +473,34 @@ where
         .collect()
 }
 
+/// Bytes of the second word of a pair that adjacency compares, so a word-start
+/// suffix index can count adjacent pairs from its terms.
+pub(crate) const PAIR_PREFIX: usize = 3;
+
+/// The part of a pair's second word that adjacency compares: its first
+/// `PAIR_PREFIX` bytes cut on a char boundary, or its first char when that
+/// char alone is longer, so a pair always holds at least one char of it.
+pub(crate) fn pair_prefix(word: &str) -> &str {
+    match truncate_on_char_boundary(word, PAIR_PREFIX) {
+        "" => word.chars().next().map_or("", |c| &word[..c.len_utf8()]),
+        prefix => prefix,
+    }
+}
+
+/// Strings whose word-start occurrences count as adjacent query words: each
+/// word, a space, and the `pair_prefix` of the next word.
+pub(crate) fn adjacent_pairs<S: AsRef<str>>(query_words: &[S]) -> Vec<String> {
+    query_words
+        .windows(2)
+        .map(|w| format!("{} {}", w[0].as_ref(), pair_prefix(w[1].as_ref())))
+        .collect()
+}
+
 /// Field weights for scoring
-const WEIGHT_TITLE: f64 = 5.0;
-const WEIGHT_SUMMARY: f64 = 3.0;
-const WEIGHT_PROJECT: f64 = 4.0;
-const WEIGHT_BODY: f64 = 1.0;
+pub(crate) const WEIGHT_TITLE: f64 = 5.0;
+pub(crate) const WEIGHT_SUMMARY: f64 = 3.0;
+pub(crate) const WEIGHT_PROJECT: f64 = 4.0;
+pub(crate) const WEIGHT_BODY: f64 = 1.0;
 
 /// Debug breakdown of a search score
 pub struct ScoreDebug {
@@ -458,12 +520,11 @@ pub struct FieldDebug {
 
 /// Core scoring implementation used by both score_text and score_text_debug.
 ///
-/// Stage 1: Fast rejection using combined text (AND logic, prefix matching).
+/// Stage 1: Fast rejection using body and project text (AND logic, prefix matching).
 /// Stage 2: Per-field scoring with log-saturated TF, adjacency bonuses, field weights.
 /// Returns None if Stage 1 rejects the conversation.
 fn score_impl(
     s: &SearchableConversation,
-    body_lower: &str,
     query_words: &[&str],
     adjacent_pairs: &[String],
     timestamp: DateTime<Local>,
@@ -473,17 +534,23 @@ fn score_impl(
         return None;
     }
 
-    // Stage 1: Fast rejection — all query words must exist as substrings
+    let body_lower: &str = &s.body_lower;
+    let project_lower: &str = &s.project_lower;
+
+    // Stage 1: Fast rejection — all query words must exist as substrings.
+    // Query words contain no whitespace, so a match never spans two fields.
     for &qw in query_words {
-        if !s.text_lower.contains(qw) {
+        if !body_lower.contains(qw) && !project_lower.contains(qw) {
             return None;
         }
     }
 
-    // Stage 1: Prefix matching on combined text (AND logic).
-    // If any word has 0 prefix matches in text_lower, reject.
+    // Stage 1: Prefix matching on body and project (AND logic).
+    // If any word has 0 prefix matches in either field, reject.
     for &qw in query_words {
-        if count_prefix_matches(&s.text_lower, qw, 1) == 0 {
+        if count_prefix_matches(body_lower, qw, 1) == 0
+            && count_prefix_matches(project_lower, qw, 1) == 0
+        {
             // CJK fallback: substring matching is acceptable for CJK text
             let has_cjk = query_words
                 .iter()
@@ -505,7 +572,7 @@ fn score_impl(
     let fields: &[(&str, f64, &'static str)] = &[
         (&s.title_lower, WEIGHT_TITLE, "title"),
         (&s.summary_lower, WEIGHT_SUMMARY, "summary"),
-        (&s.project_lower, WEIGHT_PROJECT, "project"),
+        (project_lower, WEIGHT_PROJECT, "project"),
         (body_lower, WEIGHT_BODY, "body"),
     ];
 
@@ -522,7 +589,7 @@ fn score_impl(
         let mut word_details = Vec::new();
         for &qw in query_words {
             let tf = count_prefix_matches(field, qw, 10); // cap at 10
-            let ln_score = if tf > 0 { ((1 + tf) as f64).ln() } else { 0.0 };
+            let ln_score = tf_score(tf);
             field_tf_score += ln_score;
             word_details.push((qw.to_string(), tf, ln_score));
         }
@@ -535,7 +602,7 @@ fn score_impl(
         } else {
             0
         };
-        let weighted_adj = weight * 2.0 * adj_count as f64;
+        let weighted_adj = adjacency_score(weight, adj_count);
         base_score += weighted_adj;
 
         field_debugs.push(FieldDebug {
@@ -556,32 +623,46 @@ fn score_impl(
     })
 }
 
+/// Log-saturated score of one query word's capped term frequency in a field.
+pub(crate) fn tf_score(tf: usize) -> f64 {
+    if tf > 0 { ((1 + tf) as f64).ln() } else { 0.0 }
+}
+
+/// Bonus for `count` adjacent query-word pairs in a field of `weight`.
+pub(crate) fn adjacency_score(weight: f64, count: usize) -> f64 {
+    weight * 2.0 * count as f64
+}
+
 /// Score with full debug breakdown. Returns None if Stage 1 rejects.
 pub fn score_text_debug(
     s: &SearchableConversation,
-    body_lower: &str,
     query_words: &[&str],
     adjacent_pairs: &[String],
     timestamp: DateTime<Local>,
     now: DateTime<Local>,
 ) -> Option<ScoreDebug> {
-    score_impl(s, body_lower, query_words, adjacent_pairs, timestamp, now)
+    score_impl(s, query_words, adjacent_pairs, timestamp, now)
 }
 
-/// Returns true if `pos` in `text` is at the start of a word (i.e. preceded by
-/// a non-alphanumeric character or is the start of the string). This treats
-/// markdown punctuation (`*`, `(`, `:`, `.`, etc.) as word boundaries, so a
-/// phrase like `**media pipeline**` is matched the same as `media pipeline`.
+/// Returns true if `pos` in `text` is at the start of a word: the start of
+/// the string, after a non-alphanumeric character, or at a letter↔digit
+/// transition (see `starts_word`). This treats markdown punctuation (`*`,
+/// `(`, `:`, `.`, etc.) as word boundaries, so a phrase like
+/// `**media pipeline**` is matched the same as `media pipeline`, and finds
+/// `1.2` in `v1.2`.
 fn is_word_start(text: &str, pos: usize) -> bool {
     pos == 0
         || text[..pos]
             .chars()
             .next_back()
-            .is_some_and(|c| !c.is_alphanumeric())
+            .is_some_and(|c| starts_word(c, text[pos..].chars().next()))
 }
 
-/// Count prefix matches of `word` in `text`, up to `max_count`.
-fn count_prefix_matches(text: &str, word: &str, max_count: usize) -> usize {
+/// Count prefix matches of `word` in `text`, up to `max_count`: occurrences
+/// at word starts, each after the end of the previous one counted. An
+/// occurrence inside a word does not hide one starting within it, so `1.1`
+/// is found in `v1.1.1`.
+pub(crate) fn count_prefix_matches(text: &str, word: &str, max_count: usize) -> usize {
     let mut start = 0;
     let mut count = 0;
     while let Some(pos) = text[start..].find(word) {
@@ -591,15 +672,26 @@ fn count_prefix_matches(text: &str, word: &str, max_count: usize) -> usize {
             if count >= max_count {
                 break;
             }
+            start = actual_pos + word.len().max(1);
+        } else {
+            start = next_char(text, actual_pos);
         }
-        start = actual_pos + word.len().max(1);
     }
     count
 }
 
+/// Byte offset of the char after the one at `pos`.
+fn next_char(text: &str, pos: usize) -> usize {
+    pos + text[pos..].chars().next().map_or(1, char::len_utf8)
+}
+
 /// Count how many precomputed adjacent pairs appear in text.
 /// Returns count capped at `max_count`.
-fn count_adjacent_pairs(text: &str, adjacent_pairs: &[String], max_count: usize) -> usize {
+pub(crate) fn count_adjacent_pairs(
+    text: &str,
+    adjacent_pairs: &[String],
+    max_count: usize,
+) -> usize {
     let mut count = 0;
     for combined in adjacent_pairs {
         let mut start = 0;
@@ -610,8 +702,10 @@ fn count_adjacent_pairs(text: &str, adjacent_pairs: &[String], max_count: usize)
                 if count >= max_count {
                     return count;
                 }
+                start = actual_pos + combined.len().max(1);
+            } else {
+                start = next_char(text, actual_pos);
             }
-            start = actual_pos + combined.len().max(1);
         }
     }
     count
@@ -619,7 +713,7 @@ fn count_adjacent_pairs(text: &str, adjacent_pairs: &[String], max_count: usize)
 
 /// Additive freshness bonus with continuous exponential decay.
 /// Max bonus: 2.0 (brand new), half-life: 7 days.
-fn freshness_bonus(timestamp: DateTime<Local>, now: DateTime<Local>) -> f64 {
+pub(crate) fn freshness_bonus(timestamp: DateTime<Local>, now: DateTime<Local>) -> f64 {
     let age = now.signed_duration_since(timestamp);
     if age < Duration::zero() {
         return 2.0; // future timestamp edge case
@@ -632,10 +726,19 @@ fn freshness_bonus(timestamp: DateTime<Local>, now: DateTime<Local>) -> f64 {
 mod tests {
     use super::*;
     use crate::search::test_fixtures::one_message_conversation;
+    use chrono::TimeZone;
+
+    #[test]
+    fn adjacent_pairs_compare_a_prefix_of_the_second_word() {
+        assert_eq!(
+            adjacent_pairs(&["generation", "snapshot", "x"]),
+            ["generation sna", "snapshot x"]
+        );
+        assert!(adjacent_pairs(&["one"]).is_empty());
+        assert_eq!(adjacent_pairs(&["a", "éééé"]), ["a é"]);
+    }
 
     /// Create a test conversation with optional metadata.
-    /// Rebuilds search_text_lower to match production behavior:
-    /// custom_title + summary are prepended to body text before normalization.
     fn make_conv_full(
         text: &str,
         project: Option<&str>,
@@ -912,8 +1015,8 @@ mod tests {
         let searchable = precompute_search_text(&convs);
 
         assert!(
-            searchable[0]
-                .text_lower
+            !searchable[0]
+                .body_lower
                 .contains("project lexical sentinel")
         );
         assert_eq!(searchable[0].project_lower, "project lexical sentinel");
@@ -930,7 +1033,7 @@ mod tests {
     fn agent_search_text_includes_progress_without_polluting_full_text() {
         let now = Local::now();
         let mut conv = make_conv("visible dialogue", now);
-        conv.agent_search_text = "subagent_progress_needle".to_string();
+        conv.agent_search_text = "subagent_progress_needle".into();
         let convs = vec![conv];
         let normal_searchable = precompute_search_text(&convs);
         let agent_searchable = precompute_agent_search_text(&convs);
@@ -1115,6 +1218,71 @@ mod tests {
     }
 
     #[test]
+    fn word_match_ranges_find_what_the_scorer_counts() {
+        const PIECES: &[&str] = &["a", "ab", "b", " ", ".", "1", "1.1", "测", "测试", "x"];
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        for _ in 0..3000 {
+            let text: String = (0..next(30)).map(|_| PIECES[next(PIECES.len())]).collect();
+            let word: String = (0..1 + next(2))
+                .map(|_| PIECES[next(PIECES.len())])
+                .collect();
+            assert_eq!(
+                crate::text_match::word_match_ranges(&text, &word, false).len(),
+                count_prefix_matches(&text, &word, usize::MAX),
+                "{text:?} {word:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn letter_digit_transitions_start_words() {
+        assert_eq!(count_prefix_matches("bump to v1.2.3 now", "1.2.3", 10), 1);
+        assert_eq!(count_prefix_matches("h264 and x264", "264", 10), 2);
+        assert_eq!(count_prefix_matches("utf8 2v", "8", 10), 1);
+        assert_eq!(count_prefix_matches("utf8 2v", "v", 10), 1);
+        assert_eq!(count_prefix_matches("1.1.1 x1.1", "1.1", 10), 2);
+        assert_eq!(count_prefix_matches("AppConfig", "config", 10), 0);
+        assert_eq!(count_prefix_matches("h264", "64", 10), 0);
+        assert_eq!(
+            count_adjacent_pairs("encode h264 video", &["264 vid".to_owned()], 3),
+            1
+        );
+    }
+
+    #[test]
+    fn mid_word_occurrence_does_not_hide_a_word_start_inside_it() {
+        assert_eq!(count_prefix_matches("bump to va.a.a now", "a.a", 10), 1);
+        assert_eq!(count_prefix_matches("a.a.a xa.a", "a.a", 10), 1);
+        assert_eq!(count_prefix_matches("aab ab", "ab", 10), 1);
+        assert_eq!(
+            count_adjacent_pairs("v1.1.1 xa", &["1.1 xa".to_owned()], 3),
+            1
+        );
+        let now = Local::now();
+        let convs = vec![make_conv("bump to v1.1.1 now", now)];
+        let searchable = precompute_search_text(&convs);
+        assert_eq!(search(&convs, &searchable, "1.1", now), [0]);
+    }
+
+    #[test]
+    fn adjacency_compares_a_four_byte_next_word() {
+        let now = Local::now();
+        let adjacent = make_conv("fiesta 🎉 time", now - Duration::days(5));
+        let separated = make_conv("fiesta then later 🎉", now - Duration::days(3));
+        let convs = vec![adjacent, separated];
+        let searchable = precompute_search_text(&convs);
+        assert_eq!(adjacent_pairs(&["fiesta", "🎉"]), ["fiesta 🎉"]);
+        assert_eq!(adjacent_pairs(&["a", "𠀀x"]), ["a 𠀀"]);
+        assert_eq!(search(&convs, &searchable, "fiesta 🎉", now), [0, 1]);
+    }
+
+    #[test]
     fn adjacency_detected_inside_markdown_bold() {
         // Markdown punctuation (`*`, parens, dots) should be treated as a
         // word boundary for both prefix matching and adjacency detection,
@@ -1150,6 +1318,148 @@ mod tests {
             1,
             "media and pipeline after punctuation must match"
         );
+    }
+
+    /// Pins the result set, order, and per-field scores of lexical search on a
+    /// fixture corpus that exercises the body/project boundary.
+    #[test]
+    fn score_impl_golden_results() {
+        let now = Local.timestamp_opt(1_760_000_000, 0).unwrap();
+        let mut agent_conv = make_conv_full(
+            "dialogue about tmux panes",
+            Some("tools/agent-runner"),
+            None,
+            None,
+            now - Duration::hours(3),
+        );
+        agent_conv.agent_search_text = "Subagent progress: cache warmup".into();
+        let convs = vec![
+            make_conv_full(
+                "error handling in the cache layer, error handling everywhere",
+                Some("workmux/cache-fix"),
+                Some("Error handling cleanup"),
+                Some("Refactor error paths"),
+                now - Duration::hours(2),
+            ),
+            make_conv_full(
+                "tmux session handling and window errors",
+                Some("dotfiles"),
+                None,
+                None,
+                now - Duration::days(3),
+            ),
+            make_conv_full(
+                "unrelated chat that mentions nothing",
+                Some("claude-history"),
+                None,
+                Some("Search ranking notes"),
+                now - Duration::days(10),
+            ),
+            make_conv_full(
+                "body ends with handling",
+                Some("error-reporter"),
+                None,
+                None,
+                now - Duration::days(1),
+            ),
+            make_conv_full(
+                "",
+                Some("tmux-config"),
+                None,
+                None,
+                now - Duration::days(40),
+            ),
+            make_conv_full(
+                "precache and subcache only as substrings",
+                Some("rust/cache"),
+                None,
+                None,
+                now - Duration::hours(30),
+            ),
+            make_conv_full(
+                "\u{6D4B}\u{8BD5} cache \u{4F1A}\u{8BDD}",
+                Some("\u{9879}\u{76EE}"),
+                None,
+                None,
+                now - Duration::days(5),
+            ),
+            make_conv_full("no project here cache cache", None, None, None, now),
+            agent_conv,
+        ];
+        let searchable = precompute_search_text(&convs);
+        let agent_searchable = precompute_agent_search_text(&convs);
+
+        let render = |debug: LexicalDebugSearch| {
+            debug
+                .results
+                .iter()
+                .map(|(index, score)| {
+                    let fields = score
+                        .fields
+                        .iter()
+                        .map(|field| {
+                            format!(
+                                "{}={:.4}+{:.4}",
+                                field.name, field.tf_score, field.adjacency_score
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!("{index}:{:.4}[{fields}]", score.total)
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let queries = [
+            "error handling",
+            "tmux",
+            "cache",
+            "cache-fix",
+            "workmux cache",
+            "error reporter",
+            "handling error",
+            "dotfiles window",
+            "\u{6D4B}\u{8BD5} \u{9879}\u{76EE}",
+            "\u{9879}\u{76EE}",
+            "rust",
+            "\"error handling\"",
+            "error \"cache layer\"",
+            "warmup",
+        ];
+        let actual = queries
+            .iter()
+            .map(|query| {
+                format!(
+                    "{query} => {} | agent => {}",
+                    render(debug_search(&convs, &searchable, query, now, |_| true)),
+                    render(debug_agent_search(
+                        &convs,
+                        &agent_searchable,
+                        query,
+                        now,
+                        |_| true
+                    )),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let expected = [
+            "error handling => 0:29.9902[title=6.9315+10.0000,summary=2.0794+0.0000,project=0.0000+0.0000,body=2.9957+6.0000] 3:5.2772[project=2.7726+0.0000,body=0.6931+0.0000] 1:2.8723[project=0.0000+0.0000,body=1.3863+0.0000] | agent => 0:29.9902[title=6.9315+10.0000,summary=2.0794+0.0000,project=0.0000+0.0000,body=2.9957+6.0000] 3:5.2772[project=2.7726+0.0000,body=0.6931+0.0000] 1:2.8723[project=0.0000+0.0000,body=1.3863+0.0000]",
+            "tmux => 4:2.8107[project=2.7726+0.0000] 8:2.6685[project=0.0000+0.0000,body=0.6931+0.0000] 1:2.1791[project=0.0000+0.0000,body=0.6931+0.0000] | agent => 4:2.8107[project=2.7726+0.0000] 8:2.6685[project=0.0000+0.0000,body=0.6931+0.0000] 1:2.1791[project=0.0000+0.0000,body=0.6931+0.0000]",
+            "cache => 0:5.4493[title=0.0000+0.0000,summary=0.0000+0.0000,project=2.7726+0.0000,body=0.6931+0.0000] 5:4.5397[project=2.7726+0.0000,body=0.0000+0.0000] 7:3.0986[body=1.0986+0.0000] 6:1.9122[project=0.0000+0.0000,body=0.6931+0.0000] | agent => 0:5.4493[title=0.0000+0.0000,summary=0.0000+0.0000,project=2.7726+0.0000,body=0.6931+0.0000] 5:4.5397[project=2.7726+0.0000,body=0.0000+0.0000] 7:3.0986[body=1.0986+0.0000] 8:2.6685[project=0.0000+0.0000,body=0.6931+0.0000] 6:1.9122[project=0.0000+0.0000,body=0.6931+0.0000]",
+            "cache-fix => 0:16.2219[title=0.0000+0.0000,summary=0.0000+0.0000,project=5.5452+8.0000,body=0.6931+0.0000] | agent => 0:16.2219[title=0.0000+0.0000,summary=0.0000+0.0000,project=5.5452+8.0000,body=0.6931+0.0000]",
+            "workmux cache => 0:16.2219[title=0.0000+0.0000,summary=0.0000+0.0000,project=5.5452+8.0000,body=0.6931+0.0000] | agent => 0:16.2219[title=0.0000+0.0000,summary=0.0000+0.0000,project=5.5452+8.0000,body=0.6931+0.0000]",
+            "error reporter => 3:15.3566[project=5.5452+8.0000,body=0.0000+0.0000] | agent => 3:15.3566[project=5.5452+8.0000,body=0.0000+0.0000]",
+            "handling error => 0:13.9902[title=6.9315+0.0000,summary=2.0794+0.0000,project=0.0000+0.0000,body=2.9957+0.0000] 3:5.2772[project=2.7726+0.0000,body=0.6931+0.0000] 1:2.8723[project=0.0000+0.0000,body=1.3863+0.0000] | agent => 0:13.9902[title=6.9315+0.0000,summary=2.0794+0.0000,project=0.0000+0.0000,body=2.9957+0.0000] 3:5.2772[project=2.7726+0.0000,body=0.6931+0.0000] 1:2.8723[project=0.0000+0.0000,body=1.3863+0.0000]",
+            "dotfiles window => 1:4.9517[project=2.7726+0.0000,body=0.6931+0.0000] | agent => 1:4.9517[project=2.7726+0.0000,body=0.6931+0.0000]",
+            "测试 项目 => 6:4.6847[project=2.7726+0.0000,body=0.6931+0.0000] | agent => 6:4.6847[project=2.7726+0.0000,body=0.6931+0.0000]",
+            "项目 => 6:3.9916[project=2.7726+0.0000,body=0.0000+0.0000] | agent => 6:3.9916[project=2.7726+0.0000,body=0.0000+0.0000]",
+            "rust => 5:4.5397[project=2.7726+0.0000,body=0.0000+0.0000] | agent => 5:4.5397[project=2.7726+0.0000,body=0.0000+0.0000]",
+            "\"error handling\" => 0:1.9836[] | agent => 0:1.9836[]",
+            "error \"cache layer\" => 0:9.1382[title=3.4657+0.0000,summary=2.0794+0.0000,project=0.0000+0.0000,body=1.6094+0.0000] | agent => 0:9.1382[title=3.4657+0.0000,summary=2.0794+0.0000,project=0.0000+0.0000,body=1.6094+0.0000]",
+            "warmup =>  | agent => 8:2.6685[project=0.0000+0.0000,body=0.6931+0.0000]",
+        ];
+        assert_eq!(actual, expected);
     }
 
     #[test]

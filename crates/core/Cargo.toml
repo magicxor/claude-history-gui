@@ -5,7 +5,7 @@ version = "0.1.76"
 edition.workspace = true
 license = "MIT"
 repository.workspace = true
-description = "UI-agnostic core of claude-history-gui: Claude Code / Pi / OMP history loading, search, semantic search, agent protocol and rendering helpers. Derived from claude-history (https://github.com/raine/claude-history, MIT, Copyright (c) 2024 Raine)."
+description = "UI-agnostic core of claude-history-gui: Claude Code / Codex / Pi / OMP history loading, search, semantic search, agent protocol and rendering helpers. Derived from claude-history (https://github.com/raine/claude-history, MIT, Copyright (c) 2024 Raine)."
 readme = "README.md"
 publish = false
 # Windows MSVC main-thread stack size only (see build.rs).
@@ -19,7 +19,7 @@ path = "src/lib.rs"
 default = []
 # Same semantics as upstream: load onnxruntime dynamically from the directory
 # of the executable instead of linking the downloaded static ONNX Runtime.
-release-dynamic-ort = ["dep:ort", "fastembed/ort-load-dynamic"]
+release-dynamic-ort = ["ort/load-dynamic", "fastembed/ort-load-dynamic"]
 # The guard rails of this crate's own unit tests, for other crates' tests:
 # HistoryEnv::from_process_env panics, the default (fastembed) embedders
 # refuse to load, update::check_latest_release panics and the terminal spawn
@@ -46,12 +46,35 @@ tempfile.workspace = true
 fastembed.workspace = true
 # Model download into HistoryEnv::semantic_model_dir (see semantic::fastembed).
 hf-hub.workspace = true
-ort = { workspace = true, optional = true }
+# The ONNX Runtime environment: the background inference thread pool, and the
+# bundled library with release-dynamic-ort (see semantic::fastembed).
+ort.workspace = true
 # GitHub release check (core::update).
 ureq.workspace = true
 # Format-preserving gui.toml edits (config::save_gui_config_changes). The
 # same version gpui-kit already brings into the GUI's tree.
 toml_edit.workspace = true
+# Store generation manifests (store::card, store::generation), the
+# word-start suffix index (store::lexindex) and the text segments
+# (store::text).
+bytemuck.workspace = true
+memmap2.workspace = true
+fst.workspace = true
+memchr.workspace = true
+zstd.workspace = true
+# NFC for keyword search (text_match::nfc).
+icu_normalizer.workspace = true
+# Codex state database (history::sources::codex::state_db), read-only.
+rusqlite.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# getrusage for bench::mark_peak_rss; kill(pid, 0) for store::progress;
+# lowering a background thread's priority (semantic::fastembed).
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# SetThreadPriority for background threads (semantic::fastembed).
+windows-sys.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

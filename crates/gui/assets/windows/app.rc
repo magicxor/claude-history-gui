@@ -26,7 +26,7 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "CompanyName", "claude-history-gui contributors\0"
-            VALUE "FileDescription", "Claude History - browser for Claude Code, Pi and OMP conversation history\0"
+            VALUE "FileDescription", "Claude History - browser for Claude Code, Codex, Pi and OMP conversation history\0"
             VALUE "FileVersion", VERSION_STR "\0"
             VALUE "InternalName", "claude-history-gui\0"
             VALUE "LegalCopyright", "Unlicense; core derived from claude-history (MIT)\0"

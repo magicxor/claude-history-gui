@@ -1,4 +1,4 @@
-//! Settings → Keys: the five configurable bindings with live validation
+//! Settings → Keys: the seven configurable bindings with live validation
 //! (`keymap::validate_keys`, DESIGN §8.5). WP6. Pure logic: the dialog feeds
 //! it the text of each key field and shows its result.
 

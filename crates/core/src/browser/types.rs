@@ -3,7 +3,9 @@
 //! GUI models itself).
 
 use crate::error::AppError;
-use crate::history::Source;
+use crate::history::Provenance;
+use crate::history::actions::refusal;
+use crate::history::model::SourceKind;
 use crate::search::mode::TuiSearchMode;
 use crate::search::query::ParsedQuery;
 use crate::semantic::types::{SemanticExplanation, SemanticScoreBreakdown};
@@ -68,6 +70,9 @@ pub fn query_has_literals(query: &str) -> bool {
 pub enum SemanticProgress {
     #[default]
     Idle,
+    /// Reading the semantic data of the cards semantic search ranks
+    /// (generation mode, where rows are cards without it).
+    LoadingSessions,
     InitializingModel,
     CacheReady,
     Embedding {
@@ -90,14 +95,66 @@ pub struct SemanticResultMetadata {
     pub explanation: SemanticExplanation,
 }
 
-/// Loading state of the list.
+/// Which parts of the list are usable. Each part becomes ready on its own.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Readiness {
+    /// Rows are shown newest first and can be acted on.
+    pub list: bool,
+    /// Lexical queries run, against the generation index or the loaded
+    /// conversations.
+    pub lexical: bool,
+    /// Whether the store is being reconciled with the session files.
+    pub reconcile: ReconcileState,
+    /// The semantic worker can rank its corpus.
+    pub semantic: bool,
+}
+
+impl Readiness {
+    pub fn ready() -> Self {
+        Self {
+            list: true,
+            lexical: true,
+            reconcile: ReconcileState::Done,
+            semantic: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum ReconcileState {
+    /// A reconcile pass may publish a newer generation (or, without a
+    /// store, the history is still loading).
+    #[default]
+    Running,
+    Done,
+}
+
+/// What a reconcile pass left for the status line (upstream 04c714b: the
+/// TUI's status message), taken once with
+/// [`super::Browser::take_index_notice`].
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum LoadingState {
-    /// Still loading conversations; `loaded` counts every conversation
-    /// received so far (including excluded ones).
-    Loading { loaded: usize },
-    /// All conversations loaded and ready.
-    Ready,
+pub enum IndexNotice {
+    /// A pass shown as indexing ended: `total` sessions were indexed.
+    Indexed { total: usize },
+    /// A pass failed with this message (the first line of its error), and
+    /// no load event reports it.
+    Failed(String),
+}
+
+impl IndexNotice {
+    /// The upstream status message (`Indexed 7,185 sessions`,
+    /// `Indexing failed: <message>`).
+    pub fn status_message(&self) -> String {
+        match self {
+            IndexNotice::Indexed { total } => {
+                format!(
+                    "Indexed {} sessions",
+                    crate::display_format::group_digits(*total)
+                )
+            }
+            IndexNotice::Failed(message) => format!("Indexing failed: {message}"),
+        }
+    }
 }
 
 /// Result of [`super::Browser::escape`] (upstream: Esc in the list).
@@ -121,7 +178,8 @@ pub enum UuidLookup {
     },
     /// No loaded session has this id. The previous rows stay until the GUI
     /// has run [`crate::history::load_session_by_uuid`] in the background
-    /// and passed the result to [`super::Browser::resolve_uuid_lookup`].
+    /// and passed the result, as a [`super::PreparedSession`], to
+    /// [`super::Browser::resolve_uuid_lookup_session`].
     Pending { uuid: String },
     /// No loaded session and no `<uuid>.jsonl` in any Claude project.
     /// Upstream silently kept the previous rows (quirk 6); core reports it so
@@ -149,6 +207,9 @@ pub enum RenameError {
     NoTarget,
     /// The session re-parsed to nothing after the rename was written.
     BecameEmpty,
+    /// The adapter of the session's source cannot rename its conversations
+    /// (upstream 9799550; the TUI's status message).
+    Unsupported(SourceKind),
     /// Writing or re-parsing the session failed.
     Failed(AppError),
 }
@@ -159,6 +220,9 @@ impl fmt::Display for RenameError {
         match self {
             RenameError::NoTarget => f.write_str("Failed to rename: session not found"),
             RenameError::BecameEmpty => f.write_str("Failed to rename: conversation became empty"),
+            RenameError::Unsupported(source) => {
+                f.write_str(&refusal(*source, Provenance::default(), "Renaming"))
+            }
             RenameError::Failed(error) => write!(f, "Failed to rename: {error}"),
         }
     }
@@ -170,7 +234,7 @@ impl std::error::Error for RenameError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeletedSession {
     pub path: PathBuf,
-    pub source: Source,
+    pub source: SourceKind,
     /// Transcript files removed: every copy of a Claude session across
     /// projects (cross-project forks), else 1.
     pub files_removed: usize,
@@ -183,6 +247,9 @@ pub enum DeleteError {
     NoTarget,
     /// Single-file mode has no list; upstream disabled delete there.
     SingleFileMode,
+    /// The adapter of the session's source cannot delete its conversations
+    /// (upstream 9799550; the TUI's status message).
+    Unsupported(SourceKind),
     /// The files could not be removed (upstream only logged this).
     Failed { path: PathBuf, error: AppError },
 }
@@ -193,6 +260,9 @@ impl fmt::Display for DeleteError {
             DeleteError::NoTarget => f.write_str("Failed to delete session: session not found"),
             DeleteError::SingleFileMode => {
                 f.write_str("Deleting is not available for a single opened file")
+            }
+            DeleteError::Unsupported(source) => {
+                f.write_str(&refusal(*source, Provenance::default(), "Deleting"))
             }
             // Upstream's debug-log line.
             DeleteError::Failed { path, error } => {
@@ -252,6 +322,15 @@ mod tests {
             .to_string(),
             "Failed to delete session a.jsonl: Session not found: a"
         );
+        // Upstream 9799550's TUI status messages for refused actions.
+        assert_eq!(
+            RenameError::Unsupported(SourceKind::Omp).to_string(),
+            "Renaming OMP sessions is not supported"
+        );
+        assert_eq!(
+            DeleteError::Unsupported(SourceKind::Pi).to_string(),
+            "Deleting Pi sessions is not supported"
+        );
         assert_eq!(
             UuidLookup::NotFound {
                 uuid: "u".to_string()
@@ -268,5 +347,15 @@ mod tests {
             .status_message(),
             None
         );
+    }
+
+    #[test]
+    fn readiness_starts_loading_and_becomes_ready_at_once() {
+        let loading = Readiness::default();
+        assert!(!loading.list && !loading.lexical && !loading.semantic);
+        assert_eq!(loading.reconcile, ReconcileState::Running);
+        let ready = Readiness::ready();
+        assert!(ready.list && ready.lexical && ready.semantic);
+        assert_eq!(ready.reconcile, ReconcileState::Done);
     }
 }

@@ -12,7 +12,8 @@ Inputs this design is built on (all in `scratchpad/docs/`): `inventory-list-mode
 `inventory-addendum.md` (ADD, incl. SAFETY A1/A2), `core-extraction-plan.md` (CORE), `gpui-kit-app-infra.md`
 (GK-INFRA), `gpui-kit-components.md` (GK-COMP), `gpui-kit-design-rules.md` (DG), and the spike reports
 `spike-viewer.md`, `spike-list.md`, `spike-platform.md` (spike code in `scratchpad/spikes/{viewer,list,platform}/src`).
-Upstream source = `C:/git/opensource/claude-history` v0.1.76 (read-only). gpui-kit source of truth = the published
+Upstream source = `C:/git/opensource/claude-history` (read-only): the design baseline is v0.1.76; the core was later
+backported through v0.1.80 (commit `38b1267`), see `crates/core/README.md` "Upstream sync". gpui-kit source of truth = the published
 `gpui-kit 0.7.3` crates in the cargo registry (GK-INFRA §0). **Core baseline = `crates/core` at commit `3ba9f90`**
 of `C:/git/opensource/claude-history-gui` (the core Modules stage is merged; §4 lists the real signatures), **plus
 WP-C (K1–K18, merge commit `78ec36c`)**; §4.3 records where WP-C's code differs from the K-item text.
@@ -118,6 +119,12 @@ reason; implementers follow the refined text.
   while focus is inside the Conversations pane**. Automatic selection changes caused by new result sets (selection
   reset to row 0, L-080) preview too while the list has focus. When focus is in the viewer, the agent panel or deep
   search, list selection changes never replace the viewer content.
+* While the list has a query, a preview (and Enter or a double-click) shows the selected result at its search hit,
+  upstream 411e227's list preview: scrolled to a line matching the query (a semantic result: among the matching lines, the one in the
+  message sharing the most words with the evidence its row shows; only without a matching line the evidence
+  alone decides, 59195df), that message focused and the query's matches
+  highlighted (§9.8a, L-109). A query edited while the row stays selected re-anchors the conversation shown after
+  the same 150 ms debounce, again only while the list has focus; a cleared query drops the highlights.
 * Any list-target action (Resume, Fork, Rename, Delete, Export, Copy…, Ctrl+O) first **flushes** a pending debounced
   preview, so the viewer always shows the conversation the action targets (§7.8).
 * Esc in the viewer follows core `view::escape` (upstream order): (1) search being typed → clear it; (2) message
@@ -134,8 +141,8 @@ Resolution at startup, first match wins:
 3. the launch cwd if it is *meaningful*: it is not a filesystem root, not the home directory, not the directory of
    the executable (or of the `.app` bundle), and (a) maps to an existing Claude projects dir
    (`env.claude_projects_dir_for(cwd).is_dir()`), or (b) has a `.git` entry (dir or file), or (c) is the recorded
-   cwd of at least one Pi/OMP session (checked after the first load batch; if it matches and no workspace was
-   chosen yet, the workspace is set then and a refresh is not needed because Pi/OMP roots do not depend on it);
+   cwd of at least one listed (not automated or child) Pi, OMP or Codex session (any non-Claude source; 7f5c443, 8f60c5f) (checked after the first load batch; if it matches and no workspace was
+   chosen yet, the workspace is set then and a refresh is not needed because Pi/OMP/Codex roots do not depend on it);
 4. `[gui] default_workspace` from gui.toml if it exists **[FLAG: added; an explicit config value beats remembered
    state]**;
 5. the last used workspace from `state.json` if `[gui] restore_session` (default true) and it exists;
@@ -143,10 +150,22 @@ Resolution at startup, first match wins:
 
 The workspace sets `HistoryEnv::workspace_dir` (core uses it for the Workspace scope filter, Pi's
 `<workspace>/.pi/settings.json`, delete-empty Local scope, show-dir, resume/fork launch dir, agent Local scope).
-**Relative paths inside `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`, `XDG_DATA_HOME`
-resolve against the launch cwd** (`HistoryEnv::env_path_base`, core gap K16), never against a workspace chosen
+**Relative paths inside `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`, `XDG_DATA_HOME`,
+`CODEX_HOME`, `CODEX_SQLITE_HOME` resolve against the launch cwd** (`HistoryEnv::env_path_base`, core gap K16), never against a workspace chosen
 later, so a variable set by the launching shell keeps its meaning. Changing the workspace at runtime triggers a
 background reload (§11.20) and re-filters.
+
+**What the Workspace scope matches** (upstream 82b355a, core `history::Workspace::contains`): a conversation
+belongs to the workspace when its project is the workspace (Claude: the project directory name, worktree-aware;
+Pi, OMP, Codex: the resolved project path is the workspace or a folder below it) or when any working directory it
+recorded (`Conversation::cwds`: every distinct cwd in order, at most 16, the first being `cwd`; Claude from each user
+record, Codex from `session_meta` and each `turn_context`, Pi/OMP from the header) is the workspace or a folder below
+it. Paths match on whole components (`…/repo` does not take in `…/repo-old`), ignore letter case on Windows, are
+compared against the workspace and its resolved path, and Windows' `\\?\` prefix is ignored (W1). So a session
+started in `~/code` that moved into `~/code/repo` is in `~/code/repo`'s scope, and a workspace at `~/code` takes in
+every repo below it. The rule is the same for the list (in memory and the store's cards), Deep search's Workspace
+scope (local agent search also keys the sessions it takes in by cwd, so their refs resolve), Debug search and the
+semantic tools. `[tui] exclude_paths` still tests only the first recorded cwd.
 
 Workspace picker (toolbar dropdown + File → "Choose workspace…" + palette): sections *Recent* (up to 10 from
 state.json, most recent first, missing dirs hidden), *Projects in loaded conversations* (distinct existing
@@ -159,7 +178,8 @@ cached on ListPane, never inside the menu builder), then "Choose folder…" (nat
 * Launch `claude` / `pi` / `omp` in a **new terminal window**; the GUI stays open. A toast names the conversation
   and the command: `Opened "Fix login bug" in Windows Terminal` + muted second line `claude --resume 3f2a…`.
   Errors are toasts with recovery actions (§12).
-* **Planning** = `core::resume::plan_resume(env, conv, workspace, fork, default_args, &ProgramOverrides)` (landed).
+* **Planning** = `core::resume::plan_resume(env, conv, workspace, fork, &Launch)` (landed; `Launch` = the agent's
+  launcher, `LayeredConfig::launcher`, and its `default_args`, upstream 8a99ccc).
   It decides the strategy (InProject / InWorkspace / CopyToWorkspace / Native), the cwd, the optional `CopyPlan`
   with `existing_targets`, and warnings. Without a workspace a plan that needs one fails with core's
   `WORKSPACE_REQUIRED_RESUME` / `WORKSPACE_REQUIRED_FORK` text; the toast offers "Choose workspace…".
@@ -177,8 +197,16 @@ cached on ListPane, never inside the menu builder), then "Choose folder…" (nat
   toast; the child is always reaped. The GUI never calls `core::resume::launch` (it copies without asking) — CI
   safety lint (§16.2).
 * Terminal configurable in gui.toml `[gui] terminal` with **core's syntax** (`auto`, `wt`, `cmd`/`console`,
-  `terminal`, `osascript`, a Linux emulator name, or a template) (§13.2). Program resolution through
-  `HistoryEnv::resolve_program` (PATH/PATHEXT, `.cmd` shims, `[gui] claude_path|pi_path|omp_path` overrides).
+  `terminal`, `osascript`, a Linux emulator name, or a template) (§13.2). **What starts an agent** (upstream
+  8a99ccc) is a `history::actions::Launcher` (program + arguments that precede the agent's own), chosen by
+  `config::agent_launcher` (`LayeredConfig::launcher`): gui.toml `[resume] command` / `[resume.pi|omp|codex] command`
+  > `[gui] claude_path|pi_path|omp_path|codex_path` > config.toml's `command` > the agent's name on `PATH`
+  (decision 17: GUI settings beat the CLI's shared file, whose wrapper may be a shell script the GUI's platform
+  cannot run; a `[gui]` path is the GUI spelling of a one-program command). A `command` is a string (one program,
+  never split) or an array (program + leading arguments); `~/` is the home and a relative path resolves against the
+  launch directory (else the workspace). `Launcher::resolve` finds the program on the env's `PATH`
+  (PATHEXT, `.cmd` shims) or by its path (the executable bit on Unix); the GUI checks it, after the login-shell
+  `PATH` probe (§14.2), before planning, so a missing program is an error toast before any copy confirmation.
 * A CopyToWorkspace plan writes into `~/.claude/projects` and **must** be confirmed in the "Copy conversation to
   workspace" dialog (§5.8) that lists every file/dir to copy (source → destination) and every `existing_target`
   that will be overwritten. The copy runs only through `ResumePlan::execute_copy()` after that confirmation (core
@@ -212,8 +240,9 @@ cached on ListPane, never inside the menu builder), then "Choose folder…" (nat
     through `core::debug::{info,warn,error}(Some(level), …)` so the level filter applies: (1)
     `core::maintenance::log_parse_errors(env, conv)` → `[INFO] Logged N parse error(s) to <GUI debug.log path>`
     (`[dev]`: the real GUI path instead of upstream's literal `~/.local/state/claude-history/debug.log`) or
-    `[WARN] Failed to write parse errors to log: <e>`; (2) `core::export::display_parse_errors(path)` (K11) → per
-    malformed line `[ERROR] Failed to parse line N: <e>` and a `=== Display Parse Error: … ===` block appended via
+    `[WARN] Failed to write parse errors to log: <e>`; (2) `core::export::display_parse_errors(&transcript)` (K11:
+    the records of the decoded transcript that could not be read, upstream 9597669) → per malformed record
+    `[ERROR] Failed to parse line N: <e>` and a `=== Display Parse Error: … ===` block appended via
     `core::debug_log::log_display_error`; (3) print stdout (A-048, A-059).
 * Windows release builds use the windows subsystem; stdout handling in §14.3.
 
@@ -279,7 +308,7 @@ Large text views use a read-only `Textarea`. Details §5.4, §11.14, D-001…D-0
 Delete empty transcripts…, Generate semantic cache…, Clear semantic cache…, Debug search…, Semantic debug search…,
 Debug log…, Show projects directory, Delete conversation by session ID…, Open JSONL file… (also under File), Check
 for updates… (also under Help), Settings…. Keyboard shortcuts (F1, and `?` when not typing) is under Help. All are
-in the command palette. Details §5.10–§5.18, §5.20, T-001…T-024.
+in the command palette. Details §5.10–§5.18, §5.20, T-001…T-025.
 
 ### PD13 Settings
 The Settings dialog edits **only** gui.toml: Save writes just the keys the user changed, through core's change-set
@@ -294,7 +323,8 @@ gui.toml cannot be parsed, Save is disabled with the parse error shown and butto
 File → "Open JSONL file…" opens an additional viewer window (not in picker mode). Resume/Fork/Delete/Rename are
 unavailable there (TUI parity; their hints are hidden — fix of V quirk 9). Esc/`q` close the window (the app quits
 when it was the last window and no main window exists). Semantic search is off. Header from
-`core::history::process_conversation_file`. Unreadable/empty files show an error state with the reason
+`core::history::process_conversation_file_in` in the app's env (a Codex rollout of the env's home finds its state
+database as the viewer does). Unreadable/empty files show an error state with the reason
 (`core::browser::Browser::single_file_error` semantics, ADD D1). The agent panel works only for files inside the
 history roots (D-035).
 
@@ -347,8 +377,8 @@ artifact names, toolchain pinned.
 | AD3 | `Home`/`End` in the list = first/last row (TUI), via `ConversationList > Input` duplicates. Caret home/end: `ctrl-home`/`ctrl-end`. | TUI parity. |
 | AD4 | PageUp/PageDown move by the number of visible rows; Ctrl+D by half of that. | LIST quirk 4 [fix]. |
 | AD5 | Mouse wheel scrolls the list viewport (does not move the selection). | Desktop convention; virtual list (LIST quirk 5 [fix]). |
-| AD6 | Viewing (click/Enter → viewer) is allowed while loading; Resume/Fork/Rename/Delete/Ctrl+O stay disabled while loading (hints dimmed). | Capture-at-open makes viewing safe; destructive parity kept. |
-| AD7 | In-viewer search matches over the rendered segment text (no ledger chrome) and counts occurrences, `i/n` = occurrence index; state machine = core `view::ViewSearch<SegMatch>`. | PD7; fixes VIEW quirk 12. |
+| AD6 | Viewing (click/Enter → viewer) is allowed while loading. Resume/Fork/Ctrl+O work once the rows are listed newest first (`Readiness::list`: the first cards of the store's generation, §11.2, upstream 3708bb6), else they wait for the load; Rename/Delete stay disabled until the load ends (store mode: until the generation is shown in full; upstream 358becb allows them on the first cards). Hints and row-menu items are dimmed/disabled accordingly. | Capture-at-open makes viewing safe; cards carry the path, source and project resume needs; edits wait like upstream's (the loader may be reading the files). |
+| AD7 | In-viewer search matches over the rendered segment text (no ledger chrome) by the list's keyword rules (core `display_format::ViewSearchQuery`, upstream d2c0f07) and counts match ranges (separator-joined words on one line are one), `i/n` = match index; state machine = core `view::ViewSearch<SegMatch>`. | PD7; fixes VIEW quirk 12. |
 | AD8 | Rename (F2) and Refresh also work from the viewer (additive). | Menus work everywhere; no conflict. |
 | AD9 | Generate semantic cache always uses the whole corpus (fresh load, no time filter), so core's `GENERATE_WITH_TIME_FILTER_ERROR` never triggers. | The GUI loads independently of the list filter. |
 | AD10 | Timestamps older than the current calendar year render as `%b %d %Y, %H:%M` (TUI: `%b %d, %H:%M`). | spike-list follow-up; additive clarity. |
@@ -417,9 +447,24 @@ Single-file window: Root ─► SingleFileWindow (Entity, key_context "SingleFil
 ```
 
 Background work (all threads named, 8 MiB stack via `std::thread::Builder::stack_size`):
-* core-owned: `history-loader` + `history-loader-forwarder` (streaming load), `corpus-prepare` (K1: sort, dedupe,
-  search index off the UI thread), `corpus-release` (drops a replaced corpus off the UI thread), `search-worker`
-  (lexical), `semantic-search-worker` (spawned by `core::browser::Browser`);
+* core-owned: `history-loader` + `history-loader-forwarder` (streaming load without the store), `corpus-prepare`
+  (K1: sort, dedupe, search index off the UI thread), `corpus-release` (drops a replaced corpus off the UI thread),
+  `search-worker` (lexical), `semantic-search-worker` (spawned by `core::browser::Browser`; its one-thread pool
+  `semantic-rank-worker` runs the work and lowers its scheduling priority before it makes the embedder, §7.6),
+  `generation-open`
+  (materializes every card of a store generation and opens its search index), `store-reconcile` (the reconcile pass:
+  parses new or changed session files into delta generations, retries a store locked by another instance every
+  second) with its `store-watch` thread (checks `CURRENT` every 200 ms while the pass runs), `semantic-corpus` (reads
+  the semantic data of a generation's cards for semantic search in store mode, on rayon's global pool, or maps
+  cards read before to a newer generation's docs; a read gives up before its next card when its browser is
+  dropped), `row-evidence` (reads the literal context of visible rows from their
+  text frames); the browser joins its `semantic-corpus` and `row-evidence` threads when it is dropped; rayon pools (`lexical-rank-worker`, `index-search-*` up to 8 threads,
+  `store-reconcile-*` up to 4, which lower their scheduling priority when they start, as upstream's reconcile
+  child ran at nice 10; not in tests) use rayon's default stack size, not 8 MiB; every scan of the session files
+  (a reconcile pass of the list, Tools or Deep search, or a load without the store) runs on a pool of its own
+  (`store-scan-*`, up to 4, 605ef46) whose threads have 8 MiB stacks and lower their scheduling priority the same
+  way; ONNX Runtime's inference pool (`semantic-embed`, half the cores, started by ONNX Runtime through core's
+  thread manager when the GUI's model loads; each lowers its scheduling priority when it starts, §7.6);
 * GUI-owned: `viewer-worker` (one per ViewerPane: single-flight parse + document + items + segments, §7.5),
   `agent-worker` (Deep Search + agent panel, single-flight per request kind with cancellation), short-lived tool
   threads (`semantic-cache-gen`, `update-check`, `delete-empty-scan`, `uuid-load`, `rename-write`, `delete-exec`,
@@ -439,20 +484,20 @@ truth.
 
 | Module | Items the GUI uses |
 |---|---|
-| `env` | `HistoryEnv { home_dir, claude_config_dir, pi_coding_agent_dir, pi_coding_agent_session_dir, pi_config_dir, omp_profile, pi_profile, xdg_data_home, path_var, pathext, workspace_dir, cache_root, config_file, gui_config_file, debug_log_file }` (+ `env_path_base`, K16: `with_env_path_base`, `launch_base_dir()`, `env_value_base_dir()`; `main` sets it to the launch cwd), `from_process_env()` (main only), `sandbox(root)`, `with_workspace`, `claude_dir()`, `claude_projects_root()`, `claude_projects_dir_for(dir)`, `cache_root()`, `semantic_cache_dir()`, `embedding_cache_file()`, `semantic_model_dir()`, `config_file()`, `gui_config_file()`, `debug_log_file()`, `workspace()`, `resolve_program(name, override)`; `WorkspaceScope { dir, project_dir_name }`, `WorkspaceScope::new`, `canonical_dir()`; `STATE_DIR_NAME`, `CACHE_DIR_NAME` |
-| `config` | `ConfigFile`, `GuiConfigFile`, `GuiSettings { theme, terminal, claude_path, pi_path, omp_path, default_workspace, restore_session }`, `LayeredConfig { cli, gui_file, effective, gui }`, `load_config_from(path)`, `load_gui_config_from(path)` (loaded **independently**, §11.1), `ConfigFile::overlaid_with(&GuiConfigFile)`, `save_gui_config_changes` (K12), `KeyChord::{short_label, help_label, gpui_keystroke, config_string}`, `parse_key_binding`, `KeyBindings { resume, fork, rename, delete, refresh }` + `from_config`, `conflicts_with_ctrl_t`, `AgentScopeConfig`, `AgentConfig` |
-| `settings` | `parse_launch_args(args) -> Result<LaunchCommand, LaunchArgsError>` (`LaunchCommand::{Run(GuiLaunchArgs), Help, Version, DeleteEmpty { local, all, yes }, Update, Agent(AgentCli), SubcommandHelp(String)}`; K14/K15, `SubcommandHelp` added by WP-C: `update --help`, `delete-empty -h`, `help <subcommand>` → print the text, exit 0), `GuiLaunchArgs` (+`display_flags`, `search_mode_override`, `picker`, `time_filter`, `settings`, `validate`), `help_text(program)`, `effective_settings(config, flags, mode_override) -> EffectiveSettings { show_last, show_tools, tool_display, show_thinking, search_mode, list_search_mode, exclude_projects, keys, semantic_toggle_enabled, resume_default_args }`, `EffectiveSettings::initial_view_prefs()`, `initial_tool_display`, `PickerAction::{ShowPath, ShowId, Resume{fork}}`, `picker_output(action, conv)`, `session_id_from_path(path)` |
-| `browser` | `Browser` (`new_loading`, `append_conversations`, `set_query`, `escape -> EscapeOutcome`, `toggle_workspace_filter`, `set_workspace_filter`, `set_workspace`, `set_excluded_projects`, `toggle_list_search_mode`, `set_list_search_mode`, `poll`, `has_search_work_in_flight`, `filtered`, `row`, `selected`, `select*`, `select_half_page_down(viewport_rows)`, `selected_path`, `selected_conversation`, `has_multiple_sources`, `conversation_by_path`, `count_text`, `search_status_text`, `semantic_status_text`, `semantic_activity_status_text`, `semantic_error`, `semantic_progress`, `semantic_result_metadata[_for_selection]`, `lexical_evidence`, `row_preview_input`, `row_header_input`, `uuid_lookup`, `rename_prefill`, `workspace`, `has_project_context`, `list_search_mode`, `is_loading`, `loading_state`), `BrowserOptions` (+ builders, `embedder_factory`, `waker`, `semantic_available`), `HistoryLoader` (`new`, `start_initial_load`, `start_refresh`, `set_time_filter`, `is_running`, `is_refreshing`, `poll(&mut Browser) -> LoaderPoll`), `LoaderOptions`, `LoadEvent::{Loaded, NoHistory, LoadFailed, Refreshed, RefreshIncomplete, RefreshFailed, RefreshInterrupted}` (+`status_message`), `ListSearchMode`, `SemanticProgress`, `SemanticResultMetadata`, `UuidLookup`, `RenameError`, `DeleteError`, `Waker`, `SemanticEmbedderFactory`, `query_has_literals`; K1–K4, K6, K18 additions |
-| `display_format` | `build_row_header(&RowHeaderInput) -> RowHeader { project, custom_title, summary, message_count, semantic_score, duration, timestamp, recency, .. }`, `build_row_preview(&RowPreviewInput) -> RowPreview { preview, source, context }`, `HighlightQuery` (`parse`, `needs_literal_context`, `match_ranges`), `HighlightedText`, `Recency`, `format_model_name`, `format_tokens`, `format_tokens_long`, `format_msg_count_long`, `format_duration_minutes`, `format_header_timestamp`, `semantic_row_metadata`, `semantic_rationale_label`, `sanitize_preview` |
-| `view` | `ViewerModel { path, entries, prefs, expanded }` (`open`, `from_entries`, `cycle_tool_display`, `toggle_thinking`, `toggle_timing`, `toggle_expanded`, `document`, `export_options`, `session_id`, `message_text`, `plain_display`), `ViewPrefs`, `ToolDisplayMode` (+`next`, `status_label`), `ConversationDocument` (`navigable_indices`, `navigable_entry_indices`, `nav_position`, `message_at_nav_position`), `DocMessage`, `DocMessageKind`, `DocBlock` (`toggle_id`, `tool_output_id`, `plain_text`), `DocBlockKind`, `DocTiming`, `Fold`, `DocToolCall`, `DocToolResult`, `DocSubagentToolResult`, `ToolBodyLine`, `BodyLineKind`, `LabelRole` (+`color`), `ToolOutputId`, `fitted_name`, `NAME_WIDTH`, `TRUNCATED_BODY_LINES`, `TRUNCATED_RESULT_LINES`, `MessageNav`, `ViewSearch<M>`, `ViewSearchMode`, `escape -> ViewEscape`, `capture_anchor_entry`, `find_entry_or_prev`; K5, K9 additions |
-| `export` | `ExportFormat::{ALL, from_index, index, label, extension}`, `ExportOptions`, `generate_export`, `export_to_path -> Result<(), ExportError>`, `default_export_file_name`, `plain_display(path, options)`, `exported_status`, constants `COPIED_TO_CLIPBOARD`, `MESSAGE_COPIED_TO_CLIPBOARD`, `NO_TEXT_CONTENT`, `MESSAGE_NOT_FOUND`, `PATH_COPIED_TO_CLIPBOARD`, `SESSION_ID_COPIED_TO_CLIPBOARD`; K11 |
-| `resume` | `plan_resume(env, conv, workspace, fork, default_args, &ProgramOverrides) -> Result<ResumePlan>`, `plan_resume_target(…, &ResumeTarget, …)`, `ResumePlan { source, kind, strategy, session_path, program, program_override, args, cwd, copy, warnings }` (+`launch_spec(env)`, `execute_copy()`, `display_command()`), `CopyPlan { files, dirs, existing_targets, target_dir, … }`, `CopyItem`, `CopyReport`, `ResumeStrategy`, `ProgramOverrides::from_gui_settings`, `WORKSPACE_REQUIRED_RESUME`, `WORKSPACE_REQUIRED_FORK`; `terminal::{TerminalLauncher::from_setting, detect_launcher, prepare_terminal_command, build_terminal_command, prepare_launcher_command, LaunchOptions, LaunchSpec, TerminalCommand (+display), Platform}`; K17. **Forbidden in the GUI**: `resume::launch` (copies without confirmation) and direct `terminal::spawn_terminal` outside `services.rs` |
-| `maintenance` | `find_empty_candidates(env, &DeleteEmptyScope) -> Vec<EmptyCandidate>` (+`modified_within`, `cli_lines`), `delete_empty_candidates(&[EmptyCandidate]) -> DeleteEmptyOutcome { deleted, skipped, failure }`, `delete_empty_summary_line`, `format_delete_empty_report`, `find_session_copies(env, uuid) -> Vec<SessionCopyFiles>`, `delete_session_by_uuid(env, uuid) -> DeleteByUuidReport`, `delete_by_uuid_message`, `show_dir(env, workspace)`, `WORKSPACE_REQUIRED_SHOW_DIR`, `load_sorted_conversations(env, show_last, debug, &time_filter)`, `debug_search_report(convs, query, now, workspace) -> DebugSearchReport` (+`to_text`), `DEBUG_SEARCH_TOP`, `parse_error_report(conv)`, `log_parse_errors(env, conv)`; K4 (`plan_session_delete`, `execute_session_delete`, `DeletePlan { source, path, session_id, files, dirs }`, `DeleteReport`, `SessionDeleteFailure { error, partial }`) |
-| `semantic_ops` | `generate_semantic_cache(env, convs, workspace, &time_filter, embedder, progress, &cancel) -> GenerateReport`, `GenerateProgress`, `GenerateOutcome`, `clear_semantic_cache(env) -> ClearReport` (K6 as built: empties `<cache root>/semantic` but keeps the directory and its `embeddings.lock`), `semantic_search_report(env, query, convs, top, workspace, embedder)`, `semantic_debug_report(env, query, convs, workspace, embedder)`, `semantic_status(env, convs, workspace)`, `EmbedderFactory<'a>`, `fastembed_factory(env)`, `no_conversations_message` |
-| `agent` | `AgentRequest::{Search, Within, Read, Outline}`, `args::{AgentSearchArgs, AgentWithinArgs, AgentReadArgs, AgentOutlineArgs, AgentOutputFlags, AgentSearchModeArgs, TimeRangeArgs, DEFAULT_READ_CONTEXT}` (+`validate`), `AgentService::{new, with_embedder_factory, with_notice_sink, with_cancellation, respond}`, `agent::execute(env, config, request) -> AgentResponse` (headless `agent …`), `cli::{AgentCli::{Request, Help}, parse_agent_args}`, `AgentResponse { stdout, stderr, exit_code, result, warnings, error, notices }` (+`text`, `error_text`, `is_success`), `AgentResult::{Search, Within, Read, Outline}`, `AgentSearchResult { output, conversations }` (+`hits`, `conversation(ref)`), `AgentReadResult`, `AgentOutlineResult`, `AgentConversationInfo { reference, full_ref, uuid, project_id, source, session_id, session_filename, path }`, `AgentNotice::{SemanticProgress, UncachedPassages}`, `agent::service::{EmbedderFactory, discover_agent_keys}`, `refs::{AgentConversationKey::from_conversation, conversation_ref, full_ref, full_ref_for_candidate}`, `diagnostic::{AgentError, AgentWarning}`, `protocol::{ReadMessage, OutlineItem, ProtocolOptions, MessageLineRange}`; K5, K7, K8, K15 |
+| `env` | `HistoryEnv { home_dir, claude_config_dir, pi_coding_agent_dir, pi_coding_agent_session_dir, pi_config_dir, omp_profile, pi_profile, codex_home, codex_sqlite_home, xdg_data_home, path_var, pathext, workspace_dir, cache_root, config_file, gui_config_file, debug_log_file }` (+ `env_path_base`, K16: `with_env_path_base`, `launch_base_dir()`, `env_value_base_dir()`; `main` sets it to the launch cwd), `from_process_env()` (main only), `sandbox(root)`, `with_workspace`, `claude_dir()`, `claude_projects_root()`, `claude_projects_dir_for(dir)`, `codex_home()` (`CODEX_HOME`, else `<home>/.codex`) + `codex_sqlite_home()` + `with_codex_home` (upstream 7f5c443), `cache_root()`, `cache_base_dir()` (`cache_root` or its `config-<hash>`, upstream `store::cache_base_dir`), `cli_cache_root()` + `is_in_cli_cache(path)` (the installed CLI's cache root, never deleted from), `semantic_cache_dir()`, `embedding_cache_file()`, `semantic_model_dir()`, `config_file()`, `gui_config_file()`, `debug_log_file()`, `workspace()`; `WorkspaceScope { dir, project_dir_name }`, `WorkspaceScope::new`; `STATE_DIR_NAME`, `CACHE_DIR_NAME`, `CLI_CACHE_DIR_NAME`, `is_within(path, dir)` |
+| `config` | `ConfigFile`, `GuiConfigFile`, `GuiSettings { theme, terminal, claude_path, pi_path, omp_path, codex_path, default_workspace, restore_session }`, `ResumeConfig { command, default_args, pi, omp: Option<LauncherConfig { command }>, codex: Option<AgentResumeConfig { command, default_args }> }` + `default_args(source)` (`[resume]` for Claude, `[resume.codex]` for Codex, eea6d37) + `command(source)` (`AgentCommand`: a string or an array naming a program, `new(words)`, `words()`; serializes a one-word command as a string; 8a99ccc), `agent_launcher(env, cli, gui, source) -> Launcher` and `LayeredConfig::{launcher, launch}(env, source)` (gui.toml `command` > `[gui] <agent>_path` > config.toml `command` > the agent's binary; 8a99ccc, decision 17), `GuiSettings::{program_path(source), program_path_key(source)}`, `TuiConfig { exclude_projects, exclude_paths, semantic_search }` / `TuiOverrides` (gui.toml; `Option` lists, so `[]` overrides; `exclude_paths` = `[tui] exclude_paths`, 982aea9), `LayeredConfig { cli, gui_file, effective, gui }`, `load_config_from(path)`, `load_gui_config_from(path)` (loaded **independently**, §11.1), `ConfigFile::overlaid_with(&GuiConfigFile)`, `save_gui_config_changes` (K12), `KeyChord::{short_label, help_label, gpui_keystroke, config_string}`, `parse_key_binding`, `KeyBindings { resume, fork, rename, delete, refresh, all_kinds, user_only }` + `from_config`, `conflicts_with_ctrl_t` (`all_kinds`: `[keys] all_kinds`, default `ctrl+g`, cb990e6; `user_only`: `[keys] user_only`, ae7ae39, default **[dev]** `alt+u` (upstream `ctrl+v`, reserved here, §8.5); both count for the Ctrl+T rule), `AgentScopeConfig`, `AgentConfig` |
+| `settings` | `parse_launch_args(args) -> Result<LaunchCommand, LaunchArgsError>` (`LaunchCommand::{Run(GuiLaunchArgs), Help, Version, DeleteEmpty { local, all, yes }, Update, Agent(AgentCli), SubcommandHelp(String)}`; K14/K15, `SubcommandHelp` added by WP-C: `update --help`, `delete-empty -h`, `help <subcommand>` → print the text, exit 0), `GuiLaunchArgs` (+`display_flags`, `search_mode_override`, `picker`, `time_filter`, `settings`, `validate`; `all_kinds` = `--all-kinds`, cb990e6), `help_text(program)`, `effective_settings(config, flags, mode_override) -> EffectiveSettings { show_last, show_tools, tool_display, show_thinking, search_mode, list_search_mode, exclude_projects, exclude_paths, keys, semantic_toggle_enabled, resume_default_args, resume_codex_default_args }`, `EffectiveSettings::initial_view_prefs()`, `EffectiveSettings::resume_default_args_for(source)` (eea6d37), `initial_tool_display`, `PickerAction::{ShowPath, ShowId, Resume{fork}}`, `picker_output(action, conv)`, `session_id_from_path(path)` |
+| `browser` | `Browser` (`family_of(path) -> ViewFamily { parent, children }` (a conversation's parent and its subagents and forks, oldest first, over every card; upstream 3c2ffeb), `new_loading`, `append_conversations`, `set_query`, `escape -> EscapeOutcome`, `toggle_workspace_filter`, `set_workspace_filter`, `set_workspace`, `workspace_display` (the workspace with `~` for the home, the prompt's folder, 82b355a), `set_excluded_projects`, `set_excluded_paths` + `excluded_paths` (`[tui] exclude_paths`: literal prefixes of the recorded cwd (case-sensitive; case-insensitive on Windows, 59417d1), applied by `ScopeFilter` in memory and by `Snapshot::head` / `scope(all_kinds, excluded_paths, workspace, ..)` for cards, 982aea9; the workspace test of both is `history::Workspace::contains`, the cards' by project key and the cwds a card stores, 82b355a), `all_kinds`, `toggle_all_kinds`, `set_all_kinds` (automated and child conversations in the list and its lexical search, keeping the query and the selected session, cb990e6), `user_only`, `toggle_user_only`, `set_user_only`, `searches_user_only` (lexical search over `Conversation::own_text` only, keeping the query and the selected session; `searches_user_only` is false in semantic mode, which ignores the toggle; ae7ae39), `toggle_list_search_mode`, `set_list_search_mode`, `poll`, `has_search_work_in_flight`, `filtered`, `row`, `selected`, `select*`, `select_half_page_down(viewport_rows)`, `selected_path`, `selected_conversation`, `has_multiple_sources`, `conversation_by_path`, `count_text`, `search_status_text`, `semantic_status_text`, `semantic_activity_status_text`, `semantic_activity_counts` (the `(done, total)` chunks the activity shows, for its progress bar; fork), `semantic_indexing -> Option<SemanticIndexing { completed, total }>` (the semantic worker's background indexing, upstream c6d0421), `semantic_error`, `semantic_progress`, `semantic_result_metadata[_for_selection]`, `list_hit() -> Option<ListHit { query, evidence }>` and `list_preview_wanted` (the selected result's search hit for the viewer: a non-blank query and a selection, the evidence the semantic row shows; upstream 411e227), `lexical_evidence`, `row_preview_input`, `row_header_input`, `uuid_lookup`, `rename_prefill`, `workspace`, `has_project_context`, `list_search_mode`, `is_loading` (`!readiness.list`, 358becb), `readiness() -> Readiness { list, lexical, reconcile: ReconcileState::{Running, Done}, semantic }`; generation mode (358becb): `show_snapshot(store::Snapshot)` (the first `SNAPSHOT_ROWS` cards), `shows_snapshot`, `generation_open`, `generation_len`, `generation_name`, `generation_is_empty`, `history_is_empty`, `is_hidden(index)`, `time_filter`, `set_time_filter(TimeFilter)`, `open_search_index` and `swap_generation(store::Snapshot)` (synchronous; the loader installs a generation opened off the UI thread), `search_index_generation`, `take_reconcile_request`, `set_reconciling`, `set_index_progress(Option<store::progress::Indexing>, running)`, `index_failed(message)`, `indexing_status_text`, `index_progress`, `take_index_notice -> Option<IndexNotice::{Indexed { total }, Failed(message)}>` (+`status_message`; the status messages of a pass shown as indexing or a failed one, 04c714b), `fill_visible_evidence(Range)`, `conversation_at`; upstream 3708bb6 replaced `loading_state`), `SNAPSHOT_ROWS`, `BrowserOptions` (+ builders incl. `with_exclude_paths`, `embedder_factory`, `waker`, `semantic_available`, `all_kinds`), `HistoryLoader` (`new`, `reconfigure` (store mode: moves to the store root of the new env), `start_initial_load` (store mode: a reconcile pass), `start_refresh` (store mode: a pass, then `Refreshed` from the generation sizes), `set_time_filter` (store mode: re-scopes the cards at the next poll), `is_running`, `is_refreshing`, `uses_store`, `open_snapshot` (`&mut self`: enters store mode; every card and the index are opened on `generation-open` and installed by a later `poll`), `finish_snapshot_write` (waits for the running pass and the ones asked for after it, returns the last `store::generation::Publish`, e905169), `poll(&mut Browser) -> LoaderPoll` incl. `pending`, `swapped`; `BUSY_RETRY`, `GENERATION_POLL`), `LoaderOptions` (incl. `drain_budget`, default `DEFAULT_DRAIN_BUDGET` = 8 ms, upstream 93e17a5; `snapshot` = store mode, default off, 3708bb6, 358becb), `LoadEvent::{Loaded, NoHistory, LoadFailed, Refreshed, RefreshIncomplete, RefreshFailed, RefreshInterrupted}` (+`status_message`), `ListSearchMode`, `SemanticProgress`, `SemanticResultMetadata`, `UuidLookup`, `SemanticIndexing`, `PreparedSession` (`Send`; `PreparedSession::new(Conversation)` normalizes the lexical body of a re-parsed session, the O(text) step for a background task; consumed by `Browser::apply_renamed_session` and `Browser::resolve_uuid_lookup_session`, 503fe42), `RenameError`, `DeleteError` (both with `Unsupported(Source)`: the source's adapter cannot rename or delete, 9799550), `Waker`, `SemanticEmbedderFactory`, `query_has_literals`; K1–K4, K6, K18 additions |
+| `display_format` | `conversation_label(&Conversation)` (title, else summary, else first message, else session id; upstream 3c2ffeb), `build_row_header(&RowHeaderInput) -> RowHeader { project, custom_title, summary, prompt_count, semantic_score, duration, timestamp, recency, .. }` (`prompt_count`: `1 prompt` / `N prompts`, e930cac) (`RowHeaderInput::show_kind_label`: the `auto`/`sub` tag of a listed automated or child conversation, cb990e6; the GUI draws it as its own run), `build_row_preview(&RowPreviewInput) -> RowPreview { preview, source, context }`, `HighlightQuery` (`parse`, `needs_literal_context`, `match_ranges`), `ViewSearchQuery` (`parse`, `is_empty`, `has_match`, `covers_all_terms` (a match holds every word and literal, 949ec4e), `match_ranges_in(text, &text_match::NormalizedForm)`: the viewer find, d2c0f07; `NormalizedForm` is the fork's owned normalized form of a text), `HighlightedText`, `Recency`, `format_model_name`, `format_tokens`, `format_tokens_long`, `count_label`, `format_header_counts` / `header_count_parts` / `header_counts` (`N prompts · M tool calls`, e930cac; `header_count_parts` is fork-only), `format_duration_minutes`, `group_digits` (`7,185`, 04c714b), `format_header_timestamp`, `semantic_row_metadata`, `semantic_rationale_label`, `sanitize_preview` |
+| `view` | `ViewerModel { path, transcript: Arc<Transcript>, prefs, expanded }` (`open(history, path, prefs)` and `open_cancellable(…, cancelled)` through the environment's `history::service::HistoryService`, `from_transcript`, `entries()` (the transcript's `history::view::entries`, numbered; 9597669), `cycle_tool_display`, `toggle_thinking`, `toggle_timing`, `toggle_expanded`, `document`, `export_options`, `session_id`, `message_text`, `plain_display`), `ViewPrefs`, `call_line_suffix` (the ` (N more lines)` suffix of a calls row, 9d4e9cc), `ToolDisplayMode` (`Off` (d0aca95) / `Summary` (was `Hidden`) / `Calls` (a60dfe9) / `Truncated` / `Full`; +`next`, `groups_tools` (was `is_summary`), `status_label`), `ConversationDocument` (`navigable_indices`, `navigable_entry_indices`, `nav_position`, `message_at_nav_position`), `DocMessage`, `DocMessageKind`, `DocBlock` (`toggle_id`, `tool_output_id`, `plain_text`), `DocBlockKind`, `DocTiming`, `Fold`, `DocToolCall`, `DocToolResult`, `DocSubagentToolResult`, `ToolBodyLine`, `BodyLineKind`, `LabelRole` (+`color`), `ToolOutputId`, `fitted_name`, `NAME_WIDTH`, `TRUNCATED_BODY_LINES`, `TRUNCATED_RESULT_LINES`, `MessageNav`, `ViewSearch<M>` (`commit` returns `No matches for /<query>` for a query with text and no matches, d2c0f07), `ViewSearchMode`, `escape -> ViewEscape`, `capture_anchor_entry`, `find_entry_or_prev`, `preview::{PreviewDoc<T: AsRef<str>> { texts, messages } (+`scroll_offset`, `message_at`, `from_rendered`), anchor(doc, query, evidence), match_ranges(doc, lines, anchor, query) -> per line (start, end, MatchEmphasis { Hit, Secondary }), widen_to_words}` (the line a list search hit is at: a line matching the query, lines holding every query word before lines holding only some (f374dc8) (the evidence's message among them, else the first; only without a match the evidence alone, 59195df); upstream 411e227 with 917758a's matcher; the hit's matches of the whole query emphasized and every match widened to whole words, 949ec4e); K5, K9 additions |
+| `export` | `ExportFormat::{ALL, from_index, index, label, extension}`, `ExportOptions`, `generate_export(&Transcript, format, options)`, `export_to_path(&Transcript, …) -> Result<(), ExportError>`, `default_export_file_name`, `plain_display(&Transcript, options)` (every generator renders `history::view::entries`; the caller decodes first with `view::open_conversation(history, path)`, whose error is `ExportError::Read`, 9597669), `exported_status`, constants `COPIED_TO_CLIPBOARD`, `MESSAGE_COPIED_TO_CLIPBOARD`, `NO_TEXT_CONTENT`, `MESSAGE_NOT_FOUND`, `PATH_COPIED_TO_CLIPBOARD`, `SESSION_ID_COPIED_TO_CLIPBOARD`; K11 |
+| `resume` | `plan_resume(env, conv, workspace, fork, &Launch) -> Result<ResumePlan>`, `plan_resume_target(…, &ResumeTarget, …)` (planned by the adapter of the target's source, `Adapter::resume`, 9799550; an action the conversation does not support, `history::actions::capabilities_of(source, provenance)`, is refused with `Failed to run Claude CLI: Resuming <source> sessions is not supported` / `Forking …`, or `… is unavailable: <source> no longer has this conversation's current history` for an orphaned one, eea6d37), `ResumeTarget { source, path, project_path, provenance }` (+`target()`), `ResumePlan { source, kind, strategy, session_path, launcher, args, cwd, copy, warnings, env }` (+`launch_spec(env)`: the launcher's program resolved (`AppError::AgentLaunch` when missing) and its arguments before `args`, `execute_copy()`, `display_command()` (`mise exec -- claude --resume …`); `env`: Codex's `CODEX_HOME`, eea6d37; `launcher`: 8a99ccc), `CopyPlan { files, dirs, existing_targets, target_dir, … }`, `CopyItem`, `CopyReport`, `ResumeStrategy`, `WORKSPACE_REQUIRED_RESUME`, `WORKSPACE_REQUIRED_FORK`; `terminal::{TerminalLauncher::from_setting, detect_launcher, prepare_terminal_command, build_terminal_command, prepare_launcher_command, LaunchOptions, LaunchSpec { program, args, cwd, env }, TerminalCommand (+display; `env` set on the launcher process), Platform, run_to_completion(spec) -> RunOutput { success, status, stderr }}` (the environment reaches the program through every launcher: `env NAME=value` in the POSIX line, `set "NAME=value" &&` in the `cmd.exe` line; `run_to_completion` runs a CLI without a terminal, refused under `cfg(test)`/`hermetic`, eea6d37); K17. **Forbidden in the GUI**: `resume::launch` (copies without confirmation) and direct `terminal::spawn_terminal` outside `services.rs` |
+| `maintenance` | `find_empty_candidates(env, &DeleteEmptyScope) -> Vec<EmptyCandidate>` (+`modified_within`, `cli_lines`), `delete_empty_candidates(&[EmptyCandidate]) -> DeleteEmptyOutcome { deleted, skipped, failure }`, `delete_empty_summary_line`, `format_delete_empty_report`, `find_session_copies(env, uuid) -> Vec<SessionCopyFiles>`, `delete_session_by_uuid(env, uuid) -> DeleteByUuidReport`, `delete_by_uuid_message`, `show_dir(env, workspace)`, `WORKSPACE_REQUIRED_SHOW_DIR`, `load_sorted_conversations(env, show_last, debug, &time_filter)`, `debug_search_report(convs, query, now, workspace) -> DebugSearchReport` (+`to_text`), `DEBUG_SEARCH_TOP`, `parse_error_report(conv)`, `log_parse_errors(env, conv)`; K4 (`plan_session_delete` (a source whose adapter cannot delete is refused with `AppError::Unsupported`: `Deleting <source> sessions is not supported`, 9799550), `execute_session_delete`, `execute_session_delete_with(env, plan, codex_launcher, run)` (a Codex plan, every rollout of the thread, runs `codex delete --force <thread id>` with `CODEX_HOME` through `run`: the GUI passes `PlatformServices::run_program`, eea6d37; started by the Codex `Launcher` with its leading arguments, a missing program fails before anything runs, 8a99ccc), `DeletePlan { source, path, session_id, files, dirs, metadata, kept }` (`metadata`: a sidecar's `.meta.json`; `kept`: a session's `/btw` forks, which stay; 3c2ffeb), `DeleteReport`, `SessionDeleteFailure { error, partial }`) |
+| `semantic_ops` | `generate_semantic_cache(env, convs, workspace, &time_filter, embedder, progress, &cancel) -> GenerateReport`, `GenerateProgress`, `GenerateOutcome`, `clear_semantic_cache(env) -> ClearReport` (K6 as built: empties `<cache root>/semantic` but keeps the directory and its `embeddings.lock`), `semantic_search_report(env, query, convs, top, workspace, embedder)`, `semantic_debug_report(env, query, convs, workspace, embedder)`, `semantic_status(env, convs, workspace)` (`CacheFileState::{Missing, Unreadable, Incompatible, Ready, Legacy}`: 8919a76 made `Incompatible` field-less, the matrix keeps only a model hash, and added `Legacy` for an unconverted `embeddings-v1.bin`), `clear_embedding_cache(env)` (the matrix and an unconverted v1 file), `EmbedderFactory<'a>`, `fastembed_factory(env)` (every core, `EmbedPriority::Foreground`), `no_conversations_message`; `semantic::fastembed::{FastembedEmbedder::new_in(model_dir, show_download_progress, EmbedPriority), EmbedPriority::{Foreground, Background}}` (the shared embedder, §7.6; upstream 8322afe) |
+| `agent` | `AgentRequest::{Search, Within, Read, Outline}`, `args::{AgentSearchArgs, AgentWithinArgs, AgentReadArgs, AgentOutlineArgs, AgentOutputFlags, AgentSearchModeArgs, TimeRangeArgs, DEFAULT_READ_CONTEXT}` (+`validate`), `AgentService::{new, with_embedder_factory, with_notice_sink, with_cancellation, respond}`, `agent::execute(env, config, request) -> AgentResponse` (headless `agent …`), `cli::{AgentCli::{Request, Help}, parse_agent_args}`, `AgentResponse { stdout, stderr, exit_code, result, warnings, error, notices }` (+`text`, `error_text`, `is_success`), `AgentResult::{Search, Within, Read, Outline}`, `AgentSearchResult { output, conversations }` (+`hits`, `conversation(ref)`), `AgentReadResult`, `AgentOutlineResult`, `AgentConversationInfo { reference, full_ref, uuid, project_id, source, session_id, session_filename, path }`, `AgentNotice::{SemanticProgress, UncachedPassages}`, `agent::service::{EmbedderFactory, discover_agent_keys(env, workspace, listed, all_kinds)}` (`AgentSearchArgs::all_kinds` = `--all-kinds`; `user_only` = `--user-only` (dcd3978: hits only from the authored text of top-level, non-note user messages, `AgentTranscript::notes` holding the Pi/OMP note ordinals; conversations ranked over `search::user_only_view`; semantic and hybrid fall back to lexical with a `semantic-unavailable` warning; `forces_lexical()`: the Deep search worker's semantic gate does not refuse such a search); read, outline, within and the GUI's ref lookups pass `all_kinds = true`, cb990e6); agent search leaves out the conversations under a `[tui] exclude_paths` prefix of its config (before reading their text) and drops their discovered keys, so they are not reported as skipped, and likewise conversations of a `[tui] exclude_projects` project (by name, 525e93f); results come in the list's keyword-search rank order; read, outline and within still open them (982aea9), `refs::{AgentConversationKey::from_conversation_in(conversation, &Registry), conversation_ref, full_ref, full_ref_for_candidate}`, `diagnostic::{AgentError, AgentWarning}`, `protocol::{ReadMessage, OutlineItem, ProtocolOptions, MessageLineRange}`; K5, K7, K8, K15 |
 | `update` | `check_latest_release(current) -> UpdateStatus` (services only), `update_status_from_response`, `UpdateStatus::{UpToDate, Available, Newer, NoRelease}`, `ReleaseInfo { tag, version, name, url, notes, … }` (+`asset_for(os, arch)`), `RELEASES_PAGE_URL`, `REPOSITORY` |
-| `history` | `Conversation`, `Source` (+`label`, `list_label`), `detect_source(path)`, `process_conversation_file(path, mtime, debug)`, `DeleteEmptyScope::{All, Local(WorkspaceScope)}`, `pi_loader::session_root`, `omp_loader::session_root`; K2 |
-| `theme`, `syntax`, `debug`, `debug_log`, `markdown`, `time_filter`, `error` | `theme::{set_theme, kind, current, theme_for, ThemeKind, ThemePreference (+resolve), Theme, Rgb}`; `syntax::highlight_code(code, lang)`; `debug::{set_sink, reset_sink, DebugLevel (+tag), log, info, warn, error, should_log}`; `debug_log::{log_debug, log_display_error}`; `markdown::expand_tabs` (K10); `time_filter::{TimePoint, TimeFilter (+resolve, matches, is_active), TimeFilterError}`; `AppError`, `Result` |
+| `history` | `Workspace` (`new(&WorkspaceScope, home)`, `of_env(env)`, `contains(conversation)`, `contains_project_key(key, key_is_path)`, `contains_cwd(path)`, `display()`: which conversations belong to the workspace, upstream 82b355a with no process cwd or home read; `path::{path_is_within, tilde_path}`), `Conversation` (+`cwds`: every distinct recorded cwd, at most `model::MAX_CWDS` = 16, `model::push_cwd`, 82b355a; +`provenance: Provenance` with `hidden_by_default`, `list_label` = `auto`/`sub`/`fork` (`Provenance::branch`: a `/btw` fork, 3c2ffeb), 8f60c5f, cb990e6; +`parent`: the session id a Claude subagent or fork belongs to, 3c2ffeb, with `history::is_parent_of(parent, child)`; +`own_text`: the authored text parts of top-level user messages, `messages::authored_text`, empty for a child conversation, ae7ae39), `model::SourceKind` (`Claude`, `Pi`, `Omp`, `Codex` (list label `CX`, 7f5c443); +`label`, `list_label`, `assistant_name`; the `history::Source` alias is gone since 9597669), `model` (normalized transcript model: `Transcript`, `Event`, `Revision`, `ConversationKey`), `adapter` (`Adapter`, `Stamp`, `Located` (+`native`: the adapter's own resolution), `Completeness`, `Discovery`, `Adapter::native_id_of`; an adapter also declares the actions its tool supports, `capabilities` (+`capabilities_for(provenance)`: a Claude subagent or fork can only be resumed, 3c2ffeb), and resumes, deletes and renames its conversations, 9799550), `actions` (`Capabilities` (+`ALL`, `NONE`), `capabilities_of(source, provenance)` (none for an orphaned conversation), `refusal(source, provenance, doing)`, `Target`; eea6d37; `Launcher { program, args, configured_at }` (+`default_for(source)`, `configured(env, command, at)`, `program_path(env, path, at)`, `resolve(env, source) -> ResolvedProgram`, `check(env, source)`, `words()`), `ConfiguredAt::{Config, Gui, GuiPath}` (names key and file in the error), `Launch { launcher, default_args }`, `config_table(source)`; 8a99ccc; `Adapter::resume` takes the `Launch`, `Adapter::delete` the `Launcher`) and `sources::Registry::from_env(env)` (+`for_source(kind)`: the adapter that acts on a source's conversations, 9799550) (one adapter per configured root, the Codex home included: `sources::codex::CodexAdapter::from_env(env)` lists the rollouts of `<codex home>/sessions` and `archived_sessions`, picks each thread's head with Codex's read-only state database and decodes its rollout chain, 7f5c443; it resumes and forks through the Codex CLI (`resume::plan_codex`, `CODEX_HOME`), deletes through `codex delete --force` (`sources::codex::{delete_spec, delete_outcome, thread_rollouts}`) and cannot rename, eea6d37; `sources::codex::view::decode_path` decodes a rollout opened by path as its thread (`process_conversation_file` shows such Codex threads); fork: single-file windows parse in their env (`Browser::new_single_file` through `process_conversation_file_in(env, …)` and `sources::decode_path_in(env, …)`), so a rollout of the env's own Codex home decodes through `CodexAdapter::from_env` with the env's `CODEX_SQLITE_HOME`, as the viewer's `HistoryService` does, and one of another home through that home's `config.toml` `sqlite_home`, else the home; the store's reconcile pass discovers through it, 8daac4c, and decodes each changed file through `Adapter::decode_into` (`decode` collects the events into a `Transcript`), feeding the events into `index::Indexer` (`push` per event, `finish` with the transcript metadata) to build the card's `Conversation`, fd27225, 350314d), `view::{entries, Entry, EntryKind}` (what a reader is shown of a transcript, in order: messages with the source's speaker, subagent reports, searchable notes, hidden records, and a `Fork` note where a forked thread's own records begin; the viewer, exports, copy-message and `--plain`/`--render` render from it, 9597669; fork: `entries_with_events` names each entry's event), `process_conversation_file(path, mtime, debug)` (`sources::decode_path_into` feeding `index::Indexer`, 350314d; fork: the list loaders stream through `decode_path_into` too; `process_conversation_file_in(env, path, mtime, debug)` parses a file opened in `env`, see above), `service::HistoryService` (`from_env(env)`, `open(key)`, `open_path(path)`; reuses the decoded `Arc<Transcript>` while the stamp is unchanged and keeps the 8 opened last, 9597669; the agent commands load transcripts through it, 59b9565; fork: one per environment, not upstream's process-wide `shared()` (the GUI's `globals::EnvHistory`), and `open_cancellable`/`open_path_cancellable` give a decode up when a flag is set, checked at each read of a Claude, Pi or OMP session file, `adapter::is_cancelled`; `decodes()` counts the decodes it ran, so the GUI's tests check one decode per viewer open), `sources::Registry::for_path(source, path)` (the instance whose root holds the file acts on it: resume, fork, rename, delete, 9597669), `DeleteEmptyScope::{All, Local(WorkspaceScope)}`, `pi_loader::session_root`, `omp_loader::session_root`; fork: `pi_loader::session_dir_settings(env)` (every Pi settings file naming a `sessionDir`, with the directory resolved as `session_root` resolves it) and `sources::codex::{state_db_dir(home, env_sqlite_home), configured_sqlite_home(home)}` (the adapter's own state database resolution) and `sources::codex::view::state_db_dir_of(env, path)` (the state database directory that decoding a rollout opened by path opens) for the sandbox gate (§15.4); K2 |
+| `theme`, `syntax`, `bench`, `debug`, `debug_log`, `markdown`, `time_filter`, `error` | `theme::{set_theme, kind, current, theme_for, ThemeKind, ThemePreference (+resolve), Theme, Rgb}`; `syntax::highlight_code(code, lang)`; `bench::{start(sink), enabled, mark, mark_peak_rss}` (upstream 40fa627 timing marks; explicit sink, no env read, no `--bench-startup`); `debug::{set_sink, reset_sink, DebugLevel (+tag), log, info, warn, error, should_log}`; `debug_log::{log_debug, log_display_error}`; `markdown::expand_tabs` (K10); `time_filter::{TimePoint, TimeFilter (+resolve, matches, is_active), TimeFilterError}`; `AppError`, `Result` |
 
 Duplicates the GUI must **not** write (each was planned in revision 1): its own loader bridge and refresh buffer
 (use `HistoryLoader`), viewer navigation/search state machines (use `MessageNav`, `ViewSearch<M>`, `escape`,
@@ -496,18 +541,18 @@ their signatures and behavior.
 | ID | Module | API | Behavior / tests |
 |---|---|---|---|
 | K1 | `browser` | `pub type CorpusSnapshot = Arc<Vec<Arc<Conversation>>>`; **breaking**: `Browser::conversations(&self) -> &[Arc<Conversation>]`; `Browser::corpus_snapshot(&self) -> CorpusSnapshot`; `pub struct PreparedCorpus` (Send, opaque); `Browser::prepare_corpus(conversations: Vec<Conversation>, dedupe: bool) -> PreparedCorpus` (associated fn: sort newest first, dedupe by canonical path when `dedupe`, reindex, build the search data); `Browser::install_prepared(&mut self, prepared: PreparedCorpus)` (finishes a load when loading, else replaces like `replace_conversations` incl. quirk-16 row keeping); `HistoryLoader::poll` never runs O(corpus) work on the caller's thread: at the end of a stream it moves the data to a `corpus-prepare` thread and a later `poll` installs it and returns the `LoadEvent` (`LoaderPoll::preparing: bool`); the waker fires when preparation ends | Storage: every conversation exists once (`Arc<Conversation>`), shared by the browser, the lexical worker and the semantic worker; search data likewise `Arc` per conversation; rename/remove/append update one element (O(n) pointer copies at most). Tests: `Arc::ptr_eq` between the browser's and the workers' corpus; existing finish/replace/refresh tests pass through the async path; a test that `poll` returns within 5 ms while preparation of a 20k synthetic corpus is running |
-| K2 | `browser`, `history` | `UuidLookup::Pending { uuid: String }` (new variant); `Browser::set_query` never touches the disk; `history::load_session_by_uuid(env: &HistoryEnv, uuid: &str, show_last: bool) -> Result<Option<Conversation>>` (blocking: find `<uuid>.jsonl`, parse, project name, preview per `show_last`); `Browser::resolve_uuid_lookup(&mut self, uuid: &str, loaded: Option<Conversation>)` (applies `Found{loaded_from_disk:true}` / `NotFound` only if the query is still that UUID; appends incrementally) | ADD C1 semantics kept (bypasses filters, appended at the end). Tests: Pending then resolved; stale UUID ignored; not found keeps rows |
-| K3 | `browser`, `history` | `history::rename_session(env: &HistoryEnv, path: &Path, source: Source, title: &str, show_last: bool) -> Result<Conversation, RenameError>` (blocking: write per source, re-parse, preview per `show_last`; Pi ensures a trailing newline); `Browser::apply_renamed(&mut self, path: &Path, renamed: Conversation) -> Result<(), RenameError>` (keeps index/project_name/project_path, updates one element and its search data, re-selects by path) | `rename_conversation` stays (sync convenience). Tests: equivalence with `rename_conversation`; `NoTarget` when the path left the corpus meanwhile |
-| K4 | `maintenance`, `browser` | `pub struct DeletePlan { pub source: Source, pub path: PathBuf, pub session_id: String, pub files: Vec<PathBuf>, pub dirs: Vec<PathBuf> }` (`path` = the listed conversation, added by WP-C); `pub struct DeleteReport { pub removed_files: Vec<PathBuf>, pub removed_dirs: Vec<PathBuf>, pub missing: Vec<PathBuf> }`; `maintenance::plan_session_delete(env: &HistoryEnv, path: &Path, source: Source) -> Result<DeletePlan>` (Claude: every copy via `find_session_copies` + session dirs; Pi: the validated file; OMP: the validated file + artifact dir); **breaking**: `maintenance::execute_session_delete(env: &HistoryEnv, plan: &DeletePlan) -> Result<DeleteReport, Box<SessionDeleteFailure>>` (was `Result<DeleteReport>`; `SessionDeleteFailure { error, partial }` converts `Into<AppError>`; WP-C3) (removes only plan items; on failure writes upstream's debug-log line `Failed to delete session <path>: <e>`); `Browser::remove_paths(&mut self, paths: &[PathBuf]) -> usize` (removes rows, keeps selection position, clears semantic metadata/evidence like `remove_selected_from_list`) | A1/A2. Tests per source; missing files reported not failed; invalid uuid → `SessionNotFound` |
-| K5 | `view` | `impl ViewerModel { pub fn entry_for_agent_ordinal(&self, ordinal: usize) -> Option<usize>; pub fn agent_ordinal_for_entry(&self, entry_index: usize) -> Option<usize> }` | Same placement as `history::messages::MessageOrdinals` over `self.entries`; replaced streaming duplicates map to the first entry with that ordinal. Tests against `agent::transcript` ordinals on fixtures |
-| K6 | `browser`, `semantic` | `Browser::suspend_semantic(&mut self)` (cancel, close the channel, **join** the worker thread, drop its embedder; while suspended semantic dispatch reports `SemanticProgress::Suspended` and `semantic_status_text()` = `"sem paused"`); `Browser::resume_semantic(&mut self)` (next dispatch respawns the worker, reloading the cache file; re-dispatches the current semantic query); cache writes take an exclusive `std::fs::File::lock` on `<semantic dir>/embeddings.lock` (wait ≤ 2 s, else skip the write with a Warn debug line); `semantic_ops::{generate_semantic_cache, clear_semantic_cache}` hold the same lock while writing/deleting | Single writer per process and across processes. Tests: suspend joins (thread gone), resume reloads a cache written meanwhile, lock contention skips without corrupting |
-| K7 | `agent` | `AgentService::with_cancellation(self, token: SemanticCancellationToken) -> Self`; checked between conversations, retrieval batches and embedding batches; cancelled → `AgentResponse` with `exit_code 1`, `error: None`, `stderr` = `Error: Semantic search cancelled\n` | Tests: a cancelled long fake-embedder search ends early |
+| K2 | `browser`, `history` | `UuidLookup::Pending { uuid: String }` (new variant); `Browser::set_query` never touches the disk; `history::load_session_by_uuid(env: &HistoryEnv, uuid: &str, show_last: bool) -> Result<Option<Conversation>>` (blocking: find `<uuid>.jsonl`, parse, project name, preview per `show_last`); `Browser::resolve_uuid_lookup_session(&mut self, uuid: &str, loaded: Option<PreparedSession>)` (the GUI's call: the background task ends in `.map(PreparedSession::new)`; `resolve_uuid_lookup(uuid, Option<Conversation>)` is the synchronous wrapper that normalizes on the caller's thread; applies `Found{loaded_from_disk:true}` / `NotFound` only if the query is still that UUID; appends incrementally) | ADD C1 semantics kept (bypasses filters, appended at the end). Tests: Pending then resolved; stale UUID ignored; not found keeps rows |
+| K3 | `browser`, `history` | `history::rename_session(env: &HistoryEnv, path: &Path, source: Source, title: &str, show_last: bool) -> Result<Conversation, RenameError>` (blocking: write per source, re-parse, preview per `show_last`; Pi ensures a trailing newline); `Browser::apply_renamed_session(&mut self, path: &Path, renamed: PreparedSession) -> Result<(), RenameError>` (the GUI's call, the background task ends in `.map(PreparedSession::new)`; `apply_renamed(path, Conversation)` is the synchronous wrapper that normalizes on the caller's thread; keeps index/project_name/project_path, updates one element and its search data, re-selects by path) | `rename_conversation` stays (sync convenience). Tests: equivalence with `rename_conversation`; `NoTarget` when the path left the corpus meanwhile |
+| K4 | `maintenance`, `browser` | `pub struct DeletePlan { pub source: Source, pub path: PathBuf, pub session_id: String, pub files: Vec<PathBuf>, pub dirs: Vec<PathBuf>, pub metadata: Vec<PathBuf>, pub kept: Vec<PathBuf> }` (`metadata` = a sidecar's `.meta.json`, `kept` = the session's `/btw` forks that stay, 3c2ffeb) (`path` = the listed conversation, added by WP-C); `pub struct DeleteReport { pub removed_files: Vec<PathBuf>, pub removed_dirs: Vec<PathBuf>, pub missing: Vec<PathBuf> }`; `maintenance::plan_session_delete(env: &HistoryEnv, path: &Path, source: Source) -> Result<DeletePlan>` (Claude: every copy via `find_session_copies` + session dirs; Pi: the validated file; OMP: the validated file + artifact dir); **breaking**: `maintenance::execute_session_delete(env: &HistoryEnv, plan: &DeletePlan) -> Result<DeleteReport, Box<SessionDeleteFailure>>` (was `Result<DeleteReport>`; `SessionDeleteFailure { error, partial }` converts `Into<AppError>`; WP-C3) (removes only plan items; on failure writes upstream's debug-log line `Failed to delete session <path>: <e>`); `Browser::remove_paths(&mut self, paths: &[PathBuf]) -> usize` (removes rows, keeps selection position, clears semantic metadata/evidence like `remove_selected_from_list`) | A1/A2. Tests per source; missing files reported not failed; invalid uuid → `SessionNotFound` |
+| K5 | `view` | `impl ViewerModel { pub fn entry_for_agent_ordinal(&self, ordinal: usize) -> Option<usize>; pub fn agent_ordinal_for_entry(&self, entry_index: usize) -> Option<usize> }` | Same placement as `history::messages::MessageOrdinals` over the transcript's dialogue events (as `agent::transcript` places them), each mapped to the entry that shows it (`history::view::entries_with_events`, 9597669), placed once when the model is built (on the viewer worker), not on each reveal; replaced streaming duplicates map to the first entry with that ordinal. Tests against `agent::transcript` ordinals on fixtures |
+| K6 | `browser`, `semantic` | `Browser::suspend_semantic(&mut self) -> SemanticWorkerExit` (close the channel, cancel, and return at once: the worker may still be finishing its current step, an embedder call of up to 64 passages (at the worker's first call also the shared model's lazy load, a download on first use) or a cache write that waits ≤ 2 s for the lock; `SemanticWorkerExit::join()` waits until its thread has ended and dropped its embedder, and the GUI's semantic gate joins it on the exclusive operation's own thread before that operation starts, never on the UI thread; `is_finished()`; while suspended semantic dispatch reports `SemanticProgress::Suspended` and `semantic_status_text()` = `"sem paused"`); `Browser::resume_semantic(&mut self)` (next dispatch respawns the worker, reloading the cache file; re-dispatches the current semantic query); cache writes take an exclusive `std::fs::File::lock` on `<semantic dir>/embeddings.lock` (wait ≤ 2 s, else skip the write with a Warn debug line); `semantic_ops::{generate_semantic_cache, clear_semantic_cache}` hold the same lock while writing/deleting. Since upstream 8919a76 the cache is the memory-mapped matrix `embeddings-v2.bin` (`semantic::matrix`): a save, under the lock, merges in the rows another writer saved since this one read the file, prunes to 50 000 entries by last use and renames a temporary file into place (never modifying a written file, so readers keep valid maps); the first read without a matrix converts a matching `embeddings-v1.bin` under the lock and removes it (lock timeout: the v1 file is used unconverted this time) | Single writer per process and across processes; no writer drops another's embeddings. Tests: suspend does not wait for a worker inside an embedder call and its exit joins it (thread gone, embedder dropped), resume reloads a cache written meanwhile, lock contention skips without corrupting, writes keep what another writer saved, a save replaces a matrix that readers still map (Windows) |
+| K7 | `agent` | `AgentService::with_cancellation(self, token: SemanticCancellationToken) -> Self`; checked between conversations, retrieval batches and embedding batches, and while agent search loads from the store (its reconcile pass, its wait for the store's `LOCK`, its card reads; §11.24); cancelled → `AgentResponse` with `exit_code 1`, `error: None`, `stderr` = `Error: Semantic search cancelled\n` | Tests: a cancelled long fake-embedder search ends early; a search waiting for the store's lock ends when cancelled |
 | K8 | `agent` | `agent::refs::conversation_key_for_path(env: &HistoryEnv, config: &ConfigFile, path: &Path) -> Result<Option<AgentConversationKey>>` — the discovered key whose canonical path equals `path`'s, else `None` | Out-of-root files (exports, attachments) and same-named copies never resolve to another file. Tests: in-root file → key; copy outside → None; same name in another root → None |
 | K9 | `view` | `DocToolResult::ledger_visible_rows(&self, content_width: usize) -> Vec<String>` (the rows the ledger shows at that width in the current fold: hard-wrapped like the ledger, at most `limit` rows when collapsed) | Visual-row truncation for soft-wrapping GUIs (a 50 KB single-line result shows ≤ 4 rows). Tests at widths 40/120 |
 | K10 | `markdown` | `pub const TAB_WIDTH: usize = 8; pub fn expand_tabs(input: &str, start_col: usize, tab_width: usize) -> String` (the existing private helper, display-width aware) | Tests (moved) |
-| K11 | `export` | `pub struct DisplayParseError { pub line_number: usize, pub error: String, pub line: String }`; `export::display_parse_errors(source: &Path) -> std::io::Result<Vec<DisplayParseError>>` (upstream `process_raw_log_entries` semantics: raw JSONL lines that do not parse as `LogEntry`, also for Pi/OMP files) | Tests on a malformed fixture |
+| K11 | `export` | `pub struct DisplayParseError { pub line_number: usize, pub error: String, pub line: String }`; `export::display_parse_errors(transcript: &Transcript) -> Vec<DisplayParseError>` (the transcript's diagnostics, as upstream's `display.rs` reports them since 9597669: Claude lines that do not parse as a record, malformed Pi/OMP records) | Tests on a malformed fixture |
 | K12 | `config` | `config::save_gui_config_changes(env: &HistoryEnv, base: &GuiConfigFile, edited: &GuiConfigFile) -> Result<PathBuf>`: re-reads gui.toml (missing → empty document); if it does not parse as `GuiConfigFile` → `ConfigError("gui.toml has errors; fix or remove it before saving: <e>")`; for each leaf key whose value differs between `base` and `edited` sets or removes that key in a `toml_edit::DocumentMut` (comments, ordering and untouched keys preserved, also keys changed by other writers since `base`); validates the result by parsing; atomic write with the existing `config.toml` refusal checks | `toml_edit` is already in the dependency tree through gpui-kit. Tests: comment preserved; concurrent theme change kept; unparseable file refused and unchanged (byte compare) |
-| K13 | crate features | `[features] hermetic = []`: every `#[cfg(test)]` guard becomes `#[cfg(any(test, feature = "hermetic"))]`: `HistoryEnv::from_process_env` panics; the semantic worker's default factory and `semantic_ops::fastembed_factory` refuse; `update::check_latest_release` panics; `resume::terminal::spawn_terminal`/`spawn_terminal_checked` return `Err(Unsupported)` | Enabled only from `crates/gui` `[dev-dependencies]` (resolver 3 unifies it into test builds only). Test: a `hermetic` feature build of core passes the same guard tests |
+| K13 | crate features | `[features] hermetic = []`: every `#[cfg(test)]` guard becomes `#[cfg(any(test, feature = "hermetic"))]`: `HistoryEnv::from_process_env` panics; the semantic worker's default factory and `semantic_ops::fastembed_factory` refuse; `update::check_latest_release` panics; `resume::terminal::spawn_terminal`/`spawn_terminal_checked` return `Err(Unsupported)`; the semantic worker and the store's reconcile pool do not lower their threads' scheduling priority (`semantic::fastembed::lower_background_thread_priority`) | Enabled only from `crates/gui` `[dev-dependencies]` (resolver 3 unifies it into test builds only). Test: a `hermetic` feature build of core passes the same guard tests |
 | K14 | `settings` | Additive `GuiLaunchArgs` fields `plain`, `render: Option<PathBuf>`, `show_dir`, `delete: Option<String>`, `debug_search: Option<String>`, `semantic_search: Option<String>`, `semantic_top: Option<usize>`, `debug_semantic_search: Option<String>`, `generate_semantic_cache`, `clear_semantic_cache`, `global`, `pager`, `no_pager`, `no_color`; additive `LaunchCommand::{DeleteEmpty { local: bool, all: bool, yes: bool }, Update, SubcommandHelp(String)}` (`help` is a subcommand: `help` alone = `Help`, `help update\|delete-empty\|help` and `<subcommand> --help` = `SubcommandHelp(text)`, `help agent [cmd]` = `Agent(AgentCli::Help)`); upstream conflict groups (`one_shot_action`, `selection_conflicting_action`, `--delete` × `--global`, `--semantic-top` requires `--semantic-search`), validator messages `value must not be empty`, `value must be greater than zero`, `invalid positive integer: <v>`; `help_text` lists them (hidden flags stay hidden) | The inverted time range stays a runtime error of `time_filter()` (GUI main prints `Error: Invalid time range: …`, exit 1). Table test of every flag and conflict pair (C-016) |
 | K15 | `agent` | `agent::cli::parse_agent_args<I, T>(args: I) -> Result<AgentCli, LaunchArgsError>`; `pub enum AgentCli { Request(AgentRequest), Help(String) }`; `LaunchCommand::Agent(AgentCli)` (additive) | Upstream clap surface of `agent search\|within\|read\|outline` (flags, aliases, value names, help texts of ADD E4, error texts, exit code 2). Tests ported from upstream `cli.rs` agent tests |
 | K16 | `env`, `history` | `HistoryEnv.env_path_base: Option<PathBuf>` (the launch cwd; `from_process_env` leaves it `None`, `main` sets it); Pi/OMP loaders resolve relative `PI_*`/`XDG_DATA_HOME` values against `env_path_base`, falling back to `workspace_dir`; `<workspace>/.pi/settings.json` and its relative `sessionDir` stay workspace-relative | Tests: relative env value with base A and workspace B resolves under A |
@@ -536,7 +581,10 @@ the GUI; the source is the truth):
   directory and keeps the directory and the lock file (removing them would break the lock's exclusivity); it never
   follows symlinks/junctions (a linked semantic dir: only the link is removed; links inside are unlinked, targets
   kept). `ClearReport.removed`/`message` keep upstream's semantics: `Semantic cache cleared.` when something was
-  removed, `Semantic cache is already empty.` otherwise (a second Clear).
+  removed, `Semantic cache is already empty.` otherwise (a second Clear). `semantic_ops::clear_embedding_cache` removes
+  the matrix and an unconverted `embeddings-v1.bin` (which a later read would convert back). On Windows the matrix is
+  replaced with `std::fs::rename` (POSIX semantics on NTFS) rather than `MoveFileExW`, which fails while any process
+  maps the file, and Clear deletes it while other instances still map it (their maps stay readable).
 * **K12**: both sides of the diff treat a missing `[gui]` table as `GuiSettings::default()`, so a theme-only save
   writes only `theme`, and concurrent changes of other keys are kept.
 * **K13**: `FastembedEmbedder::new_in` itself refuses under `any(test, feature = "hermetic")` with
@@ -587,19 +635,19 @@ Should-close handler: `cx.quit()` (PD6).
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ File Edit View Session Tools Help          Claude History — proj                     ─  ☐  ✕    │ TitleBar
 ├────────────────────────────────────┬─────────────────────────────────────────────────────────────┤
-│ [Conversations] [Deep search]      │ proj · Fix login bug · opus-4.5 · 42 messages · 1h 5m · ⚠ 2 │ viewer header (TUI
-│ ┌────────────────────────────────┐ │ 926k tokens · 2026-10-12 14:03                              │  order, wraps; summary
+│ [Conversations] [Deep search]      │ proj · Fix login bug · opus-4.5 · 9 prompts · ⚠ 2           │ viewer header (TUI
+│ ┌────────────────────────────────┐ │ 96 tool calls · 1h 5m · 926k tokens · 2026-10-12 14:03      │  order, wraps; summary
 │ │❯ token refresh        12/340 ✕│ │ Session token refresh flow and retry on 401                 │  same line if it fits)
 │ └────────────────────────────────┘ │─────────────────────────────────────────────────────────────│
-│ (Lexical|Semantic) (All|Workspace) │ Tools [Summary|Truncated|Full] [Thinking] [Timing]           │ viewer toolbar
+│ (Lexical|Semantic) (All|Workspace) │ Tools [Off|Summary|Calls|Truncated|Full] [Thinking] [Timing] │ viewer toolbar
 │ [▣ proj ▾] [Any time ▾]        [⟳] │                       [Outline] [Resume] [Fork] [⋯]          │
 ├────────────────────────────────────┤─────────────────────────────────────────────────────────────│
 │ CC Fix login bug          3 min ago│ Sep 04 13:59      You │ How do I refresh the token when…    │ transcript
-│    proj · 42 msgs · 1h 5m · 0.87   │                Claude │ You can wrap the call in a retry …  │ (gpui list,
+│    proj · 9 prompts · 1h 5m · 0.87 │                Claude │ You can wrap the call in a retry …  │ (gpui list,
 │    last answer … first question …  │                Claude │ Read 2 files, ran 1 shell command ▸ │  one item per
 ├────────────────────────────────────┤              ↳ Result │ ┌ code ─────────────────────────┐   │  ledger block
 │ Pi Deploy pipeline        yesterday│                       │ │ fn refresh() { … }            │   │  or ≈100-line
-│    api · 7 msgs                    │                       │ └───────────────────────────────┘   │  chunk)
+│    api · 3 prompts                 │                       │ └───────────────────────────────┘   │  chunk)
 │    preview …                       │                       │ (4 more lines…)                     │
 ├────────────────────────────────────┤             Thinking  │ Considering the retry budget …      │
 │ 12/340 · ⟳ sem embedding 40% 12/30 │─────────────────────────────────────────────────────────────│
@@ -610,10 +658,14 @@ Should-close handler: `cx.quit()` (PD6).
 * Left pane: `v_flex().size_full().min_h_0()`, `bg(sidebar)`. The TabBar is `underline()` small. Switching tabs
   focuses the new tab's primary element (search input / deep-search query) and switches the pane width (PD1).
 * Search input: `Input::new(&search).small().cleanable(true).prefix(prompt).suffix(status)` where prompt = `❯`
-  (accent role) or `Project ❯` ("Project" muted) when scope = Workspace; status =
+  (accent role) or `<folder> ❯` (folder muted) when scope = Workspace: the workspace with `~` for the home directory
+  (`Browser::workspace_display`, upstream 82b355a), cut from the start (`…/group/repo`) when it would take more than
+  about a third of the pane (`list::prompt_folder_chars`, average glyph width); status =
   `Browser::search_status_text()` (L-032; `…` substitution per §12) plus a `Spinner::new().xsmall()` while
   `has_search_work_in_flight()`.
-* Toolbar row 1: `ButtonGroup` (exclusive) **Lexical | Semantic**; `ButtonGroup` **All | Workspace** (Workspace
+* Toolbar row 1: `ButtonGroup` (exclusive) **Lexical | Semantic**; the **You only** toggle button (outline, selected
+  while on; `ToggleUserOnly`, ae7ae39; tooltip with its key `Search only your own messages`, in semantic mode `Search
+  only your own messages (lexical search; semantic search ignores it)`); `ButtonGroup` **All | Workspace** (Workspace
   disabled without a workspace). Row 2: workspace dropdown button (icon `FolderOpen`, label = workspace short name
   or "No workspace"), time filter dropdown (`dropdown_menu_with_anchor(Anchor::TopRight)`; label "Any time" or the
   active filter, e.g. "Since 2d" / "Before 2026-07-20"), spacer, Refresh ghost icon button (`RefreshCw`,
@@ -622,11 +674,17 @@ Should-close handler: `cx.quit()` (PD6).
   `Select` button.
 * List: `uniform_list` of `ListItem`s (row anatomy §10.1), `Scrollbar::vertical`.
 * List footer (`StatusBar`, `text_xs`) shows **state first** (DG §9.12): left = count (`12/340`, `sem 12/340`,
-  `Loading… 57`) and, when present, the load/refresh indicator (`Spinner` + `Refreshing conversations…`) or the
-  semantic activity (`Spinner` + `sem preparing embeddings`, or `Progress` + `sem embedding 40%  12/30 chunks`);
+  `Loading… 57`) and, when present, the load/refresh indicator (`Spinner` + `Refreshing conversations…`), the
+  semantic activity (`Spinner` + `sem preparing embeddings`, or `Progress` + `sem embedding 40%  12/30 chunks`, or
+  `Progress` + `sem indexing 40%  12/30 chunks` while the semantic worker embeds the corpus in the background behind
+  the answered searches, upstream c6d0421) and
+  the store's indexing progress (`Progress` + `Indexing conversations… 2,345 / 7,185`, then `Spinner` + `Finishing
+  index… 7,185 conversations`, with `  ·  results may be incomplete` while a query is typed; it replaces the refresh
+  indicator; upstream 04c714b);
   right = key hints **only while the list has focus and no activity is shown**, in priority order (open, resume,
-  fork, rename, delete, scope, mode) with lower-priority chips dropped until the row fits; `F1 help` is always kept
-  (§8.7).
+  fork, rename, delete, scope, `all kinds` while automated and subagent conversations are listed, `you only` while
+  search is limited to the user's own messages, mode) with lower-priority chips dropped until the row fits; `F1
+  help`, `all kinds` and `you only` are always kept (§8.7).
 * Viewer: §9; agent panel §5.4.
 
 Empty/error placeholders inside the list area and the viewer use `Empty` with a recovery action (§12).
@@ -658,7 +716,10 @@ selection (A1). Right-click also selects and previews the row (the list keeps fo
 └──────────────────────────────┘
 ```
 Shortcut labels come from the live keymap. Items that need a known source (Resume, Fork, Rename, Delete) are
-disabled for targets with an unknown source; while loading they are disabled (AD6).
+disabled for targets with an unknown source, and each one the conversation's capabilities refuse (core
+`history::actions::capabilities_of`, eea6d37: Rename of a Codex thread, all four for an orphaned thread) is
+disabled too. While loading, Rename and Delete are disabled, and Resume and Fork until the rows are listed newest
+first (the first cards of the store's generation, AD6).
 
 ### 5.3 Workspace picker and time filter dropdowns
 ```
@@ -700,6 +761,7 @@ Inverted range → inline `Invalid time range: lower bound … is later than upp
 │ Mode (Default|Lexical|Semantic|Exact|Hybrid)  Options ▸│  Default = [agent].mode → [search].mode → lexical
 │ ┌ Options ───────────────────────────────────────────┐│  (disclosure, collapsed by default, state persisted)
 │ │ Scope (Default·All|All|Workspace)  Time [Any ▾]    ││  Default = [agent].scope ("Default (Workspace)")
+│ │ ☐ Include exec and subagent runs ☐ Only my messages││  --all-kinds (cb990e6), --user-only (dcd3978); wrap after Time
 │ │ Top [10]   Layout (Grouped|Flat)                   ││  "message hits" label when Flat
 │ │ Hits per conversation [2]  ☐ Show duplicate hits   ││
 │ │ Budget [6000] chars  ☐ No budget                   ││
@@ -756,16 +818,16 @@ Out-of-root file (single-file window on an export or attachment): panel body "Ou
 
 ### 5.5 Single-file viewer window
 ```
-┌──────────────────────────────────────────────────────────────────────────┐
-│ File Edit View Help     3f2a19c0-….jsonl — Claude History         ─ ☐ ✕ │
-├──────────────────────────────────────────────────────────────────────────┤
-│ proj · Fix login bug · 42 messages · 2026-10-12 14:03                    │
-│ Tools [Summary|Truncated|Full] [Thinking] [Timing]   [Outline] [⋯]       │
-├──────────────────────────────────────────────────────────────────────────┤
-│ (transcript as in the main window)                                       │
-├──────────────────────────────────────────────────────────────────────────┤
-│ [12/42] tools·sum think·off info·off │ / search  e export  q close  F1   │
-└──────────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────┐
+│ File Edit View Help     3f2a19c0-….jsonl — Claude History         ─ ☐ ✕   │
+├────────────────────────────────────────────────────────────────────────────┤
+│ proj · Fix login bug · 9 prompts · 2026-10-12 14:03                        │
+│ Tools [Off|Summary|Calls|Truncated|Full] [Thinking] [Timing] [Outline] [⋯] │
+├────────────────────────────────────────────────────────────────────────────┤
+│ (transcript as in the main window)                                         │
+├────────────────────────────────────────────────────────────────────────────┤
+│ [12/42] tools·sum think·off info·off │ / search  e export  q close  F1     │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 The menu tree is the shared one (§8.10): Session items without a handler here (Resume, Fork, Rename, Delete,
 Select and exit) are disabled; File → "Show conversations" opens or focuses the main window.
@@ -801,7 +863,9 @@ Success → close; the row and header update in place (no toast, PD16).
 AlertDialog (not overlay-closable), `.description(..)` + children for the path list (scrollable when long),
 `.ok_text("Delete").ok_variant(Danger)`. A focused `div().key_context("Confirm")` inside the alert binds `y`,
 `shift-y` → confirm, `n`, `shift-n` → cancel, and **`enter` → no-op** (AD18). Pi: one file; OMP: the file +
-`<stem>/` artifacts folder. While the delete runs the buttons are disabled. The same pattern (title naming the
+`<stem>/` artifacts folder; Codex (eea6d37): every rollout of the thread, heading `Codex conversation · … ·
+<thread id>`, note `Runs the Codex CLI's delete --force <thread id>, which removes the thread and its state. This can't be
+undone.` (Codex itself deletes them). While the delete runs the buttons are disabled. The same pattern (title naming the
 target, danger verb, Enter ignored, y/n keys) is used by every destructive confirmation: §5.8 with overwrites,
 §5.10, §5.11 Clear, §5.15, the export "Replace" prompt.
 
@@ -909,7 +973,7 @@ for the dialog's lifetime ("Reload" re-runs). Scope Workspace = `debug_search_re
 │ Scope (All | Workspace)                                  [Run]      │
 │ ┌────────────────────────────────────────────────────────────────┐ │
 │ │ Semantic search: searching 812 cached chunk(s) from 120 recent │ │ read-only Textarea
-│ │ conversation(s) with fastembed BGESmallENV15                   │ │
+│ │ conversation(s) with fastembed SnowflakeArcticEmbedXS          │ │
 │ │ #01 0.812 …                                                    │ │
 │ └────────────────────────────────────────────────────────────────┘ │
 │ [Copy]                                                   [Close]   │
@@ -922,8 +986,8 @@ Same corpus rule as §5.12. Runs under the semantic gate (shared embedder).
 ┌ Debug log ────────────────────────────────────────────────────────────────┐
 │ [Messages] [Parse errors] [debug.log]       Level (Debug|Info|Warn|Error)  │
 │ 14:03:12 [INFO] Loading global history from 41 projects                    │ read-only Textarea
-│ 14:03:12 [DEBUG] Cache: 120 hits, 3 misses                                 │
-│ 14:03:13 [WARN] Failed to load Pi/OMP history: …                           │
+│ 14:03:12 [DEBUG] Reconcile: Outcome { publish: Published("g000002"), … }   │
+│ 14:03:13 [WARN] Failed to load project …                                   │
 │ [Clear] [Copy]                                                   [Close]   │
 └────────────────────────────────────────────────────────────────────────────┘
 Parse errors tab: the viewer's conversation (captured at open): `maintenance::parse_error_report(conv)`
@@ -955,9 +1019,10 @@ Find = `maintenance::find_session_copies` (errors: `Session not found: <id>`). D
 │ Search  │ claude program   [                     ] [Browse…] resolved: C:\Users\me\.local\bin\claude.exe │
 │ Keys    │ pi program       [                     ] [Browse…] not found on PATH │
 │ Resume  │ omp program      [                     ] [Browse…]                   │
-│ Agent   │ Default workspace[                     ] [Browse…]                   │
+│ Agent   │ codex program    [                     ] [Browse…]                   │
+│         │ Default workspace[                     ] [Browse…]                   │
 │         │ ☑ Restore last session (window, workspace, view options)            │
-│         │ Display page: Default tool display (Summary|Full)                   │
+│         │ Display page: Default tool display (Off|Summary|Full)               │
 │         │      from config.toml: Full · applies at startup, before the       │
 │         │      remembered value                                     [Reset]   │
 │         │ Keys page:  Resume [ctrl+r ] ⓘ from config.toml   [Reset]           │
@@ -985,17 +1050,17 @@ Rows and labels: §8.7. Opens scrolled to the section of the region that had foc
 
 ### 5.18 About / Check for updates (Help)
 ```
-┌ About Claude History GUI ──────────────────────────────┐
-│ Claude History GUI 0.1.0 (core 0.1.76)                  │
-│ A desktop browser for Claude Code, Pi and OMP history.  │
-│ License: Unlicense. Core derived from claude-history    │
-│ (MIT, © 2024 Raine).                                    │
-│ Data: C:\Users\me\.claude                               │
-│ Cache: C:\Users\me\.cache\claude-history-gui            │
-│ Config: …\.config\claude-history\gui.toml (+config.toml)│
-│ State: …\.local\state\claude-history-gui\state.json     │
-│ [Check for updates…] [Open project page]      [Close]   │
-└────────────────────────────────────────────────────────┘
+┌ About Claude History GUI ─────────────────────────────────────┐
+│ Claude History GUI 0.1.0 (core 0.1.76)                        │
+│ A desktop browser for Claude Code, Codex, Pi and OMP history. │
+│ License: Unlicense. Core derived from claude-history          │
+│ (MIT, © 2024 Raine).                                          │
+│ Data: C:\Users\me\.claude                                     │
+│ Cache: C:\Users\me\.cache\claude-history-gui                  │
+│ Config: …\.config\claude-history\gui.toml (+config.toml)      │
+│ State: …\.local\state\claude-history-gui\state.json           │
+│ [Check for updates…] [Open project page]      [Close]         │
+└───────────────────────────────────────────────────────────────┘
 ┌ Check for updates ─────────────────────────────────────┐
 │ ⟳ Checking for updates…                                │
 │ → Available: "Claude History GUI 0.2.0 is available (you have 0.1.0)." + notes + [Open release page] │
@@ -1152,8 +1217,8 @@ go into `crates/gui/tests/fixtures/<owner>/` or are generated by `test_support::
 
 ```
 App
- ├─ Global AppState (globals.rs)       env Arc<HistoryEnv>, config + per-file errors, launch, settings, workspace,
- │                                     view defaults, UiState handle, keys, revision
+ ├─ Global AppState (globals.rs)       env Arc<HistoryEnv> + its EnvHistory (history service), config + per-file
+ │                                     errors, launch, settings, workspace, view defaults, UiState handle, keys, revision
  ├─ Global DebugBufferHandle           Arc<DebugBuffer> (ring of 5,000 debug-sink lines)
  ├─ Global Services                    Arc<dyn PlatformServices> (+ typed Arc<RecordingServices> in tests/QA)
  ├─ Global SharedEmbedderHandle        one embedding model per process (§7.6)
@@ -1178,7 +1243,8 @@ Ownership rules:
   (K1–K4 move every O(corpus) or I/O step to core threads or GUI background tasks). Other entities read through
   `ListPane` methods (`conversation(path)`, `header_info(path)`, `project_paths()`).
 * `ViewerModel` is owned by `ViewerPane`; documents/items/segments are built by the pane's `viewer-worker` from an
-  `Arc<Vec<RenderableEntry>>` (the model's entries are an `Arc`).
+  `Arc<Transcript>` (the model's transcript, decoded through the app's `EnvHistory`; its entries are derived per
+  build).
 * No entity holds `&mut Window`/`&mut Context`; cross-entity references are `Entity<_>` (owner → child) or
   `WeakEntity<_>` (child → owner, dialogs → panes).
 
@@ -1193,6 +1259,9 @@ pub enum ListPaneEvent {
     /// within conversation… / Outline, Session → Search within / Outline / Read range from the list, D-029),
     /// which then takes the focus.
     OpenRequested { target: ConversationTarget, focus_viewer: bool, agent_tab: Option<AgentTab> },
+    /// (upstream 411e227) The selected row stayed but its search hit (`ListPane::list_hit_for`, core
+    /// `Browser::list_hit`) changed: the query was edited or cleared, or semantic results brought other evidence.
+    HitChanged { target: ConversationTarget, hit: Option<ListHit> },
     /// Corpus changed: load finished, refresh, rename, delete, UUID load.
     CorpusChanged,
     /// Loading/refreshing state changed (footer, menus, palette enabled state).
@@ -1223,12 +1292,16 @@ pub enum CorpusNotice { Deleted(Vec<PathBuf>) }
 
 Workspace (`workspace/mod.rs`) subscribes with `subscribe_in`:
 * `SelectionChanged` → if the list contains focus: debounce 150 ms (`_preview_task`), then
-  `viewer.open(OpenRequest::new(target, false))` unless the target equals the viewer's path.
-  `None` → leave the viewer as is. `flush_pending_preview()` runs the pending preview immediately (§7.8); the main
-  window calls it in the **capture phase** of every list-target action (session actions included), so the pane's
-  handler already sees the flushed preview (L-085).
-* `OpenRequested` → `viewer.open(OpenRequest::new(target, focus_viewer).with_agent_tab(agent_tab))`; with a tab the
-  viewer opens its agent panel on that tab and focuses it.
+  `viewer.open(OpenRequest::new(target, false).with_list_hit(hit))` with the row's search hit read when the event is
+  handled (`list.list_hit_for(path)`, L-109), unless the target equals the viewer's path: then the hit alone is sent
+  after the same debounce (`viewer.set_list_hit`), when it differs from the viewer's. `None` → leave the viewer as is.
+  `flush_pending_preview()` runs the pending preview (and a pending hit) immediately (§7.8); the main window calls it
+  in the **capture phase** of every list-target action (session actions included), so the pane's handler already
+  sees the flushed preview (L-085).
+* `HitChanged` → if the list contains focus: a pending preview of that row takes the new hit; else, when the viewer
+  shows the row, `viewer.set_list_hit(hit)` after the debounce.
+* `OpenRequested` → `viewer.open(OpenRequest::new(target, focus_viewer).with_agent_tab(agent_tab)
+  .with_list_hit(list.list_hit_for(path)))`; with a tab the viewer opens its agent panel on that tab and focuses it.
 * `CorpusChanged` → `viewer.set_header(list.header_info(viewer_path))`.
 * `CorpusNotice::Deleted(paths)` (from any deleting route) → `list.remove_paths(&paths)`; if the viewer shows one of
   them → `viewer.clear()` (focus list); agent result sets for those paths are marked deleted (clicks disabled).
@@ -1247,6 +1320,7 @@ Workspace (`workspace/mod.rs`) subscribes with `subscribe_in`:
 ```rust
 pub struct AppState {
     pub env: Arc<HistoryEnv>,                   // workspace_dir and env_path_base kept in sync
+    pub history: EnvHistory,                    // env's HistoryService (9597669), replaced with env
     pub config: LayeredConfig,                  // effective = gui.toml over config.toml (failed file → defaults)
     pub config_errors: ConfigErrors,            // { cli: Option<String>, gui: Option<String> } (per file)
     pub launch: LaunchContext,                  // model.rs
@@ -1279,8 +1353,12 @@ impl OpenTargets {
     pub fn holds(cx: &App, path: &Path) -> bool; pub fn len(cx: &App) -> usize;
 }
 pub fn same_path(a: &Path, b: &Path) -> bool;                 // exact, then case-insensitive on Windows
+pub struct EnvHistory { /* env, Arc<OnceLock<HistoryService>> */ }  // core HistoryService::from_env, built on
+impl EnvHistory { pub fn new(env: Arc<HistoryEnv>) -> Self; pub fn service(&self) -> &HistoryService }  // first use,
+pub fn env_history(cx: &App) -> EnvHistory;                   // off the UI thread; viewer, exports, print, tools
 pub enum SemanticGateState { Open, Exclusive(SemanticOp) }
-pub struct SemanticGate { pub state: SemanticGateState }      // current/is_open/enter_exclusive(op, cx) -> bool/leave(cx)
+pub struct SemanticGate { pub state: SemanticGateState }      // current/is_open/enter_exclusive(op, cx) -> Option<SemanticGateEntry>/leave(cx)
+pub struct SemanticGateEntry;                                 // wait(self): joins the stopped list worker (on the operation's thread)
 pub struct LastToast(pub SharedString);                       // read by QA probes (last_toast(cx))
 pub enum CorpusNotice { Deleted(Vec<PathBuf>) }
 pub struct CorpusBus;  // emits CorpusNotice through cx.emit on a small global Entity<CorpusBus> (CorpusBusHandle)
@@ -1300,7 +1378,10 @@ signature):
 2. `startup::load_config(&env) -> (LayeredConfig, ConfigErrors)` (WP7) — `load_config_from` and
    `load_gui_config_from` independently; a failing file contributes defaults.
 3. `persist::load(&env) -> UiState` (WP6).
-4. `startup::resolve_workspace(&launch, &env, &config.gui, &ui) -> Option<WorkspaceScope>` (WP7, PD3).
+4. `startup::startup_workspace(&launch, &env, &config.gui, &ui) -> Option<WorkspaceScope>` (WP7, PD3):
+   `startup::resolve_workspace`, then, when the process enforces the sandbox gate (`launch.sandbox_gate`), its
+   workspace rule (§15.4 rule 6, `startup::checked_startup_workspace`); a refusal goes to stderr and the process
+   exits 3 before any window opens.
 5. `startup::resolve_initial_view(&launch, &config, &settings, &ui) -> (ViewPrefs, ListSearchMode)` (WP7, PD17).
 6. set `AppState`, `Services`, `DebugBufferHandle`, `SemanticGate`, other globals.
 7. `embedder::install(cx)` (WP7).
@@ -1340,6 +1421,10 @@ pub trait PlatformServices: Send + Sync + 'static {
     /// RecordingServices returns Ok(()) to stand for that success: callers treat Ok as "the launching terminal took
     /// over" and quit with exit 0 and no output.
     fn exec_in_current_terminal(&self, spec: &LaunchSpec) -> Result<(), String>;
+    /// Blocking (until the program exits); background. Real: core terminal::run_to_completion after the launch
+    /// guard (Codex: `codex delete --force <id>`, eea6d37). RecordingServices records ServiceCall::Run(spec) and
+    /// answers `set_run_result` (default: exit status 0).
+    fn run_program(&self, spec: &LaunchSpec) -> Result<RunOutput, String>;
     fn stdout_kind(&self) -> StdoutKind;                 // Redirected | Terminal | None (after AttachConsole on Windows)
     fn stdin_is_tty(&self) -> bool;                      // Unix picker exec decision (PD5); false on Windows
     fn write_stdout(&self, text: &str) -> Result<(), String>;
@@ -1395,17 +1480,18 @@ An unanswered prompt in `RecordingServices` answers `Ok(None)` (cancel) after th
 touches the real clipboard whatever has focus. gpui-kit components that perform side effects themselves (`Link` with
 an `href`, `PopupMenu::link`, a `TextView` without a link handler, the `Clipboard` copy button) must not be used
 without routing them through `Services`. `RealServices` refuses every side effect in `cfg(test)` builds.
-Debug builds of `RealServices` refuse `spawn_terminal`/`exec_in_current_terminal` for `claude`/`pi`/`omp` unless a
-program override is configured or `CHG_ALLOW_REAL_LAUNCH=1` (§15.4).
+Debug builds of `RealServices` refuse `spawn_terminal`/`exec_in_current_terminal`/`run_program` for
+`claude`/`pi`/`omp`/`codex` unless a program override is configured or `CHG_ALLOW_REAL_LAUNCH=1` (§15.4).
 
 ### 7.5 Background work model
 
 | Work | Mechanism | Result delivery | Stale guard |
 |---|---|---|---|
-| Initial load / refresh / reload | core `HistoryLoader` (`LoaderOptions::with_waker`), K1 off-thread preparation, K18 policy | waker → `async_channel::bounded::<()>(1)` → ListPane `_poll_task` → `loader.poll(&mut browser)` then `browser.poll()` | core |
-| Lexical + semantic search | core `Browser` workers, same waker | same task → `browser.poll()` → `on_results` | core generations |
-| UUID lookup (K2) | `cx.background_spawn(history::load_session_by_uuid)` when `uuid_lookup() == Pending` | `browser.resolve_uuid_lookup(uuid, conv)` | core ignores a stale UUID |
-| Rename (K3) | `cx.background_spawn(history::rename_session(..))` | `browser.apply_renamed(path, conv)` | dialog id + path |
+| Initial load / refresh / reload | core `HistoryLoader` (`LoaderOptions::with_waker`), K1 off-thread preparation, K18 policy | waker → `async_channel::bounded::<()>(1)` → ListPane `_poll_task` → `loader.poll(&mut browser)` then `browser.poll()`, then one yield to the executor | core |
+| Lexical + semantic search | core `Browser` workers, same waker; the lexical worker ranks the loaded corpus on a one-thread pool or the store index on `index-search-*` (≤ 8 threads, top page first, ac7f591) | same task → `browser.poll()` → `on_results` | core generations; index answers by `Arc` identity |
+| Store generations (ac7f591, e905169, 358becb) | core `HistoryLoader` in store mode: `generation-open` thread materializes every card of a generation and opens its index (and maps the semantic corpus to it); `store-reconcile` thread (own `store-reconcile-*` pool, ≤ 4 threads) runs a reconcile pass (`store::reconcile::reconcile_cancellable` over the env's sources: one stat per session file on the scan's own `store-scan-*` pool, only new or changed files parsed, delta generations, merges), retried every `BUSY_RETRY` (1 s) while another instance holds `LOCK`, with a `store-watch` thread that reads `CURRENT` every `GENERATION_POLL` (200 ms) and wakes the poll when it names another generation (by inequality, as upstream; the records of `CURRENT` and `PROGRESS` are per store root); each sends its result before calling the waker; dropping the loader gives up a running pass (or its wait for the lock), then joins both | waker → `loader.poll` → `Browser::install_generation` | generation name |
+| UUID lookup (K2) | `cx.background_spawn(history::load_session_by_uuid)` when `uuid_lookup() == Pending` | `browser.resolve_uuid_lookup_session(uuid, conv)`; the task is `load_session_by_uuid(..).map(PreparedSession::new)` | core ignores a stale UUID |
+| Rename (K3) | `cx.background_spawn(history::rename_session(..).map(PreparedSession::new))` | `list.apply_renamed(path, prepared)` → `browser.apply_renamed_session` | dialog id + path |
 | Delete (K4) | `background_spawn(plan_session_delete)` → dialog → `background_spawn(execute_session_delete)` | `CorpusNotice::Deleted(plan files)` | dialog disabled while running |
 | Viewer open / rebuild | `viewer-worker` std thread per ViewerPane: a single **latest-request slot** (Mutex + Condvar) and an `AtomicU64` generation; the worker checks the generation between entries/items and abandons stale work; result posted to an async channel | `this.update_in(v.install(gen, result))`; the previous document is dropped right after install | generation |
 | Syntect highlighting | `cx.background_spawn` per batch of visible code segments; warm-up at startup on `syntect-warmup` | cache insert + `cx.notify()` | key `(item_id, chunk, seg, ThemeKind)` |
@@ -1425,22 +1511,53 @@ channel closes; every named thread uses an 8 MiB stack.
 ### 7.6 Semantic gate and the shared embedder
 
 * `embedder.rs` (WP7) owns one `SharedEmbedder`: `Arc<Mutex<Option<Box<dyn SemanticEmbedder + Send>>>>` loaded lazily
-  (`FastembedEmbedder::new_in(env.semantic_model_dir(), false)`) on the first thread that needs it. It hands out
+  (`FastembedEmbedder::new_in(env.semantic_model_dir(), false, EmbedPriority::Background)`) on the first thread
+  that needs it. It hands out
   adapters for the three core factory shapes: `browser::SemanticEmbedderFactory` (Arc, for `BrowserOptions`),
   `agent::service::EmbedderFactory` (Box, for `AgentService::with_embedder_factory`), and
   `semantic_ops::EmbedderFactory<'_>` (`&mut FnMut`, for Tools). Each adapter returns a thin `SemanticEmbedder` that
-  locks the shared model per call. Result: one model in memory; Clear can drop it. Tests/QA install a fake through
-  `embedder::install_fake(cx, factory)`; `init_for_test` installs a refusing factory by default (`semantic model is
-  not available in tests`). `--qa-model-dir` points the real factory at a pre-downloaded model dir (feature `qa`).
+  locks the shared model per call (an empty batch only loads the model). The list's browser factory loads the model
+  when the semantic worker creates its embedder (`InitializingModel`) and fails with the load error, so the search
+  or prewarm that needed it reports it (`sem failed`): the first real embedding runs in the worker's background
+  indexing (upstream c6d0421). The list worker's background indexing locks the model per call of 64 passages
+  (`DEFAULT_EMBEDDING_BATCH_SIZE`; unlocking between calls), so a Deep Search query embedding usually waits about
+  one call; the mutex is not fair, so it may wait longer. Result: one model in memory; Clear can drop it.
+  Threads (upstream 8322afe, 9ee0a03): the model runs ONNX inference on half the cores (`EmbedPriority::Background`) for
+  every consumer, so Tools > Generate semantic cache uses half the cores where upstream's CLI command uses every
+  core; a call sorts its passages by length and runs the model on batches of 8 (`MODEL_BATCH_SIZE`). The process's
+  first (and only) model is a Background one, so core sets ONNX Runtime up once with a global intra-op pool of half
+  the cores (one inter-op thread; idle threads sleep instead of spinning) whose `semantic-embed` threads lower their
+  own scheduling priority when they start (below normal on Windows, nice 10 on Linux, utility QoS on macOS). Every
+  consumer's inference runs on that pool, Deep Search's query embeddings included, so on a busy machine they wait
+  for a core like indexing does. The thread calling the model takes part in inference at its own priority: the
+  list's semantic worker lowers its own thread before it makes its embedder (not in tests or `hermetic` builds);
+  the agent worker and Tools threads are not. (The store's reconcile pool, which does not embed, lowers its
+  threads the same way.) Windows
+  ends the pool's threads before ort releases the environment at exit, so the pool's join waits for their
+  handles (std's join would panic there and abort the exit). The headless `agent` subcommand embeds in the
+  foreground (`Foreground`: per-session pools on every core, normal priority). Tests/QA
+  install a fake through `embedder::install_fake(cx, factory)`; `init_for_test` installs a refusing factory by
+  default (`semantic model is not available in tests`). `--qa-model-dir` points the real factory at a pre-downloaded model dir (feature `qa`).
   If `FastembedEmbedder` turns out not to be `Send`, WP7 falls back to per-consumer instances and records it (risk
   §19).
-* `SemanticGate` (globals.rs): `Open` normally. Generate/Clear semantic cache (WP5) call
-  `gate.enter_exclusive(op, cx)`: ListPane `browser.suspend_semantic()` (K6; joins the worker; footer `sem paused`),
-  AgentWorker drops queued semantic/hybrid jobs with `Semantic search is paused while the cache is
-  generated/cleared` and stops using the embedder, the shared model is dropped (Clear) or kept (Generate uses it).
+* `SemanticGate` (globals.rs): `Open` normally. Generate/Clear semantic cache (WP5) and the semantic report run call
+  `gate.enter_exclusive(op, cx)`: ListPane `browser.suspend_semantic()` (K6; footer `sem paused` at once),
+  AgentWorker drops queued semantic/hybrid jobs (not user-only searches, which core runs lexically) with
+  `Semantic search is paused while the cache is generated/cleared` and stops using the embedder. The list's worker is
+  stopped but not waited for on the UI thread: since background indexing (c6d0421) it is usually in the middle of an
+  embedder call (64 passages; cancellation is checked between calls; at the first call also the shared model's lazy load, a download on first use) or a cache write (up to 2 s waiting for
+  `embeddings.lock`, then the write), so a join there could freeze the window for up to seconds (goal 6). The gate
+  returns a `SemanticGateEntry` holding the worker's `SemanticWorkerExit`; the operation's own thread calls
+  `entry.wait()` first (joins the worker), so the operation starts only once the worker has ended and no list worker
+  uses the model or writes the cache while it runs (the Generate dialog shows `Semantic cache: starting…`
+  meanwhile; checking the cancellation inside an embedder call would need upstream's `SemanticEmbedder` trait to take
+  a token, so the wait, which only delays the operation's start, stays at most one call). Then the shared model is
+  dropped (Clear, on its thread) or kept (Generate uses it).
   `gate.leave(cx)` → `browser.resume_semantic()` (reloads the cache from disk), AgentWorker accepts jobs again. While
   `Exclusive`, a second Generate/Clear is disabled. Cache files are additionally protected by core's write lock (K6),
-  so a second GUI instance or a racing writer never corrupts them.
+  so a second GUI instance or a racing writer never corrupts them, and each save merges in what the others saved
+  (8919a76), so the list worker, Deep search and a second instance no longer drop each other's new embeddings. The
+  matrix is memory-mapped: the list worker and each Deep search request read it without copying the vectors.
 
 ### 7.7 Focus model and key contexts
 
@@ -1497,6 +1614,7 @@ pub struct ConversationTarget {
     pub project_name: Option<SharedString>,
     pub project_path: Option<PathBuf>,
     pub custom_title: Option<String>,
+    pub provenance: Provenance,          // Conversation.provenance; default for agent hits and unparsed files (eea6d37)
 }
 impl ConversationTarget {
     pub fn from_conversation(c: &Conversation) -> Self;                 // source = Some(c.source)
@@ -1506,8 +1624,16 @@ impl ConversationTarget {
     pub fn describe(&self) -> String;                                    // "proj · Fix login bug · 3f2a19c0-…"
     pub fn header_id_differs(&self) -> bool { self.session_id != self.file_stem }
     pub fn can_modify(&self) -> bool { self.source.is_some() }
+    /// eea6d37: core `capabilities_of(source, provenance)` (none for an unknown source), per `SessionAct`
+    /// (Resume, Fork, Rename, Delete), and the reason an act is unavailable (core `refusal`, or
+    /// `Unknown conversation type`).
+    pub fn capabilities(&self) -> Capabilities;
+    pub fn allows(&self, act: SessionAct) -> bool;
+    pub fn refusal(&self, act: SessionAct) -> Option<String>;
 }
 ```
+`ops::copy::live_target` also takes the corpus entry's provenance, so an action started from an agent hit is checked
+again against the live conversation (an orphaned thread is refused).
 Where targets come from:
 * **Pane handlers** resolve their own target synchronously in the action handler: ViewerPane → its open target;
   ListPane → `selected_target()` after `workspace.flush_pending_preview()`; DeepSearchPane → selected hit target;
@@ -1524,14 +1650,16 @@ Where targets come from:
 ### 7.9 Shared value types (model.rs, frozen; complete list)
 
 `ConversationTarget` (§7.8); `HeaderInfo { title: SharedString, project_name: Option<SharedString>, custom_title:
-Option<SharedString>, model: Option<String>, message_count: usize, duration_minutes: Option<u64>, total_tokens: u64,
+Option<SharedString>, model: Option<String>, message_count: usize, prompt_count: usize, tool_call_count: usize (e930cac),
+duration_minutes: Option<u64>, total_tokens: u64,
 timestamp: DateTime<Local>, summary: Option<SharedString>, parse_error_count: usize, file_stem: SharedString }`
 (+`from_conversation`, `stem_only`); `OpenRequest { target: ConversationTarget, focus: bool, reveal:
 Option<RevealRequest> }`; `RevealRequest { path: PathBuf, full_ref: Option<String>, kind: RevealKind }`;
 `RevealKind::{AgentOrdinal { ordinal: usize, hint: ContentVisibilityHint }, EntryIndex(usize)}`;
 `ContentVisibilityHint { tools, tool_results, thinking, subagents: bool }`; (as built) `OpenRequest` also has
 `agent_tab: Option<AgentTab>` (open the agent panel on that tab and focus it) with `OpenRequest::{new(target, focus),
-with_reveal(reveal), with_agent_tab(tab)}`; `ViewerMode::{Main, SingleFile}`;
+with_reveal(reveal), with_agent_tab(tab)}`; (upstream 411e227) `OpenRequest.list_hit: Option<ListHit>` (core
+`browser::ListHit { query, evidence }`, the list's search hit, L-109) with `with_list_hit(hit)`; `ViewerMode::{Main, SingleFile}`;
 `AgentTab::{Outline, Within, Read}`; `LeftTab::{Conversations, DeepSearch}`; `PaneFocus::{List, ListToolbar,
 DeepSearch, Viewer, AgentPanel, Other}`; `HelpSection::{List, Viewer, AgentPanel, DeepSearch, Global, Dialogs}`;
 `SettingsPage::{General, Display, Search, Keys, Resume, Agent}`; `KeyAction::{Resume, Fork, Rename, Delete,
@@ -1601,9 +1729,9 @@ CopyPath, CopySessionId, CopyHeaderSessionId, Reveal, SearchWithin, Outline, Del
     `OpenJsonlFile` only outside picker mode, `ShowConversations` only on single-file roots, and Resume/Fork/Rename/
     Delete/SelectAndExit never in single-file windows.
 * Registration order inside `keymap::install_all(cx)` (after `gpui_kit::init`): (1) static table §8.3 in table
-  order, (2) input-editing bindings §8.4, (3) user-configurable bindings §8.5 in the order rename, refresh, fork,
-  resume, delete (later wins at equal depth, which reproduces the TUI check order delete > resume > fork > refresh >
-  rename, C-028).
+  order, (2) input-editing bindings §8.4, (3) user-configurable bindings §8.5 in the order rename, user only, all
+  kinds, refresh, fork, resume, delete (later wins at equal depth, which reproduces the TUI check order delete >
+  resume > fork > refresh > all kinds > user only > rename, C-028).
 
 ### 8.2 Action list (actions.rs)
 
@@ -1623,13 +1751,15 @@ gpui_kit::actions!(history, [
   CopyAsLedger, CopyAsPlain, CopyAsMarkdown, CopyAsJsonl,
   // list
   SelectPrev, SelectNext, SelectPageUp, SelectPageDown, SelectHalfPageDown, SelectFirst, SelectLast,
-  ClearQuery, ToggleScope, ToggleSearchMode, SetModeLexical, SetModeSemantic, SetScopeAll, SetScopeWorkspace,
-  OpenRowContextMenu,
+  ClearQuery, ToggleScope, ToggleSearchMode, ToggleAllKinds, ToggleUserOnly, SetModeLexical, SetModeSemantic,
+  SetScopeAll, SetScopeWorkspace, OpenRowContextMenu,
   // viewer
   ScrollLineDown, ScrollLineUp, NextMessage, PrevMessage, ScrollHalfPageDown, ScrollHalfPageUp,
   ScrollPageDown, ScrollPageUp, ScrollTop, ScrollBottom, StartSearch, NextMatch, PrevMatch, CommitSearch,
-  CancelSearch, FindClearQuery, CycleToolDisplay, SetToolsSummary, SetToolsTruncated, SetToolsFull,
-  ToggleThinking, ToggleTiming, ToggleOutputs, ViewerEscape, ViewerBack,
+  CancelSearch, FindClearQuery, CycleToolDisplay, SetToolsOff, SetToolsSummary, SetToolsCalls, SetToolsTruncated,
+  SetToolsFull,
+  ToggleThinking, ToggleTiming, ToggleOutputs, ViewerEscape, ViewerBack, OpenParentConversation,
+  ShowSubagentsAndForks,
   // deep search / agent panel
   RunDeepSearch, CancelDeepSearch, DeepSearchEscape, DeepSelectNext, DeepSelectPrev, DeepOpenHit,
   ToggleAgentText, AgentPanelEscape, AgentSelectNext, AgentSelectPrev, AgentOpenSelected,
@@ -1693,14 +1823,16 @@ Columns: **Win/Linux** and **macOS** keystrokes (identical unless shown), **Cont
 | StartSearch | `/` | `/` | `Viewer && !Input` | ViewerPane | Edit → Find in conversation |
 | NextMatch / PrevMatch | `n` / `shift-n` | same | `Viewer && !Input` | ViewerPane | only when search is Active |
 | NextMatch / PrevMatch | `f3` / `shift-f3` | `cmd-g` / `cmd-shift-g` | `Viewer` | ViewerPane | desktop aliases (additive) |
-| CommitSearch | `enter` | `enter` | `Viewer > Input` | ViewerPane | `ViewSearch::commit`; focus back to viewer |
+| CommitSearch | `enter` | `enter` | `Viewer > Input` | ViewerPane | `ViewSearch::commit`; focus back to viewer; no matches → toast `No matches for /<query>` |
 | CancelSearch | `escape` | `escape` | `Viewer > Input` | ViewerPane | `view::escape` (clears a search being typed) |
 | CycleToolDisplay | `t` | `t` | `Viewer && !Input` | ViewerPane | View → Tool display ▸ (SetTools*) |
 | ToggleThinking | `shift-t` | `shift-t` | `Viewer && !Input` | ViewerPane | View → Show thinking (checked) |
 | ToggleTiming | `i` | `i` | `Viewer && !Input` | ViewerPane | View → Show timestamps (checked) |
 | ToggleOutputs | `x` | `x` | `Viewer && !Input` | ViewerPane | AD12 |
 | ViewerEscape | `escape` | `escape` | `Viewer` | ViewerPane | PD2 unwinding (`view::escape`) |
-| ViewerBack | `q` | `q` | `Viewer && !Input` | ViewerPane | → LeaveRequested |
+| ViewerBack | `q` | `q` | `Viewer && !Input` | ViewerPane | → the back stack's last conversation (`OpenRelated`), else LeaveRequested (upstream 3c2ffeb) |
+| ShowSubagentsAndForks | `s` | `s` | `Viewer && !Input` | ViewerPane (main window only) | Session → Subagents and forks…: the picker (`FamilyMenu`, `viewer/family.rs`), else toast `No subagents or forks in this conversation` (upstream 3c2ffeb) |
+| OpenParentConversation | `shift-p` | `shift-p` | `Viewer && !Input` | ViewerPane (main window only) | Session → Open parent conversation: `OpenRelated(parent)`, else toast `This conversation has no parent` / `Parent conversation not found` (upstream 3c2ffeb) |
 | ExportConversation | `e` | `e` | `Viewer && !Input` | ViewerPane → `ops::export::open_export_menu` | Session/File → Export… |
 | YankOrCopyMessage | `y` | `y` | `Viewer && !Input` | ViewerPane (nav active → copy message; else copy menu) | |
 | CopyPath | `shift-y` | `shift-y` | `Viewer && !Input` | ViewerPane → `ops::copy::copy_path` | Session → Copy path |
@@ -1720,6 +1852,7 @@ Columns: **Win/Linux** and **macOS** keystrokes (identical unless shown), **Cont
 | ConfirmEnterIgnored | `enter` | `enter` | `Confirm` | no-op (beats Dialog's `enter → Confirm`, deeper context) | AD18 |
 | RenameClear | `ctrl-u` | `ctrl-u` | `RenameDialog > Input` | clears the whole field | AD19 |
 | ExportPick1..4 | `1`..`4` | same | `ExportMenu` | ExportMenu | j/k → base `SelectUp`/`SelectDown`, Enter → `Confirm`, Esc → `Cancel` |
+| (base `SelectDown`/`SelectUp`/`Confirm`/`Cancel`) | `j`/`down`, `k`/`up`, `enter`, `escape`/`q`/`s` | same | `FamilyMenu` | FamilyMenu | the Subagents and forks picker (upstream 3c2ffeb) |
 
 Context notes (as built): the list rows above use `keymap::CTX_LIST_KEYS` = `ConversationList && !ListToolbar` so
 a focused list-toolbar button keeps Enter/Space/Tab/arrows; Deep search hit keys use the `DeepResults` context of the
@@ -1750,19 +1883,26 @@ focusable results list and agent-panel row keys the `AgentRows` context of the p
   defaults plus `ctrl-w`.
 
 ### 8.5 User-configurable bindings (`[keys]`)
-Five actions — **Resume, Fork, Rename, Delete, Refresh** — take their keystroke from the effective `KeyBindings`
-(`gui.toml [keys]` > `config.toml [keys]` > defaults ctrl+r, ctrl+f, f2, ctrl+x, ctrl+l; core
-`settings::EffectiveSettings::keys`). Each is registered in `ConversationList && !ListToolbar`, `ConversationList >
+Seven actions — **Resume, Fork, Rename, Delete, Refresh**, **ToggleAllKinds** (Show automated and subagent
+conversations, upstream cb990e6) and **ToggleUserOnly** (Search only your own messages, upstream ae7ae39) — take
+their keystroke from the effective `KeyBindings` (`gui.toml [keys]` > `config.toml [keys]` > defaults ctrl+r,
+ctrl+f, f2, ctrl+x, ctrl+l, ctrl+g, alt+u; core `settings::EffectiveSettings::keys`). **[dev]** `user_only` defaults
+to `alt+u`: upstream's `ctrl+v` is paste in the search field and reserved below (a `config.toml` that sets `ctrl+v`
+keeps Alt+U, with the usual debug-log line). Registration order rename, user only, all kinds, refresh, fork, resume,
+delete (later wins): the TUI check order delete > resume > fork > refresh > all kinds > user only > rename (C-028).
+ToggleAllKinds and ToggleUserOnly are list actions (the viewer's binding is forwarded to the list; not persisted, as
+upstream). Each is registered in `ConversationList && !ListToolbar`, `ConversationList >
 Input` and `Viewer && !Input` (`keymap::USER_BINDING_CONTEXTS`; AD8 adds Rename/Refresh in the viewer). Single-file windows have no handler for
-Resume/Fork/Rename/Delete → menu items disabled (parity). While loading, Resume/Fork/Rename/Delete and SelectAndExit
-handlers return early and their hints are dimmed (AD6).
+Resume/Fork/Rename/Delete → menu items disabled (parity). While loading, the Rename/Delete handlers return early and
+their hints are dimmed; Resume/Fork/SelectAndExit (and the open hint) only until the rows are listed newest first
+(`ListPane::list_ready`, the first cards of the store's generation; AD6).
 
 Validation and warnings (Settings → Keys, also applied at startup):
 * Errors (binding rejected, previous value kept): core `parse_key_binding` messages (`Unknown modifier: …`,
   `Function keys do not support modifiers: …`, `Invalid key binding: …`, `Unknown key: …`).
 * Warnings (binding accepted, shown in Settings and as one Info line in the debug sink at startup): plain character
   (`"<c>": a plain character can't be typed in the search field`), `ctrl+t` (`ctrl+t disables the Lexical/Semantic
-  shortcut`), duplicates among the five (`<a> and <b> share <key>; <winner> wins` using TUI priority), shadowing a
+  shortcut`), duplicates among the seven (`<a> and <b> share <key>; <winner> wins` using TUI priority), shadowing a
   static binding in the same context (`<key> replaces "<label>" in the conversation list/viewer`).
 * `ctrl+c`, `ctrl+v`, `ctrl+a`, `ctrl+z`, `ctrl+y`, `ctrl+w` are rejected with `<key> is reserved for clipboard and
   editing` **[FLAG: TUI allowed them; in the GUI they would break copy/paste/word delete in inputs]**.
@@ -1808,9 +1948,14 @@ Static rows such as `f5 → Refresh` are never removed by a rebinding (C-034). N
 ### 8.7 Hints and Shortcuts dialog from the live keymap
 * Footer/status hints use `Kbd::binding_for_action(&A, Some(ctx), window)` and render nothing when `None`. Hints
   are shown only for the region that has focus, after state (counts, activity), in priority order; chips that do
-  not fit the measured width are dropped from the lowest priority up; `F1 help` always stays.
-  * List footer (priority order): `⏎ open`, Resume `resume`, Fork `fork`, Rename `rename`, Delete `delete` (these
-    five dimmed while loading), `Tab All|Prj` (only with a workspace; active value accent/bold), `Ctrl+T lex|sem`
+  not fit the measured width are dropped from the lowest priority up; `F1 help`, `Ctrl+G all kinds` and `Alt+U you
+  only` always stay.
+  * List footer (priority order): `⏎ open`, Resume `resume`, Fork `fork`, Rename `rename`, Delete `delete`
+    (open/resume/fork dimmed until the rows are listed (`ListPane::list_ready`), rename/delete while loading),
+    `Tab All|Prj` (only with a workspace; active value accent/bold), `Ctrl+G all kinds` (only while automated and
+    subagent conversations are listed; accent/bold, upstream's `^G·all kinds`; never dropped, like `F1 help`), `Alt+U
+    you only` (only while search is limited to the user's own messages; `Alt+U you only: not in semantic` in semantic
+    mode; accent/bold, upstream's `^V·you only`; never dropped), `Ctrl+T lex|sem`
     (only when ToggleSearchMode is bound; active value accent/bold), `F1 help`; picker mode puts `Esc cancel` first.
     Semantic activity or the refresh indicator replaces the hints (TUI parity).
   * Viewer status (priority order, search inactive): `/ search`, `e export`, `y yank`, Resume `resume`, Fork `fork`,
@@ -1823,13 +1968,15 @@ Static rows such as `f5 → Refresh` are never removed by a rebinding (C-034). N
     `Ctrl+D` Half page down; `Ctrl+U` Kill to start of line; `Ctrl+K` Kill to end of line; `PgUp / PgDn` Jump by page;
     `Home / End` Jump to first/last; `Tab` Toggle scope (All/Project); `Ctrl+T` Toggle semantic search (only if
     bound); `Ctrl+S` Semantic details (only if Ctrl+T bound); `Enter` Open viewer; `Ctrl+O` Select and exit;
-    `Ctrl+W` Delete word; Resume; Fork resume; Rename; Delete; Refresh conversations; `Esc` Clear search (TUI: Quit —
+    `Ctrl+W` Delete word; Resume; Fork resume; Rename; Delete; Refresh conversations; Show automated and subagent
+    conversations (cb990e6); Search only your own messages (ae7ae39; upstream's help adds `(lexical)`); `Esc` Clear
+    search (TUI: Quit —
     PD6); plus GUI rows `Ctrl+E` End of line, `Alt+B / Alt+F` Word left/right, `Shift+F10` Row menu.
   * **Viewer** (TUI order): `j / ↓` Scroll down; `k / ↑` Scroll up; `J / ]` Next message; `K / [` Previous message;
     `d / Ctrl+D` Half page down; `u / Ctrl+U` Half page up; `g / Home` Jump to top; `G / End` Jump to bottom; `/`
-    Search; `n / N` Next / prev match; `t` Cycle tools: off/trunc/full (TUI text kept); `T` Toggle thinking; `i`
-    Toggle timing; `e` Export to file; `y` Copy to clipboard / message; `p` Show file path; `Y` Copy path; `I` Copy
-    session ID; Resume; Fork resume; Delete; `q / Esc` Back to list (single-file: `Close`); plus GUI rows `x`
+    Search; `n / N` Next / prev match; `t` Cycle tools: off/sum/calls/trunc/full (TUI text, d0aca95, a60dfe9); `T`
+    Toggle thinking; `i` Toggle timing; `e` Export to file; `y` Copy to clipboard / message; `p` Show file path; `Y` Copy path; `I` Copy
+    session ID; Subagents and forks (`s`); Open parent conversation (`P`); Resume; Fork resume; Delete; `q / Esc` Back (upstream 3c2ffeb; single-file: `Close`); plus GUI rows `x`
     Expand/collapse tool output, `o` Outline, `Ctrl+C` Copy selection.
   * **Agent panel**, **Deep search**, **Global** (Quit, Command palette, Settings, Keyboard shortcuts, Open JSONL
     file, Choose workspace, Focus conversations / deep search / viewer, Next/previous region (F6), Focus viewer mode,
@@ -1881,11 +2028,13 @@ tree is rebuilt — and every open AppMenuBar `reload()`ed — after theme chang
 activation (check marks reflect the active window's viewer, tracked in `ActivePane`).
 * **File**: Open JSONL file…, Show conversations, Choose workspace…, Clear workspace, Export…, Close window, Quit.
 * **Edit**: Copy, Find in conversation, Find in all conversations….
-* **View**: Conversations, Deep search, Viewer, Focus viewer, Tool display ▸ Summary/Truncated/Full, Show thinking,
-  Show timestamps, Search mode ▸ Lexical/Semantic, Scope ▸ All/Workspace, Theme ▸ System/Light/Dark, Refresh.
+* **View**: Conversations, Deep search, Viewer, Focus viewer, Tool display ▸ Off/Summary/Calls/Truncated/Full,
+  Show thinking, Show timestamps, Search mode ▸ Lexical/Semantic, Scope ▸ All/Workspace, Show automated and subagent
+  conversations (check mark, cb990e6), Theme ▸ System/Light/Dark, Refresh.
 * **Session**: Open, Resume, Fork, Rename…, Delete…, Export…, Copy to clipboard ▸ 4 formats, Copy message, Copy path,
-  Copy session ID, Copy header session ID, Show file path, Reveal in file manager, Search within conversation…,
-  Outline, Read range…, Semantic result details, Print and exit (picker: Select and exit).
+  Copy session ID, Copy header session ID, Show file path, Reveal in file manager, Open parent conversation,
+  Subagents and forks… (3c2ffeb), Search within conversation…, Outline, Read range…, Semantic result details, Print
+  and exit (picker: Select and exit).
 * **Tools**: Delete empty transcripts…, Generate semantic cache…, Clear semantic cache…, Debug search…, Semantic debug
   search…, Debug log…, Show projects directory, Delete conversation by session ID…, Open JSONL file…, Check for
   updates…, Settings….
@@ -1897,7 +2046,9 @@ activation (check marks reflect the active window's viewer, tracked in `ActivePa
 
 ### 9.1 Overview
 ```
-open(path) ──(viewer-worker) ViewerModel::open(path, prefs)      core: parse → Arc<Vec<RenderableEntry>>
+open(path) ──(viewer-worker) ViewerModel::open_cancellable(history, path, prefs, stale)
+                                                                  core: HistoryService decode → Arc<Transcript>
+           ──(viewer-worker) transcript.diagnostics.len()         gui: ParseCount, a card's header badge (§9.10)
            ──(viewer-worker) model.document()                     core: build_document(entries, prefs, expanded)
            ──(viewer-worker) items::build(&doc, &model, cols)     gui: ledger blocks → items, big blocks → ≈100-line chunks
            ──(viewer-worker) segments for every item              gui: markdown → Vec<Segment> (flags, not colors), tabs expanded
@@ -1907,6 +2058,8 @@ open(path) ──(viewer-worker) ViewerModel::open(path, prefs)      core: parse
 The `viewer-worker` (one std thread per ViewerPane, §7.5) has a single latest-request slot: a new open/rebuild
 request replaces a queued one, bumps an `AtomicU64` generation, and the running build checks the generation between
 entries and between items and abandons stale work. Arrowing through the list therefore never queues full parses.
+An open decodes the file once: the malformed lines a card's header does not know (V-008) are counted from the
+transcript the build decoded, never by a decode of their own beside it.
 `cols` = the content column width in mono cells: `floor(content_px / advance("0", mono, text_xs))`, recomputed
 (debounced 100 ms) on width/rem change, which triggers an anchored rebuild (§9.6). `core::view::ledger` rendering is
 not used; the ledger-equivalent counts come from core's `ledger_*` helpers.
@@ -1916,7 +2069,7 @@ not used; the ledger-equivalent counts come from core's `ledger_*` helpers.
 pub struct ViewerItem {
     pub id: ItemId,                    // stable across rebuilds: (entry_index, block_ordinal, detail_ix, chunk_ix) or (ToolOutputId, chunk_ix)
     pub version: u64,                  // hash of rendered content (changes when expanded/truncated text changes)
-    pub nav_position: Option<usize>,   // ConversationDocument::nav_position of its message (None: Pi metadata etc.)
+    pub nav_position: Option<usize>,   // ConversationDocument::nav_position of its message (None: notes etc.)
     pub entry_index: usize,
     pub first_of_message: bool,
     pub first_chunk: bool,             // lanes, header and chevron are drawn on the first chunk of a block only
@@ -1927,6 +2080,7 @@ pub struct Lanes { pub timestamp: Option<SharedString>, pub label: Option<Shared
 pub enum ItemBody {
     Markdown { segments: Arc<Vec<Segment>>, thinking: bool },
     ToolSummary { sentence: SharedString, id: Option<ToolOutputId>, expanded: bool },
+    CallLine { header: SharedString, id: Option<ToolOutputId>, hidden_lines: usize },  // calls mode (a60dfe9): one row per call, a group's row with its own id (a1c88f8); ` (N more lines)` suffix when the truncated form hides lines (9d4e9cc): header clipped to cols minus the suffix, suffix kept whole
     ToolCall { id: ToolOutputId, header: Option<SharedString>, lines: Arc<Segment> /* SegKind::ToolBody, this chunk */,
                more: Option<usize>, expandable: bool, expanded: bool },
     ToolResult { id: ToolOutputId, segments: Arc<Vec<Segment>>, more: Option<usize>, expandable: bool, expanded: bool },
@@ -1953,12 +2107,13 @@ pub fn build(doc: &ConversationDocument, model: &ViewerModel, cols: usize, cance
 | Markdown, top-level user | `You` | TextPrimary | yes (skill: no) | skill: yes | `DocTiming::Stamp` when timing on |
 | Markdown, assistant (label repeated per text block) | agent or `Claude`/`Pi`/`OMP` | Accent | yes | no | first block only (core `DocTiming`) |
 | Markdown, subagent / agent progress | `↳…` (core label) | TextPrimary / Accent | no | yes | Pad |
-| Markdown, Pi metadata | core label | TextSecondary | no | yes | Pad |
+| Markdown, note (Pi/OMP custom message, Codex `Fork`) | core label | TextSecondary | no | yes | Pad |
 | Thinking | `Thinking` | AccentDim | no | no (italic + thinking role) | first block only |
 | ToolSummary / ToolCall | message label | AccentDim | no | message dimmed | first block only |
+| CallLine (calls mode) | message label on the first line of a run, none after | AccentDim | no | message dimmed | first line only |
 | ToolResult (top-level) | `↳ Result` | ToolText | no | no | first block only |
 | SubagentToolResult | `↳ Tool` (header `<Result>`) | AccentDim | no | yes | Pad |
-| ToolSummaryDetails items | group label on the first item | AccentDim | no | yes | Pad |
+| ToolSummaryDetails items (expanded summary group or calls row) | group label on the first item | AccentDim | no | yes | Pad (a calls row: the row's own slot, so the group's first row keeps the stamp) |
 
   Label text is fitted with core `view::fitted_name` (9 display cells, `Branch s…`, V-014). The timing lane is
   reserved whenever timing is on (quirks 1–2 fixed); `DocTiming::Disabled` blocks show an empty lane.
@@ -1973,10 +2128,9 @@ bitflags-like: Style { bold, italic, code, heading, link, quote, dimmed, strike,
 pub fn markdown(text: &str) -> Vec<Segment>;
 pub fn code_block(text: &str, lang: &str) -> Segment;          // fenced ```text for tool results
 pub fn tool_body(lines: &[ToolBodyLine], clip_cols: Option<usize>) -> Segment;  // diff_add / diff_remove / dimmed per line
-pub fn plain(text: &str, dimmed: bool, clip_cols: Option<usize>) -> Segment;    // subagent results (pretty JSON)
-pub struct SearchText { pub lower: String, pub origin: Option<Vec<u32>> }       // built lazily on the first search
-pub fn search_text(seg: &Segment) -> SearchText;   // ASCII fast path: lower = to_ascii_lowercase, origin = None;
-                                                   // origin only when lowercasing changes byte lengths (as core DocSearchIndex)
+pub fn plain(text: &str, dimmed: bool, clip_cols: Option<usize>) -> Segment;    // subagent results
+// search.rs keeps core `text_match::NormalizedForm::new(&seg.text)` per segment, built lazily on the first search
+// (the search-normalized text plus a sparse offset map back to the segment text, as core DocSearchIndex)
 ```
 Rules (parity with `markdown/layout.rs` + TUI sink, V-033…V-046, V-099, V-100):
 * pulldown-cmark 0.13 with only `ENABLE_STRIKETHROUGH | ENABLE_TABLES`.
@@ -2012,6 +2166,10 @@ h_flex().w_full().items_start()                       // one ledger row per item
  └─ content     v_flex flex_1 min_w_0 gap per 9.3
        ├─ Markdown: one SelText per segment (Code: bg(muted) rounded p_2 mono; TableRow: mono row + bottom border)
        ├─ ToolSummary: SelText sentence (tool_text, dimmed); chevron ▸/▾ button when clickable
+       ├─ CallLine: like ToolSummary, the call header clipped to `cols` (one row per call, key `ItemKey::Tool(row id)`;
+       │            a group's row toggles just its call (a1c88f8), which then shows as ToolSummaryDetails items, the
+       │            call and its result under a `tool details` chevron; a mixed message's rows toggle nothing and are
+       │            keyed by position)
        ├─ ToolCall: header row on the first chunk (tool_text; chevron if expandable) + empty spacer + body chunk (mono)
        │            + "(N more lines…)" row on the last chunk (dimmed, cursor pointer, toggles) when truncated
        ├─ ToolResult: rows/segments + indicator row as above
@@ -2021,10 +2179,13 @@ h_flex().w_full().items_start()                       // one ledger row per item
   (V-018 fix: no clipping) except collapsed tool lines, which are clipped to `cols` by design.
 * Hover: items of an expandable tool output get `hover(|s| s.bg(hover role))` (V-017).
 * Spacing between messages: `pt_3` on the first item of each message; `pt_1` between items of a message; chunk
-  items of the same block have no gap.
+  items of the same block and consecutive call lines have no gap.
 * Search highlights: `HighlightStyle { background_color: match role, color: on-match role }`; current match
-  `background_color: current-match role (warning token), color: on-current role` (V-075). Style runs are built by a
-  deterministic overlay (base spans, then code tokens, then match ranges on top; spike-list §6).
+  `background_color: current-match role (warning token), color: on-current role` (V-075); the list hit's secondary
+  matches a soft accent wash (`soft_match_background`) without a color change (§9.8a). Style runs are built by a deterministic overlay (base spans, then
+  code tokens, then match ranges on top; spike-list §6): `render::overlay_matches` cuts the base runs at the match
+  boundaries by hand and lays each match's style over the base style (its fields win), since `combine_highlights`
+  folds overlapping styles in hash order.
 * Colors: `theme_tokens::roles()` (§5 intro).
 
 ### 9.5 SelText, selection and copy (seltext.rs)
@@ -2055,7 +2216,11 @@ row), taken from the handle LRU (§9.7).
   `items[top.item_ix].id`) and the anchor entry via core `capture_anchor_entry(nav_entries, focused, nav_active,
   first_at_or_below_top)`; rebuild in the worker; diff the old and new `(id, version)` lists into `ListState::splice`
   calls; resolve the anchor id in the new list (exact; else core `find_entry_or_prev` → that message's first item,
-  else 0) and `scroll_to(ListOffset { item_ix, offset_in_item: same ? top.offset_in_item : 0 })`; then
+  e.g. the message before a tool-only one that Off mode removed (d0aca95), else 0) and `scroll_to(ListOffset { item_ix, offset_in_item: same ? top.offset_in_item : 0 })`.
+  When the focused message survives but its first item is replaced (an expanded or collapsed summary group or
+  calls row, a tool display mode change) the fallback finds that same message: its first row keeps its offset from
+  the viewport top, so the clicked row stays under the pointer. This applies only while that item's top was in view;
+  when it was scrolled above the viewport the message is top-aligned instead. Then
   `MessageNav::refocus(resolved)` (V-081, F9). `remeasure()` alone is never used for width changes (it re-anchors
   proportionally).
 * Opening a different conversation: `ListState::reset_with_uniform_height(n, rem * 3.0)` (keeps the size hint for a
@@ -2067,8 +2232,8 @@ row), taken from the handle LRU (§9.7).
 * Syntect tokens: `Lru<(ItemId, u16 seg, ThemeKind), Arc<Vec<(Range<usize>, HighlightStyle)>>>`, 2,000 segments;
   computed on the background executor for visible code segments (first render shows plain code color, then
   re-renders when ready; syntect warmed at startup).
-* Search texts: built lazily per segment on the first search after an open/rebuild and kept in a side table with the
-  items; dropped on open. No per-segment lowercase copy exists before the user searches.
+* Search texts: normalized forms built lazily per segment on the first search after an open/rebuild and kept in a side
+  table with the items; dropped on open. No per-segment normalized copy exists before the user searches.
 * All caches cleared on theme change (ThemeKind is part of the key anyway) and on open; the previous document and
   items are dropped as soon as the new ones are installed.
 
@@ -2077,20 +2242,62 @@ row), taken from the handle LRU (§9.7).
   `refresh`, `input_status`, `match_counter`) and `view::escape`. `SegMatch { item_ix, segment_ix, range, hidden:
   Option<ToolOutputId> }`.
 * `/` → find bar visible (`Input` small, `cleanable`), focus it; `ViewSearch::start` (V-072).
-* Every query change: `set_query(q, find)` where `find` = case-insensitive search over the items' lazy search texts
-  (visible text) plus, for collapsed tool outputs, over their full text taken from the model on demand
-  (`DocToolResult::text`, the full body lines, the subagent text) → `hidden: Some(id)`. Occurrences are counted
-  (AD7). The first match is revealed and its message focused (`MessageNav::focus`, V-073).
+* Every query change: `set_query(q, find)` where `find` = core `ViewSearchQuery::parse(q)` matched with
+  `match_ranges_in` over the items' lazy normalized forms (visible text) plus, for collapsed tool outputs, over their
+  full text taken from the model on demand (`DocToolResult::text`, the full body lines, the subagent text) →
+  `hidden: Some(id)`. The rules are the list's keyword rules (upstream d2c0f07): any query word matches at word
+  starts, normalized and case-folded (`istanbul` finds `İstanbul`, `strasse` finds `Straße`; anywhere for CJK
+  queries; `ired` does not match inside `fired`), quoted and `_` literals match exactly (smart case), and words joined
+  by separators on one line (`needle_token` for `needle token`) form one range. Match ranges are counted (AD7). The
+  first match is revealed and its message focused (`MessageNav::focus`, V-073).
 * Reveal: if `hidden` → toggle that output expanded (anchored rebuild, then `refresh` recomputes matches) — PD7
   auto-expand; then `scroll_to(ListOffset{item_ix, 0})`; on the next frame SelText reports the match y;
   `scroll_by(y - viewport_top - 3 * line)` so the match sits a few lines from the top (exact, two frames). Only
   scroll if the match is outside the viewport (n/N parity).
-* Enter → `commit` (Active if matches else Off); focus returns to `viewer_focus`. Esc in the find input → `escape`.
+* Enter → `commit` (Active if matches else Off); focus returns to `viewer_focus`; a query with text and no matches
+  shows the info toast `No matches for /<query>` (the find bar closes, so its `(no matches)` suffix is gone; upstream
+  d2c0f07's status line). Esc in the find input → `escape`.
 * `n`/`N` (or F3/Shift+F3) in Active: `next_match`/`prev_match` (wrap), reveal, focus message.
 * Rebuilds keep Active matches: `refresh` (V-076).
 * Find bar text: `/` + query + `input_status()`; status bar in Active shows `n next  N prev  <i>/<n>  Esc clear`.
 * Throughput target: ≤ 10 ms for 2,000 matches on 3k messages; first search on a 10k-message transcript ≤ 60 ms
   including the lazy index build.
+
+### 9.8a List hit (hit.rs; upstream 411e227 list preview, L-109)
+* Upstream's TUI shows the selected search result in a third pane beside or below the list. The GUI's viewer already
+  previews the selection (PD2), so it is that pane: an open from the list while its query is not blank carries core
+  `Browser::list_hit()` (`ListHit { query, evidence }`; the evidence is the semantic evidence the row shows) in
+  `OpenRequest::list_hit`. The TUI pane's layout, its click and hover rules and its render cache have no counterpart.
+* The build job carries the hit: after the items, `hit::find` (gpui-free) splits every segment's text into lines and
+  every navigable message into the range of its items' lines, and calls core `view::preview::anchor`, restricted to the lines matching the query when any match (the evidence alone decides
+  only without a match, 59195df): the line of
+  the message sharing the most distinctive words (4+ characters, case-folded, at most 64) with the evidence (at least
+  three, or all when fewer; within it the line sharing the most), else the first line matching the query
+  (`ViewSearchQuery::has_match`). The query's matches (`ViewSearchQuery::match_ranges`, the `/` search's rules) are
+  the overlay, emphasized by core `view::preview::match_ranges` (upstream 949ec4e) once per hit for the whole
+  conversation (on the build worker or the re-find task, never per paint): the hit's message (the one holding the
+  anchor line) has its matches of the whole query (`ViewSearchQuery::covers_all_terms`, every word and literal in
+  the match) as the hit, or, when it has none, the matches on the anchor line; they are drawn with the fill of the
+  `/` search's other matches (`Emphasis::Hit`). Every other match is secondary, a soft accent wash
+  (`Emphasis::Secondary`; upstream 6755b3b: `search_match_soft_bg`; the text keeps its color). Matches widen to the whole words
+  they touch (`widen_to_words`, alphanumeric characters), so a prefix match on `tests` covers the word. Lines are
+  segment text: the ledger's name column, timestamp and wrapping are not searched (upstream's pane searches them).
+* Placement (upstream `scroll_offset`, in pixels): the anchor message's first item goes to the top and the message is
+  focused (`MessageNav::focus`, the GUI's hit marker; upstream marks the line in its gutter); the next frame's paint
+  reports the anchor's y (a `SelText` reveal at the line's first match): within the upper two thirds of the viewport
+  it stays, else `scroll_by` puts it a third of the way down. When that frame painted no position (the anchor lies
+  below the viewport), the anchor's item goes to the top and the next frame moves the anchor a third of the way down.
+* A new hit for the conversation shown (`ListPaneEvent::HitChanged`, debounced like a preview, list focus only) is
+  found again in the installed items on a background task, without a rebuild; the viewport moves only when the
+  anchor line changed. Rebuilds (t / T / i, width, expansion) find the hit again in the new items and keep the
+  viewport (anchored rebuild). A cleared query (`set_list_hit(None)`) drops the highlights and keeps the viewport.
+* A hit change previews only the conversation the viewer already shows: with another conversation shown and no preview
+  of the selected row pending, the row opens on the next selection change (PD2), not on a query edit. An open from the
+  list (double-click, Enter) for the conversation shown makes the request's hit authoritative, `None` included.
+* The hit's overlay and the `/` search's are never drawn together (one overlay of disjoint matches per segment,
+  §9.4): `/` drops the hit, a new hit ends a running search.
+* Hidden tool output is neither searched nor expanded (upstream renders the preview with nothing expanded); an
+  unreadable file shows the viewer's `Failed to open` view (upstream's pane: `Cannot preview`).
 
 ### 9.9 Message navigation (nav.rs)
 * State = core `view::MessageNav`; positions = `ConversationDocument::navigable_indices()` (V-071).
@@ -2111,19 +2318,43 @@ row), taken from the handle LRU (§9.7).
 
 ### 9.10 Header, toolbar, status bar
 * Header (header.rs) from `HeaderInfo` (model.rs), TUI order on one wrapping line: project (`Unknown` fallback,
-  accent bold) · custom title (only if set and non-empty) · model (`format_model_name`, only if known) · `1 message`
-  / `N messages` (`format_msg_count_long`) · duration (`format_duration_minutes`, only if known) · tokens (**only if
+  accent bold) · custom title (only if set and non-empty) · model (`format_model_name`, only if known) · `1 prompt`
+  / `N prompts` · `1 tool call` / `M tool calls` (only if there are any; upstream e930cac: the prompts the person
+  typed and the distinct tool calls instead of every message; core `header_count_parts`, two parts; the line-fit
+  heuristic measures them in cells; `HeaderInfo::message_count` is no longer shown but still tells a stem-only
+  header apart, as a real conversation can have no prompts) · duration (`format_duration_minutes`, only if known) ·
+  tokens (**only if
   `total_tokens > 0`**: `format_tokens_long` `926k tokens` if the line has room, else `format_tokens` `926k`) ·
   timestamp (`format_header_timestamp`); summary (only if set) on the same line when it fits, else on a second line
   (header_summary role). Conversation not in the corpus → file stem only (V-006). `parse_error_count > 0` → warning
   badge `⚠ N` with tooltip `1 malformed line` / `N malformed lines` that opens Tools → Debug log → Parse errors (V-008). Header is bound to
-  the live corpus (V-007): Workspace pushes `set_header` on `CorpusChanged`.
-* Toolbar (toolbar.rs): segmented `Summary | Truncated | Full` (SetTools*), toggles `Thinking`, `Timing`
+  the live corpus (V-007): Workspace pushes `set_header` on `CorpusChanged`. A card's header (store mode) carries no
+  parse errors: the open build counts the malformed lines of the transcript it decoded (`worker::ParseCount`, with
+  the file's modification time read before the decode; no second decode of the file) and the badge shows that
+  count from the install on; the headers of later corpus changes keep it (no badge flicker while generations are
+  swapped in) at the cost of one stat of the file. Only a file that changed since its count is counted again, as
+  the viewer never re-reads the file it shows (V-082): `worker::Recounter` decodes it through the environment's
+  `HistoryService`, one recount at a time, with a cancel flag another open or a cleared viewer sets (V-101); while
+  it runs, later headers wait for its count and the file is checked once more after it (its count belongs to the version read before the decode). A version that no longer decodes keeps the last count.
+* Family line (upstream 3c2ffeb; `HeaderInfo::family`, from core `Browser::family_of` in `ListPane::header_info`,
+  over every card, hidden subagents included; `header::family_line`): under the header, muted, when the
+  conversation names a parent or has subagents or forks: `↳ fork of <parent>` / `↳ subagent of <parent>` (the
+  parent's core `conversation_label`, at most 60 characters, a link that opens it, tooltip `Open the parent
+  conversation (Shift+P)`), or `↳ subagent of session <short id> (not found)`; then `1 subagent, 2 forks` (a button
+  that opens the picker, tooltip `Subagents and forks (s)`). Single-file windows have no family.
+* Subagents and forks picker (`viewer/family.rs`, an in-app dialog, key context `FamilyMenu`, QA id
+  `family-menu`, rows `family:row:<n>`): title `Subagents and forks`; one row per child, oldest first: `▶` on the
+  selected row, `sub` / `fork`, the label, `<messages> · %m-%d %H:%M`; j/k/↑/↓ move, Enter or a click opens, Esc, `q`,
+  `s` or [Esc] Cancel closes (upstream's `Children` dialog).
+* Toolbar (toolbar.rs): segmented `Off | Summary | Calls | Truncated | Full` (SetTools*; built with the View menu items
+  from one table, `TOOL_DISPLAY_MODES`), toggles `Thinking`, `Timing`
   (`.selected(bool)`), spacer, find bar (when active), `Outline`, `Resume`, `Fork`, `⋯` dropdown (Export…, Copy to
   clipboard ▸, Copy message, Copy path, Copy session ID, Copy header session ID, Show file path, Reveal in file
   manager, Rename…, Search within conversation…, Read range…, Delete…). Single-file: no Resume/Fork/Rename/Delete;
-  unknown-source targets: those items disabled with tooltip `Unknown conversation type`.
-* Status bar (status.rs): `[i/N]` (mono), `tools·sum|trn|all  think·on|off  info·on|off` (`ToolDisplayMode::
+  unknown-source targets: those items disabled with tooltip `Unknown conversation type`; items the conversation's
+  capabilities refuse (Rename of a Codex thread, all four for an orphaned thread; eea6d37) disabled, the Resume
+  and Fork buttons with core's refusal as tooltip.
+* Status bar (status.rs): `[i/N]` (mono), `tools·off|sum|cal|trn|all  think·on|off  info·on|off` (`ToolDisplayMode::
   status_label`; key letter accent, rest muted — clickable), `│`, hints (§8.7, focus-dependent, priority-trimmed).
 
 ---
@@ -2134,7 +2365,8 @@ row), taken from the handle LRU (§9.7).
 ```rust
 pub struct RowModel {                 // built per visible row each frame (cheap; no Vec clones)
     pub id: SharedString,             // path string (domain id; QA id "row:<file stem>")
-    pub source_label: Option<&'static str>,      // "CC" | "Pi" | "OMP" when Browser::has_multiple_sources()
+    pub source_label: Option<&'static str>,      // "CC" | "Pi" | "OMP" | "CX" when Browser::has_multiple_sources()
+    pub kind_label: Option<&'static str>,        // "auto" | "sub": Provenance::list_label (listed on request, cb990e6)
     pub header: RowHeader,                       // core display_format::build_row_header(width = usize::MAX / 4)
     pub preview: RowPreview,                     // core display_format::build_row_preview(max_width = preview chars)
 }
@@ -2144,7 +2376,7 @@ ListItem::new(id).selected(is_sel).h(row_h).px_3().py_1()        row_h = rems(4.
  ├─ line 1 (text_sm): [source lane w_10 mono text_xs muted] TITLE ············ time (mono text_xs, recency role)
  │      TITLE = custom title (custom_title role) → else summary (summary role) → else project (text_primary role);
  │      font_semibold when selected; highlight ranges of that field; truncated with …
- ├─ line 2 (text_xs): project (if not the title) · "42 msgs" (msg_count role) · duration (duration role) ·
+ ├─ line 2 (text_xs): [kind tag "auto"/"sub" (source_label role) ·] project (if not the title) · "12 prompts" (msg_count role; e930cac) · duration (duration role) ·
  │      score "0.87" (accent; Semantic mode with metadata) · summary (when line 1 shows the custom title); truncated with …
  ├─ line 3 (text_xs, preview role): preview with highlights (accent)
  └─ line 4 (literal mode only, text_xs, context_base role): context snippets with context highlight
@@ -2155,7 +2387,8 @@ border_b_1 (separator role) between rows
   rows, score only on rows ≥ 70 chars) do not apply: every field is present and the layout truncates with `…`
   **[dev, AD20]**; the score is hidden only when the row is narrower than 22rem.
 * Tooltip on the row: full `project · title · summary` + full path. Accessibility label `"{title} · {project} ·
-  {relative time}"`. Right-click → context menu (§5.2).
+  {relative time}"`; for an automated or subagent conversation `project` is prefixed with its kind tag (`sub ·
+  proj`). Right-click → context menu (§5.2).
 
 ### 10.2 Preview text (L-024, L-025)
 `max_chars` = floor(line width ÷ average char width of `text_xs`) − 2 (cap 400). Text, source and highlights come
@@ -2167,9 +2400,13 @@ from `build_row_preview` (`PreviewSource` = semantic evidence / lexical context 
 (quoted literals **or** unquoted `_`-identifiers, which core treats as literal filters; fixes quirk 10; WP1's P test
 asserts `a_b` → true and raises a CCR if `literal_context_specs` does not cover it). All rows use
 `row_h = rems(5.5)` while it is on; rows without a context line render an empty fourth line.
+A literal matches only where it starts at a word start (the start of the text, after a non-alphanumeric character:
+`_ . / -` and whitespace all begin words, or at a switch between a letter and a digit, so `"264"` matches inside
+`H264`; 5896b9e), in every surface that uses core's `Literal` (filters, exact fallback, agent retrieval,
+highlights); `"Config"` does not match inside `AppConfig`.
 
 ### 10.4 Search input status (L-032)
-`Browser::search_status_text()` (`Loading… <n>` after the `…` substitution of §12, `<i>/<n>`, `0/<n>`, `sem …`,
+`Browser::search_status_text()` (`Loading…`, or `Loading… <n>` while loading in memory, after the `…` substitution of §12, `<i>/<n>`, `0/<n>`, `sem …`,
 ` sem failed` with the full error in a tooltip (`semantic_error()`), ` sem no text`, ` sem paused`), plus the spinner
 while `has_search_work_in_flight()`.
 
@@ -2192,18 +2429,21 @@ recorded each frame (for the keyboard context menu position).
    * `Agent(cli)` (K15) → headless §11.23. `--show-dir`, `--render FILE` with stdout available → headless §11.23.
    * `args.time_filter()` error → stderr `Error: Invalid time range: <e>` (AppError Display), **exit 1** (upstream
      runtime error, C-005).
-   * Debug builds and `--features qa`: the sandbox gate (§15.4) runs here, before any data is read.
+   * Debug builds and `--features qa`: the sandbox gate (§15.4) runs here, on the `HistoryEnv` just built (the one
+     the app gets), before any data is read; `[FILE]` and `--render FILE` are then checked against its rule for
+     files opened by path (rule 7: refused → `Refusing to run: …`, exit 3).
 2. `claude_history_gui::run(launch, env)` → gpui application → `app::init` (§7.3 order):
    * config: `config.toml` and `gui.toml` loaded **independently** (`load_config_from`, `load_gui_config_from`); a
      failing file → its error in `ConfigErrors`, defaults for its part; effective = `cli.overlaid_with(&gui_file)`;
      `settings = effective_settings(&effective, &args.display_flags(), args.search_mode_override())`;
    * UiState (state.json);
-   * workspace (PD3);
+   * workspace (PD3; debug and QA builds also check it against the sandbox gate's workspace rule, §15.4: a refusal
+     prints `Refusing to run: …` and exits 3 before any window opens);
    * **initial view and list mode** (`startup::resolve_initial_view`, P table test C-066), per field:
 
 | Field | 1st | 2nd | 3rd (only if `[gui] restore_session`) | default |
 |---|---|---|---|---|
-| tool display | `--show-tools` → Full, `--no-tools` → Summary | config `[display] no_tools` set (gui.toml > config.toml): true → Summary, false → Full | state.json `view.tool_display` | Summary |
+| tool display | `--show-tools` → Full, `--no-tools` → Off | config `[display] no_tools` set (gui.toml > config.toml): true → Off, false → Full (d0aca95) | state.json `view.tool_display` | Summary |
 | show thinking | `--show-thinking` / `--hide-thinking` | config `[display] show_thinking` set | state.json `view.show_thinking` | false |
 | show timing | — | — | state.json `view.show_timing` | false |
 | show last (previews) | `--last` / `--first` | config `[display] last` set | — | true |
@@ -2217,30 +2457,134 @@ recorded each frame (for the keyboard context menu position).
 4. After the first frame (`cx.defer`): one configuration-error dialog per failing file (§5.20); startup tool (AD14:
    `run_startup_tool`); QA runner start (feature `qa`); `login-shell-path` probe (macOS/Linux when not started from a
    terminal, §14.2).
-5. `ListPane::new` starts the initial load (§11.2) immediately.
+5. `ListPane::new` opens the store's current generation and starts the initial load (§11.2) immediately: with a
+   usable generation the first frame already lists the newest conversations.
 
-### 11.2 Initial load (streaming)
+### 11.2 Initial load (store mode; in memory without a store)
 1. `ListPane::new`: `browser = Browser::new_loading(BrowserOptions::new(env).with_show_last(settings.show_last)
-   .with_default_mode(app.list_mode).with_exclude_projects(settings.exclude_projects).with_workspace(workspace)
+   .with_default_mode(app.list_mode).with_exclude_projects(settings.exclude_projects).with_exclude_paths(settings.exclude_paths).with_workspace(workspace)
    .with_workspace_filter(args.local && workspace.is_some()).with_waker(waker).with_embedder_factory(shared.browser_factory()))`;
-   `loader = HistoryLoader::new(env, LoaderOptions::new(show_last).with_debug_level(level).with_time_filter(launch.time_filter).with_waker(waker))`;
-   `loader.start_initial_load()`. `level` = `--debug` level, else the Debug log dialog's selector (default Info).
-2. Waker → `_poll_task` → `poll_all(cx)`: `let p = loader.poll(&mut browser)` (appends batches; at the end the K1
-   preparation runs on `corpus-prepare` and a later poll installs it) then `browser.poll()`; notify once.
+   `loader = HistoryLoader::new(env, LoaderOptions::new(show_last).with_debug_level(level).with_time_filter(launch.time_filter).with_waker(waker).with_snapshot(true))`;
+   `if let Some(s) = loader.open_snapshot() { browser.show_snapshot(s) }`; `loader.start_initial_load()`. `level` =
+   `--debug` level, else the Debug log dialog's selector (default Info). The store (`with_snapshot`) is on unless the
+   `ListSnapshots(false)` global says otherwise (G tests of the in-memory path, `test_support::use_memory_list`);
+   with it on and a store root (`store::default_root`, §13.4) the loader is in **store mode** (upstream 358becb: the
+   list never holds the loaded history).
+   * **First rows (upstream 3708bb6).** `open_snapshot` maps the store's `CURRENT` generation (`None` on the first
+     run, after corruption or a format change: the rows then wait for the first generation the initial pass
+     publishes, `Loading…`). `show_snapshot` lists at most `SNAPSHOT_ROWS` (500) cards, newest first, in the current
+     scope (exclusions; Claude directory name or canonical Pi/OMP project path, W1) and the time filter, and selects
+     the first: `Readiness::list` is set, so Open, Resume, Fork and Ctrl+O work on them (AD6), while the view stays
+     `Loading` (Rename/Delete wait). Tab and workspace/exclusion changes decide every card's scope again (from the
+     generation's projects). A query typed meanwhile is kept; the cards stay listed.
+   * **The generation in full (upstream ac7f591, 358becb).** `open_snapshot` also starts a `generation-open` thread
+     that materializes every card (list-only conversations: no text, no parse errors), builds their path and session
+     lookups and opens the generation's search index (`base.fst/post/short` and the zstd text frames, §13.4); a later
+     poll installs them (`Browser::install_generation`): row `r` is card `r`, the browse list holds every card in
+     scope, `Readiness::lexical` is set and the loader reports `Loaded { conversations: <cards>, .. }`, keeping the
+     selected session (no new `SelectionChanged`). A lexical query then runs on the index: the worker answers the top
+     50 rows with their evidence (windows of the text decompressed from the frames) and then every result,
+     abandoning the rest when a newer query arrives; a selection made on the first page survives the complete
+     answer. The literal context of visible rows the worker left without evidence is read from their frames on a
+     `row-evidence` thread (`fill_visible_evidence`, called with the rows `uniform_list` draws). Without index files
+     (an older generation) every card is listed and queries browse until a generation has them.
+   * **Reconcile passes (upstream e905169, 358becb).** `start_initial_load` starts a reconcile pass on a
+     `store-reconcile` thread (upstream ran a detached `--reconcile` process at launch). The pass takes `LOCK`
+     without waiting, stats every Claude, Pi, OMP and Codex session file (Codex rollouts, with the read-only state database for thread metadata) of the env's sources and compares size and mtime
+     with the fingerprints in `CURRENT`; only new or changed files are parsed (as the history loader parses them) and
+     published as delta generations (newest 200 files first, then every 2 s of parsing; unchanged text, semantic and index
+     segments hard-linked from the previous generation, deltas merged past the thresholds); files that hold no
+     conversation are remembered as ignored; a source or directory that cannot be listed keeps its cards; nothing is
+     written when no file changed. A pass that published then removes the per-project and Pi/OMP caches of v0.1.1
+     and earlier from the cache dir, still holding `LOCK` (`store::legacy`, upstream 75df2d4; §13.4 "GUI caches").
+     When another instance holds the lock the pass tries again every second
+     (`BUSY_RETRY`) until it gets it. While it runs, its `store-watch` thread reads `CURRENT` every 200 ms and wakes
+     the poll when it names another generation than the one recorded (by inequality, as upstream's `show_current`
+     compared: a store whose directory is deleted while the app runs is numbered from `g000001` again and still
+     shown); the poll opens it on `generation-open` unless it is the one shown (an open may find a newer generation
+     than `CURRENT` named) and swaps it in: the query, the
+     scope, the time filter and the selected session are kept, a query's rows stay (moved by path) until it answers
+     on the new index (quirk 16; upstream 7ec719a), and `LoaderPoll::swapped` makes the pane emit `CorpusChanged`
+     (header, project paths). A refresh (§11.3), a rename or a delete asks for another pass, run after the one
+     running. Reloads reconfigure the loader (`HistoryLoader::reconfigure`) instead of replacing it, so the UI thread
+     never waits for a pass. At quit gpui drops the list pane, and with it the loader, on the main thread before the
+     process exits: the drop sets a flag that the pass checks after the scan, per file while parsing, while it writes
+     text frames, builds or merges index segments and before each manifest
+     (`store::reconcile::reconcile_cancellable`), and that wakes a pass waiting for the lock, so a pass still running
+     is given up within moments (its `gNNN.tmp` removed) and the window closes without waiting; the generations it
+     published before stay, and the next start's pass goes on from them (upstream's detached process outlived the
+     TUI). Every loader thread sends its result before it calls the waker, so the poll it schedules always finds it.
+   * **Indexing progress (upstream 04c714b).** A pass that parses at least 50 files writes `indexing <pid> <parsed>
+     <to parse>` to the store's `PROGRESS` file (a `reconcile-progress` thread, at most every 250 ms; removed when
+     the pass ends, and by the next pass after a crash). The `store-watch` thread reads it with `CURRENT`, also while
+     the pass waits for another instance's lock (that instance's progress), and wakes the poll when it changes; the
+     poll hands it to `Browser::set_index_progress` while a pass runs or is due, and the footer shows it (§5.1). When
+     no pass runs any more, a pass that was shown leaves `IndexNotice::Indexed`: success toast `Indexed <n>
+     conversations` (replacing the refresh toasts). A failed pass records `failed <message>` in `PROGRESS` (upstream's
+     record for the instance that started it); the loader reports the first line of the error itself: during a
+     refresh as `RefreshFailed` (§11.3), for the initial load with no conversation listed as `LoadFailed`, otherwise
+     as `IndexNotice::Failed`: error toast `Indexing failed: <message>` + [Show debug log]. The loader keeps its
+     record of `PROGRESS` (like that of `CURRENT`) per store root: when a workspace switch moves it to another root
+     (§11.20) the indicator ends without a notice, and a pass still running over the previous store no longer
+     reaches the footer, the success toast or a failure report.
+   * **Edits (upstream 358becb).** Rename and delete work on cards once the generation is shown in full. A delete
+     hides the rows of the deleted session (by its key hash) from the list and the index's scope until a generation
+     without it is shown; a hidden row is no longer in the list (`ListPane::conversation`). A rename shows the new
+     title on its row (the index keeps the old one) until a generation holds it. Both ask for a reconcile pass
+     (`Browser::take_reconcile_request`, which wakes the poll); the swap drops the overlays the new generation
+     reflects.
+   * **Semantic search (upstream ecc2f2f).** Cards carry no text: semantic search ranks the cards with their
+     semantic data (`store::SemanticCards`: turns, message ranges, route and agent text from the generation's
+     `sem-*.zst` segments), read on a `semantic-corpus` thread the first time semantic mode needs them
+     (`SemanticProgress::LoadingSessions`, footer `sem loading conversations`), and ranks those whose card is in
+     scope (time filter included, deleted ones out); results are shown as cards. After a swap, semantic mode reads
+     the new generation's cards in the background (cards whose semantic data is unchanged keep the earlier
+     allocation, so the resident semantic index matches them by pointer and re-chunks only changed cards), and the
+     older cards serve meanwhile once mapped to the new docs by path (on `generation-open` for the swap, else on a
+     `semantic-corpus` thread; a semantic query waits for that mapping). A read of a generation no longer shown is
+     given up. A generation whose semantic data cannot be read keeps the cards read before (mapped to it; a read
+     failing once they serve it does not run their query again); with none, semantic search fails with `semantic
+     corpus unavailable`. It is not read again until semantic mode is entered again (Retry does that) or a newer
+     generation is shown. Quoted-only
+     semantic queries find their matches in the generation's lexical index, newest first, and read the text of the
+     first 200 for their evidence (later rows show their preview); the cards are sent to the semantic worker again
+     once their generation's index is open.
+   * **In memory (store off).** Without a store the rows stream in, every session file parsed (no cache since
+     upstream 75df2d4): `loader.poll` appends batches as they arrive
+     (suffix `Loading… <n>`), and at the end the K1 preparation (§4.3) runs on `corpus-prepare` and a later poll
+     installs it. Upstream 358becb loaded in memory synchronously before the first frame; the fork keeps its
+     background streaming loader for this case.
+2. Waker → `_poll_task` → `poll_all(cx)`: `let p = loader.poll(&mut browser)` then `browser.poll()`; notify once. In
+   memory one poll appends batches for at most `LoaderOptions::drain_budget` (8 ms, upstream 93e17a5; at least one
+   batch): a batch left over is held for the next poll (`p.pending`) and core calls the waker for it. After each poll
+   the task yields once to the executor, so a frame can be drawn before the next wake is handled. Core loads Claude
+   projects (parallel, one batch per project) concurrently with every other instance (Pi, OMP and, since
+   9597669, Codex) parsed together through the registry (`store::reconcile::parse_everything`) and sent newest
+   first in batches of 32 once that parse ends; the registry scan removes duplicates, and a root that cannot be
+   listed is skipped without a message; batches arrive interleaved.
 3. On `p.event`:
-   * `Loaded { project_errors }` → selection row 0 → `SelectionChanged`; `project_errors > 0` → warning toast
+   * `Loaded { project_errors }` → selection row 0 (the selected card's session in store mode) →
+     `SelectionChanged` when it changed; `project_errors > 0` → warning toast
      `N project(s) could not be loaded. See Tools → Debug log.`; `CorpusChanged`, `LoadStateChanged`; project paths
      for the workspace picker recomputed in the background.
    * `NoHistory(e)` → empty view with `e` text (`No conversation history found in selected scope[ within the
-     requested time range]`) + [Refresh] [Clear time filter] (if active).
-   * `LoadFailed(e)` → error view `Couldn't load history` + `e` + [Retry] (`start_refresh`) [Show debug log].
-4. A query typed while loading is kept in the Input and passed to `browser.set_query` (core applies it at the end).
+     requested time range]`) + [Refresh] [Clear time filter] (if active). In store mode: the first pass ended with
+     no card inside the time filter (`Browser::history_is_empty`).
+   * `LoadFailed(e)` → error view `Couldn't load history` + `e` + [Retry] (`start_refresh`) [Show debug log]. In
+     store mode: the first pass failed and no conversation is listed, `e` = `I/O error: indexing sessions failed:
+     <message>` (upstream 04c714b exited with it; a missing projects directory is no error there: the pass lists it
+     as empty).
+4. A query typed while loading is kept in the Input and passed to `browser.set_query` (core runs it on the
+   generation's index once it is open, or in memory applies it at the end).
 
 ### 11.3 Refresh (Ctrl+L, F5, toolbar, menu, palette; also after delete-empty / delete-by-ID if the viewer is unaffected)
 1. `loader.start_refresh()` returns false while a load runs (no-op, parity). Else the footer shows the persistent
    indicator `Refreshing conversations…` (no start toast, PD16).
-2. Core loads into a hidden buffer; the current list stays interactive; preparation off-thread (K1). Rows renamed or
-   removed while the load streams or prepares are replayed onto the installed corpus by core (K1 as built, §4.3).
+2. Store mode (upstream 358becb): core runs a reconcile pass (after the one running, if any); the list stays
+   interactive and the generation the pass leaves is swapped in (§11.2); `Refreshed { old, new }` reports the
+   generation sizes before and after. In memory: core loads into a hidden buffer; the current list stays interactive;
+   preparation off-thread (K1). Rows renamed or removed while the load streams or prepares are replayed onto the
+   installed corpus by core (K1 as built, §4.3).
 3. `Refreshed { old, new, .. }` → toast `Refreshed conversations: <old> → <new>` (replaces the previous refresh toast,
    `id1::<RefreshToast>`); `CorpusChanged`. `RefreshIncomplete` → warning toast `Refresh incomplete; keeping the
    current list` + action "Show debug log". `RefreshFailed(e)` → error toast `Refresh failed: <e>` + "Retry".
@@ -2255,20 +2599,39 @@ recorded each frame (for the keyboard context menu position).
    footer/status; if `semantic_error()` changed → error toast with the full text (once per error) + actions "Switch
    to lexical" and "Retry".
 3. Lexical/semantic semantics are core's (LIST §5–§6, CORE §5.1): generation-tagged lexical worker; semantic with
-   lexical fallback, progress, prewarm; worker failure → respawn once → `semantic worker unavailable`.
+   lexical fallback, progress, prewarm; worker failure → respawn once → `semantic worker unavailable`. The semantic
+   worker answers a search or prewarm at once from the passages embedded so far and embeds the rest in the
+   background, in slices of about 2 s between commands (a new command cancels the running slice; the cache is
+   written at most every 30 s and when indexing ends), then ranks the latest search again and the list refreshes,
+   keeping a row the user moved to (upstream c6d0421). A search that nothing embedded so far matches keeps its
+   lexical rows and shows `sem embedding` until a slice makes an indexed conversation match: it is then answered
+   (upstream 960281f) and refreshed once when indexing ends (or gets the embedding error while still unanswered: fork). Every report wakes
+   the poller (upstream's TUI polled every 250 ms).
 4. Mode toggle (Ctrl+T / toolbar / menu): `browser.toggle_list_search_mode()`; remembered in state.json
    `search_mode` (used next launch only when no config key is set, PD17). Scope toggle (Tab / toolbar):
-   `browser.toggle_workspace_filter()`.
-5. Footer activity = `semantic_activity_status_text()`.
+   `browser.toggle_workspace_filter()`. All-kinds toggle (Ctrl+G / View menu / palette; `--all-kinds` at launch,
+   never remembered): `browser.set_all_kinds(..)`, which keeps the query and the selected conversation; in store
+   mode the cards' scope (`Snapshot::scope(all_kinds, ..)`) is decided again and the index query re-runs, no worker
+   rebuild (cb990e6). Hidden kinds have no semantic turns, so semantic search does not find them. User-only toggle
+   (Alt+U / toolbar `You only` / View menu / palette; never remembered, as upstream): `browser.set_user_only(..)`
+   keeps the query and the selected conversation and re-runs a lexical query over own text only
+   (`SearchIndex::search(.., user_only)` on the `own-*` index segments, or the lexical worker's
+   `search::user_only_view` of the corpus in memory, built once per corpus version); evidence comes from own text
+   (the worker's, and `fill_visible_evidence`). In semantic mode it changes nothing until the mode is lexical again
+   (ae7ae39).
+5. Footer activity = `semantic_activity_status_text()`, its progress bar from `semantic_activity_counts()`.
 
 ### 11.5 UUID jump (K2)
 After `set_query`, `uuid_lookup()`:
 * `Found { .. }` → the single row is selected and previewed (`CorpusChanged` if `loaded_from_disk`).
-* `Pending { uuid }` → background `history::load_session_by_uuid(env, uuid, show_last)` → `browser.resolve_uuid_lookup(uuid, result)`.
+* `Pending { uuid }` → background `history::load_session_by_uuid(env, uuid, show_last)` → `.map(PreparedSession::new)` (still in the background) → `browser.resolve_uuid_lookup_session(uuid, result)`.
 * `NotFound { uuid }` → error toast `Session not found: <uuid>` (`UuidLookup::status_message`, LIST quirk 6 fix);
   previous rows stay.
 * After a refresh or reload (K2 as built, §4.3) a UUID result stays `Found` (core re-appends the session when the new
   corpus lacks it) or `NotFound`; it is `Pending` only while the GUI's lookup is in flight. No GUI handling needed.
+* Store mode (upstream 358becb): the generation's cards are looked up first (all of them, also outside the time
+  filter or the first cards), so only a session the store does not hold yet is read from disk; a session read from
+  disk that a swapped-in generation lacks stays as a row after the cards.
 
 ### 11.6 Open in viewer (preview / Enter / double-click / deep-search hit / agent reveal)
 1. Workspace → `viewer.open(OpenRequest { target, focus, reveal })`.
@@ -2278,8 +2641,15 @@ After `set_query`, `uuid_lookup()`:
 3. `install(gen, result)`: stale → drop. `Err(e)` → error view `Failed to open: <e>` with [Retry] and [Show debug
    log] + toast with the same text (L-051/A-054). Ok → replace model (old document dropped),
    `ListState::reset_with_uniform_height`, header from `list.header_info(path)` (single-file: from
-   `process_conversation_file`), clear search & expanded, `MessageNav::new`; apply `reveal`; if `focus` →
+   `process_conversation_file`), clear search & expanded, `MessageNav::new`; show the list hit the build found
+   (§9.8a); apply `reveal`; if `focus` →
    `viewer_focus.focus()` after the frame; emit `TargetChanged`.
+4. Related opens (upstream 3c2ffeb): `P`, `s` + Enter and the family line's links push the shown target on the
+   viewer's back stack and emit `ViewerPaneEvent::OpenRelated(target)`; Workspace opens it with
+   `OpenRequest::related()` and `select_in_list = false` (the list keeps its selection; a subagent is usually not
+   listed). Esc after the PD2 unwinding and `q` pop the back stack (another `OpenRelated`) before they emit
+   `LeaveRequested`. Any other open (list, Deep search, agent panel) clears the stack, so does clearing the
+   viewer; deleted conversations leave it (`CorpusNotice::Deleted`).
 
 ### 11.7 Viewer toggles and expansion
 `t`/`T`/`i`/SetTools*/`x`/click → mutate `ViewerModel` (`cycle_tool_display`, `toggle_thinking`, `toggle_timing`,
@@ -2288,23 +2658,40 @@ the worker (§9.6); Active search `refresh`ed. Clicking an expandable control al
 
 ### 11.8 Rename (F2, menus, palette, row menu; list or viewer; K3)
 1. The pane handler captures `target` (§7.8); while loading, unknown source or single-file → no-op (menu item
-   disabled).
+   disabled). A conversation whose capabilities refuse it (`ConversationTarget::refusal`, core
+   `capabilities_of`: a Codex thread, an orphaned one, eea6d37; a Claude subagent or `/btw` fork, 3c2ffeb) →
+   warning toast with core's refusal (`Renaming CX sessions is not supported`, `Renaming CC subagents and forks is
+   not supported`) before any dialog opens (`routing::run_session_action`); the row
+   menu and the viewer's ⋯ menu show Rename… disabled.
 2. `ops::rename::open_rename_dialog(target, window, cx)`: `InputState` prefilled with `target.custom_title` (caret at
    end, focus once); dialog §5.6 registered in `OpenTargets`.
-3. Save/Enter → buttons show a spinner; background `history::rename_session(env, path, source, input, show_last)` →
-   UI: `list.apply_renamed(path, conv)` (K3). Ok → close dialog; row/header update via `CorpusChanged` (no toast).
-   `Err(RenameError)` → inline error (`Failed to rename: conversation became empty` / `Failed to rename: <e>`;
-   dialog stays open, input kept). `NoTarget` (the conversation left the list meanwhile) → inline `This conversation
+3. Save/Enter → buttons show a spinner; background `history::rename_session(env, path, source, input, show_last).map(PreparedSession::new)` →
+   UI: `list.apply_renamed(path, prepared)` → `browser.apply_renamed_session` (K3). Ok → close dialog; row/header update via `CorpusChanged` (no toast).
+   `Err(RenameError)` → inline error (`Failed to rename: conversation became empty` / `Failed to rename: <e>` /
+   `Renaming <source> sessions is not supported` when the source's adapter cannot rename (9799550; Codex is
+   refused up front, step 1); dialog stays open, input kept). `NoTarget` (the conversation left the list meanwhile) → inline `This conversation
    is no longer in the list`.
 
 ### 11.9 Delete (Ctrl+X, menus, palette, row menu; list or viewer; K4)
-1. Capture `target`; while loading, unknown source or single-file → no-op.
-2. Background `maintenance::plan_session_delete(env, &target.path, source)`. Error (e.g. `Session not found: <id>`) →
-   error toast.
-3. Open the confirmation (§5.7) with the plan (files, dirs, copy count); registered in `OpenTargets`. `y`/`Y`/Delete
-   button → buttons disabled; background `execute_session_delete(env, &plan)`.
+1. Capture `target`; while loading, unknown source or single-file → no-op; refused by its capabilities (an orphaned
+   Codex thread, eea6d37) → warning toast with core's refusal (§11.8 step 1), checked again with the live corpus
+   entry's provenance after planning (an agent hit does not know it).
+2. Background `maintenance::plan_session_delete(env, &target.path, source)`. Error (e.g. `Session not found: <id>`, or
+   `Deleting <source> sessions is not supported` when the source's adapter cannot delete: 9799550) → error
+   toast. A Codex plan lists every rollout of the thread (eea6d37). A Claude sidecar (subagent or `/btw` fork,
+   3c2ffeb) plans its transcript and its `.meta.json` (`DeletePlan::metadata`) and nothing else; a Claude session
+   plans its session directories but keeps the `/btw` forks in them (`DeletePlan::kept`; the execution removes the
+   directory with `remove_session_dir`, which keeps the forks it finds then), and the confirmation says `Its /btw
+   fork stays, a conversation of its own.` / `Its N /btw forks stay, conversations of their own.`.
+3. Open the confirmation (§5.7) with the plan (files, dirs, copy count; for Codex `Runs the Codex CLI's delete --force <id>,
+   which removes the thread and its state. This can't be undone.`); registered in `OpenTargets`. `y`/`Y`/Delete
+   button → buttons disabled; background `execute_session_delete_with(env, &plan, config.launcher(env, Codex), run)` (the configured Codex
+   command or `[gui] codex_path`, 8a99ccc) with
+   `run` = `PlatformServices::run_program` (only a Codex plan runs a program: `codex delete --force <thread id>`
+   with `CODEX_HOME`, `CREATE_NO_WINDOW` on Windows; a failure is `codex delete failed (<status>): <stderr>`).
 4. Ok(report) → `CorpusNotice::Deleted(plan.files)` (all deleted copies leave the list, the viewer is cleared if it
-   shows one, other dialogs on those paths close, §7.2); toast `Deleted "<title>"` or, for several Claude copies,
+   shows one, other dialogs on those paths close, §7.2; a Codex thread's rollouts leave even when the recorder in a
+   test or QA run removed nothing); toast `Deleted "<title>"` or, for several Claude copies,
    `Deleted session <id> (<n> copies across projects)` (core `delete_by_uuid_message`). Err(e) → error toast
    `Failed to delete session <path>: <e>` (core also appends that line to debug.log; LIST quirk 7 fix). As built
    (K4): `<path>` is `plan.path`, the listed conversation (also when another copy failed); a plan that
@@ -2312,19 +2699,37 @@ the worker (§9.6); Active search `refresh`ed. Clicking an expandable control al
 5. Pending searches: core keeps indices consistent (F8).
 
 ### 11.10 Resume / Fork
-1. Capture `target`; loading, unknown source or single-file → no-op.
+1. Capture `target`; loading before the rows are listed (`list_ready`), unknown source or single-file → no-op;
+   refused by its capabilities (an orphaned Codex thread, eea6d37) → warning toast with core's refusal (§11.8
+   step 1), checked again with the live corpus entry's provenance once the plan is made.
 2. `conv` = `list.conversation(&target.path)` (live `project_path`) or, when not in the corpus, a background
    `process_conversation_file` → `ResumeTarget`.
-3. `plan = core::resume::plan_resume(&env, &conv, workspace.as_ref(), fork, &settings.resume_default_args,
-   &ProgramOverrides::from_gui_settings(&config.gui))`:
+3. `launch = Launch { launcher: config.launcher(&env, source), default_args:
+   settings.resume_default_args_for(source) }` (`[resume] default_args` for Claude, `[resume.codex] default_args` for
+   Codex, none for Pi/OMP; eea6d37); in the background, after the login-shell `PATH` probe (≤ 3 s, step 4),
+   `launch.launcher.check(&env, source)`: `Err(AgentLaunch)` → error toast with core's text (upstream 8a99ccc:
+   ``Cannot start agent: `<program>` was not found on PATH; …`` naming the key to check, or suggesting `command`)
+   + action "Open Settings" (Resume page for a `command` or when nothing is set, General for a `[gui]` program path), before any copy confirmation; then
+   `plan = core::resume::plan_resume_target(&env, &target, workspace.as_ref(), fork, &launch)`:
+   * the adapter of the conversation's source plans it (`Registry::for_source`, `Adapter::resume`; 9799550) and
+     core refuses what the conversation does not support (`capabilities_of`; `Failed to run Claude CLI: Resuming
+     <source> sessions is not supported` / `… is unavailable: …`, eea6d37).
+   * A Claude subagent or `/btw` fork (3c2ffeb) resumes the session that holds it (its transcript is planned in
+     place of the sidecar, copy included); Fork is refused by its capabilities; a sidecar whose session file is
+     gone fails with `Failed to run Claude CLI: The session holding this transcript no longer exists: <path>`.
+   * Codex (eea6d37): `codex [default_args] resume|fork <thread id>` in the thread's project directory, else the
+     workspace with the `Session directory … does not exist` warning; `plan.env` = `CODEX_HOME` of the rollout's
+     home, which every launcher passes on (`env 'CODEX_HOME=…'` in the POSIX line, `set "CODEX_HOME=…" &&` in the
+     `cmd.exe` line, and on the launcher process).
    * `Err(AppError::WorkspaceRequired(msg))` → toast `msg` + action "Choose workspace…"; other errors → toast with the
      error text.
    * `plan.warnings` → warning toast(s) (e.g. `Session directory <dir> does not exist`).
    * `plan.copy = Some(copy)` → confirmation §5.8 (danger when `existing_targets` is non-empty); confirmed →
      background `plan.execute_copy()`; error → toast `Failed to copy the conversation: <e>`.
 4. macOS/Linux: if the login-shell PATH probe is still running, wait for it (≤ 3 s, spinner on the toast).
-5. `spec = plan.launch_spec(&env)`: `Err` → toast `Could not find '<program>' on PATH. Set its path in Settings →
-   General.` + action "Open Settings". Batch-script programs with arguments `cmd /C` cannot pass → core's error text.
+5. `spec = plan.launch_spec(&env)` (the launcher's arguments, then the plan's): `Err(AgentLaunch)` (the program went
+   away after step 3) → the same toast + "Open Settings". Batch-script programs with arguments `cmd /C` cannot pass →
+   core's error text.
 6. For each `launcher in terminal::launcher_candidates(&env, &options)` (K17; options = `LaunchOptions` with
    `[gui] terminal` and `$TERMINAL` read by `main`): `cmd = prepare_launcher_command(&env, &launcher, &spec, &options)?` → background `services.spawn_terminal(&cmd, 3 s)`:
    `Ok(None)` or `Ok(Some(0))` → success toast (PD4 text, with `plan.display_command()`); `Ok(Some(code≠0))` → error
@@ -2336,26 +2741,34 @@ the worker (§9.6); Active search `refresh`ed. Clicking an expandable control al
 * Export: capture target + options (`ViewerModel::export_options()` in the viewer; `settings.show_tools` /
   `show_thinking` from the list) → menu §5.9 → format → `services.prompt_save_path(dir, default_name)` → extension
   check (PD8: append, then `Replace "<name>"?` when the appended path exists) → background
-  `core::export::export_to_path` → toast `Exported to <path>` + Reveal, or `ExportError` Display (`Failed to read:
-  <e>` / `Failed to write: <e>`); the directory is remembered. Save dialog `Err` → PD8 fallback.
-* Copy as: same options → background `generate_export` → `services.clipboard_write` → `Copied to clipboard`.
+  `core::view::open_conversation` (through the app's `EnvHistory`) and `core::export::export_to_path` → toast
+  `Exported to <path>` + Reveal, or `ExportError` Display (`Failed to read: <e>` / `Failed to write: <e>`); the
+  directory is remembered. Save dialog `Err` → PD8 fallback.
+* Copy as: same options → background `open_conversation` + `generate_export` → `services.clipboard_write` →
+  `Copied to clipboard`.
 * Copy message (`y` with nav): `ViewerModel::message_text(entry)` → non-empty → clipboard + `Message copied to
   clipboard`; empty → `No text content in this message`; Err → `Message not found`.
 * Copy path → `Path copied to clipboard`; copy session ID (file stem) → `Session ID copied to clipboard`; copy header
   ID → `Session ID copied to clipboard`; show path → toast with the full path and Copy/Reveal buttons.
 
 ### 11.12 Single-file
-`claude-history-gui FILE`, `--render FILE` without redirection, or File → Open JSONL file…: validate (`File not
+`claude-history-gui FILE`, `--render FILE` without redirection, or File → Open JSONL file…: (debug and QA builds) the
+sandbox gate's rule for files opened by path (§15.4 rule 7): a Codex rollout whose Codex home or state database
+lies outside the sandbox home is refused — at startup `Refusing to run: …`, exit 3 (`startup::dispatch`); from the
+dialog an error toast `Couldn't open <p>: <reason>` and that file is not opened (`startup::opened_file_refusal`) —
+then validate (`File not
 found: <p>` / `Not a file: <p>` → window opens in an error state), open `SingleFileWindow` with
-`ViewerPane(SingleFile)`, header from `history::process_conversation_file(path, None, debug)` in the background
-(`Ok(None)` → stem-only header and the D1 error state `<file> contains no conversation messages`; `Err` → header stem
+`ViewerPane(SingleFile)`, header from `Browser::new_single_file` in the background
+(`history::process_conversation_file_in(env, path, mtime, None)`: a Codex rollout of the env's home honors
+`CODEX_SQLITE_HOME` like the viewer; `Ok(None)` → stem-only header and the D1 error state
+`<file> contains no conversation messages`; `Err` → header stem
 + error), target `ConversationTarget::from_parsed_file`. The agent panel asks the agent worker for
 `conversation_key_for_path` (K8) and is disabled with the D-035 text when `None`. Esc/q → `window.remove_window()`;
 the app quits when no windows remain.
 
 ### 11.13 Picker mode and Ctrl+O
-1. Ctrl+O / Select (not while loading; no selection → nothing): ListPane flushes the pending preview, captures the
-   target → `ops::select::select_and_exit(target, window, cx)`.
+1. Ctrl+O / Select (not before the rows are listed; no selection → nothing): ListPane flushes the pending
+   preview, captures the target → `ops::select::select_and_exit(target, window, cx)`.
 2. Picker ShowPath/ShowId → `settings::picker_output(action, conv)` → `exit::quit_with_output(line + "\n")`
    (`services.write_stdout`, flush, `cx.quit()`, exit 0). Error → stderr `Error: <e>`, exit 1. No stdout → toast
    `Nothing to print to …` and stay open.
@@ -2366,7 +2779,7 @@ the app quits when no windows remain.
    and a failed launch keeps the picker open. Under `--resume` the fork flag is the key pressed (Ctrl+R / Ctrl+F),
    not `--fork-session`.
 4. No picker → PD5 "Print and exit": `services.stdout_kind()`: Redirected → print; Terminal → confirmation first;
-   None → toast. Text = `generate_export(Ledger, settings options)` or `plain_display(path, options)` with
+   None → toast. Text = `generate_export(Ledger, settings options)` or `plain_display(transcript, options)` with
    `--plain`/`[display] plain`; `--debug` diagnostics in the PD5 order; then quit 0.
 5. Picker + Esc with an empty query, Quit, or closing the main window → `exit::quit_without_output` (exit 0).
 
@@ -2380,14 +2793,17 @@ the app quits when no windows remain.
    a running Search job is cancelled (K7) and replaced; the worker builds
    `AgentService::new(env, config).with_embedder_factory(shared.agent_factory()).with_cancellation(token)
    .with_notice_sink(progress → channel)` → `respond(AgentRequest::Search(args))`. While the semantic gate is
-   Exclusive, semantic/hybrid jobs fail fast with `Semantic search is paused while the cache is generated`.
+   Exclusive, semantic/hybrid jobs fail fast with `Semantic search is paused while the cache is generated`
+   (a user-only search is never gated: core runs it lexically).
 3. Progress notices → status line (`Embedding 12/30`). `UncachedPassages { count, bounded_top_up: false }` → banner
    `<count> passage(s) are not cached. Generate the semantic cache to include them.` + [Generate semantic cache…]
    (the exact upstream line stays in the agent text view's stderr part).
 4. Reply → `AgentResponse`: success → render `AgentResult::Search` (groups/hits from `output`, conversations from
    `conversations`), warnings banner, effective-mode hint (quoted-only → `Exact match forced`), stats; failure →
    `error: Some(AgentError)` → alert with kind + detail (ambiguous-ref candidates as clickable full refs) or the
-   `error_text()`; cancelled → `Search cancelled`. "Show agent text output" shows `text()` + notices.
+   `error_text()`; ambiguous-ref candidates are expanded to full refs through `discover_agent_keys` and
+   `full_ref_for_candidate` for every source (refs digest the instance root and native id, 429d123), and an anchor
+   that no current message matches fails with `stale-anchor` (the core detail tells the user to search again); cancelled → `Search cancelled`. "Show agent text output" shows `text()` + notices.
 5. Open hit → `DeepSearchEvent::OpenHit { target: from_agent_info(conversation(hit.conversation_ref)), reveal:
    RevealRequest { path, full_ref, AgentOrdinal { ordinal: focus.start, hint: from options } } }`.
 6. Agent panel (Outline / Within / Read): every result set stores `{ target, full_ref, generation }` captured when it
@@ -2405,21 +2821,23 @@ the app quits when no windows remain.
      §7.2). Never `viewer.reveal` on a different conversation.
 
 ### 11.15 Tool deletions (delete-empty, delete by session ID)
-Both broadcast `CorpusNotice::Deleted(paths)` with every removed transcript (from `DeleteEmptyOutcome::deleted` /
+Both keep the `/btw` forks in a deleted session's directory (upstream 3c2ffeb; delete-by-ID's confirmation says
+so). Both broadcast `CorpusNotice::Deleted(paths)` with every removed transcript (from `DeleteEmptyOutcome::deleted` /
 the K4 plan) — the same route as §11.9 — so the list drops them, the viewer is cleared if it shows one, and dialogs
 and agent result sets holding them close. Then a background refresh runs (Pi/OMP untouched; Claude counts updated).
 
 ### 11.16 Semantic cache generation / clear (semantic gate, §7.6)
-* Generate: dialog → `gate.enter_exclusive(Generate)` (list worker suspended + joined, agent semantic jobs paused) →
-  std thread: `maintenance::load_sorted_conversations(env, show_last, None, &TimeFilter::default())` (fresh, no time
+* Generate: dialog → `gate.enter_exclusive(Generate)` (list worker suspended, agent semantic jobs paused) →
+  std thread: `entry.wait()` (joins the list worker, §7.6) →
+  `maintenance::load_sorted_conversations_cancellable(env, show_last, None, &TimeFilter::default())` (fresh, no time
   filter, AD9) → `semantic_ops::generate_semantic_cache(env, &convs, scope_workspace, &TimeFilter::default(),
   &mut shared.ops_factory(), &mut progress, &cancel)`; progress lines into the dialog; Cancel → `cancel.cancel()` →
-  `Semantic search cancelled`; capacity error text from core; done → `GenerateReport::text`; finally `gate.leave()`
+  `Semantic search cancelled` (also while the load waits for the list's reconcile pass); capacity error text from core; done → `GenerateReport::text`; finally `gate.leave()`
   (list worker resumes and reloads the cache).
-* Clear: AlertDialog §5.11 → `gate.enter_exclusive(Clear)` → shared model dropped (files closed) →
-  `semantic_ops::clear_semantic_cache(env)` (under core's lock; empties `<cache root>/semantic` and keeps the directory
-  and `embeddings.lock`, never follows links — K6 as built) → `ClearReport::message` / error (+Retry) →
-  `gate.leave()`.
+* Clear: AlertDialog §5.11 → `gate.enter_exclusive(Clear)` → std thread: `entry.wait()` (joins the list worker) →
+  shared model dropped (files closed) → `semantic_ops::clear_semantic_cache(env)` (under core's lock; empties
+  `<cache root>/semantic` and keeps the directory and `embeddings.lock`, never follows links — K6 as built) →
+  `ClearReport::message` / error (+Retry) → `gate.leave()`.
 
 ### 11.17 Update check
 Help/Tools → Check for updates… (or `update` subcommand) → dialog `Checking for updates…` → background
@@ -2436,7 +2854,8 @@ Help/Tools → Check for updates… (or `update` subcommand) → dialog `Checkin
    &edited)` → reload both files → `AppState` update → apply:
    * keys → `keymap::install_user_bindings(cx, &new_keys)` (menus/palette rebuilt, hints refresh);
    * theme → §11.19; terminal/program paths → next launch of a terminal;
-   * `[tui] exclude_projects` → `browser.set_excluded_projects`;
+   * `[tui] exclude_projects` → `browser.set_excluded_projects`; `[tui] exclude_paths` → `browser.set_excluded_paths`
+     (the next Deep Search run reads it from the effective config);
    * `[display] last` → list refresh (previews are chosen at load);
    * `[display] no_tools` / `show_thinking`, `[search] mode` → new defaults for conversations opened later and for
      the next launch (they now beat remembered values, PD17); the open view keeps its toggles;
@@ -2453,18 +2872,28 @@ caches, anchored re-render), list notify; menus/palette rebuilt (check marks); t
 theme applies to this session only and a warning toast says `Theme not saved: gui.toml has errors`.
 
 ### 11.20 Workspace change
-Picker selection / Choose folder… / Clear → validate dir → `AppState.workspace` + `env.workspace_dir` (new
+Picker selection / Choose folder… / Clear → validate dir → (debug and QA builds) the sandbox gate's workspace rule
+(§15.4 rule 6, `startup::workspace_refusal`): a workspace whose Pi settings lead outside the sandbox home → error
+toast `Couldn't switch the workspace: <reason>`, nothing changes (PD3 rule 3 (c) likewise keeps no workspace and
+shows `Couldn't use the launch folder as the workspace: <reason>`) → `AppState.workspace` + `env.workspace_dir` (new
 `Arc<HistoryEnv>`) → `browser.set_workspace(scope)` → recents (state.json) → title → reload with
 `loader.start_refresh_with(RefreshPolicy::ApplyPartial)` (K18): the rows always match the new workspace;
 `project_errors > 0` → warning toast `N project(s) could not be loaded. See Tools → Debug log.`; `RefreshFailed(e)`
 → the workspace, title and scope revert to the previous values (and the env/browser too) + error toast
-`Couldn't switch the workspace: <e>`. If a load is already running, the change waits for it and then reloads.
+`Couldn't switch the workspace: <e>`. If a load is already running, the change waits for it and then reloads. In store
+mode the reload is a reconcile pass; a workspace whose Pi/OMP session roots differ (`.pi/settings.json`) moves the
+loader to that store root (`roots-<hash>`), whose generation is swapped in once open (the rows shown stay until then).
+A pass still running over the previous store goes on (the new store's pass runs after it), but its progress,
+completion toast and failure are no longer shown; the indexing indicator ends at the switch.
 
 ### 11.21 Time filter change
 Dropdown preset or custom dialog → `TimePoint::from_str` + `TimeFilter::resolve` (errors inline) →
 `loader.set_time_filter(filter)` → reload with `RefreshPolicy::ApplyPartial` as in §11.20; success → chip label
 updated; `RefreshFailed` → chip and loader filter revert + error toast `Couldn't apply the time filter: <e>`. The
-filter is not persisted (PD17).
+filter is not persisted (PD17). In store mode the next poll re-scopes the cards of the generation shown under the new
+filter (`Browser::set_time_filter`, no file is read; upstream fixed the filter at launch) and the reload is a
+reconcile pass; `HistoryLoader::set_time_filter` (and `reconfigure`) wake the poll, so a filter or workspace reverted
+after a failed pass re-scopes the cards at once.
 
 ### 11.22 Quit, window close and persistence
 * `exit::quit(cx)`: picker mode → `quit_without_output`; else `persist::flush`, `cx.quit()`.
@@ -2476,20 +2905,39 @@ filter is not persisted (PD17).
 ### 11.23 Headless paths (no window)
 * `help …` / `<subcommand> --help` (K14 as built): `SubcommandHelp(text)` → stdout, exit 0.
 * `claude-history-gui agent …` (K15): `Help(text)` → stdout, exit 0; `Request(req)` →
-  `core::agent::execute(&env, &config.effective, req)` with the env's workspace = launch cwd (upstream used the cwd)
-  → write `stdout`/`stderr` verbatim, exit `exit_code`; parse error → stderr clap-style text, exit 2. Semantic
+  `core::agent::execute(&env, &config.effective, req)` with the env's workspace = launch cwd (upstream used the cwd;
+  debug and QA builds first check it against the sandbox gate's workspace rule, §15.4: refused → `Refusing to run: …`,
+  exit 3) → write `stdout`/`stderr` verbatim, exit `exit_code`; parse error → stderr clap-style text, exit 2. Semantic
   requests load the real model (as upstream); no window is created.
 * `--show-dir` with stdout available: workspace = PD3 rules 1–3 (no GUI state) → `maintenance::show_dir(env,
   workspace)` → stdout path + `\n`, exit 0; error → stderr `Error: <e>`, exit 1. Without stdout → open the GUI and
   show the projects-directory toast (AD14).
-* `--render FILE` with stdout **redirected**: `generate_export(Ledger, settings options)` (no ANSI, `[dev]` vs
+* `--render FILE` with stdout **redirected**: (debug and QA builds) the sandbox gate's rule for files opened by path
+  first (§15.4 rule 7: refused → `Refusing to run: …`, exit 3); the file decoded through
+  `HistoryService::from_env(env)`, then `generate_export(Ledger, settings options)` (no ANSI, `[dev]` vs
   upstream's ANSI ledger) → stdout, exit 0; errors → stderr, exit 1. Otherwise the single-file window (C-011).
+
+* `--dump-semantic-turns PATH` (hidden, upstream f222b3c): the corpus of §11.24 (`load_sorted_conversations`, no time
+  filter), written by `semantic_ops::dump_turns` as one JSON object per line (`path`, `timestamp` RFC 3339,
+  `project`, `title`, `summary`, `preview`, `message_count`, `turns`), newest first; stderr `Wrote semantic turns of N
+  conversation(s) to PATH`, exit 0; errors → stderr `Error: <e>`, exit 1. A relative PATH is resolved against the
+  launch directory. No window, whatever stdout is.
 
 ### 11.24 One-shot tool corpora (P11)
 Debug search, Semantic search report, Semantic debug dump and Generate cache work on a **fresh load** in the
 background, never the list corpus: `maintenance::load_sorted_conversations(env, show_last, debug, &tf)` with `tf` =
-the launch time filter (Generate: none, AD9). Their Scope control (All | Workspace) is preselected Workspace when the
-app was started with `-L/--local` (or the startup tool says `local: true`) and a workspace exists.
+the launch time filter (Generate: none, AD9). The fresh load reads the store (upstream 16cc49c):
+`store::load_conversations(env, show_last, debug, Contents::Full)` runs a reconcile pass on the calling thread
+(usually nothing to parse, since the list's passes keep the store current). When another thread or process holds
+the store's `LOCK` (the list's `store-reconcile` pass, a second instance), it waits for the lock and runs the pass
+once more. Then it reads every card with its text frame and semantic data, parse errors included. Without a cache
+root, or when the store cannot be read, it parses the session files of every instance through the registry
+(`store::load_in_memory`, Codex included since 9597669). Deep
+search's `agent search` loads its corpus the same way, through `store::load_conversations_cancellable`: a cancelled
+job (K7) stops waiting for the lock at once (it asks for it every 100 ms), so the `agent-worker` thread is free for the
+next job. The keys-less fallback of `resolve_agent_read_args`/`resolve_agent_conversation_arg` reads cards only (`Contents::Cards`), as upstream; `agent read`/`outline`/`within`, and so the agent panel, resolve refs from `discover_agent_keys`, never through that fallback.
+The tools' Scope control (All | Workspace) is preselected Workspace when the app was started with `-L/--local` (or
+the startup tool says `local: true`) and a workspace exists.
 
 ---
 
@@ -2504,24 +2952,38 @@ W warning, E error. Every error state offers a recovery action (DG §9.13).
 
 | Where | Condition | UI | Text (in-app) | TUI / core origin |
 |---|---|---|---|---|
-| List area | initial load, 0 rows yet | centered Spinner + text | `Reading history…`; suffix `Loading… 0` | `Loading... 0` |
-| List area | `LoadFailed(e)` | Empty (error icon) + [Retry] [Show debug log] | title `Couldn't load history`; body `e` (e.g. `Claude projects directory not found at <path>`) | TUI exited with `e` |
+| List area | initial load, 0 rows yet | centered Spinner + text | `Reading history…`; suffix `Loading…` (in memory `Loading… <n>` once rows stream in) | `Loading...` (358becb) |
+| List area | `LoadFailed(e)` | Empty (error icon) + [Retry] [Show debug log] | title `Couldn't load history`; body `e` (e.g. `Claude projects directory not found at <path>`; store mode `I/O error: indexing sessions failed: <message>`) | TUI exited with `e` |
 | List area | `NoHistory(e)` | Empty + [Refresh] [Clear time filter] (if active) | `No conversation history found in selected scope` (+ ` within the requested time range`) | (TUI, verbatim) |
 | List area | query has no matches | Empty (muted) + [Clear search] | `No matching conversations` | blank list |
 | List area | everything excluded / out of scope | Empty + [Show all] | `No conversations in this scope` + `Switch to All or change the workspace.` | blank list |
+| List area | `[tui] exclude_projects` / `exclude_paths` hide every row (L-079) | Empty + [Open Settings] (Workspace scope: [Show all] [Open Settings]) | `Every conversation is in an excluded project` / `… in an excluded working directory` / `Every conversation is excluded` (both) + `Excluded in Settings (exclude_projects): <names>; (exclude_paths): <prefixes>.`; Workspace scope: `No conversations in this scope` + `Switch to All or change the workspace. Excluded projects / working directories / projects and working directories stay hidden: <values>.` | blank list |
 | List area | semantic failed | list cleared (TUI) + Empty + [Switch to lexical] [Retry] | `Semantic search failed` + `semantic_error()` text | suffix `sem failed` |
 | List area | semantic no text | Empty + [Switch to lexical] | `No text to search semantically` | suffix `sem no text` |
-| Search suffix | states | label | `Loading… <n>` / `<i>/<n>` / `0/<n>` / `sem <i>/<n>` / `sem failed` / `sem no text` / `sem paused` | `Browser::search_status_text` |
-| Footer | semantic init / embedding | spinner / progress | `sem preparing embeddings` / `sem embedding <p>%  <d>/<t> chunks` | `semantic_activity_status_text` (verbatim) |
+| Search suffix | states | label | `Loading…` / `Loading… <n>` (in memory) / `<i>/<n>` / `0/<n>` / `sem <i>/<n>` / `sem failed` / `sem no text` / `sem paused` | `Browser::search_status_text` |
+| Footer | semantic data read (store mode) / init / embedding / background indexing | spinner / progress | `sem loading conversations` / `sem preparing embeddings` / `sem embedding <p>%  <d>/<t> chunks` / `sem indexing <p>%  <d>/<t> chunks` | `semantic_activity_status_text` (verbatim; `sem loading conversations` is fork wording for upstream 358becb's `LoadingSessions`, which upstream shows no text for; `sem indexing` is upstream c6d0421's) |
 | Footer | refresh/reload running | spinner (persistent) | `Refreshing conversations…` | `Refreshing sessions...` (`REFRESHING_STATUS`) |
+| Footer | a reconcile pass shown as indexing (store mode, 04c714b) | progress bar / spinner; replaces the refresh indicator | `Indexing conversations… <done> / <total>` / `Finishing index… <total> conversations` (+ `  ·  results may be incomplete` while a query is typed; thousands separated by `,`) | `Browser::indexing_status_text` (`Indexing sessions… 2,345 / 7,185`, `Finishing index… 7,185 sessions`) |
+| Toast S | a pass shown as indexing ended | replaces the refresh toasts | `Indexed <n> conversations` | `Indexed <n> sessions` (`IndexNotice::status_message`) |
+| Toast E | a failed reconcile pass that no load event reports (not a refresh's pass, and not a first pass that left nothing listed) | + [Show debug log]; replaces the refresh toasts | `Indexing failed: <message>` | `Indexing failed: <message>` (`IndexNotice::status_message`) |
+| Footer / View menu / rows | automated and subagent conversations listed (cb990e6) | chip (accent, while on) / check mark / line-2 tag | `Ctrl+G all kinds` / `Show automated and subagent conversations` / `auto`, `sub` | `^G·all kinds` / help `Show/hide automated and subagent sessions` / `Provenance::list_label` |
+| Toolbar / footer / View menu | search limited to the user's own messages (ae7ae39) | toggle button (selected while on) + tooltip / chip (accent, while on) / check mark | `You only`, tooltip `Search only your own messages` (semantic mode: `Search only your own messages (lexical search; semantic search ignores it)`) / `Alt+U you only`, in semantic mode `Alt+U you only: not in semantic` / `Search only your own messages` | `^V·you only` / `you only: not in semantic` / help `Search only your own messages (lexical)` |
+| Deep search options | `--user-only` (dcd3978) | checkbox + tooltip | `Only my messages`; tooltip `Search only your own messages; semantic and hybrid modes search lexically instead` | clap help (verbatim tooltip) |
+| Deep search options | `--all-kinds` (cb990e6) | checkbox + tooltip | `Include exec and subagent runs`; tooltip `Also search automated (Codex exec) and subagent conversations` | clap help (verbatim tooltip) |
 | Toast S | refresh done | replaces previous | `Refreshed conversations: <old> → <new>` | `Refreshed sessions: <old> -> <new>` |
 | Toast W | refresh with project errors | + [Show debug log] | `Refresh incomplete; keeping the current list` | `Refresh incomplete; keeping existing sessions` |
 | Toast E | refresh fatal / interrupted | + [Retry] | `Refresh failed: <err>` / `Refresh failed; keeping the current list` | `Refresh failed: <err>` / `Refresh failed; keeping existing sessions` |
 | Toast W | load/reload with project errors | + [Show debug log] | `N project(s) could not be loaded. See Tools → Debug log.` | (ignored by TUI) |
 | Toast E | UUID not found | | `Session not found: <uuid>` | `UuidLookup::status_message` |
-| Rename dialog | errors (inline) | | `Failed to rename: conversation became empty` / `Failed to rename: <err>` / `This conversation is no longer in the list` | `RenameError` Display |
+| Rename dialog | errors (inline) | | `Failed to rename: conversation became empty` / `Failed to rename: <err>` / `This conversation is no longer in the list` / `Renaming <source> sessions is not supported` (Codex is refused before the dialog, next row) | `RenameError` Display (9799550: the TUI's refusal status) |
+| Toast W | an action the conversation's capabilities refuse (eea6d37) | | `Renaming CX sessions is not supported` / `<Resuming\|Forking\|Renaming\|Deleting> is unavailable: CX no longer has this conversation's current history` / `<Forking\|Renaming> CC subagents and forks is not supported` (3c2ffeb) | core `history::actions::refusal` (upstream status line, verbatim) |
+| Viewer header | family line (3c2ffeb) | muted line, link, button | `↳ fork of <label>` / `↳ subagent of <label>` / `↳ subagent of session <id> (not found)` / `1 subagent, 2 forks`; tooltips `Open the parent conversation (Shift+P)` / `Subagents and forks (s)` | `↳ fork of <label>  P open` / `N subagents, M forks  s list` |
+| Dialog | subagents and forks picker (3c2ffeb) | | title `Subagents and forks`; rows `sub` / `fork` + label + `<n> · %m-%d %H:%M`; `[Esc] Cancel` | ` Subagents and forks ` / `[Enter] Open  [Esc] Cancel` |
+| Toast I | `s` / `P` with nothing to open (3c2ffeb) | | `No subagents or forks in this conversation` / `This conversation has no parent` / `Parent conversation not found` | core `browser::{NO_CHILDREN_STATUS, NO_PARENT_STATUS, PARENT_NOT_FOUND_STATUS}` (`… in this session`, `This session has no parent`, `Parent session not found`) |
+| Delete confirmation | a Claude session with `/btw` forks (3c2ffeb) | | `Its /btw fork stays, a conversation of its own.` / `Its <n> /btw forks stay, conversations of their own.` before `This can't be undone.` | — |
 | Rename | success | row + header update, no toast | — | `Session renamed` |
-| Toast S / E | delete | | `Deleted "<title>"` / `Deleted session <id> (<n> copies across projects)` / `Failed to delete session <path>: <err>` | CLI `delete_by_uuid_message`; TUI debug-log line |
+| Toast S / E | delete | | `Deleted "<title>"` / `Deleted session <id> (<n> copies across projects)` (Claude only) / `Failed to delete session <path>: <err>` (Codex: `<err>` = `I/O error: codex delete failed (<status>): <stderr>`, eea6d37) / `Deleting <source> sessions is not supported` | CLI `delete_by_uuid_message`; TUI debug-log line; TUI refusal status (9799550); upstream's `codex delete` error |
+| Delete confirmation | Codex note (eea6d37) | | `Runs the Codex CLI's delete --force <thread id>, which removes the thread and its state. This can't be undone.` | — |
 | Toast I | a deletion closed open dialogs | | `Closed: "<title>" was deleted` | — |
 | Viewer | nothing selected | Empty | `No conversation selected` + `Select a conversation on the left, or press Enter.` | — |
 | Viewer | opening | thin progress / Spinner | `Loading conversation…` | — |
@@ -2529,10 +2991,12 @@ W warning, E error. Every error state offers a recovery action (DG §9.13).
 | Viewer | no visible rows | Empty + [Show thinking] [Show tools in full] | `This conversation has no visible messages` | blank viewer |
 | Viewer | truncated output | indicator row | `(N more lines…)` | `(N more lines...)` |
 | Viewer find bar | typing | label | `/<query>` + ` (no matches)` / ` (<i>/<n>)` | `ViewSearch::input_status` (verbatim) |
+| Toast I | Enter in the find bar with a query that has text and no matches (d2c0f07) | | `No matches for /<query>` | `ViewSearch::commit` (upstream status line, verbatim) |
 | Toast | viewer copy/export | | `Path copied to clipboard`, `Session ID copied to clipboard`, `Message copied to clipboard`, `No text content in this message`, `Message not found`, `Copied to clipboard`, `Exported to <full path>`, `Failed to read: <e>`, `Failed to write: <e>` | core `export` constants (verbatim) |
 | Toast I | partial selection copy | | `Copied the visible part of the selection. Use Y, y or Export to copy more.` / `Nothing copied: the selection scrolled out of view.` | — |
 | Toast I | `p` | + [Copy] [Reveal] | `<full path>` | (TUI shows the path) |
-| Toast E | resume/fork | + recovery action | core `WORKSPACE_REQUIRED_RESUME/FORK` + [Choose workspace…]; `Could not find '<p>' on PATH. Set its path in Settings → General.` + [Open Settings]; `Failed to launch terminal: <e>` + [Terminal settings]; `Failed to copy the conversation: <e>`; `Failed to run Claude CLI: <e>` | core `AppError` texts |
+| Toast E | resume/fork | + recovery action | core `WORKSPACE_REQUIRED_RESUME/FORK` + [Choose workspace…]; ``Cannot start agent: `<program>` was not found on PATH; …`` / ``… is not an executable file; check `command` under [resume.pi] in gui.toml`` (upstream 8a99ccc, the key and file named, fork) + [Open Settings]; `Failed to launch terminal: <e>` + [Terminal settings]; `Failed to copy the conversation: <e>`; `Failed to run Claude CLI: <e>` | core `AppError` texts |
+| Toast E | resume/fork of a sidecar whose session file is gone (3c2ffeb) | | `The session this came from no longer exists` (core `PARENT_GONE_STATUS`; checked in `ops::resume::run_plan` before planning, upstream's `selected_resumable`) | core |
 | Toast I | resume/fork ok | | `Opened "<title>" in <launcher>` + `<command>` | — |
 | Toast W | resume plan warnings | | core `ResumePlan::warnings` lines (e.g. `Session directory <dir> does not exist`) | core |
 | Single-file | bad path / empty | error view | `File not found: <p>` / `Not a file: <p>` / `<file> contains no conversation messages` | (TUI) / core D1 |
@@ -2570,11 +3034,12 @@ Usage lines: `claude-history-gui [OPTIONS] [FILE]` / `claude-history-gui delete-
 | `[FILE]` | | path | single-file viewer window (PD14) | C-001 |
 | `--workspace DIR` | `-w` | path | workspace (PD3 rule 1) | C-019 |
 | `--local` | `-L` | | workspace = launch cwd (PD3 rule 2); start in Workspace scope; one-shot tools preselect Workspace | C-003 |
+| `--all-kinds` | | | start with automated (Codex exec) and subagent conversations listed (no effect with `[FILE]`, as upstream) | C-068 |
 | `--global` | `-g` | | hidden, deprecated, no effect; conflicts with `--delete` | C-004 |
 | `--since WHEN` / `--after WHEN` | | TimePoint | lower time bound (aliases, mutually exclusive) | C-005 |
 | `--before WHEN` | | TimePoint | upper time bound; inverted range → `Error: Invalid time range: …`, exit 1 | C-005 |
 | `--last` / `--first` | `-l` / – | | previews last/first messages (exclusive) | C-002 |
-| `--show-tools` / `--no-tools` | `-t` / – | | initial tool display Full / Summary; Ctrl+O output `show_tools` | C-006 |
+| `--show-tools` / `--no-tools` | `-t` / – | | initial tool display Full / Off (d0aca95); Ctrl+O output `show_tools` | C-006 |
 | `--show-thinking` / `--hide-thinking` | | | initial show_thinking; Ctrl+O output | C-007 |
 | `--semantic` / `--lexical` | | | initial list mode (GUI-only, core) | C-062 |
 | `--show-path` | `-p` | | picker: print path | C-008 |
@@ -2592,6 +3057,7 @@ Usage lines: `claude-history-gui [OPTIONS] [FILE]` / `claude-history-gui delete-
 | `--debug-semantic-search QUERY` | | hidden | same dialog, debug-dump mode | C-015 |
 | `--generate-semantic-cache` | | hidden | Generate semantic cache dialog (not auto-started; scope from `-L`) | C-015 |
 | `--clear-semantic-cache` | | hidden | Clear semantic cache confirmation | C-015 |
+| `--dump-semantic-turns PATH` | | hidden | headless: every conversation's semantic turns as JSON lines to PATH (`semantic_ops::dump_turns`, §11.23), summary on stderr, exit | C-015 |
 | `-h/--help`, `-V/--version` | | | print `help_text` / `claude-history-gui <version>`; exit 0 | C-017 |
 | `help [COMMAND]`, `<subcommand> -h/--help` | | subcommand | `help` = `--help`; `help update\|delete-empty\|help` and `update --help`, `delete-empty -h` → `LaunchCommand::SubcommandHelp(text)`: print `text`, exit 0; `help agent [cmd]` → the agent help (K14/K15 as built) | C-017 |
 | `delete-empty [--local\|--all] [--yes]` | | subcommand | Delete empty transcripts dialog with the scope; `--yes` ignored (confirmation in the UI) | C-018 |
@@ -2601,7 +3067,7 @@ Usage lines: `claude-history-gui [OPTIONS] [FILE]` / `claude-history-gui delete-
 
 Conflict groups (core K14; message `error: the argument '<a>' cannot be used with '<b>'`, exit 2): `one_shot_action`
 (at most one of `--show-dir`, `--delete`, `--debug-search`, `--debug-semantic-search`, `--semantic-search`,
-`--generate-semantic-cache`, `--clear-semantic-cache`, `--render`, `FILE`); `selection_conflicting_action` (those
+`--generate-semantic-cache`, `--clear-semantic-cache`, `--dump-semantic-turns`, `--render`, `FILE`); `selection_conflicting_action` (those
 except `--show-dir`, conflicting also with `--resume`, `--show-path`, `--show-id`, `--plain`); picker kinds mutually
 exclusive; `--delete` × `--global`; `FILE` × `--local`/`--global`/picker flags; `--semantic-top` requires
 `--semantic-search` (`value must be greater than zero`; non-number → `invalid positive integer: <v>`); invalid
@@ -2610,7 +3076,13 @@ Subcommands cannot be combined with top-level flags.
 
 ### 13.2 `gui.toml` and `config.toml`
 * `config.toml` (`~/.config/claude-history/config.toml`): read-only, upstream schema with `deny_unknown_fields`;
-  parse errors → §5.20 dialog. Never written (core refuses).
+  parse errors → §5.20 dialog. Never written (core refuses). `[resume.codex] default_args` (upstream eea6d37) is
+  part of that schema: Codex's resume/fork arguments, separate from Claude's `[resume] default_args`. So are
+  `[resume] command`, `[resume.pi] command`, `[resume.omp] command` and `[resume.codex] command` (upstream 8a99ccc):
+  the program that starts each agent, a string (never split) or an array (program + leading arguments); an empty
+  command or one with a blank program is a parse error (`command must …`).
+* `config.toml`'s `[semantic]` table (`daemon`, `pause_on_battery`; upstream 939c20b) is part of the accepted schema but
+  ignored by the GUI (no background daemon); `gui.toml` has no `[semantic]` table.
 * `gui.toml` (`~/.config/claude-history/gui.toml`, core `GuiConfigFile`): may override `[display]`, `[resume]`,
   `[keys]`, `[tui]`, `[search]`, `[agent]` and holds `[gui]`. Effective value = gui.toml > config.toml > default.
   Written only by `save_gui_config_changes` (K12): changed keys only, comments preserved, refused while the file is
@@ -2624,18 +3096,22 @@ when no config key is set and restore_session is on) or `Default: <value>`; "App
 |---|---|---|---|---|---|
 | General | Theme | `[gui] theme` | Segmented | system / light / dark | immediately |
 | General | Terminal | `[gui] terminal` | Select + custom text | core syntax: `auto` (default), `wt`, `cmd` (`console`), `terminal`, `osascript`, a Linux emulator name (`gnome-terminal`, `ptyxis`, `kgx`, `konsole`, `xfce4-terminal`, `tilix`, `alacritty`, `kitty`, `wezterm`, `xterm`, `x-terminal-emulator`), or a template with `{cwd}`, `{args}`, `{cmd}`; the field previews the command for a sample resume (`build_terminal_command`) | next launch |
-| General | claude / pi / omp program | `[gui] claude_path` / `pi_path` / `omp_path` | path input + Browse… | must exist when set; shows the PATH resolution result | next launch |
+| General | claude / pi / omp / codex program | `[gui] claude_path` / `pi_path` / `omp_path` / `codex_path` (codex: eea6d37; also the Codex delete) | path input + Browse… | must exist when set; shows what starts the agent (`resolved: <path>` / `not found on PATH` / `not an executable file`, after `runs …; from <key> in <file> · ` when a `command` decides; gui.toml's `command` beats it, config.toml's does not, 8a99ccc) | next launch |
 | General | Default workspace | `[gui] default_workspace` | folder input + Browse… | existing dir | next start |
 | General | Restore last session | `[gui] restore_session` | Switch | default on | next start |
 | Display | Preview shows | `[display] last` | Segmented Last / First | | list refresh |
-| Display | Default tool display | `[display] no_tools` | Segmented Summary / Full | true → Summary, false → Full, unset = remembered/Summary | next opened conversation + start |
+| Display | Default tool display | `[display] no_tools` | Segmented Off / Summary / Full | true → Off, false → Full, unset = remembered/Summary (d0aca95; a remembered Calls or Truncated shows as Summary); Summary removes the key, so config.toml or the remembered mode applies again (the control shows that value before Save, as after Reset) | next opened conversation + start |
 | Display | Show thinking and subagents by default | `[display] show_thinking` | Switch | | same |
 | Display | Ctrl+O prints plain text | `[display] plain` | Switch | | next Ctrl+O |
 | Display | (pager) | `[display] pager` | read-only "not used by the GUI" | | — |
 | Search | Default search mode | `[search] mode` | Select lexical/semantic/exact/hybrid | list maps exact/hybrid → Lexical; Deep search uses all 4 | next start; Deep search next run |
-| Search | Excluded projects | `[tui] exclude_projects` | list editor | exact names; `repo` also hides `repo/<worktree>` | immediately |
-| Keys | Resume, Fork, Rename, Delete, Refresh | `[keys] …` | text inputs (`ctrl+r` syntax) + live warnings | §8.5 | immediately |
-| Resume | Default arguments | `[resume] default_args` | list editor | Claude only | next resume |
+| Search | Excluded projects | `[tui] exclude_projects` | list editor | exact names; `repo` also hides `repo/<worktree>`; also hides from Deep search | immediately (Deep search: next run) |
+| Search | Excluded working directories | `[tui] exclude_paths` (982aea9) | list editor | literal prefixes of the first recorded cwd (case-insensitive on Windows; e.g. `/tmp/`, `C:\Users\me\AppData\Local\Temp\`); also Deep search | immediately; Deep search next run |
+| Keys | Resume, Fork, Rename, Delete, Refresh, Show automated and subagent conversations, Search only your own messages | `[keys] …` (`all_kinds`, `user_only`: default `alt+u`, **[dev]** upstream `ctrl+v`, ae7ae39) | text inputs (`ctrl+r` syntax) + live warnings | §8.5 | immediately |
+| Resume | Claude Code command | `[resume] command` (8a99ccc) | list editor, one word per line | the program (name on PATH or path; `~/`, relative to the launch folder) then its leading arguments; one word is saved as a string, more as an array, none removes the key; shows the same probe as the program row (`runs <command> · resolved: <path>`); a page note explains the words, `~/`, relative paths and that aliases need a script; default `claude` | next resume |
+| Resume | Default arguments | `[resume] default_args` | list editor | Claude only, after the command's arguments | next resume |
+| Resume | Pi / OMP / Codex command | `[resume.pi]` / `[resume.omp]` / `[resume.codex] command` (8a99ccc) | list editor | as the Claude Code command; Codex's also runs `codex delete` | next resume |
+| Resume | Codex default arguments | `[resume.codex] default_args` (eea6d37) | list editor | Codex only, after the command, before `resume`/`fork` | next resume |
 | Agent | Scope | `[agent] scope` | global / local | | next run |
 | Agent | Mode | `[agent] mode` | lexical/semantic/exact/hybrid | | next run |
 | Agent | Output budget (chars) | `[agent] output_chars` | NumberInput ≥ 1 | 6000 default | next run |
@@ -2668,14 +3144,19 @@ Path: `<home>/.local/state/claude-history-gui/state.json` (the directory of `env
 ```
 Restored values are clamped (window to current displays, widths to the ranges and the window, PD1). `restore_session =
 false` → only `last_export_dir` and `recent_workspaces` are used. A version-1 file is read (its `time_filter_text` is
-ignored).
+ignored). `view.tool_display` is `off|summary|calls|truncated|full` (`off`: d0aca95, `calls`: a60dfe9); a value
+this build does not know reads as never remembered instead of making the file corrupt (a build before a60dfe9
+forgets a remembered `calls`).
 
 ### 13.4 Data locations (core `env.rs`)
 | What | Location |
 |---|---|
 | Claude data | `$CLAUDE_CONFIG_DIR` or `<home>/.claude` (read; written by rename/delete/fork-copy/delete-empty) |
 | Pi / OMP sessions | per core loaders (`PI_*`, `OMP_PROFILE`, `XDG_DATA_HOME`, relative values against the launch cwd (K16), workspace `.pi/settings.json`) |
-| GUI caches | `<home>/.cache/claude-history-gui/{projects,config-<hash>/projects,pi,omp,semantic,launch}` |
+| Codex home (read-only) | `$CODEX_HOME` or `~/.codex`; its state database in the home's `config.toml` `sqlite_home`, else `$CODEX_SQLITE_HOME`, else the home (relative values resolve like the `PI_*` paths) |
+| GUI caches | `<home>/.cache/claude-history-gui/{semantic,launch}` and the list snapshot below; the per-project and Pi/OMP caches of v0.1.1 and earlier (`projects/*.bin` and `config-<hash>/projects/*.bin` tagged `CLHIST01`, `pi/root-<hash>/sessions.bin` tagged `PIHIST01` and `omp/root-<hash>/sessions.bin` tagged `OMHIST01`, `.tmp*` files older than an hour beside them, then the dirs this empties) are removed by `store::legacy` after a reconcile pass that published, while it holds `LOCK`; never in the installed CLI's `<home>/.cache/claude-history` (`history::sources::Registry::cli_cache`; 75df2d4) |
+| List snapshot (store) | `<home>/.cache/claude-history-gui[/config-<hash>]/v3/roots-<hash>/` (`store::default_root`; `roots-<hash>` covers the resolved Pi and OMP session roots, so another workspace `.pi/settings.json` or `PI_*` value reads and writes its own generations): `LOCK`, `CURRENT`, `PROGRESS` (while a pass that parses at least 50 files runs: `indexing <pid> <parsed> <to parse>`, written through `PROGRESS.tmp`; after a failed pass `failed <message>` until the next pass; 04c714b), `gNNNNNN/manifest` (cards newest first with their file fingerprints, index locations, own-text locations, the index segment table and the ignored files; a card keeps the cwds recorded after the first as one NUL-separated heap string, 82b355a, and the session id of its parent, 3c2ffeb, and its prompt and tool call counts, e930cac; manifest version 14, ae7ae39, b9497ce, 1aa8eeb, a76d5df, 5896b9e, 82b355a, 3c2ffeb, e930cac), `gNNNNNN/text-NNNN.zst` (each conversation's text as one checksummed zstd frame), `gNNNNNN/sem-NNNN.zst` (each conversation's semantic turns, message ranges, route text, agent text and parse errors as one zstd frame of bincode, none when it has no such data; e61a999, 16cc49c), `gNNNNNN/own-NNNN.zst` (what the person typed, `Conversation::own_text`, one frame per conversation that has some; ae7ae39), `gNNNNNN/base.fst`, `base.post`, `base.short` (word-start suffix index segment 0) and `delta-NNNN.fst/post/short` (further index segments), each with an `own-` twin over the own text (same doc ids; ae7ae39); segments a generation shares with the previous one are hard links (copies where links fail), one generation is kept behind `CURRENT`; in store mode the list's rows and its search index (358becb), updated by the reconcile passes at start, on refresh and after a rename or delete, §11.2, and read in full by the one-shot tools and Deep search after a pass of their own, §11.24; upstream's format (e905169) |
+| Embedding cache | `<home>/.cache/claude-history-gui/semantic/embeddings-v2.bin`: upstream's memory-mapped matrix (8919a76; header with the model, schema and chunk settings, sorted 16-byte blake3 keys, last-use and protection columns, 64-byte aligned `f32` rows), written whole and renamed into place under `embeddings.lock` (K6); an `embeddings-v1.bin` from earlier versions is converted once and removed |
 | Embedding model | `<home>/.cache/claude-history-gui/semantic/fastembed` |
 | CLI config | `<home>/.config/claude-history/config.toml` (read-only) |
 | GUI config | `<home>/.config/claude-history/gui.toml` |
@@ -2700,7 +3181,9 @@ ignored).
 * Never kill terminal processes (they may host the user's other tabs).
 
 ### 14.2 Program resolution and PATH
-`env.resolve_program(name, override)` (core; PATHEXT, `.cmd` shims). On macOS/Linux, when the GUI was not started
+`Launcher::resolve(env, source)` (core, 8a99ccc: the configured `command` or `[gui]` path, else the agent's name;
+`program::find_program_path`: PATHEXT, `.cmd` shims, the executable bit on Unix, a relative path is never looked up);
+`program::find_program` / `find_program_path` for other programs (`HistoryEnv::path_var`, `pathext`); there is no separate `resolve_program`, so nothing bypasses the launcher precedence. On macOS/Linux, when the GUI was not started
 from a terminal (stdin not a TTY), `login-shell-path` runs `$SHELL -ilc 'printf "__CHG_PATH__%s__CHG_END__" "$PATH"'`
 (interactive + login so `.zshrc`/`.bashrc` entries such as nvm, volta, bun are included) with a 3 s timeout, parses
 the text between the markers, and prepends it (deduplicated) to `HistoryEnv.path_var`, plus `~/.local/bin`,
@@ -2756,7 +3239,7 @@ line).
 
 Absolute rules:
 * No OS input injection (no SendKeys, no synthetic OS mouse) and no real-desktop automation.
-* No test, QA run or agent dev run reads or writes the real `~/.claude`, `~/.pi`, `~/.omp`,
+* No test, QA run or agent dev run reads or writes the real `~/.claude`, `~/.pi`, `~/.omp`, `~/.codex`,
   `~/.config/claude-history`, `~/.cache/claude-history*`, `~/.local/state/claude-history*`, the real clipboard, or
   launches `claude`/`pi`/`omp`, URLs, file managers or native file dialogs. This is **enforced**, not only stated:
   core `hermetic` guards in every GUI test build (K13), the env redirect in the test binary, `PlatformServices` for
@@ -2777,15 +3260,20 @@ Absolute rules:
 ### 15.2 gpui tests (G) — hermetic harness (`src/test_support/mod.rs`, WP0, frozen)
 * `crates/gui` `[dev-dependencies]` enables `claude-history-core/hermetic` (K13): in GUI test builds
   `from_process_env` panics, the default embedder factories refuse, `check_latest_release` panics and terminal
-  spawning returns an error — even if GUI code bypasses a seam by mistake.
+  spawning returns an error — even if GUI code bypasses a seam by mistake. The semantic worker and the store's
+  reconcile pool do not lower their threads' priority there.
 * A `#[ctor::ctor]` in `test_support` runs before any test: it creates a per-process temp root and sets (unsafe
   `set_var`, before threads exist) `HOME`, `USERPROFILE`, `CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR`,
-  `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`,
-  `XDG_STATE_HOME` inside it and removes `OMP_PROFILE`, `PI_PROFILE`, `TERMINAL`, `CLAUDE_HISTORY_CLIPBOARD`.
+  `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`, `CODEX_HOME`, `CODEX_SQLITE_HOME`, `XDG_DATA_HOME`,
+  `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` inside it and removes `OMP_PROFILE`, `PI_PROFILE`, `TERMINAL`, `CLAUDE_HISTORY_CLIPBOARD`.
 * `app::init_for_test` installs `RecordingServices`, a refusing embedder (`embedder::install_fake` to opt in),
-  disables state.json writes, and uses an empty config unless the test writes one into its `TestWorld`.
+  disables state.json writes, and uses an empty config unless the test writes one into its `TestWorld`. The list's
+  store is on (`ListSnapshots(true)`, store mode as in the app, upstream 358becb; `use_memory_list(cx, world, args)`
+  before the window opens turns it off for tests of the in-memory loader), and the world's directory is held by every
+  list pane (`WorldDir`), so it is removed only after the pane's loader gave up and joined its reconcile pass (the app
+  outlives the test function's locals).
 ```rust
-pub struct TestWorld { pub tmp: tempfile::TempDir, pub env: HistoryEnv }   // HistoryEnv::sandbox(tmp)
+pub struct TestWorld { pub tmp: Arc<tempfile::TempDir>, pub env: HistoryEnv }   // HistoryEnv::sandbox(tmp)
 impl TestWorld {
     pub fn new() -> Self;
     pub fn add_claude_session(&self, project_dir: &str, uuid: &str, lines: &[&str]) -> PathBuf;
@@ -2865,12 +3353,18 @@ resize 1280 820
 quit 0
 ```
   Probe keys (`qa/probe.rs`, read-only accessors on the panes): `list.count`, `list.loaded`, `list.loading`,
-  `list.query`, `list.mode`, `list.scope`, `list.selected_title`, `list.selected_path`, `list.ui_busy_max`,
+  `list.ready` (rows listed newest first and actionable: the first cards while loading), `list.snapshot` (the rows are
+  cards of a store generation), `list.generation` (the generation shown, empty without one), `list.index` (the store
+  generation lexical queries run on, empty without one), `list.reconciling` (store mode: a reconcile pass runs or is
+  due, or a generation it published is still being opened; `false` once the newest generation is shown in full),
+  `list.indexing` (store mode: the footer's indexing text while a pass is shown as indexing, empty otherwise),
+  `list.query`, `list.mode`, `list.scope`, `list.all_kinds` (automated and subagent conversations listed), `list.user_only` (search limited to the user's own messages, ae7ae39), `list.selected_title`, `list.selected_path`, `list.ui_busy_max`,
   `viewer.path`, `viewer.items`, `viewer.messages`, `viewer.nav_focus`, `viewer.indicator`, `viewer.search.count`,
   `viewer.search.current`, `viewer.tool_display`, `viewer.thinking`, `viewer.timing`, `viewer.frame_p95`,
+  `viewer.hit` and `viewer.hit_line` (the list's search hit shown: its query and the line it is at, L-109),
   `focus` (list|viewer|agent|deep|dialog|none), `dialog` (open dialog id or none), `toast.last`, `clipboard`,
-  `stdout`, `calls.terminal.count`, `calls.terminal.last`, `calls.open_url.last`, `deep.hits`, `deep.groups`,
-  `deep.mode`, `agent.tab`, `agent.target`, `theme`; since the fix round also `window.frame_p95` and
+  `stdout`, `calls.terminal.count`, `calls.terminal.last`, `calls.run.count`, `calls.run.last` (programs run to completion: the Codex delete, eea6d37), `calls.open_url.last`, `deep.hits`, `deep.groups`,
+  `deep.mode`, `deep.all_kinds`, `deep.user_only` (Deep search limited to the user's own messages, dcd3978), `agent.tab`, `agent.target`, `theme`; since the fix round also `window.frame_p95` and
   `window.frame_max` (the whole main window's frame over its last 512 frames, X-008).
 * Report: `<qa-out>/report.txt` (one `PASS|FAIL|SKIP <line> <step> [detail]` per step + summary) and
   `<qa-out>/report.json`; exit code 0 if no FAIL, else 1.
@@ -2883,36 +3377,76 @@ quit 0
   the viewer's frame in the main window with 20k rows, V-094); WP3 `rename.qa`, `delete.qa`,
   `resume-fork.qa`, `export-copy.qa`, `picker.qa`, `picker-exit.qa`; WP4 `deep-search.qa`, `agent-panel.qa`; WP5
   `tools.qa`; WP6
-  `settings-keys.qa`, `theme.qa`, `palette.qa`; WP-I `cross-pane.qa`.
+  `settings-keys.qa`, `theme.qa`, `palette.qa`; WP-I `cross-pane.qa`; the eea6d37 backport `codex.qa` (a Codex
+  thread added by `new-sandbox.ps1 -WithCodex`: viewer, refused Rename, Resume with `CODEX_HOME`, the recorded
+  `codex delete`).
 
 ### 15.4 Sandbox gate, sandbox procedure (dev runs and QA)
-* **Gate** (`qa/gate.rs`, runs in `main` for `--features qa` builds **and every debug build**): refuse with exit 3
+* **Gate** (`qa/gate.rs`, runs in `main` for `--features qa` builds **and every debug build**, on the `HistoryEnv`
+  the app gets: `main` builds it first, which reads no data, and `qa::gate::run(&env)` checks exactly that value):
+  refuse with exit 3
   and `Refusing to run: <reason>. Create a sandbox with tools/qa/new-sandbox.ps1 or set CHG_ALLOW_REAL_HOME=1.`
-  unless all hold: (1) the resolved home (`home::home_dir()`) contains a `.qa-sandbox` file; (2) the home is not the
+  unless all hold: (1) the env's home (`home::home_dir()`) contains a `.qa-sandbox` file; (2) the home is not the
   OS profile directory of the current user, obtained from the OS, not from variables (Windows
   `SHGetKnownFolderPath(FOLDERID_Profile)`, Unix `getpwuid_r(getuid())` → `pw_dir`); (3) each of
-  `CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`, `XDG_DATA_HOME`,
-  `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` is unset or (canonically) inside the home; (4) `OMP_PROFILE`
-  and `PI_PROFILE` are unset or plain names. As built (WP0): when the OS cannot tell the profile directory the gate
-  refuses (fails closed), and the default data locations used while the variables are unset (`<home>/.claude`,
-  `.claude.json`, `.pi`, `.omp`, `.config`, `.cache`, `.local` and their data subfolders,
+  `CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`, `CODEX_HOME`,
+  `CODEX_SQLITE_HOME`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` is unset or
+  (canonically) inside the home; set but empty, a variable counts as unset only where the app reads it so
+  (`qa::gate::EMPTY_MEANS_UNSET`): the app reads an empty `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR` or
+  `PI_CONFIG_DIR` as a relative path (an empty `PI_CODING_AGENT_SESSION_DIR` is the launch directory), so it is
+  refused; (4) `OMP_PROFILE`
+  and `PI_PROFILE` are unset or plain names; (5) the data locations the app reads, derived from exactly that env
+  and from config files inside the sandbox, canonically stay inside the home: the Claude data and projects
+  directories (`HistoryEnv::claude_dir`, `claude_projects_root`), the Codex home (`CODEX_HOME`, else
+  `<home>/.codex`) with its `sessions` and `archived_sessions` directories and its state database directory (its
+  `config.toml` `sqlite_home`, absolute or relative to the Codex home, else `CODEX_SQLITE_HOME`, else the Codex
+  home: core `sources::codex::state_db_dir`), the store and semantic cache directories (`cache_base_dir`, which
+  `CLAUDE_CONFIG_DIR` moves into `config-<hash>`, `semantic_cache_dir`), the `sessionDir` of Pi's `settings.json`
+  in the agent directory (`PI_CODING_AGENT_DIR`, else `<home>/.pi/agent`; core `pi_loader::session_dir_settings`),
+  and the Pi and OMP session roots (`pi_loader::session_root`, `omp_loader::session_root`; OMP reads no settings
+  file). A config file that is missing or does not parse adds
+  nothing (the app then uses the locations already checked); the refusal names the file and the setting
+  (`sqlite_home in <file>`, `sessionDir in <file>`). (6) Every workspace the app applies is checked too
+  (`qa::gate::check_workspace`: rule 5 with that workspace): Pi also reads `<workspace>/.pi/settings.json`, and a
+  relative `sessionDir` (in either file) resolves against the workspace, so the `sessionDir` of both files and the
+  Pi session root with that workspace must stay inside the home. (7) Every file opened by path (`[FILE]`,
+  `--render FILE`, File → Open JSONL file…) is checked too (`qa::gate::check_opened_file`): the file itself is read
+  as named, wherever it lies (opening it is the user's explicit choice; QA scenarios open copies inside the
+  sandbox), but a Codex rollout decodes
+  through the Codex home holding it, which may be another home than the env's: that home, its `sessions` and
+  `archived_sessions` directories and the state database directory decoding the rollout opens (that home's
+  `config.toml` `sqlite_home`, else the home; core `sources::codex::view::state_db_dir_of`) must canonically stay
+  inside the sandbox home. `main` passes `qa::gate::enforced()` on (`ProcessInfo::sandbox_gate` →
+  `LaunchContext::sandbox_gate`); the GUI's startup workspace (`startup::startup_workspace`), the launch
+  directory of the headless `agent` commands and the files of `[FILE]` and `--render FILE` (`startup::dispatch`)
+  are refused like the gate (exit 3); a runtime workspace change (workspace picker, PD3 rule 3 (c);
+  `startup::workspace_refusal`) with an error toast while the previous workspace stays (§11.20), a file chosen in
+  File → Open JSONL file… (`startup::opened_file_refusal`) with an error toast and the file is not opened
+  (§11.12). As built (WP0): when
+  the OS cannot tell the profile directory the gate refuses (fails closed), and the default data locations used while the variables are unset (`<home>/.claude`,
+  `.claude.json`, `.pi`, `.omp`, `.codex`, `.config`, `.cache`, `.local` and their data subfolders,
   `qa::gate::DEFAULT_DATA_PATHS`) must canonically stay inside the home when they exist — a junction or symlink to
-  real data is refused. Debug builds skip the gate only with `CHG_ALLOW_REAL_HOME=1` (the user's
-  own choice); `--features qa` builds never skip it.
+  real data is refused. Debug builds skip the gate (rules 6 and 7 included) only with `CHG_ALLOW_REAL_HOME=1` (the
+  user's own choice); `--features qa` builds never skip it.
 * Debug builds of `RealServices` also refuse to spawn a terminal whose program is a resolved `claude`/`pi`/`omp`
   unless `[gui] <prog>_path` is set to a harmless program inside the sandbox or `CHG_ALLOW_REAL_LAUNCH=1`.
 * Procedure:
   1. `tools/qa/new-sandbox.ps1 -Source <scratchpad>/sandbox/home -Dest $env:TEMP\chg-sbx-<n>`: copies the corpus
      (never use the source in place), creates `<dest>\.qa-sandbox`, `<dest>\.config\claude-history\`,
-     `<dest>\.local\state\`, and a `gui.toml` with `claude_path`/`pi_path`/`omp_path` pointing at a harmless
-     recorder script in the sandbox.
+     `<dest>\.local\state\`, and a `gui.toml` with `claude_path`/`pi_path`/`omp_path`/`codex_path` pointing at a
+     harmless recorder script in the sandbox.
   2. `tools/qa/run-gui.ps1 -Sandbox <dest> -Exe <path> [-Scenario x.qa -Out <dir>] [-Shots]` sets, for the child
      process only: `USERPROFILE`, `HOME` = `<dest>`; `CLAUDE_CONFIG_DIR` = `<dest>\.claude`; `PI_CODING_AGENT_DIR` =
-     `<dest>\.pi\agent`; `XDG_*` under `<dest>`; removes `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`,
-     `OMP_PROFILE`, `PI_PROFILE`; starts the watcher when `-Shots`; waits; prints the report.
+     `<dest>\.pi\agent`; `CODEX_HOME` = `<dest>\.codex`; `XDG_*` under `<dest>`; removes
+     `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`, `CODEX_SQLITE_HOME`, `OMP_PROFILE`, `PI_PROFILE`; starts the watcher when `-Shots`; waits; prints the report.
   3. Semantic QA: the model downloads into the sandbox cache on first use unless `--qa-model-dir
-     <scratchpad>\qa-model-cache` points at a pre-downloaded copy (feature `qa` only).
+     <scratchpad>\qa-model-cache` points at a pre-downloaded copy (feature `qa` only). That copy must hold the
+     snowflake-arctic-embed-xs model: loading removes superseded models (the old BGE download) from the dir.
   4. Plain dev runs use the same script without `-Scenario`.
+  5. A fresh sandbox has no store (upstream 358becb): the first launch lists nothing until the initial reconcile pass
+     publishes its first generation (the newest sessions), and the list is ready (`wait-loaded`) from then on while
+     the pass goes on publishing. A scenario that needs every session listed, or a quiet app, waits for
+     `list.total` and `list.reconciling == false` first (`perf-list.qa`, `cross-pane.qa`, `perf-viewer-main.qa`).
 
 ### 15.5 Screenshot QA procedure (Windows; macOS/Linux screenshots are D items)
 For each scenario with `shot` steps: run with `-Shots` in light and dark (`set-theme`), collect PNGs, review against
@@ -2941,6 +3475,22 @@ precondition (no O(corpus) work on the UI thread: e.g. K1/K2/K3 paths are async,
 * **List** (`perf-list.qa`, synthetic 20k-row sandbox via `synth::corpus`): UI-thread time ≤ 16 ms at load end
   (install), ≤ 16 ms at refresh end, ≤ 5 ms for rename apply, ≤ 5 ms for delete removal, ≤ 2 ms for a UUID paste,
   ≤ 2 ms per typed key; idle CPU ≈ 0 over 60 s (no timer besides the 30 s ticker).
+* **First rows** (upstream 3708bb6; not gated yet): with a generation, the first frame lists the newest cards.
+  `ListPane::new` maps and validates the manifest (linear in its rows, memory only) and builds at most 500 cards on
+  the UI thread before the first frame (upstream measured 7.7 ms to the populated first frame); re-reading the cards
+  on a scope change or a new time filter decides every card's scope from its project (memory only). **Store mode**
+  (upstream 358becb, not gated yet): materializing every card, their path and session lookups, opening the index (it
+  normalizes every title) and mapping the rows shown to the new cards run on `generation-open`; the install (load
+  end, refresh end, each swap) swaps pointers and computes every card's scope (a flag per card, the same "install"
+  target); a delete hides rows (a flag per row, the "delete removal" target) and a rename sets one title (the
+  "rename apply" target). Upstream measured a 64 MB peak footprint for a warm launch on 5,983 sessions, against
+  2.5 GB+ with the loaded corpus. The reconcile pass runs on `store-reconcile`, the cards' semantic data is
+  read on `semantic-corpus`, visible-row evidence is read on `row-evidence`; an index answer costs the UI thread a lookup
+  per row.
+* **Semantic background indexing** (upstream c6d0421, not gated): the semantic worker embeds in slices of about 2 s;
+  each slice wakes the list once (the footer's `sem indexing` progress), and a refreshed result costs what any
+  semantic answer costs. The idle-CPU target applies once indexing has ended: after semantic mode met conversations
+  without embeddings, indexing keeps one core busy until they are embedded, also after a switch back to lexical.
 * **Viewer** (`perf-viewer.qa`, synthetic 10k messages with 20 tool outputs of 5,000 lines, opened in Full mode):
   first content ≤ 3.5 s after open; install ≤ 50 ms UI time; page-through avg ≤ 12 ms, p95 ≤ 20 ms; idle frame ≤ 3 ms;
   toggle `t`/`T` ≤ 60 ms UI time; first search ≤ 60 ms; working set ≤ 400 MB, and within ±10% after opening 20
@@ -2956,6 +3506,13 @@ precondition (no O(corpus) work on the UI thread: e.g. K1/K2/K3 paths are async,
   `perf-viewer-main.qa` gates the viewer's idle frame in the main window with 20k rows (median of nine < 12 ms; the
   probe spans the whole window's layout and paint there) and reports its page-through (V-094). Measured values and
   their stability: §17.11 "Fix round".
+* **As built (store mode, upstream 358becb)**: the QA sandboxes start without a store, so the load end is the install
+  of the first generation the initial reconcile pass publishes (the newest sessions, a few hundred cards):
+  `busy.load_end` (cross-pane) times that install. The rest of the 20k rows arrive as swaps of newer generations;
+  each swap is an install for `list.install_busy_max` (the whole poll, core's share included: gated `< 16ms` by
+  `perf-list.qa`), `list.install_pane_max` (the pane's share, gated too) and `list.loader_install_max` (core's share,
+  reported), read once the pass has listed every session (`list.total`) and is done (`list.reconciling == false`). The 20k-row scenarios
+  measure nothing before that, so the X-007 idle window and the frame and keystroke gates run in a quiet app.
 
 ### 15.9 Deferred manual checks (D) — the user runs them before a release
 * **Windows**: release zip on a clean VM starts (VC++ DLLs app-local); real terminal launch through Windows Terminal
@@ -2969,7 +3526,8 @@ precondition (no O(corpus) work on the UI thread: e.g. K1/K2/K3 paths are async,
 * **All OSes, first semantic search (S-030)**: with an empty GUI model cache and network access, run the first real
   semantic search; the model downloads into the GUI cache with no console output (the GUI passes `progress: false`),
   the toast/progress shows in the window, and the search completes. Then repeat offline: it uses the cache.
-  `CLAUDE_HISTORY_GUI_ORT_SELFTEST=1 <exe>` prints `onnxruntime ok` in release builds with the bundled library (S-032).
+  `CLAUDE_HISTORY_GUI_ORT_SELFTEST=1 <exe>` prints `onnxruntime ok` in release builds with the bundled library (S-032;
+  it loads the library and configures the background inference pool through it, as the GUI's embedder does).
 
 ### 15.10 Failure fixtures per OS (`test_support::fault`)
 * `undeletable(path)`: Windows — open the file with `share_mode(0)` (deletion fails with a sharing violation) and keep
@@ -3092,8 +3650,8 @@ ctor.workspace = true
   2. `bash tools/ci/safety-lint.sh` — fails when, outside the allow-listed files: `from_process_env` (allowed:
      `main.rs`), `home::home_dir`/`dirs::home_dir`/`std::env::var(_os)?`/`current_dir(` (allowed: `main.rs`,
      `qa/gate.rs`, `services.rs`), `std::process::Command` (allowed: `services.rs`, `ops/console.rs`),
-     `spawn_terminal`/`resume::launch(`/`check_latest_release` (allowed: `services.rs`), `execute_copy` (allowed:
-     `ops/resume.rs`), `write_to_clipboard`/`read_from_clipboard`/`prompt_for_new_path`/`prompt_for_paths`/
+     `spawn_terminal`/`resume::launch(`/`run_to_completion`/`check_latest_release` (allowed:
+     `services.rs`), `execute_copy` (allowed: `ops/resume.rs`), `write_to_clipboard`/`read_from_clipboard`/`prompt_for_new_path`/`prompt_for_paths`/
      `reveal_path`/`open_url`/`open_with_system` (allowed: `services.rs`) appear in `crates/gui/src`. As built, the
      same rules run as the source test `skeleton_tests/safety_lint.rs`, whose allow lists are the reference: they
      also allow the WP0 guard tests in `skeleton_tests.rs` (`from_process_env`, `home::home_dir`, `env::var(_os)`,
@@ -3242,7 +3800,7 @@ its tests and the WP-C FEATURES rows with their test names. Later CCRs run as WP
 ### 17.3 WP1 — Conversation list (Phase A)
 Owns: `crates/gui/src/list/*`, `widgets/time_range.rs`, `test_support/fixtures_list.rs`, `tests/fixtures/list/`,
 `qa/scenarios/{startup-load,list-search,semantic-toggle,perf-list}.qa`.
-Consumes: core `browser` (§4.1 + K1, K2, K3 `apply_renamed`, K4 `remove_paths`, K6, K18), `display_format`
+Consumes: core `browser` (§4.1 + K1, K2, K3 `apply_renamed_session` (`PreparedSession`), K4 `remove_paths`, K6, K18), `display_format`
 (`build_row_header`, `build_row_preview`, `HighlightQuery`), `time_filter`, `history::load_session_by_uuid` (K2);
 GUI `AppState`, `Services`, `notify`, `embedder` (browser factory), `theme_tokens::roles`, `keymap` (hints via
 `Kbd`), `qa_ext`, `model`, `exit::quit_without_output` (picker Esc).
@@ -3266,12 +3824,13 @@ impl ListPane {
     pub fn scope_is_workspace(&self) -> bool;
     pub fn has_workspace(&self) -> bool;
     pub fn refresh(&mut self, cx: &mut Context<Self>);
-    pub fn apply_renamed(&mut self, path: &Path, renamed: Conversation, cx: &mut Context<Self>) -> Result<(), RenameError>;
+    pub fn apply_renamed(&mut self, path: &Path, renamed: PreparedSession, cx: &mut Context<Self>) -> Result<(), RenameError>;
     pub fn remove_paths(&mut self, paths: &[PathBuf], cx: &mut Context<Self>);
     pub fn set_workspace(&mut self, workspace: Option<WorkspaceScope>, cx: &mut Context<Self>);   // reload ApplyPartial, revert on failure
     pub fn set_time_filter(&mut self, filter: TimeFilter, label: Option<String>, cx: &mut Context<Self>);
     pub fn set_exclude_projects(&mut self, excluded: Vec<String>, cx: &mut Context<Self>);
-    pub fn suspend_semantic(&mut self, cx: &mut Context<Self>);
+    pub fn set_exclude_paths(&mut self, excluded: Vec<String>, cx: &mut Context<Self>);
+    pub fn suspend_semantic(&mut self, cx: &mut Context<Self>) -> SemanticWorkerExit;   // join off the UI thread
     pub fn resume_semantic(&mut self, cx: &mut Context<Self>);
     pub fn project_paths(&self) -> &[PathBuf];                    // cached, computed off-thread
     pub fn choose_workspace_folder(&mut self, window: &mut Window, cx: &mut Context<Self>);
@@ -3369,7 +3928,7 @@ Provides: `main` (incl. headless paths §11.23, time-filter error exit 1); `star
 resolve_workspace, resolve_initial_view, run_startup_tool, show_config_errors}`; `ops::console::{stdout_kind,
 ensure_console, write_stdout, write_stderr}`; complete `RealServices` (spawn via `spawn_terminal_checked`, debug-build
 guard, `exec_in_current_terminal` Unix exec, `login_shell_path`); `embedder::{install, install_fake, browser_factory,
-agent_factory, ops_factory, drop_model}`; `debug_sink::install`; the QA runner (§15.3) + gate (§15.4); CI/release
+agent_factory, ops_factory, installed}` (`SharedEmbedder::drop_model`); `debug_sink::install`; the QA runner (§15.3) + gate (§15.4); CI/release
 (§16); icons + `assets/windows/app.rc` + build.rs resource compile; macOS bundle script; Linux `.desktop`.
 Tests: P launch mapping (`GuiLaunchArgs` → `LaunchContext`/`StartupTool`), PD3 workspace resolution table (incl. root
 /home/exe-dir exclusions, Pi/OMP cwd, `-L`), PD17 initial view resolution table (C-066), console kind logic with
@@ -3384,7 +3943,7 @@ DoD: common + CI green on 3 OSes + dry-run artifacts downloadable + `smoke.qa`; 
 Owns: `crates/gui/src/ops/{resume, rename, delete, export, copy, select, tests}.rs`,
 `test_support/fixtures_ops.rs`, `tests/fixtures/ops/`,
 `qa/scenarios/{rename,delete,resume-fork,export-copy,picker,picker-exit}.qa`.
-Consumes: core `resume` (`plan_resume`, `ResumePlan`, `CopyPlan`, `ProgramOverrides`, `terminal::{launcher_candidates,
+Consumes: core `resume` (`plan_resume`, `ResumePlan`, `CopyPlan`, `history::actions::Launch`, `terminal::{launcher_candidates,
 prepare_launcher_command, LaunchOptions}`), `history::rename_session` (K3),
 `maintenance::{plan_session_delete, execute_session_delete, SessionDeleteFailure, delete_by_uuid_message}` (K4), `export::*`,
 `settings::{picker_output, EffectiveSettings}`, `export::display_parse_errors` (K11), `maintenance::log_parse_errors`;
@@ -3481,7 +4040,7 @@ DoD: common + Q `deep-search.qa`, `agent-panel.qa`.
 Owns: `crates/gui/src/tools/*`, `test_support/fixtures_tools.rs`, `tests/fixtures/tools/`,
 `qa/scenarios/tools.qa`.
 Consumes: core `maintenance` (+K4), `semantic_ops`, `update` (via services), `history`, `debug_log`; GUI `MainPanes`
-(list refresh/suspend), `SemanticGate`, `embedder::{ops_factory, drop_model}`, `single_file::open_window`,
+(list refresh/suspend), `SemanticGate`, `embedder::{ops_factory, installed}`, `single_file::open_window`,
 `Services`, `notify`, `DebugBufferHandle`, `widgets::{confirm, path_list, text_view}`, `CorpusBus`,
 `startup::run_startup_tool` (tests of C-013…C-015 call it).
 Provides:
@@ -3616,9 +4175,11 @@ changes below (commits `integrator: …` on master). Contract changes a Phase-B 
 * **Title bar (`workspace/title_bar.rs`, screenshot review)**: gpui-kit's title-bar row never shrinks below its
   content's min-content width, so the window title is laid out absolutely between the menu bar and the window
   controls and truncates there (at 640 px the single-file window had clipped its close button).
-* **PD3 rule 3 (c) (L-082, WP7 request)**: after the first completed load the main window calls
+* **PD3 rule 3 (c) (L-082, WP7 request)**: after the first completed load (in store mode also the first
+  reconcile pass, `ListPane::is_reconciling()` false: a fresh store first lists only its newest delta generation) the
+  main window calls
   `startup::apply_recorded_cwd_workspace(cx, ListPane::recorded_agent_cwds())` once (new `ListPane` method: the
-  distinct cwds of the loaded Pi/OMP conversations); on a match `AppState.workspace` is set and the list re-scopes
+  distinct cwds of the listed Pi/OMP/Codex conversations, i.e. every non-Claude source except automated and child ones); on a match `AppState.workspace` is set and the list re-scopes
   through `ListPane::set_workspace` (a background reload).
 * **Keymap (WP6)**: `keymap::install_all` also binds `help::shortcuts::bindings()` (context `ShortcutsDialog`); code
   that clears and rebuilds the keymap keeps them (`install_user_bindings` does). Status-bar hints look bindings up with
@@ -3628,13 +4189,14 @@ changes below (commits `integrator: …` on master). Contract changes a Phase-B 
   check is pending (tests call `run_until_parked` after typing); Settings invoked from another window closes the open
   dialog (its draft is discarded) and reopens in the invoking window; shadow warnings for app-wide static keys say
   "in the window". Since C-033 (WP-C2) `[gui] theme` / `restore_session` are optional: Reset removes the key and an
-  explicit default reads as "From gui.toml".
+  explicit default reads as "From gui.toml". Until Save, a control whose key the draft removes shows the value that applies without it; the source line
+  describes the saved files.
 * **Focus (§7.7, §9.5, WP2)**: `ViewerPane::focus` moves focus to the viewer even when it is empty (the frozen
   `f6_cycles_through_the_list_toolbar` contract requires F6 to reach the empty viewer); §7.7/§9.5 text saying "no-op
   when empty" is superseded.
 * **Viewer (WP2)**: a hovered link shows its URL in the status bar (no tooltip; deviation from AD13/V-041's GUI
   column; click → `Open link?` → OpenUrl / Copy link as specified); the parse worker runs on the gpui background
-  executor with a single-flight gate (a stale parse is abandoned mid-file: `ViewerModel::open_cancellable` polls the generation every 64 lines, V-101); viewer probes `viewer.status`,
+  executor with a single-flight gate (a stale parse is abandoned mid-file: `ViewerModel::open_cancellable` checks the generation at each read of the session file, V-101; the open counts a card's malformed lines from its own transcript, and a recount of a changed file is single flight and cancelled the same way, V-008); viewer probes `viewer.status`,
   `viewer.loading`, `viewer.find`, `viewer.search.mode`, `viewer.expanded`, `viewer.nav_active`,
   `viewer.agent_panel`, `viewer.first_content_ms`, `viewer.install_ms`, `viewer.toggle_ms`, `viewer.search_ms`,
   `viewer.frame_*` exist in addition to §15.3's list.
@@ -3733,7 +4295,7 @@ changes WP-I must know:
   cx)`); `Workspace::on_corpus_notice` still marks the agent panel. The agent panel's hit menu leaves out Search
   within / Outline / Read range. A multi-conversation Read keeps the viewer's conversation as its target when it was
   read, else the first one read (titles of other conversations fall back to the file stem). Ambiguous-ref
-  candidates are expanded to full refs for every source (Pi/OMP through `discover_agent_keys` and `full_ref_for_candidate`, WP-C3; skipped for a cancelled job). Result
+  candidates are expanded to full refs for every source (through `discover_agent_keys` and `full_ref_for_candidate`, WP-C3, 9718bf8; skipped for a cancelled job; since 429d123 a ref digests the source instance root and the adapter's native id, so Claude candidates need the discovered key too). Refs and anchors issued earlier still resolve; an anchor matching no message of the current history is the typed error `stale-anchor`. Result
   rows stay `div`s (multi-line cards with nested buttons) with stable domain ids. Probes: `deep.*`, and `agent.*` —
   **the main window now routes `agent.*` to the panel** (integrator; `deep.agent.*` still works); single-file
   windows route only `viewer.*`, `focus`, `window.kind`.
@@ -4145,7 +4707,7 @@ left after Phase C. Merged with `git merge --no-ff` in that order, each merge fo
 * **core**: tests only (refresh prewarm S-029, agent_progress export skip A-056).
 * **viewer**: V-088 Select All (`SelectAllTranscript`: Ctrl/Cmd+A in the `Viewer` context and Edit → Select All;
   a focused input keeps its own select-all; Copy takes the whole transcript, painted or not); V-101 a superseded
-  parse is abandoned mid-file (core `ViewerModel::open_cancellable`, polled every 64 lines); V-045 tables with
+  parse is abandoned mid-file (core `ViewerModel::open_cancellable`, checked at each read of the file); V-045 tables with
   non-ASCII cells lay out one fixed-width element per cell; V-094 the new `perf-viewer-main.qa` (also in
   `qa.yml`); A-055 the toolbar ⋯ dropdown tested through the real PopupMenu.
 * **ops**: A-001 Resume and Fork resume in every picker mode take the picker path and quit after a successful
@@ -4390,7 +4952,7 @@ Every review finding of revision 1, in the order received (lens / title), with t
 | P16 | CLI parser deviations (exit code, validator message, missing conflict) | Accepted | Inverted range = runtime `Error: Invalid time range: …` exit 1; `invalid positive integer: <v>`; `--delete`×`--global` (K14, §11.1, §13.1; C-005, C-016, C-020). |
 | P17 | Window-close semantics contradict PD5/PD6 | Accepted | Closing the main window always quits (picker: no output) via its should-close handler (PD6, §11.22; C-065, X-033). |
 | P18 | Uncached-passages banner tells users to run the CLI | Accepted | Banner `<n> passage(s) are not cached. Generate the semantic cache to include them.` + button; the upstream line stays only in the agent text (§12; D-006). |
-| P19 | Clear/Generate don't reset the agent embedder; concurrent cache writers | Accepted | Semantic gate suspends and joins the list worker (K6), pauses agent semantic jobs, drops the shared model before Clear; core write lock (K6) (§7.6, §11.16; T-010, T-024, X-041). |
+| P19 | Clear/Generate don't reset the agent embedder; concurrent cache writers | Accepted | Semantic gate suspends the list worker and joins it on the operation's thread before the operation starts (K6), pauses agent semantic jobs, drops the shared model before Clear; core write lock (K6) (§7.6, §11.16; T-010, T-024, X-041). |
 | P20 | Viewer scroll keys active while typing in the find bar | Accepted | All viewer navigation keys use `Viewer && !Input`, matching V-079 parity (§8.1, §8.3; V-079). |
 | P21 | Time-filter/workspace reloads keep the old list on errors | Accepted | Reloads use K18 `RefreshPolicy::ApplyPartial` with a warning; a fatal failure reverts the chip/workspace with an error toast (§11.20–11.21). |
 | P22 | Deletes from Tools don't clear the viewer or dialogs | Accepted | Every deleting route broadcasts `CorpusNotice::Deleted`; Workspace removes rows, clears the viewer, closes registered dialogs and marks agent result sets (§7.2, §11.15; T-023). |
@@ -4408,7 +4970,7 @@ Every review finding of revision 1, in the order received (lens / title), with t
 | F5 | Ctrl+W closes the main window from text fields | Accepted | `ctrl-w` = delete word in every Input (Windows/Linux); CloseWindow only in `SingleFileWindow` (§8.3–§8.4; C-056, C-064). |
 | F6 | A large tool output/code block is one list item | Accepted | ≈100-line chunk items with stable `(block, chunk)` ids, lanes on the first chunk, search/reveal mapped to chunks; 5k-line outputs in the perf fixture (§9.2, §15.8; V-099). |
 | F7 | Viewer open pipeline has no cancellation; search buffers multiply memory | Accepted | Single-flight `viewer-worker` with generation checks; lazy search texts with an ASCII fast path; previous document released on install (§9.1, §9.7; V-101, V-102). |
-| F8 | Several uncoordinated cache writers and embedders | Partly accepted | Adopted: exclusive gate with suspend+join for Generate/Clear (K6), one shared embedder, core cross-process write lock. Not adopted: a single SemanticService thread for Browser/agent/tools (large core refactor); remaining list-vs-agent writes are serialized by the lock and only cost cache entries (§7.6). |
+| F8 | Several uncoordinated cache writers and embedders | Partly accepted | Adopted: exclusive gate with suspend+join for Generate/Clear (K6), one shared embedder, core cross-process write lock. Not adopted: a single SemanticService thread for Browser/agent/tools (large core refactor); remaining list-vs-agent writes are serialized by the lock and, since each save merges what the others saved (8919a76), no longer cost cache entries (§7.6). |
 | F9 | Pane minimums don't fit the minimum window | Accepted | Viewer min 32rem, list 18–40rem, agent panel auto-collapses the list, widths clamped on startup/resize (PD1; L-088, X-040). |
 | F10 | Irreversible deletes should use AlertDialog naming the target | Accepted | `widgets/confirm.rs` AlertDialog pattern with `Delete "<title>"?`, `Clear semantic cache?`, `Delete N empty transcripts?` (§5.7, §5.10, §5.11, §5.15). |
 | F11 | Notification action API mismatch | Accepted | `.autohide(true)` after `.action`, two-button toasts via `.content`, `id1` replace keys (PD16, §6 notify.rs). |

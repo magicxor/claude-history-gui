@@ -43,6 +43,9 @@ pub struct AgentSearchRequest {
     pub retrieval_hits_per_conversation: Option<usize>,
     pub all_hits: bool,
     pub budget: Option<usize>,
+    /// Retrieve hits only from what the person typed; see
+    /// `AgentRetrievalOptions::user_only`.
+    pub user_only: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -434,7 +437,10 @@ pub fn run_within_search(
     let hits = match mode {
         SearchMode::Lexical | SearchMode::Exact => retrieval_hits(
             &request.query,
-            request.top,
+            AgentRetrievalOptions {
+                limit: request.top,
+                ..AgentRetrievalOptions::default()
+            },
             conversation,
             resolved,
             transcript,
@@ -454,7 +460,10 @@ pub fn run_within_search(
             hybrid_hits(
                 retrieval_hits(
                     &request.query,
-                    candidate_depth,
+                    AgentRetrievalOptions {
+                        limit: candidate_depth,
+                        ..AgentRetrievalOptions::default()
+                    },
                     conversation,
                     resolved,
                     transcript,
@@ -533,6 +542,14 @@ pub fn run_global_lexical_search_reporting(
         .into_iter()
         .map(|resolved| (resolved.key.path.clone(), resolved))
         .collect::<HashMap<_, _>>();
+    // A query without words or literals, such as a lone separator, browses
+    // in the TUI; it matches no conversation here.
+    let parsed = ParsedQuery::parse(&request.query);
+    let has_terms = !parsed.literals().is_empty()
+        || crate::search::lexical::normalized_query_words(parsed.unquoted())
+            .split_whitespace()
+            .next()
+            .is_some();
     let mut hits = Vec::new();
     let mut transcripts_loaded = 0;
 
@@ -551,16 +568,35 @@ pub fn run_global_lexical_search_reporting(
             }
         };
         transcripts_loaded += 1;
-        hits.extend(retrieval_hits(
+        // Every conversation keyword search ranks gets hits: messages with
+        // every term, else messages with some, else the conversation itself
+        // when only its title, summary or project matched.
+        let conversation_hits = retrieval_hits(
             &request.query,
-            request
-                .retrieval_hits_per_conversation
-                .unwrap_or_else(|| lexical_per_conversation_candidate_depth(request)),
+            AgentRetrievalOptions {
+                limit: request
+                    .retrieval_hits_per_conversation
+                    .unwrap_or_else(|| lexical_per_conversation_candidate_depth(request)),
+                user_only: request.user_only,
+                partial_matches: true,
+                ..AgentRetrievalOptions::default()
+            },
             conversation,
             resolved,
             &transcript,
             retrieval_mode,
-        ));
+        );
+        if conversation_hits.is_empty() && has_terms {
+            hits.push(conversation_hit(
+                &request.query,
+                conversation,
+                resolved,
+                &transcript,
+                retrieval_mode,
+            ));
+        } else {
+            hits.extend(conversation_hits);
+        }
         if request.retrieval_hits_per_conversation.is_some() && hits.len() >= request.top {
             break;
         }
@@ -576,8 +612,7 @@ pub fn run_global_lexical_search_reporting(
         }
     }
 
-    sort_output_hits(&mut hits);
-    let (hits, groups) = finalize_global_hits(hits, request);
+    let (hits, groups) = finalize_ranked_hits(hits, request);
 
     Ok(AgentSearchOutput {
         protocol: AgentProtocolKind::Search,
@@ -664,24 +699,17 @@ pub fn run_global_hybrid_search(
 pub fn scoped_conversation_inputs(
     conversations: &[Conversation],
     scope: AgentSearchScope,
-    current_project_dir_name: Option<&str>,
+    workspace: Option<&crate::history::Workspace>,
 ) -> Result<Vec<usize>> {
     let mut indices = Vec::new();
     for (index, conversation) in conversations.iter().enumerate() {
         if scope == AgentSearchScope::Local {
-            let Some(project) = current_project_dir_name else {
+            let Some(workspace) = workspace else {
                 return Err(AppError::ConfigError(
                     "local agent search requires a current project".to_string(),
                 ));
             };
-            let matches = conversation
-                .path
-                .parent()
-                .and_then(|p| p.file_name())
-                .is_some_and(|name| {
-                    crate::history::is_same_project(&name.to_string_lossy(), project)
-                });
-            if !matches {
+            if !workspace.contains(conversation) {
                 continue;
             }
         }
@@ -723,7 +751,7 @@ fn lexical_per_conversation_candidate_depth(request: &AgentSearchRequest) -> usi
 
 fn retrieval_hits(
     query: &str,
-    limit: usize,
+    options: AgentRetrievalOptions,
     conversation: &Conversation,
     resolved: &ResolvedConversation,
     transcript: &AgentTranscript,
@@ -741,14 +769,68 @@ fn retrieval_hits(
             timestamp: Some(conversation.timestamp),
         },
         &search_query,
-        AgentRetrievalOptions {
-            limit,
-            ..AgentRetrievalOptions::default()
-        },
+        options,
     )
     .into_iter()
     .map(|hit| retrieval_output_hit(hit, conversation, resolved, transcript, mode))
     .collect()
+}
+
+/// A hit on the conversation as a whole, at its first message, for a
+/// conversation that keyword search matched outside any one message: in its
+/// title, summary or project. The preview shows the matching field.
+fn conversation_hit(
+    query: &str,
+    conversation: &Conversation,
+    resolved: &ResolvedConversation,
+    transcript: &AgentTranscript,
+    mode: SearchMode,
+) -> AgentOutputHit {
+    let words =
+        crate::search::lexical::normalized_query_words(ParsedQuery::parse(query).unquoted());
+    let field_matches = |field: &str| {
+        let normalized = crate::text_match::normalize_for_search(field);
+        let anywhere = crate::text_match::contains_cjk(&words);
+        words.split_whitespace().any(|word| {
+            !crate::text_match::word_match_ranges(&normalized, word, anywhere).is_empty()
+        })
+    };
+    let preview = [
+        conversation.custom_title.as_deref(),
+        conversation.summary.as_deref(),
+        conversation.project_name.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|field| field_matches(field))
+    .map_or_else(|| title_for_conversation(conversation), str::to_string);
+    let focus_range = MessageRange::single(
+        transcript
+            .messages
+            .first()
+            .map_or(1, |message| message.ordinal),
+    );
+    AgentOutputHit {
+        conversation_ref: resolved.reference.canonical(),
+        project_id: resolved.key.project_id(),
+        conversation_uuid: resolved.reference.uuid(),
+        session: resolved.key.session_filename.clone(),
+        anchors: anchors_for_range(transcript, resolved, focus_range),
+        title: title_for_conversation(conversation),
+        score: 0.0,
+        evidence_score: 0.0,
+        semantic_score_breakdown: None,
+        source: if mode == SearchMode::Exact {
+            AgentHitKind::Exact
+        } else {
+            AgentHitKind::Lexical
+        },
+        evidence_source: AgentHitSource::Dialogue,
+        render_options: AgentHitRenderOptions::default(),
+        preview: format_evidence_preview(&preview),
+        focus_range,
+        read_range: read_range_for_focus(focus_range, transcript.messages.len().max(1), 1),
+    }
 }
 
 fn retrieval_output_hit(
@@ -928,6 +1010,45 @@ fn finalize_global_hits(
     (output_hits, groups)
 }
 
+/// Like `finalize_global_hits` for hits listed conversation by conversation
+/// in keyword search rank order: conversations keep that order, as in the
+/// TUI, and hits within one are ordered by `sort_group_hits`.
+fn finalize_ranked_hits(
+    mut hits: Vec<AgentOutputHit>,
+    request: &AgentSearchRequest,
+) -> (Vec<AgentOutputHit>, Vec<AgentConversationGroup>) {
+    let mut rank = HashMap::new();
+    for hit in &hits {
+        let next = rank.len();
+        rank.entry(hit.conversation_ref.clone()).or_insert(next);
+    }
+    if request.flat {
+        hits.sort_by(|a, b| {
+            rank[&a.conversation_ref]
+                .cmp(&rank[&b.conversation_ref])
+                .then_with(|| compare_group_hits(a, b))
+        });
+        deduplicate_hits_by_identity(&mut hits);
+        hits.truncate(request.top);
+        return (hits, Vec::new());
+    }
+
+    let mut groups = build_conversation_groups(
+        hits,
+        usize::MAX,
+        request.hits_per_conversation,
+        request.all_hits,
+    );
+    groups.sort_by_key(|group| rank[&group.conversation_ref]);
+    groups.truncate(request.top);
+    let output_hits = groups
+        .iter()
+        .flat_map(|group| group.hits.iter().cloned())
+        .take(request.top)
+        .collect();
+    (output_hits, groups)
+}
+
 fn deduplicate_hits_by_identity(hits: &mut Vec<AgentOutputHit>) {
     let mut unique = Vec::<AgentOutputHit>::with_capacity(hits.len());
     for hit in hits.drain(..) {
@@ -1050,22 +1171,23 @@ fn merge_duplicate_hit(existing: &mut AgentOutputHit, candidate: &AgentOutputHit
 }
 
 fn sort_group_hits(hits: &mut [AgentOutputHit]) {
-    hits.sort_by(|a, b| {
-        score_bucket(b.score)
-            .cmp(&score_bucket(a.score))
-            .then_with(|| {
-                evidence_source_rank(a.evidence_source)
-                    .cmp(&evidence_source_rank(b.evidence_source))
-            })
-            .then_with(|| {
-                b.evidence_score
-                    .partial_cmp(&a.evidence_score)
-                    .unwrap_or(Ordering::Equal)
-            })
-            .then_with(|| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal))
-            .then_with(|| a.focus_range.start.cmp(&b.focus_range.start))
-            .then_with(|| source_rank(a.source).cmp(&source_rank(b.source)))
-    });
+    hits.sort_by(compare_group_hits);
+}
+
+fn compare_group_hits(a: &AgentOutputHit, b: &AgentOutputHit) -> Ordering {
+    score_bucket(b.score)
+        .cmp(&score_bucket(a.score))
+        .then_with(|| {
+            evidence_source_rank(a.evidence_source).cmp(&evidence_source_rank(b.evidence_source))
+        })
+        .then_with(|| {
+            b.evidence_score
+                .partial_cmp(&a.evidence_score)
+                .unwrap_or(Ordering::Equal)
+        })
+        .then_with(|| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal))
+        .then_with(|| a.focus_range.start.cmp(&b.focus_range.start))
+        .then_with(|| source_rank(a.source).cmp(&source_rank(b.source)))
 }
 
 fn score_bucket(score: f64) -> i64 {
@@ -1313,30 +1435,35 @@ mod tests {
 
     fn conversation(path: &str, title: &str) -> Conversation {
         Conversation {
-            source: crate::history::Source::Claude,
+            source: crate::history::model::SourceKind::Claude,
             session_id: String::new(),
             path: PathBuf::from(path),
             index: 0,
             timestamp: Local::now(),
-            preview: title.to_string(),
-            preview_first: title.to_string(),
-            preview_last: title.to_string(),
-            full_text: title.to_string(),
-            agent_search_text: String::new(),
-            semantic_route_text: String::new(),
-            semantic_turns: vec![title.to_string()],
+            preview: title.to_string().into(),
+            preview_first: title.to_string().into(),
+            preview_last: title.to_string().into(),
+            full_text: title.to_string().into(),
+            own_text: "".into(),
+            agent_search_text: "".into(),
+            semantic_route_text: "".into(),
+            semantic_turns: vec![title.to_string()].into(),
             semantic_turn_ranges: vec![MessageRange::single(1)],
-            search_text_lower: title.to_string(),
             project_name: Some("project-a".to_string()),
             project_path: None,
             cwd: None,
+            cwds: Vec::new(),
             message_count: 1,
+            prompt_count: 1,
+            tool_call_count: 0,
             parse_errors: vec![],
             summary: None,
             custom_title: Some(title.to_string()),
             model: None,
             total_tokens: 0,
             duration_minutes: None,
+            provenance: Default::default(),
+            parent: None,
         }
     }
 
@@ -1371,6 +1498,7 @@ mod tests {
             retrieval_hits_per_conversation: None,
             all_hits: false,
             budget: None,
+            user_only: false,
         }
     }
 
@@ -2452,6 +2580,7 @@ mod tests {
             retrieval_hits_per_conversation: None,
             all_hits: false,
             budget: None,
+            user_only: false,
         };
         let hits = vec![
             semantic_hit_with_source(
@@ -2520,6 +2649,7 @@ mod tests {
             retrieval_hits_per_conversation: None,
             all_hits: false,
             budget: None,
+            user_only: false,
         };
         let mut hits = (1..=20)
             .map(|index| semantic_hit(0, MessageRange::single(index), "first", 1.0))
@@ -2614,6 +2744,51 @@ mod tests {
         assert_eq!(output.hits.len(), 3);
         assert_eq!(output.stats.shortlisted, 50);
         assert_eq!(output.stats.transcripts_loaded, 3);
+    }
+
+    #[test]
+    fn global_lexical_keeps_every_ranked_conversation_in_rank_order() {
+        let paths = ["split.jsonl", "whole.jsonl", "titled.jsonl"];
+        let mut conversations = paths
+            .iter()
+            .map(|path| conversation(path, "plain"))
+            .collect::<Vec<_>>();
+        conversations[2].custom_title = Some("zanzibar plans".into());
+        let keys = paths
+            .iter()
+            .map(|&path| AgentConversationKey::new("project-a", path, PathBuf::from(path)))
+            .collect::<Vec<_>>();
+        let load = |key: &AgentConversationKey| {
+            Ok(match key.path.to_str().unwrap() {
+                "split.jsonl" => transcript(vec![
+                    message(1, AgentMessageRole::User, "zanzibar first"),
+                    message(2, AgentMessageRole::Assistant, "then migration"),
+                ]),
+                "whole.jsonl" => transcript(vec![message(
+                    1,
+                    AgentMessageRole::User,
+                    "zanzibar migration notes",
+                )]),
+                _ => transcript(vec![message(1, AgentMessageRole::User, "unrelated")]),
+            })
+        };
+        let ranked = [2, 0, 1];
+
+        for flat in [false, true] {
+            let request = global_request("zanzibar migration", SearchMode::Lexical, 10, flat);
+            let output =
+                run_global_lexical_search(&request, &conversations, &keys, &ranked, load).unwrap();
+            let hits = output_hits(&output);
+            let mut order = hits
+                .iter()
+                .map(|hit| hit.session.as_str())
+                .collect::<Vec<_>>();
+            order.dedup();
+            assert_eq!(order, ["titled.jsonl", "split.jsonl", "whole.jsonl"]);
+            assert_eq!(hits[0].preview, "zanzibar plans");
+            assert_eq!(hits[0].focus_range, MessageRange::single(1));
+            assert_eq!(output.groups.len(), if flat { 0 } else { 3 });
+        }
     }
 
     #[test]

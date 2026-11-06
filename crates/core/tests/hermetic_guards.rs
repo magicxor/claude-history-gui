@@ -46,11 +46,14 @@ fn the_gui_embedder_loader_refuses_to_load_the_model() {
     // DESIGN §7.6: the GUI's shared embedder calls `new_in` directly, not
     // through a default factory; a GUI test that reaches it (for example a
     // missed fake) must not download either.
-    use claude_history_core::semantic::fastembed::{FastembedEmbedder, HERMETIC_REFUSAL};
+    use claude_history_core::semantic::fastembed::{
+        EmbedPriority, FastembedEmbedder, HERMETIC_REFUSAL,
+    };
     let root = tempfile::tempdir().unwrap();
     let env = HistoryEnv::sandbox(root.path());
     let model_dir = env.semantic_model_dir().unwrap();
-    let error = match FastembedEmbedder::new_in(model_dir.clone(), false) {
+    let error = match FastembedEmbedder::new_in(model_dir.clone(), false, EmbedPriority::Background)
+    {
         Ok(_) => panic!("the real model must not load in a hermetic build"),
         Err(error) => error.to_string(),
     };
@@ -69,6 +72,7 @@ fn terminals_are_never_spawned() {
         },
         args: Vec::new(),
         cwd: Some(root.path().to_path_buf()),
+        env: Vec::new(),
     };
     let launcher = if cfg!(windows) {
         TerminalLauncher::WindowsConsole
@@ -87,6 +91,13 @@ fn terminals_are_never_spawned() {
     );
     assert_eq!(
         spawn_terminal_checked(&command, Duration::from_millis(10))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    // Nor is an agent's CLI run to completion (`codex delete`, eea6d37).
+    assert_eq!(
+        claude_history_core::resume::terminal::run_to_completion(&spec)
             .unwrap_err()
             .kind(),
         std::io::ErrorKind::Unsupported

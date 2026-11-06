@@ -9,7 +9,9 @@
 //!   `Replace "<name>"?` when that path exists (Enter ignored). A failing save
 //!   dialog (Linux without the portal) falls back to the default folder.
 //! * Everything is computed from the captured target and the options captured
-//!   with it; writing and generating run off the UI thread.
+//!   with it; decoding (through the environment's history service, core
+//!   `view::open_conversation`), generating and writing run off the UI
+//!   thread.
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
@@ -17,9 +19,10 @@ use std::rc::Rc;
 
 use chrono::Local;
 use claude_history_core::export::{
-    COPIED_TO_CLIPBOARD, ExportFormat, ExportOptions, default_export_file_name, export_to_path,
-    exported_status, generate_export,
+    COPIED_TO_CLIPBOARD, ExportError, ExportFormat, ExportOptions, default_export_file_name,
+    export_to_path, exported_status, generate_export,
 };
+use claude_history_core::view::open_conversation;
 use gpui_kit::base::actions::{Cancel, Confirm, SelectDown, SelectUp};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::list::ListItem;
@@ -30,7 +33,7 @@ use gpui_kit::{
 };
 
 use crate::actions::{ExportPick1, ExportPick2, ExportPick3, ExportPick4};
-use crate::globals::{OpenTargets, app_state};
+use crate::globals::{OpenTargets, app_state, env_history};
 use crate::model::ConversationTarget;
 use crate::notify::Toast;
 use crate::ops::copy::clear_dialog;
@@ -296,9 +299,11 @@ pub fn copy_as(
     cx: &mut App,
 ) {
     let path = target.path.clone();
-    let task = cx
-        .background_executor()
-        .spawn(async move { generate_export(&path, format, opts) });
+    let history = env_history(cx);
+    let task = cx.background_executor().spawn(async move {
+        let transcript = open_conversation(history.service(), &path)?;
+        generate_export(&transcript, format, opts)
+    });
     window
         .spawn(&*cx, async move |cx| {
             let result = task.await;
@@ -478,10 +483,14 @@ pub fn write_export(
     cx: &mut App,
 ) {
     let source = target.path.clone();
+    let history = env_history(cx);
     let task = {
         let dest = dest.clone();
-        cx.background_executor()
-            .spawn(async move { export_to_path(&source, format, opts, &dest) })
+        cx.background_executor().spawn(async move {
+            let transcript =
+                open_conversation(history.service(), &source).map_err(ExportError::Read)?;
+            export_to_path(&transcript, format, opts, &dest)
+        })
     };
     window
         .spawn(&*cx, async move |cx| {

@@ -3,16 +3,19 @@
 //!
 //! Core types are used directly (`ToolDisplayMode`, `ViewPrefs`,
 //! `ExportFormat`, `ExportOptions`, `PickerAction`, `ListSearchMode`,
-//! `TerminalCommand`, `LaunchSpec`, `UpdateStatus`); this module never mirrors
-//! them.
+//! `TerminalCommand`, `LaunchSpec`, `UpdateStatus`, `ListHit`); this module
+//! never mirrors them.
 
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Local};
 use claude_history_core::agent::AgentConversationInfo;
-use claude_history_core::display_format::sanitize_preview;
+use claude_history_core::browser::ListHit;
+use claude_history_core::display_format::{conversation_label, sanitize_preview};
 use claude_history_core::export::ExportFormat;
-use claude_history_core::history::{Conversation, Source};
+use claude_history_core::history::actions::{Capabilities, capabilities_of, refusal};
+use claude_history_core::history::model::SourceKind;
+use claude_history_core::history::{Conversation, Provenance};
 use claude_history_core::settings::{GuiLaunchArgs, PickerAction};
 use claude_history_core::time_filter::TimeFilter;
 use gpui_kit::SharedString;
@@ -20,6 +23,42 @@ use serde::{Deserialize, Serialize};
 
 /// Longest conversation title the GUI derives (characters, `…` included).
 pub const TITLE_MAX_CHARS: usize = 80;
+
+/// Why Resume, Fork, Rename and Delete are unavailable for a target whose
+/// source is unknown (a disabled item's tooltip).
+pub const UNKNOWN_SOURCE: &str = "Unknown conversation type";
+
+/// The conversation actions whose availability core decides
+/// (`history::actions::capabilities_of`, upstream eea6d37).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SessionAct {
+    Resume,
+    Fork,
+    Rename,
+    Delete,
+}
+
+impl SessionAct {
+    /// The verb of core's refusal texts (`Resuming CX sessions is not
+    /// supported`).
+    pub fn doing(self) -> &'static str {
+        match self {
+            SessionAct::Resume => "Resuming",
+            SessionAct::Fork => "Forking",
+            SessionAct::Rename => "Renaming",
+            SessionAct::Delete => "Deleting",
+        }
+    }
+
+    fn allowed_by(self, capabilities: &Capabilities) -> bool {
+        match self {
+            SessionAct::Resume => capabilities.resume,
+            SessionAct::Fork => capabilities.fork,
+            SessionAct::Rename => capabilities.rename,
+            SessionAct::Delete => capabilities.delete,
+        }
+    }
+}
 
 /// The conversation an action, dialog, viewer or result set acts on,
 /// captured when it starts (PD15, ADD A1/A2). Code never re-reads the live
@@ -29,7 +68,7 @@ pub struct ConversationTarget {
     pub path: PathBuf,
     /// `None` = unknown: Resume/Fork/Rename/Delete are disabled
     /// ("Unknown conversation type").
-    pub source: Option<Source>,
+    pub source: Option<SourceKind>,
     /// `Conversation.session_id` (Pi/OMP: header id); the file stem when unknown.
     pub session_id: String,
     /// `path.file_stem()` (lossy): the TUI's "session ID".
@@ -40,6 +79,11 @@ pub struct ConversationTarget {
     pub project_name: Option<SharedString>,
     pub project_path: Option<PathBuf>,
     pub custom_title: Option<String>,
+    /// `Conversation.provenance`: an orphaned conversation allows no action.
+    /// Default (not orphaned) for a target built from an agent result or an
+    /// unparsed file; [`crate::ops::copy::live_target`] takes the corpus
+    /// entry's.
+    pub provenance: Provenance,
 }
 
 impl ConversationTarget {
@@ -60,6 +104,7 @@ impl ConversationTarget {
             project_name: c.project_name.clone().map(SharedString::from),
             project_path: c.project_path.clone(),
             custom_title: non_empty(c.custom_title.as_deref()).map(str::to_string),
+            provenance: c.provenance,
         }
     }
 
@@ -86,6 +131,7 @@ impl ConversationTarget {
             project_name: None,
             project_path: None,
             custom_title: None,
+            provenance: Provenance::default(),
         }
     }
 
@@ -110,6 +156,7 @@ impl ConversationTarget {
                     project_name: None,
                     project_path: None,
                     custom_title: None,
+                    provenance: Provenance::default(),
                 }
             }
         }
@@ -140,6 +187,34 @@ impl ConversationTarget {
     pub fn can_modify(&self) -> bool {
         self.source.is_some()
     }
+
+    /// The actions core allows for this conversation
+    /// (`history::actions::capabilities_of`: its source's adapter, none for
+    /// an orphaned conversation); none for an unknown source.
+    pub fn capabilities(&self) -> Capabilities {
+        match self.source {
+            Some(source) => capabilities_of(source, self.provenance),
+            None => Capabilities::NONE,
+        }
+    }
+
+    /// Whether `act` is available for this conversation.
+    pub fn allows(&self, act: SessionAct) -> bool {
+        act.allowed_by(&self.capabilities())
+    }
+
+    /// Why `act` is unavailable (`None` when it is available): core's
+    /// refusal text (upstream's status message, e.g. `Renaming CX sessions is
+    /// not supported`), or [`UNKNOWN_SOURCE`].
+    pub fn refusal(&self, act: SessionAct) -> Option<String> {
+        if self.allows(act) {
+            return None;
+        }
+        Some(match self.source {
+            Some(source) => refusal(source, self.provenance, act.doing()),
+            None => UNKNOWN_SOURCE.to_string(),
+        })
+    }
 }
 
 /// The viewer header's data (DESIGN §9.10), taken from the live corpus.
@@ -149,13 +224,75 @@ pub struct HeaderInfo {
     pub project_name: Option<SharedString>,
     pub custom_title: Option<SharedString>,
     pub model: Option<String>,
+    /// Every message, tool calls and results included. Not shown since
+    /// upstream e930cac; [`HeaderInfo::is_stem_only`] still tests it, as a
+    /// real conversation can have no prompts.
     pub message_count: usize,
+    /// `Conversation::prompt_count` and `tool_call_count` (upstream
+    /// e930cac): the header shows `N prompts · M tool calls`.
+    pub prompt_count: usize,
+    pub tool_call_count: usize,
     pub duration_minutes: Option<u64>,
     pub total_tokens: u64,
     pub timestamp: DateTime<Local>,
     pub summary: Option<SharedString>,
     pub parse_error_count: usize,
+    /// Whether `parse_error_count` is known: a row from the store (a card)
+    /// carries no parse errors, so the viewer counts them from the file
+    /// (upstream 358becb).
+    pub parse_errors_known: bool,
     pub file_stem: SharedString,
+    /// The conversation's parent, subagents and forks (upstream 3c2ffeb):
+    /// the family line under the header.
+    pub family: HeaderFamily,
+}
+
+/// A conversation related to the one in the viewer: its parent, or one of
+/// its subagents and `/btw` forks (upstream 3c2ffeb).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FamilyMember {
+    pub target: ConversationTarget,
+    /// Core's `display_format::conversation_label`: the title, else the
+    /// summary, else the first message, else the session ID.
+    pub label: String,
+    /// A `/btw` fork (`Provenance::branch`), else a subagent.
+    pub fork: bool,
+    pub message_count: usize,
+    pub timestamp: DateTime<Local>,
+}
+
+impl FamilyMember {
+    pub fn from_conversation(c: &Conversation) -> Self {
+        Self {
+            target: ConversationTarget::from_conversation(c),
+            label: conversation_label(c),
+            fork: c.provenance.branch,
+            message_count: c.message_count,
+            timestamp: c.timestamp,
+        }
+    }
+}
+
+/// The family line of the viewer header (DESIGN §9.10, upstream 3c2ffeb),
+/// from core's `Browser::family_of`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HeaderFamily {
+    /// The session ID of the conversation this one names as its parent
+    /// (`Conversation::parent`), found or not.
+    pub parent_id: Option<String>,
+    /// This conversation is a `/btw` fork (else, with a parent, a subagent).
+    pub is_fork: bool,
+    /// The parent, when the corpus has it.
+    pub parent: Option<FamilyMember>,
+    /// Its subagents and forks, oldest first.
+    pub children: Vec<FamilyMember>,
+}
+
+impl HeaderFamily {
+    /// Whether the family line has anything to show.
+    pub fn is_empty(&self) -> bool {
+        self.parent_id.is_none() && self.children.is_empty()
+    }
 }
 
 impl HeaderInfo {
@@ -168,12 +305,20 @@ impl HeaderInfo {
                 .map(|t| SharedString::from(t.to_string())),
             model: c.model.clone(),
             message_count: c.message_count,
+            prompt_count: c.prompt_count,
+            tool_call_count: c.tool_call_count,
             duration_minutes: c.duration_minutes,
             total_tokens: c.total_tokens,
             timestamp: c.timestamp,
             summary: non_empty(c.summary.as_deref()).map(|s| SharedString::from(s.to_string())),
             parse_error_count: c.parse_errors.len(),
+            parse_errors_known: true,
             file_stem: file_stem.into(),
+            family: HeaderFamily {
+                parent_id: c.parent.clone(),
+                is_fork: c.provenance.branch,
+                ..HeaderFamily::default()
+            },
         }
     }
 
@@ -188,12 +333,16 @@ impl HeaderInfo {
             custom_title: None,
             model: None,
             message_count: 0,
+            prompt_count: 0,
+            tool_call_count: 0,
             duration_minutes: None,
             total_tokens: 0,
             timestamp: DateTime::<Local>::from(std::time::SystemTime::UNIX_EPOCH),
             summary: None,
             parse_error_count: 0,
+            parse_errors_known: true,
             file_stem,
+            family: HeaderFamily::default(),
         }
     }
 
@@ -217,6 +366,15 @@ pub struct OpenRequest {
     /// Read range from the list or Deep search, D-029). The panel then has
     /// the focus whatever `focus` says.
     pub agent_tab: Option<AgentTab>,
+    /// Opened from the viewer's family line or back stack (upstream
+    /// 3c2ffeb): the viewer keeps the conversations it came from; any other
+    /// open forgets them.
+    pub related: bool,
+    /// The list's search hit in this conversation (an open from the list
+    /// while it has a query, upstream 411e227 list preview): the viewer
+    /// shows the conversation scrolled to the hit, its message focused and
+    /// the query's matches highlighted (DESIGN §9.8a, L-109).
+    pub list_hit: Option<ListHit>,
 }
 
 impl OpenRequest {
@@ -227,7 +385,22 @@ impl OpenRequest {
             focus,
             reveal: None,
             agent_tab: None,
+            related: false,
+            list_hit: None,
         }
+    }
+
+    /// Show the conversation at the list's search hit (see
+    /// [`OpenRequest::list_hit`]).
+    pub fn with_list_hit(mut self, hit: Option<ListHit>) -> Self {
+        self.list_hit = hit;
+        self
+    }
+
+    /// A related open (see [`OpenRequest::related`]).
+    pub fn related(mut self) -> Self {
+        self.related = true;
+        self
     }
 
     pub fn with_reveal(mut self, reveal: RevealRequest) -> Self {
@@ -375,7 +548,7 @@ impl SettingsPage {
     }
 }
 
-/// The five user-configurable key actions (`[keys]`, §8.5).
+/// The seven user-configurable key actions (`[keys]`, §8.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum KeyAction {
     Resume,
@@ -383,25 +556,36 @@ pub enum KeyAction {
     Rename,
     Delete,
     Refresh,
+    /// List or hide automated and subagent conversations (upstream
+    /// cb990e6, `ToggleAllKinds`).
+    AllKinds,
+    /// Search only the user's own messages, or everything (upstream
+    /// ae7ae39, `ToggleUserOnly`).
+    UserOnly,
 }
 
 impl KeyAction {
     /// Display order (Settings → Keys).
-    pub const ALL: [KeyAction; 5] = [
+    pub const ALL: [KeyAction; 7] = [
         KeyAction::Resume,
         KeyAction::Fork,
         KeyAction::Rename,
         KeyAction::Delete,
         KeyAction::Refresh,
+        KeyAction::AllKinds,
+        KeyAction::UserOnly,
     ];
 
-    /// The TUI's check order, highest priority first: delete > resume > fork
-    /// > refresh > rename (C-028). With equal keys the earlier one wins.
-    pub const PRIORITY: [KeyAction; 5] = [
+    /// The TUI's check order, highest priority first: delete, resume, fork,
+    /// refresh, all kinds, user only, rename (C-028). With equal keys the
+    /// earlier one wins.
+    pub const PRIORITY: [KeyAction; 7] = [
         KeyAction::Delete,
         KeyAction::Resume,
         KeyAction::Fork,
         KeyAction::Refresh,
+        KeyAction::AllKinds,
+        KeyAction::UserOnly,
         KeyAction::Rename,
     ];
 
@@ -412,6 +596,8 @@ impl KeyAction {
             KeyAction::Rename => "Rename",
             KeyAction::Delete => "Delete",
             KeyAction::Refresh => "Refresh",
+            KeyAction::AllKinds => crate::menus::ALL_KINDS_LABEL,
+            KeyAction::UserOnly => crate::menus::USER_ONLY_LABEL,
         }
     }
 
@@ -423,6 +609,8 @@ impl KeyAction {
             KeyAction::Rename => "rename",
             KeyAction::Delete => "delete",
             KeyAction::Refresh => "refresh",
+            KeyAction::AllKinds => "all_kinds",
+            KeyAction::UserOnly => "user_only",
         }
     }
 
@@ -517,6 +705,13 @@ pub struct LaunchContext {
     /// `$TERMINAL` (Linux launcher detection, §11.10 step 6, §14.1), read once
     /// by `main`; `app::init` stores it for `ops::resume` (integrator, Phase B).
     pub terminal_var: Option<std::ffi::OsString>,
+    /// This process enforces the sandbox gate (§15.4, `qa::gate::enforced`,
+    /// from `main` through `startup::ProcessInfo`): every workspace applied
+    /// must pass `qa::gate::check_workspace` (the startup workspace or exit
+    /// 3, a runtime change or an error toast), every file opened by path
+    /// `qa::gate::check_opened_file` (`file` is checked in `startup::dispatch`,
+    /// File → Open JSONL file… shows an error toast). Off in tests unless set.
+    pub sandbox_gate: bool,
 }
 
 impl LaunchContext {
@@ -668,6 +863,35 @@ mod tests {
         assert_eq!(target.describe(), "abc");
     }
 
+    /// Upstream eea6d37: Codex threads cannot be renamed, orphaned ones
+    /// allow nothing, and the refusals are core's texts.
+    #[test]
+    fn actions_follow_the_capabilities_of_the_conversation() {
+        let unknown = ConversationTarget::from_parsed_file(Path::new("/tmp/abc.jsonl"), None);
+        assert_eq!(
+            unknown.refusal(SessionAct::Resume).as_deref(),
+            Some(UNKNOWN_SOURCE)
+        );
+        let mut codex = unknown.clone();
+        codex.source = Some(SourceKind::Codex);
+        for act in [SessionAct::Resume, SessionAct::Fork, SessionAct::Delete] {
+            assert!(codex.allows(act), "{act:?}");
+            assert_eq!(codex.refusal(act), None);
+        }
+        assert_eq!(
+            codex.refusal(SessionAct::Rename).as_deref(),
+            Some("Renaming CX sessions is not supported")
+        );
+        codex.provenance.orphaned = true;
+        assert_eq!(
+            codex.refusal(SessionAct::Delete).as_deref(),
+            Some("Deleting is unavailable: CX no longer has this conversation's current history")
+        );
+        let mut claude = unknown;
+        claude.source = Some(SourceKind::Claude);
+        assert!(claude.allows(SessionAct::Rename));
+    }
+
     #[test]
     fn describe_shortens_the_session_id() {
         let mut target = ConversationTarget::from_parsed_file(
@@ -695,7 +919,10 @@ mod tests {
     #[test]
     fn key_action_priority_follows_the_tui_check_order() {
         assert_eq!(KeyAction::Delete.priority(), 0);
-        assert_eq!(KeyAction::Rename.priority(), 4);
+        assert_eq!(KeyAction::Rename.priority(), 6);
         assert!(KeyAction::Resume.priority() < KeyAction::Fork.priority());
+        assert!(KeyAction::Refresh.priority() < KeyAction::AllKinds.priority());
+        assert!(KeyAction::AllKinds.priority() < KeyAction::UserOnly.priority());
+        assert!(KeyAction::UserOnly.priority() < KeyAction::Rename.priority());
     }
 }

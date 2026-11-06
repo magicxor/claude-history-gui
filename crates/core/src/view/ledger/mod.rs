@@ -8,12 +8,20 @@
 //! upstream, all mechanical: the palette comes from [`crate::theme::current`]
 //! instead of terminal detection (R3); `process_command_message` lives in
 //! [`crate::commands`]; a few items are re-exported `pub(crate)` for the
-//! layout-free [`crate::view::document`] builder; the agent-progress label is
-//! sliced by characters instead of bytes (W18). Rendering output is unchanged.
+//! layout-free [`crate::view::document`] builder (`group_messages` and
+//! `group_summary_line` take the group's parsed range and parent (and
+//! summary) instead of the ledger's `PendingToolSummary`, and the result
+//! lookup of upstream's `render_call_details` is `group_call_result`, so the
+//! builder can share them); the agent-progress
+//! label is sliced by characters instead of bytes (W18). Rendering output is
+//! unchanged.
 
-use crate::claude::LogEntry;
+use crate::history::model::Transcript;
+use crate::history::service::HistoryService;
+use crate::history::view::{self, Entry, EntryKind};
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::theme::{self, Theme};
 
@@ -40,13 +48,13 @@ use summary::{PendingToolSummary, flush_tool_summary};
 pub(crate) use markdown::render_markdown_to_lines;
 pub(crate) use style::{assistant_label, subagent_label};
 pub(crate) use summary::{
-    ToolActivitySummary, summarize_tool_calls, tool_only_assistant_summary,
-    user_entry_is_only_tool_results,
+    ToolActivitySummary, call_header, call_rows, entry_shows_nothing, group_call_result,
+    group_messages, group_summary_line, hidden_lines_suffix, summarize_tool_calls, summary_rows,
+    tool_only_assistant_summary, user_entry_is_only_tool_results,
 };
 pub(crate) use timing::{RowTiming, TimingSlot};
 pub(crate) use tools::{
-    ToolOutputKind, format_tool_result_content, make_tool_output_id, make_tool_summary_output_id,
-    tool_result_display_text,
+    ToolOutputKind, make_tool_output_id, make_tool_summary_output_id, tool_result_display_text,
 };
 
 /// Width of the focus gutter indicator (▌ + space)
@@ -85,29 +93,36 @@ pub struct ToolOutputId(pub String);
 /// Controls how tool calls and results are displayed
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ToolDisplayMode {
+    /// Tool calls and results are not rendered at all
+    Off,
     #[default]
-    Hidden,
+    Summary,
+    /// Each tool call on one line, without results
+    Calls,
     Truncated,
     Full,
 }
 
 impl ToolDisplayMode {
-    /// Cycle to the next mode: Summary → Truncated → Full → Summary
+    /// Cycle to the next mode: Off → Summary → Calls → Truncated → Full → Off
     pub fn next(self) -> Self {
         match self {
-            Self::Hidden => Self::Truncated,
+            Self::Off => Self::Summary,
+            Self::Summary => Self::Calls,
+            Self::Calls => Self::Truncated,
             Self::Truncated => Self::Full,
-            Self::Full => Self::Hidden,
+            Self::Full => Self::Off,
         }
     }
 
-    pub fn is_summary(self) -> bool {
-        matches!(self, Self::Hidden)
+    /// Whether runs of tool calls collapse into rows that expand on click
+    pub fn groups_tools(self) -> bool {
+        matches!(self, Self::Summary | Self::Calls)
     }
 
     /// Whether full or truncated tool details should be rendered
     pub fn shows_details(self) -> bool {
-        !matches!(self, Self::Hidden)
+        matches!(self, Self::Truncated | Self::Full)
     }
 
     /// Whether tools should be included in exported text
@@ -118,7 +133,9 @@ impl ToolDisplayMode {
     /// Fixed-width label for the status bar (3 chars each)
     pub fn status_label(self) -> &'static str {
         match self {
-            Self::Hidden => "sum",
+            Self::Off => "off",
+            Self::Summary => "sum",
+            Self::Calls => "cal",
             Self::Truncated => "trn",
             Self::Full => "all",
         }
@@ -153,60 +170,55 @@ pub struct RenderedConversation {
     pub messages: Vec<MessageRange>,
 }
 
-/// Format an ISO 8601 timestamp to Mon DD HH:MM in local time
-pub fn format_timestamp(iso_timestamp: &str) -> Option<String> {
-    use chrono::{DateTime, Local};
-    // Parse RFC 3339 timestamp (handles timezone offsets) and convert to local time
-    DateTime::parse_from_rfc3339(iso_timestamp)
-        .ok()
-        .map(|dt| dt.with_timezone(&Local).format("%b %d %H:%M").to_string())
+/// Format a timestamp as Mon DD HH:MM in local time
+pub fn format_timestamp(timestamp: chrono::DateTime<chrono::Utc>) -> String {
+    timestamp
+        .with_timezone(&chrono::Local)
+        .format("%b %d %H:%M")
+        .to_string()
 }
 
+/// An entry of the conversation shown, with its position among the
+/// transcript's entries: the identity tool outputs and message ranges
+/// refer to.
 #[derive(Debug)]
-pub struct RenderableEntry {
+pub struct RenderableEntry<'a> {
     pub entry_index: usize,
-    entry: LogEntry,
+    entry: Entry<'a>,
 }
 
-impl RenderableEntry {
-    /// An entry at `entry_index` of the normalized entry list (see
-    /// [`parse_conversation_file`]).
-    pub fn new(entry_index: usize, entry: LogEntry) -> Self {
+impl<'a> RenderableEntry<'a> {
+    /// An entry at `entry_index` of the transcript's entries (see
+    /// [`renderable_entries`]).
+    pub fn new(entry_index: usize, entry: Entry<'a>) -> Self {
         Self { entry_index, entry }
     }
 
-    /// The parsed log entry.
-    pub fn entry(&self) -> &LogEntry {
+    /// The entry shown.
+    pub fn entry(&self) -> &Entry<'a> {
         &self.entry
     }
 }
 
-pub fn parse_conversation_file(file_path: &Path) -> std::io::Result<Vec<RenderableEntry>> {
-    Ok(parse_conversation_file_cancellable(file_path, &|| false)?.unwrap_or_default())
+/// The conversation whose session file is `path`, opened through `history`
+/// (fork: the service of the caller's [`crate::HistoryEnv`]; upstream used
+/// a process-wide one).
+pub fn open_conversation(
+    history: &HistoryService,
+    path: &Path,
+) -> std::io::Result<Arc<Transcript>> {
+    history
+        .open_path(path)
+        .map(|(_, transcript)| transcript)
+        .map_err(|error| std::io::Error::other(error.to_string()))
 }
 
-/// [`parse_conversation_file`] that stops early (`Ok(None)`) when `cancelled`
-/// returns true (polled every 64 lines).
-pub fn parse_conversation_file_cancellable(
-    file_path: &Path,
-    cancelled: &dyn Fn() -> bool,
-) -> std::io::Result<Option<Vec<RenderableEntry>>> {
-    let Some(normalized) = crate::history::normalized_log_entries_cancellable(file_path, cancelled)
-        .map_err(|error| std::io::Error::other(error.to_string()))?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(
-        normalized
-            .into_iter()
-            .map(|(_, entry)| entry)
-            .enumerate()
-            .filter_map(|(entry_index, entry)| {
-                (!matches!(entry, LogEntry::FileHistorySnapshot { .. }))
-                    .then_some(RenderableEntry { entry_index, entry })
-            })
-            .collect(),
-    ))
+pub fn renderable_entries(transcript: &Transcript) -> Vec<RenderableEntry<'_>> {
+    view::entries(transcript)
+        .into_iter()
+        .enumerate()
+        .map(|(entry_index, entry)| RenderableEntry { entry_index, entry })
+        .collect()
 }
 
 pub fn render_parsed_conversation(
@@ -218,7 +230,7 @@ pub fn render_parsed_conversation(
     let mut pending_tool_summary: Option<PendingToolSummary> = None;
 
     for (parsed_idx, parsed) in entries.iter().enumerate() {
-        if options.tool_display.is_summary()
+        if options.tool_display.groups_tools()
             && try_extend_or_start_pending_summary(
                 &mut lines,
                 &mut messages,
@@ -271,11 +283,11 @@ fn try_extend_or_start_pending_summary(
     let entry_index = parsed.entry_index;
     let entry = &parsed.entry;
 
-    if let Some((parent_id, agent, timestamp, summary)) =
+    if let Some((parent_id, speaker, timestamp, summary)) =
         tool_only_assistant_summary(entry, options)
     {
         match pending {
-            Some(p) if p.parent_id.as_deref() == parent_id && p.agent.as_deref() == agent => {
+            Some(p) if p.parent_id.as_deref() == parent_id && p.speaker == speaker => {
                 p.last_parsed_idx = parsed_idx;
                 p.summary.merge(summary);
             }
@@ -287,12 +299,18 @@ fn try_extend_or_start_pending_summary(
                     first_parsed_idx: parsed_idx,
                     last_parsed_idx: parsed_idx,
                     parent_id: parent_id.map(str::to_string),
-                    agent: agent.map(str::to_string),
-                    timestamp: timestamp.map(str::to_string),
+                    speaker: speaker.to_owned(),
+                    timestamp,
                     summary,
                 });
             }
         }
+        return true;
+    }
+
+    // Records that render nothing sit between a tool result and the next
+    // call; they must not split one run of tool calls into several rows.
+    if pending.is_some() && entry_shows_nothing(entry, options) {
         return true;
     }
 
@@ -316,9 +334,11 @@ fn render_entry_with_range(
 ) {
     let entry_index = parsed.entry_index;
     let entry = &parsed.entry;
-    let is_message = matches!(entry, LogEntry::User { .. } | LogEntry::Assistant { .. })
-        || matches!(entry, LogEntry::Progress { data, .. }
-            if options.show_thinking && crate::claude::parse_agent_progress(data).is_some());
+    let is_message = match entry.kind {
+        EntryKind::Message { .. } => true,
+        EntryKind::Subagent { .. } => options.show_thinking,
+        EntryKind::Note { .. } | EntryKind::Hidden => false,
+    };
 
     let start_line = lines.len();
     render_entry(lines, entry_index, entry, options);
@@ -426,13 +446,12 @@ fn postprocess_blank_lines(lines: &mut Vec<RenderedLine>, messages: &mut Vec<Mes
     messages.retain(|m| m.start_line < m.end_line);
 }
 
-/// Render a conversation file to lines for display in the TUI viewer
+/// Render a conversation to lines for display in the TUI viewer
 pub fn render_conversation(
-    file_path: &Path,
+    transcript: &Transcript,
     options: &RenderOptions,
-) -> std::io::Result<RenderedConversation> {
-    let entries = parse_conversation_file(file_path)?;
-    Ok(render_parsed_conversation(&entries, options))
+) -> RenderedConversation {
+    render_parsed_conversation(&renderable_entries(transcript), options)
 }
 
 #[cfg(test)]

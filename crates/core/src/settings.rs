@@ -48,9 +48,11 @@ pub fn resolve_bool_setting(
 /// `Truncated`, which is only reachable by cycling inside the viewer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum InitialToolDisplay {
+    /// No tool calls, results or summaries (upstream d0aca95).
+    Off,
     /// Summary mode ("Searched for 2 patterns, read 1 file").
     #[default]
-    Hidden,
+    Summary,
     /// Every tool call and result in full.
     Full,
 }
@@ -58,7 +60,8 @@ pub enum InitialToolDisplay {
 impl From<InitialToolDisplay> for crate::view::ToolDisplayMode {
     fn from(display: InitialToolDisplay) -> Self {
         match display {
-            InitialToolDisplay::Hidden => Self::Hidden,
+            InitialToolDisplay::Off => Self::Off,
+            InitialToolDisplay::Summary => Self::Summary,
             InitialToolDisplay::Full => Self::Full,
         }
     }
@@ -94,6 +97,9 @@ pub struct EffectiveSettings {
     pub list_search_mode: TuiSearchMode,
     /// `[tui].exclude_projects`: display names hidden from the list.
     pub exclude_projects: Vec<String>,
+    /// `[tui].exclude_paths` (upstream 982aea9): working-directory prefixes
+    /// hidden from the list (literal; case-sensitive except on Windows).
+    pub exclude_paths: Vec<String>,
     /// `[keys]` with defaults.
     pub keys: KeyBindings,
     /// Whether the lexical/semantic toggle (Ctrl+T) is available: upstream
@@ -101,9 +107,23 @@ pub struct EffectiveSettings {
     pub semantic_toggle_enabled: bool,
     /// `[resume].default_args` (Claude only).
     pub resume_default_args: Vec<String>,
+    /// `[resume.codex].default_args` (Codex only, upstream eea6d37).
+    pub resume_codex_default_args: Vec<String>,
 }
 
 impl EffectiveSettings {
+    /// The configured arguments for resuming a conversation of `source`
+    /// (upstream `ResumeConfig::default_args`): `[resume].default_args` for
+    /// Claude, `[resume.codex].default_args` for Codex, none for Pi and OMP.
+    pub fn resume_default_args_for(&self, source: crate::history::model::SourceKind) -> &[String] {
+        use crate::history::model::SourceKind;
+        match source {
+            SourceKind::Claude => &self.resume_default_args,
+            SourceKind::Codex => &self.resume_codex_default_args,
+            SourceKind::Pi | SourceKind::Omp => &[],
+        }
+    }
+
     /// The viewer preferences a session starts with: the initial tool
     /// display and thinking visibility from these settings, timing off (as
     /// upstream, where timing always starts off).
@@ -117,8 +137,9 @@ impl EffectiveSettings {
 }
 
 /// The viewer's initial tool display (`main.rs:193-205`): `--show-tools`
-/// gives Full, `--no-tools` gives Hidden; otherwise `[display].no_tools`
-/// `true` gives Hidden, `false` gives **Full**, unset gives Hidden.
+/// gives Full, `--no-tools` gives Off; otherwise `[display].no_tools`
+/// `true` gives Off, `false` gives **Full**, unset gives Summary (upstream
+/// d0aca95; `true` and `--no-tools` gave Summary before).
 pub fn initial_tool_display(
     flags: &DisplayFlags,
     no_tools_config: Option<bool>,
@@ -126,12 +147,12 @@ pub fn initial_tool_display(
     if flags.show_tools {
         InitialToolDisplay::Full
     } else if flags.no_tools {
-        InitialToolDisplay::Hidden
+        InitialToolDisplay::Off
     } else {
         match no_tools_config {
-            Some(true) => InitialToolDisplay::Hidden,
+            Some(true) => InitialToolDisplay::Off,
             Some(false) => InitialToolDisplay::Full,
-            None => InitialToolDisplay::Hidden,
+            None => InitialToolDisplay::Summary,
         }
     }
 }
@@ -172,12 +193,22 @@ pub fn effective_settings(
         search_mode: resolve_search_mode(resolution),
         list_search_mode: resolve_tui_search_mode(resolution),
         exclude_projects: tui.exclude_projects,
+        exclude_paths: tui.exclude_paths,
         semantic_toggle_enabled: !keys.conflicts_with_ctrl_t(),
         keys,
         resume_default_args: config
             .resume
             .as_ref()
             .and_then(|resume| resume.default_args.clone())
+            .unwrap_or_default(),
+        resume_codex_default_args: config
+            .resume
+            .as_ref()
+            .map(|resume| {
+                resume
+                    .default_args(crate::history::model::SourceKind::Codex)
+                    .to_vec()
+            })
             .unwrap_or_default(),
     }
 }
@@ -231,6 +262,10 @@ pub struct GuiLaunchArgs {
     pub file: Option<PathBuf>,
     /// `-L, --local`: start with the workspace filter on.
     pub local: bool,
+    /// `--all-kinds`: start listing automated (Codex exec) and subagent
+    /// conversations, which are hidden by default (upstream cb990e6; no
+    /// effect with `[FILE]`, as upstream).
+    pub all_kinds: bool,
     /// `-w, --workspace <DIR>`: the workspace folder, as typed (it may be
     /// relative or end with a separator). Turn it into a scope with
     /// [`GuiLaunchArgs::workspace_scope`].
@@ -284,6 +319,9 @@ pub struct GuiLaunchArgs {
     pub generate_semantic_cache: bool,
     /// `--clear-semantic-cache` (hidden)
     pub clear_semantic_cache: bool,
+    /// `--dump-semantic-turns <PATH>` (hidden): write every conversation's
+    /// semantic turns as JSON lines and exit, for embedding benchmarks
+    pub dump_semantic_turns: Option<PathBuf>,
     /// `-g, --global` (hidden, deprecated: global is the default; no effect)
     pub global: bool,
     /// `--pager` (accepted; the GUI has no pager)
@@ -429,6 +467,10 @@ impl GuiLaunchArgs {
             (self.semantic_search.is_some(), "--semantic-search <QUERY>"),
             (self.generate_semantic_cache, "--generate-semantic-cache"),
             (self.clear_semantic_cache, "--clear-semantic-cache"),
+            (
+                self.dump_semantic_turns.is_some(),
+                "--dump-semantic-turns <PATH>",
+            ),
             (self.render.is_some(), "--render <FILE>"),
             (self.file.is_some(), "[FILE]"),
         ]
@@ -484,6 +526,10 @@ impl GuiLaunchArgs {
             (self.semantic_search.is_some(), "--semantic-search <QUERY>"),
             (self.generate_semantic_cache, "--generate-semantic-cache"),
             (self.clear_semantic_cache, "--clear-semantic-cache"),
+            (
+                self.dump_semantic_turns.is_some(),
+                "--dump-semantic-turns <PATH>",
+            ),
             (self.file.is_some(), "[FILE]"),
         ];
         let selection = [
@@ -516,11 +562,12 @@ impl GuiLaunchArgs {
 
 /// The usage text for `--help`. The hidden upstream flags (`--global`,
 /// `--semantic-search`, `--semantic-top`, `--debug-semantic-search`,
-/// `--generate-semantic-cache`, `--clear-semantic-cache`) are accepted but
+/// `--generate-semantic-cache`, `--clear-semantic-cache`,
+/// `--dump-semantic-turns`) are accepted but
 /// not listed, as upstream.
 pub fn help_text(program: &str) -> String {
     format!(
-        "Browse Claude Code, Pi and OMP conversation history
+        "Browse Claude Code, Codex, Pi and OMP conversation history
 
 Usage: {program} [OPTIONS] [FILE]
        {program} delete-empty [--local|--all] [--yes]
@@ -538,6 +585,7 @@ Arguments:
 
 Options:
   -L, --local                   Start with the workspace filter on
+      --all-kinds               List automated (Codex exec) and subagent conversations too
   -w, --workspace <DIR>         Workspace folder (used for the workspace filter, resume and fork)
       --since <WHEN>            Only conversations this recent, as a duration or date (2d, 1d6h, 6mo, 2026-07-20)
       --after <WHEN>            Alias for --since
@@ -545,7 +593,7 @@ Options:
       --first                   Preview the first messages of each conversation
   -l, --last                    Preview the last messages of each conversation (default)
   -t, --show-tools              Start the viewer with tool calls shown in full
-      --no-tools                Start the viewer with tool calls summarized (default)
+      --no-tools                Start the viewer with tool calls hidden
       --show-thinking           Show thinking blocks and subagent internals
       --hide-thinking           Hide thinking blocks and subagent internals (default)
   -p, --show-path               Picker mode: print the selected conversation's path and exit
@@ -578,6 +626,7 @@ pub fn parse_process_args() -> std::result::Result<LaunchCommand, LaunchArgsErro
 fn long_option(name: &str) -> Option<(&'static str, bool)> {
     const OPTIONS: &[(&str, bool)] = &[
         ("local", false),
+        ("all-kinds", false),
         ("workspace", true),
         ("since", true),
         ("after", true),
@@ -607,6 +656,7 @@ fn long_option(name: &str) -> Option<(&'static str, bool)> {
         ("debug-semantic-search", true),
         ("generate-semantic-cache", false),
         ("clear-semantic-cache", false),
+        ("dump-semantic-turns", true),
         ("global", false),
         ("pager", false),
         ("no-pager", false),
@@ -639,6 +689,7 @@ fn value_name(option: &str) -> &'static str {
     match option {
         "workspace" => "<DIR>",
         "render" => "<FILE>",
+        "dump-semantic-turns" => "<PATH>",
         "delete" => "<SESSION_ID>",
         "debug-search" | "semantic-search" | "debug-semantic-search" => "<QUERY>",
         "semantic-top" => "<SEMANTIC_TOP>",
@@ -938,6 +989,7 @@ where
                 }
                 match option {
                     "local" => parsed.local = true,
+                    "all-kinds" => parsed.all_kinds = true,
                     "first" => parsed.first = true,
                     "last" => parsed.last = true,
                     "show-tools" => parsed.show_tools = true,
@@ -992,6 +1044,7 @@ where
                     }
                 }
                 "render" => parsed.render = Some(PathBuf::from(value)),
+                "dump-semantic-turns" => parsed.dump_semantic_turns = Some(PathBuf::from(value)),
                 "delete" => parsed.delete = Some(utf8_value(value)?),
                 "debug-search" => parsed.debug_search = Some(utf8_value(value)?),
                 "semantic-search" => {
@@ -1054,14 +1107,16 @@ mod tests {
             EffectiveSettings {
                 show_last: true,
                 show_tools: false,
-                tool_display: InitialToolDisplay::Hidden,
+                tool_display: InitialToolDisplay::Summary,
                 show_thinking: false,
                 search_mode: SearchMode::Lexical,
                 list_search_mode: TuiSearchMode::Lexical,
                 exclude_projects: Vec::new(),
+                exclude_paths: Vec::new(),
                 keys: KeyBindings::default(),
                 semantic_toggle_enabled: true,
                 resume_default_args: Vec::new(),
+                resume_codex_default_args: Vec::new(),
             }
         );
     }
@@ -1071,11 +1126,12 @@ mod tests {
         let none = DisplayFlags::default();
         assert_eq!(
             initial_tool_display(&none, None),
-            InitialToolDisplay::Hidden
+            InitialToolDisplay::Summary
         );
+        // Upstream d0aca95: no_tools = true turns tools off.
         assert_eq!(
             initial_tool_display(&none, Some(true)),
-            InitialToolDisplay::Hidden
+            InitialToolDisplay::Off
         );
         // Upstream quirk kept: no_tools = false starts in Full, not summary.
         assert_eq!(
@@ -1096,8 +1152,9 @@ mod tests {
         };
         assert_eq!(
             initial_tool_display(&hide, Some(false)),
-            InitialToolDisplay::Hidden
+            InitialToolDisplay::Off
         );
+        assert_eq!(initial_tool_display(&hide, None), InitialToolDisplay::Off);
 
         let config = ConfigFile {
             display: Some(DisplayConfig {
@@ -1118,8 +1175,12 @@ mod tests {
         use crate::view::{ToolDisplayMode, ViewPrefs};
 
         assert_eq!(
-            ToolDisplayMode::from(InitialToolDisplay::Hidden),
-            ToolDisplayMode::Hidden
+            ToolDisplayMode::from(InitialToolDisplay::Off),
+            ToolDisplayMode::Off
+        );
+        assert_eq!(
+            ToolDisplayMode::from(InitialToolDisplay::Summary),
+            ToolDisplayMode::Summary
         );
         assert_eq!(
             ToolDisplayMode::from(InitialToolDisplay::Full),
@@ -1151,7 +1212,7 @@ mod tests {
         assert_eq!(
             settings.initial_view_prefs(),
             ViewPrefs {
-                tool_display: ToolDisplayMode::Hidden,
+                tool_display: ToolDisplayMode::Summary,
                 show_thinking: settings.show_thinking,
                 show_timing: false,
             }
@@ -1168,9 +1229,15 @@ mod tests {
             }),
             resume: Some(ResumeConfig {
                 default_args: Some(vec!["--model".into(), "opus".into()]),
+                codex: Some(crate::config::AgentResumeConfig {
+                    default_args: Some(vec!["--yolo".into()]),
+                    ..Default::default()
+                }),
+                ..Default::default()
             }),
             tui: Some(TuiConfig {
                 exclude_projects: vec!["secret".into()],
+                exclude_paths: vec!["/tmp/".into()],
                 semantic_search: None,
             }),
             keys: Some(KeysConfig {
@@ -1183,7 +1250,18 @@ mod tests {
         assert!(!settings.show_last);
         assert!(settings.show_thinking);
         assert_eq!(settings.resume_default_args, vec!["--model", "opus"]);
+        assert_eq!(settings.resume_codex_default_args, vec!["--yolo"]);
+        assert_eq!(
+            settings.resume_default_args_for(crate::history::model::SourceKind::Codex),
+            ["--yolo"]
+        );
+        assert!(
+            settings
+                .resume_default_args_for(crate::history::model::SourceKind::Pi)
+                .is_empty()
+        );
         assert_eq!(settings.exclude_projects, vec!["secret"]);
+        assert_eq!(settings.exclude_paths, vec!["/tmp/"]);
         assert_eq!(settings.keys.rename, KeyChord::ctrl('t'));
         assert!(!settings.semantic_toggle_enabled);
 
@@ -1203,8 +1281,8 @@ mod tests {
     fn search_mode_resolution_includes_the_deprecated_tui_key() {
         let legacy = |semantic: Option<bool>, mode: Option<SearchMode>| ConfigFile {
             tui: Some(TuiConfig {
-                exclude_projects: Vec::new(),
                 semantic_search: semantic,
+                ..TuiConfig::default()
             }),
             search: Some(SearchConfig { mode }),
             ..ConfigFile::default()
@@ -1243,6 +1321,7 @@ mod tests {
     fn every_option_parses() {
         let parsed = run(&[
             "--local",
+            "--all-kinds",
             "--workspace",
             "C:\\code\\my project",
             "--since",
@@ -1258,6 +1337,7 @@ mod tests {
             "--semantic",
         ]);
         assert!(parsed.local);
+        assert!(parsed.all_kinds);
         assert_eq!(
             parsed.workspace,
             Some(PathBuf::from("C:\\code\\my project"))
@@ -1384,8 +1464,10 @@ mod tests {
         assert_eq!(parse_launch_args(["-V"]), Ok(LaunchCommand::Version));
         let help = help_text("claude-history-gui");
         assert!(help.contains("Usage: claude-history-gui [OPTIONS] [FILE]"));
+        assert!(help.starts_with("Browse Claude Code, Codex, Pi and OMP"));
         for option in [
             "--local",
+            "--all-kinds",
             "--workspace",
             "--since",
             "--after",
@@ -1479,7 +1561,7 @@ mod tests {
     fn launch_args_feed_settings() {
         let parsed = run(&["--no-tools", "--first", "--show-thinking", "--semantic"]);
         let settings = parsed.settings(&ConfigFile::default());
-        assert_eq!(settings.tool_display, InitialToolDisplay::Hidden);
+        assert_eq!(settings.tool_display, InitialToolDisplay::Off);
         assert!(!settings.show_last);
         assert!(settings.show_thinking);
         assert_eq!(settings.list_search_mode, TuiSearchMode::Semantic);
@@ -1558,6 +1640,10 @@ mod tests {
         );
         assert!(run(&["--generate-semantic-cache"]).generate_semantic_cache);
         assert!(run(&["--clear-semantic-cache"]).clear_semantic_cache);
+        assert_eq!(
+            run(&["--dump-semantic-turns", "turns.jsonl"]).dump_semantic_turns,
+            Some(PathBuf::from("turns.jsonl"))
+        );
         // The compatibility flags change nothing else.
         let mut plain = run(&["--pager", "--no-color", "--global"]);
         plain.pager = false;
@@ -1576,6 +1662,7 @@ mod tests {
             &["--semantic-search", "q"],
             &["--generate-semantic-cache"],
             &["--clear-semantic-cache"],
+            &["--dump-semantic-turns", "t.jsonl"],
             &["--render", "r.jsonl"],
             &["f.jsonl"],
         ];
@@ -1739,6 +1826,7 @@ mod tests {
             "--debug-semantic-search",
             "--generate-semantic-cache",
             "--clear-semantic-cache",
+            "--dump-semantic-turns",
         ] {
             assert!(!help.contains(hidden), "{hidden}");
         }

@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
+use claude_history_core::semantic::types::DEFAULT_EMBEDDING_BATCH_SIZE;
 use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, TestAppContext};
 
 use crate::deep_search::worker::AgentWorkerHandle;
@@ -18,6 +20,10 @@ use crate::tools::semantic_cache::{
     GenerateDialog, GenerateState, current_generate, open_clear_semantic_cache,
     open_generate_semantic_cache,
 };
+
+/// Conversations whose passages (two each) take three embedder calls: two
+/// full batches of `DEFAULT_EMBEDDING_BATCH_SIZE` and half a batch.
+const THREE_BATCHES: usize = DEFAULT_EMBEDDING_BATCH_SIZE + DEFAULT_EMBEDDING_BATCH_SIZE / 4;
 
 /// Opens the gates when the test ends (a worker blocked on a gate would
 /// otherwise outlive it).
@@ -117,9 +123,9 @@ fn embedded_counts(text: &str) -> Option<(usize, usize)> {
 /// event is `y/y`.
 #[gpui_kit::test]
 fn progress_events_reach_the_dialog_while_running(cx: &mut TestAppContext) {
-    // 40 conversations = 80 passages = three batches of 32: the first batch
-    // is embedded, the second waits at the gate.
-    let (_world, control, _f, handle) = setup(cx, &[], 40);
+    // Three batches: the first batch is embedded, the second waits at the
+    // gate.
+    let (_world, control, _f, handle) = setup(cx, &[], THREE_BATCHES);
     let gate = Gate::closed();
     *control.batch_gate.lock().unwrap() = Some(gate.clone());
     let _open = OpenOnDrop(vec![gate.clone()]);
@@ -196,9 +202,9 @@ fn a_second_window_does_not_cancel_a_running_generate(cx: &mut TestAppContext) {
 /// T-008: Cancel stops the run (`Semantic search cancelled`).
 #[gpui_kit::test]
 fn cancel_stops_a_run(cx: &mut TestAppContext) {
-    // 40 conversations = 80 passages = three batches of 32: the second batch
-    // waits at the gate, the cancel is seen before the third.
-    let (_world, control, _f, handle) = setup(cx, &[], 40);
+    // Three batches: the second batch waits at the gate, the cancel is seen
+    // before the third.
+    let (_world, control, _f, handle) = setup(cx, &[], THREE_BATCHES);
     let init = Gate::closed();
     *control.batch_gate.lock().unwrap() = Some(init.clone());
     let _open = OpenOnDrop(vec![init.clone()]);
@@ -240,8 +246,14 @@ fn generate_holds_the_semantic_gate(cx: &mut TestAppContext) {
     assert!(cx.update(|cx| AgentWorkerHandle::global(cx).is_semantic_paused()));
     let status = f.read(cx, |list, _| list.search_status().text);
     assert!(status.contains("sem paused"), "{status}");
-    assert!(!cx.update(|cx| SemanticGate::enter_exclusive(SemanticOp::Clear, cx)));
-    assert!(!cx.update(|cx| SemanticGate::enter_exclusive(SemanticOp::Generate, cx)));
+    assert!(
+        cx.update(|cx| SemanticGate::enter_exclusive(SemanticOp::Clear, cx))
+            .is_none()
+    );
+    assert!(
+        cx.update(|cx| SemanticGate::enter_exclusive(SemanticOp::Generate, cx))
+            .is_none()
+    );
     // A second Start is a no-op while running.
     dialog.update(cx, |d, cx| d.start(cx));
     assert_eq!(state(cx, &dialog), GenerateState::Running);
@@ -258,6 +270,103 @@ fn generate_holds_the_semantic_gate(cx: &mut TestAppContext) {
     f.wait_idle(cx);
     let status = f.read(cx, |list, _| list.search_status().text);
     assert!(!status.contains("sem paused"), "{status}");
+}
+
+/// Put the list in semantic mode with the batch gate closed: its background
+/// indexing embeds its first slice (one batch) and then blocks inside its
+/// second embedder call until the returned gate opens.
+fn list_worker_in_a_batch(
+    cx: &mut TestAppContext,
+    control: &Arc<FakeEmbedderControl>,
+    f: &ListFixture,
+) -> Arc<Gate> {
+    let gate = Gate::closed();
+    *control.batch_gate.lock().unwrap() = Some(gate.clone());
+    f.press(cx, "ctrl-t");
+    wait_for(cx, "the list's indexing to block in a batch", |_| {
+        control.passage_calls.load(Ordering::SeqCst) >= 2
+    });
+    gate
+}
+
+/// T-024, K6: taking the gate stops the list's semantic worker without
+/// waiting for it on the UI thread, even while the worker is inside an
+/// embedder call; the entry is ready once that call returned and the worker
+/// ended, without embedding anything more.
+#[gpui_kit::test]
+fn the_gate_does_not_wait_for_a_busy_list_worker(cx: &mut TestAppContext) {
+    let (_world, control, f, _handle) = setup(cx, &[], THREE_BATCHES);
+    let batch = list_worker_in_a_batch(cx, &control, &f);
+    let _open = OpenOnDrop(vec![batch.clone()]);
+    let entry = cx
+        .update(|cx| SemanticGate::enter_exclusive(SemanticOp::Generate, cx))
+        .expect("the gate was open");
+    // Back on the UI thread while the worker is still in its call.
+    assert!(!entry.is_ready(), "the worker is still embedding");
+    let status = f.read(cx, |list, _| list.search_status().text);
+    assert!(status.contains("sem paused"), "{status}");
+    batch.open();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !entry.is_ready() {
+        assert!(Instant::now() < deadline, "the list's worker did not end");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    entry.wait();
+    assert_eq!(
+        control.passage_calls.load(Ordering::SeqCst),
+        2,
+        "the worker stopped after its running call"
+    );
+    cx.update(SemanticGate::leave);
+    f.wait_idle(cx);
+}
+
+/// T-010, K6: Clear starts only once the list's semantic worker has ended
+/// (until then it may use the model and write the cache). Confirmed while the
+/// worker is inside an embedder call, the UI goes on and nothing is deleted
+/// until the call returns; then the folder is emptied and stays empty.
+#[gpui_kit::test]
+fn clear_waits_for_the_list_worker_off_the_ui_thread(cx: &mut TestAppContext) {
+    let (world, control, f, handle) = setup(cx, &[], THREE_BATCHES);
+    let batch = list_worker_in_a_batch(cx, &control, &f);
+    let _open = OpenOnDrop(vec![batch.clone()]);
+    // Back to lexical: the worker goes on with its call, and leaving the gate
+    // starts no new one.
+    f.press(cx, "ctrl-t");
+    cx.run_until_parked();
+    let shared = cx.update(crate::embedder::shared);
+    let dir = world.env.semantic_cache_dir().expect("semantic dir");
+    let model = dir.join("fastembed").join("model.bin");
+    std::fs::create_dir_all(model.parent().unwrap()).unwrap();
+    std::fs::write(&model, "model").unwrap();
+
+    cx.update_window(handle, |_, window, cx| {
+        open_clear_semantic_cache(window, cx)
+    })
+    .unwrap();
+    settle(cx, handle);
+    cx.simulate_keystrokes(handle, "y");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read(SemanticGate::current),
+        SemanticGateState::Exclusive(SemanticOp::Clear)
+    );
+    assert!(model.exists(), "Clear waits for the worker's call");
+    assert!(shared.is_loaded(), "the worker still holds the model");
+
+    batch.open();
+    wait_for(cx, "Clear to finish", |cx| {
+        last_toast(cx).as_ref() == "Semantic cache cleared."
+    });
+    cx.run_until_parked();
+    assert!(!model.exists());
+    assert!(
+        !dir.join("embeddings-v2.bin").exists(),
+        "the worker wrote nothing after the clear"
+    );
+    assert!(!shared.is_loaded(), "the model was dropped");
+    assert_eq!(control.passage_calls.load(Ordering::SeqCst), 2);
+    assert!(cx.read(SemanticGate::is_open));
 }
 
 /// T-009: with `--since 1d` Generate still covers the whole corpus (also the
@@ -347,7 +456,7 @@ fn clear_drops_the_model_and_keeps_the_lock(cx: &mut TestAppContext) {
     let dir = world.env.semantic_cache_dir().expect("semantic dir");
     std::fs::create_dir_all(dir.join("fastembed")).unwrap();
     std::fs::write(dir.join("fastembed").join("model.bin"), "model").unwrap();
-    std::fs::write(dir.join("embeddings-v1.bin"), "cache").unwrap();
+    std::fs::write(dir.join("embeddings-v2.bin"), "cache").unwrap();
     std::fs::write(dir.join("embeddings.lock"), "").unwrap();
 
     cx.update_window(handle, |_, window, cx| {
@@ -366,7 +475,7 @@ fn clear_drops_the_model_and_keeps_the_lock(cx: &mut TestAppContext) {
         dir.join("embeddings.lock").exists(),
         "embeddings.lock stays"
     );
-    assert!(!dir.join("embeddings-v1.bin").exists());
+    assert!(!dir.join("embeddings-v2.bin").exists());
     assert!(!dir.join("fastembed").exists());
     assert!(cx.read(SemanticGate::is_open));
 
@@ -387,8 +496,11 @@ fn clear_is_refused_while_the_gate_is_held(cx: &mut TestAppContext) {
     let (world, _control, _f, handle) = setup(cx, &[], 6);
     let dir = world.env.semantic_cache_dir().expect("semantic dir");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("embeddings-v1.bin"), "cache").unwrap();
-    assert!(cx.update(|cx| SemanticGate::enter_exclusive(SemanticOp::Generate, cx)));
+    std::fs::write(dir.join("embeddings-v2.bin"), "cache").unwrap();
+    assert!(
+        cx.update(|cx| SemanticGate::enter_exclusive(SemanticOp::Generate, cx))
+            .is_some()
+    );
     cx.update_window(handle, |_, window, cx| {
         open_clear_semantic_cache(window, cx)
     })
@@ -396,6 +508,6 @@ fn clear_is_refused_while_the_gate_is_held(cx: &mut TestAppContext) {
     settle(cx, handle);
     cx.simulate_keystrokes(handle, "y");
     cx.run_until_parked();
-    assert!(dir.join("embeddings-v1.bin").exists());
+    assert!(dir.join("embeddings-v2.bin").exists());
     cx.update(SemanticGate::leave);
 }

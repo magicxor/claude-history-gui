@@ -5,6 +5,8 @@
 //!   workspace, view defaults, persisted UI state. Read with [`app_state`],
 //!   change with [`update_app_state`] (bumps `revision`; views observe the
 //!   global and re-read).
+//! * [`EnvHistory`]: the environment's history service, through which the
+//!   viewer, exports, prints and tools open conversations ([`env_history`]).
 //! * [`DebugBuffer`]: the ring of debug-sink lines shown by Tools → Debug log.
 //! * [`MainPanes`], [`ActivePane`]: the main window's panes and the region
 //!   that last had focus per window (menu/palette fallback, §7.8).
@@ -21,15 +23,16 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Local};
 use claude_history_core::HistoryEnv;
 use claude_history_core::WorkspaceScope;
-use claude_history_core::browser::ListSearchMode;
+use claude_history_core::browser::{ListSearchMode, SemanticWorkerExit};
 use claude_history_core::config::LayeredConfig;
 use claude_history_core::debug::DebugLevel;
+use claude_history_core::history::service::HistoryService;
 use claude_history_core::settings::EffectiveSettings;
 use claude_history_core::view::ViewPrefs;
 use gpui_kit::{
@@ -52,6 +55,8 @@ use crate::viewer::ViewerPane;
 pub struct AppState {
     /// The environment; `workspace_dir` is kept in sync with `workspace`.
     pub env: Arc<HistoryEnv>,
+    /// The history service of `env`, replaced with it.
+    pub history: EnvHistory,
     /// Effective configuration = gui.toml over config.toml (a failing file
     /// contributes defaults).
     pub config: LayeredConfig,
@@ -89,6 +94,8 @@ impl AppState {
         let mut env = (*self.env).clone();
         env.workspace_dir = workspace.as_ref().map(|w| w.dir().to_path_buf());
         self.env = Arc::new(env);
+        // The Pi session root may follow the workspace's settings.
+        self.history = EnvHistory::new(self.env.clone());
         self.workspace = workspace;
     }
 
@@ -242,6 +249,51 @@ impl Global for DebugBufferHandle {}
 /// The debug buffer (panics before `app::init`).
 pub fn debug_buffer(cx: &App) -> Arc<DebugBuffer> {
     cx.global::<DebugBufferHandle>().0.clone()
+}
+
+// ---------------------------------------------------------------------------
+// History service
+// ---------------------------------------------------------------------------
+
+/// The history service of an environment (core `HistoryService::from_env`):
+/// the viewer, exports, prints and tools open conversations through it, so a
+/// conversation decodes through the adapter of the instance whose root holds
+/// it (a Codex rollout with the environment's state database) and the
+/// transcripts opened last are reused (upstream 9597669 keeps one such
+/// service for the whole process; here [`AppState`] holds one per
+/// environment). The service is built on first use, by the background task
+/// that needs it: resolving the Pi and OMP roots reads their settings files.
+#[derive(Clone, Default)]
+pub struct EnvHistory {
+    env: Option<Arc<HistoryEnv>>,
+    service: Arc<OnceLock<HistoryService>>,
+}
+
+impl EnvHistory {
+    pub fn new(env: Arc<HistoryEnv>) -> Self {
+        Self {
+            env: Some(env),
+            service: Arc::default(),
+        }
+    }
+
+    /// The service, built on first use (off the UI thread); without an
+    /// environment, one without instances, which opens every path as a
+    /// loose session file.
+    pub fn service(&self) -> &HistoryService {
+        self.service.get_or_init(|| match &self.env {
+            Some(env) => HistoryService::from_env(env),
+            None => HistoryService::default(),
+        })
+    }
+}
+
+/// The app's [`EnvHistory`]; before `app::init` (a lone pane in a test) one
+/// without an environment.
+pub fn env_history(cx: &App) -> EnvHistory {
+    cx.try_global::<AppState>()
+        .map(|state| state.history.clone())
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -441,15 +493,7 @@ impl OpenTargets {
 
 /// Path equality used for deletions (exact, then case-insensitive on Windows).
 pub fn same_path(a: &Path, b: &Path) -> bool {
-    if a == b {
-        return true;
-    }
-    if cfg!(windows) {
-        let a = a.to_string_lossy().replace('/', "\\").to_lowercase();
-        let b = b.to_string_lossy().replace('/', "\\").to_lowercase();
-        return a == b;
-    }
-    false
+    a == b || claude_history_core::history::path::same_path(a, b)
 }
 
 // ---------------------------------------------------------------------------
@@ -475,6 +519,34 @@ pub struct SemanticGate {
 
 impl Global for SemanticGate {}
 
+/// The semantic gate just taken ([`SemanticGate::enter_exclusive`]). The
+/// list's semantic worker has been told to stop but may still be finishing
+/// its current step: an embedder call (up to 64 passages, or at the first call the model's lazy load) or a cache write
+/// (up to 2 s waiting for `embeddings.lock`, then the write; core K6). The
+/// exclusive operation calls [`SemanticGateEntry::wait`] first, on its own
+/// background thread, and only then touches the semantic cache or the
+/// model, so the UI thread never waits for the worker and the worker never
+/// writes the cache while the operation runs.
+#[must_use = "the exclusive operation must wait for the list's semantic worker before it starts"]
+#[derive(Debug)]
+pub struct SemanticGateEntry {
+    list_worker: SemanticWorkerExit,
+}
+
+impl SemanticGateEntry {
+    /// Block until the list's semantic worker has ended (at once when there
+    /// was none). Never on the UI thread.
+    pub fn wait(self) {
+        self.list_worker.join();
+    }
+
+    /// Whether the list's semantic worker has ended (tests).
+    #[cfg(test)]
+    pub fn is_ready(&self) -> bool {
+        self.list_worker.is_finished()
+    }
+}
+
 impl SemanticGate {
     pub fn current(cx: &App) -> SemanticGateState {
         cx.try_global::<SemanticGate>()
@@ -486,22 +558,26 @@ impl SemanticGate {
         Self::current(cx) == SemanticGateState::Open
     }
 
-    /// Take the gate for `op`. Returns `false` (and changes nothing) when it
-    /// is already held: a second Generate/Clear is not allowed.
-    pub fn enter_exclusive(op: SemanticOp, cx: &mut App) -> bool {
+    /// Take the gate for `op`. Returns `None` (and changes nothing) when it
+    /// is already held: a second Generate/Clear is not allowed. The list's
+    /// semantic worker is stopped without waiting for it (footer `sem
+    /// paused` at once): the operation waits for it on its own thread
+    /// through the returned entry.
+    pub fn enter_exclusive(op: SemanticOp, cx: &mut App) -> Option<SemanticGateEntry> {
         if !Self::is_open(cx) {
-            return false;
+            return None;
         }
         cx.default_global::<SemanticGate>().state = SemanticGateState::Exclusive(op);
         AgentWorkerHandle::global(cx).pause_semantic(true);
         let panes = main_panes(cx);
-        if let Some(list) = panes.list() {
-            list.update(cx, |list, cx| list.suspend_semantic(cx));
-        }
+        let list_worker = panes
+            .list()
+            .map(|list| list.update(cx, |list, cx| list.suspend_semantic(cx)))
+            .unwrap_or_default();
         if let Some(deep) = panes.deep() {
             deep.update(cx, |deep, cx| deep.pause_semantic(true, cx));
         }
-        true
+        Some(SemanticGateEntry { list_worker })
     }
 
     /// Release the gate: the list worker resumes (reloading the cache) and

@@ -4,7 +4,7 @@ version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Desktop browser for Claude Code, Pi and OMP conversation history (gpui-kit GUI on claude-history-core)."
+description = "Desktop browser for Claude Code, Codex, Pi and OMP conversation history (gpui-kit GUI on claude-history-core)."
 publish = false
 build = "build.rs"
 
@@ -39,7 +39,7 @@ serde_json.workspace = true
 chrono.workspace = true
 pulldown-cmark.workspace = true
 unicode-width.workspace = true
-home.workspace = true                # qa/gate.rs only (safety-lint allow-listed)
+home.workspace = true                # services.rs and skeleton_tests.rs only (safety-lint allow-listed)
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true

@@ -84,7 +84,7 @@ fn run(world: &TestWorld, args: &[&str], kind: StdoutKind, cwd: Option<&Path>) -
     rec.set_stdout_kind(kind);
     let process = ProcessInfo {
         launch_cwd: cwd.map(Path::to_path_buf),
-        qa: None,
+        ..ProcessInfo::default()
     };
     let env = world.env.clone();
     let flow = dispatch(
@@ -158,6 +158,11 @@ fn display_flags_map_and_conflict() {
     assert_eq!(
         ToolDisplayMode::from(tools.tool_display),
         ToolDisplayMode::Full
+    );
+    let no_tools = gui(&["--no-tools"]).launch().args.settings(&config);
+    assert_eq!(
+        ToolDisplayMode::from(no_tools.tool_display),
+        ToolDisplayMode::Off
     );
     assert!(
         gui(&["--show-thinking"])
@@ -496,6 +501,34 @@ fn a_cancelled_picker_exits_zero_with_empty_stdout(cx: &mut TestAppContext) {
     assert_eq!(recording(cx).stdout(), "");
 }
 
+/// `--dump-semantic-turns PATH` (hidden) writes the corpus' turns as JSON lines
+/// headless and reports on stderr, whatever the stdout kind.
+#[test]
+fn dump_semantic_turns_writes_json_lines_headless() {
+    let world = TestWorld::new();
+    let corpus = world.standard_corpus();
+    let out = world.home().join("turns.jsonl");
+    let result = run(
+        &world,
+        &["--dump-semantic-turns", "turns.jsonl"],
+        StdoutKind::None,
+        Some(world.home()),
+    );
+    assert_eq!(result.code(), 0, "{}", result.rec.stderr());
+    assert!(
+        result.rec.stderr().starts_with("Wrote semantic turns of "),
+        "{}",
+        result.rec.stderr()
+    );
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.lines().count() >= corpus.len() - 1, "{text}");
+    for line in text.lines() {
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(value["turns"].is_array());
+        assert!(value["path"].is_string());
+    }
+}
+
 /// C-011: `--render FILE` prints the Ledger headless when stdout is redirected.
 #[test]
 fn render_prints_the_ledger_to_a_redirected_stdout() {
@@ -509,7 +542,12 @@ fn render_prints_the_ledger_to_a_redirected_stdout() {
         Some(world.home()),
     );
     assert_eq!(redirected.code(), 0);
-    let expected = generate_export(&file, ExportFormat::Ledger, ExportOptions::default()).unwrap();
+    let expected = generate_export(
+        &crate::test_support::transcript(&file),
+        ExportFormat::Ledger,
+        ExportOptions::default(),
+    )
+    .unwrap();
     assert!(!expected.is_empty());
     assert_eq!(redirected.rec.stdout(), expected);
     assert!(
@@ -531,7 +569,7 @@ fn render_prints_the_ledger_to_a_redirected_stdout() {
         Some(world.home()),
     );
     let expected = generate_export(
-        &file,
+        &crate::test_support::transcript(&file),
         ExportFormat::Ledger,
         ExportOptions {
             show_tools: true,
@@ -679,6 +717,172 @@ fn agent_runs_headless_with_the_core_protocol_output() {
         "{}",
         broken.rec.stderr()
     );
+}
+
+/// §15.4 rule 6: under the sandbox gate, the launch directory of the agent
+/// commands and the GUI's startup workspace must not lead Pi outside the
+/// sandbox home; a refusal exits 3 with the gate's text.
+#[test]
+fn the_sandbox_gate_checks_the_startup_workspace() {
+    let world = TestWorld::new();
+    let cwd = world.home().join("gated");
+    let outside = tempfile::tempdir().unwrap();
+    let settings = cwd.join(".pi").join("settings.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(
+        &settings,
+        serde_json::json!({ "sessionDir": outside.path() }).to_string(),
+    )
+    .unwrap();
+    let gated = |args: &[&str]| {
+        let raw = os(args);
+        let rec = Arc::new(RecordingServices::new());
+        rec.set_stdout_kind(StdoutKind::Redirected);
+        let process = ProcessInfo {
+            launch_cwd: Some(cwd.clone()),
+            sandbox_gate: true,
+            ..ProcessInfo::default()
+        };
+        let env = world.env.clone();
+        let flow = dispatch(
+            parse_launch_args(raw.clone()),
+            &raw,
+            &process,
+            &*rec,
+            &mut || Ok(env.clone()),
+        );
+        (flow, rec)
+    };
+
+    // `agent …`: refused before any search.
+    let (flow, rec) = gated(&["agent", "search", "alpha"]);
+    assert!(matches!(flow, Flow::Exit(exit::EXIT_REFUSED)), "{flow:?}");
+    let stderr = rec.stderr();
+    assert!(
+        stderr.starts_with(&format!(
+            "Refusing to run: sessionDir in {}",
+            settings.display()
+        )),
+        "{stderr}"
+    );
+    assert!(rec.stdout().is_empty());
+    let ungated = run(
+        &world,
+        &["agent", "search", "alpha"],
+        StdoutKind::Redirected,
+        Some(&cwd),
+    );
+    assert_ne!(ungated.code(), exit::EXIT_REFUSED, "no gate, no check");
+
+    // The GUI: the launch carries the flag and its startup workspace is refused.
+    let workspace_arg = cwd.display().to_string();
+    let (flow, _) = gated(&["--workspace", &workspace_arg]);
+    let Flow::Gui(launch, env) = flow else {
+        panic!("expected a GUI launch, got {flow:?}");
+    };
+    assert!(launch.sandbox_gate);
+    let (gui, ui) = (GuiSettings::default(), UiState::default());
+    let refusal = checked_startup_workspace(&launch, &env, &gui, &ui).unwrap_err();
+    assert!(
+        refusal.starts_with(&format!(
+            "Refusing to run: sessionDir in {}",
+            settings.display()
+        )),
+        "{refusal}"
+    );
+    let mut ungated = (*launch).clone();
+    ungated.sandbox_gate = false;
+    assert_eq!(
+        checked_startup_workspace(&ungated, &env, &gui, &ui),
+        Ok(Some(WorkspaceScope::new(&cwd).unwrap()))
+    );
+    // A session directory inside the sandbox passes.
+    std::fs::write(&settings, r#"{"sessionDir":"sessions"}"#).unwrap();
+    assert_eq!(
+        checked_startup_workspace(&launch, &env, &gui, &ui),
+        Ok(Some(WorkspaceScope::new(&cwd).unwrap()))
+    );
+}
+
+/// §15.4 rule 7: under the sandbox gate, `[FILE]` and `--render FILE`
+/// (headless or in a window, absolute or relative to the launch directory)
+/// exit 3 with the gate's text when the file is a Codex rollout whose home
+/// names a state database directory outside the sandbox home; any other
+/// file opens, and without the gate nothing is checked.
+#[test]
+fn the_sandbox_gate_checks_files_opened_at_startup() {
+    let world = TestWorld::new();
+    let outside = tempfile::tempdir().unwrap();
+    let codex_home = world.home().join("second-codex");
+    let day = codex_home
+        .join("sessions")
+        .join("2026")
+        .join("09")
+        .join("03");
+    std::fs::create_dir_all(&day).unwrap();
+    let rollout =
+        day.join("rollout-2026-09-03T10-00-00-01a00000-0000-7000-8000-0000000000aa.jsonl");
+    std::fs::write(&rollout, "").unwrap();
+    let config = codex_home.join("config.toml");
+    std::fs::write(
+        &config,
+        format!("sqlite_home = '{}'\n", outside.path().display()),
+    )
+    .unwrap();
+    let dispatch_with = |args: &[&str], kind: StdoutKind, sandbox_gate: bool| {
+        let raw = os(args);
+        let rec = Arc::new(RecordingServices::new());
+        rec.set_stdout_kind(kind);
+        let process = ProcessInfo {
+            launch_cwd: Some(world.home().to_path_buf()),
+            sandbox_gate,
+            ..ProcessInfo::default()
+        };
+        let env = world.env.clone();
+        let flow = dispatch(
+            parse_launch_args(raw.clone()),
+            &raw,
+            &process,
+            &*rec,
+            &mut || Ok(env.clone()),
+        );
+        Run { flow, rec }
+    };
+
+    let file = rollout.display().to_string();
+    let relative = rollout
+        .strip_prefix(world.home())
+        .unwrap()
+        .display()
+        .to_string();
+    let expected = format!("Refusing to run: sqlite_home in {} (", config.display());
+    for (args, kind) in [
+        (vec![file.as_str()], StdoutKind::None),
+        (vec![relative.as_str()], StdoutKind::None),
+        (vec!["--render", file.as_str()], StdoutKind::Redirected),
+        (vec!["--render", relative.as_str()], StdoutKind::Redirected),
+        (vec!["--render", file.as_str()], StdoutKind::None),
+    ] {
+        let gated = dispatch_with(&args, kind, true);
+        assert_eq!(gated.code(), exit::EXIT_REFUSED, "{args:?}");
+        let stderr = gated.rec.stderr();
+        assert!(stderr.starts_with(&expected), "{args:?}: {stderr}");
+        assert!(gated.rec.stdout().is_empty(), "{args:?}");
+        let ungated = dispatch_with(&args, kind, false);
+        assert!(
+            !matches!(ungated.flow, Flow::Exit(exit::EXIT_REFUSED)),
+            "{args:?}: no gate, no check"
+        );
+    }
+
+    // The state database inside the sandbox: opened.
+    std::fs::write(&config, "sqlite_home = \"db\"\n").unwrap();
+    assert!(dispatch_with(&[&file], StdoutKind::None, true).is_gui());
+    // Any other file, even outside the sandbox (the user named it): opened.
+    let loose = outside.path().join("session.jsonl");
+    std::fs::write(&loose, "").unwrap();
+    let loose = loose.display().to_string();
+    assert!(dispatch_with(&[&loose], StdoutKind::None, true).is_gui());
 }
 
 #[test]
@@ -927,9 +1131,12 @@ fn recorded_cwd_entry_updates_the_app_workspace(cx: &mut TestAppContext) {
             state.launch.launch_cwd = Some(project.clone());
             state.set_workspace(None);
         });
-        assert!(!apply_recorded_cwd_workspace(cx, [world.home()]));
+        assert_eq!(apply_recorded_cwd_workspace(cx, [world.home()]), Ok(false));
         assert!(app_state(cx).workspace.is_none());
-        assert!(apply_recorded_cwd_workspace(cx, [project.as_path()]));
+        assert_eq!(
+            apply_recorded_cwd_workspace(cx, [project.as_path()]),
+            Ok(true)
+        );
         assert_eq!(
             app_state(cx)
                 .workspace
@@ -937,11 +1144,39 @@ fn recorded_cwd_entry_updates_the_app_workspace(cx: &mut TestAppContext) {
                 .map(|w| w.dir().to_path_buf()),
             Some(canon(&project))
         );
-        assert!(!apply_recorded_cwd_workspace(cx, [project.as_path()]));
+        assert_eq!(
+            apply_recorded_cwd_workspace(cx, [project.as_path()]),
+            Ok(false)
+        );
+    });
+
+    // §15.4 rule 6: under the sandbox gate, a launch directory whose Pi
+    // settings lead outside the sandbox home is not applied.
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(project.join(".pi")).unwrap();
+    std::fs::write(
+        project.join(".pi").join("settings.json"),
+        serde_json::json!({ "sessionDir": outside.path() }).to_string(),
+    )
+    .unwrap();
+    cx.update(|cx| {
+        update_app_state(cx, |state, _| state.set_workspace(None));
+        assert_eq!(
+            apply_recorded_cwd_workspace(cx, [project.as_path()]),
+            Ok(true),
+            "not checked without the gate"
+        );
+        update_app_state(cx, |state, _| {
+            state.set_workspace(None);
+            state.launch.sandbox_gate = true;
+        });
+        let reason = apply_recorded_cwd_workspace(cx, [project.as_path()]).unwrap_err();
+        assert!(reason.contains("sessionDir in "), "{reason}");
+        assert!(app_state(cx).workspace.is_none(), "the workspace stays");
     });
 }
 
-/// L-082: the cwd recorded by a Pi/OMP session is meaningful once the first batch is loaded.
+/// L-082: the cwd recorded by a Pi, OMP or Codex session is meaningful once the first batch is loaded.
 #[test]
 fn pi_omp_recorded_cwd_selects_the_workspace() {
     let t = Table::new();
@@ -958,6 +1193,12 @@ fn pi_omp_recorded_cwd_selects_the_workspace() {
     assert_eq!(
         found.map(|scope| scope.dir().to_path_buf()),
         Some(canon(&cwd))
+    );
+    // A Codex thread's cwd arrives the same way (every non-Claude source records one).
+    let codex = t.dir("codex-project");
+    assert!(
+        workspace_from_recorded_cwd_with(Some(&codex), None, env, [codex.as_path()], None)
+            .is_some()
     );
     // No match, an already chosen workspace, the home directory and the exe directory do not.
     assert!(
@@ -1018,24 +1259,30 @@ fn remembered(
 /// C-066 / V-049: tool display precedence.
 #[test]
 fn initial_tool_display_precedence() {
-    use RememberedToolDisplay::{Full, Summary, Truncated};
+    use RememberedToolDisplay::{Calls, Full, Off, Summary, Truncated};
     let full = remembered(Some(Full), None, None, None);
     let summary = remembered(Some(Summary), None, None, None);
     let none = UiState::default();
-    let hidden = ToolDisplayMode::Hidden;
+    let hidden = ToolDisplayMode::Summary;
+    let off = ToolDisplayMode::Off;
     let tool = |args: &[&str], config: Option<&str>, gui: Option<&str>, ui: &UiState| {
         view_of(args, config, gui, ui).0.tool_display
     };
     // Defaults.
     assert_eq!(tool(&[], None, None, &none), hidden);
-    // `no_tools = false` beats remembered Summary; `true` beats remembered Full.
+    // `no_tools = false` beats remembered Summary; `true` (Off since
+    // upstream d0aca95) beats remembered Full.
     assert_eq!(
         tool(&[], Some("[display]\nno_tools = false"), None, &summary),
         ToolDisplayMode::Full
     );
     assert_eq!(
         tool(&[], Some("[display]\nno_tools = true"), None, &full),
-        hidden
+        off
+    );
+    assert_eq!(
+        tool(&[], None, Some("[display]\nno_tools = true"), &summary),
+        off
     );
     // gui.toml beats config.toml.
     assert_eq!(
@@ -1059,7 +1306,16 @@ fn initial_tool_display_precedence() {
         ToolDisplayMode::Truncated
     );
     assert_eq!(tool(&[], None, None, &summary), hidden);
-    // Flags beat both.
+    assert_eq!(
+        tool(&[], None, None, &remembered(Some(Off), None, None, None)),
+        off
+    );
+    // Upstream a60dfe9's calls mode is restored like the others.
+    assert_eq!(
+        tool(&[], None, None, &remembered(Some(Calls), None, None, None)),
+        ToolDisplayMode::Calls
+    );
+    // Flags beat both; `--no-tools` turns tools off (upstream d0aca95).
     assert_eq!(
         tool(
             &["--no-tools"],
@@ -1067,13 +1323,13 @@ fn initial_tool_display_precedence() {
             None,
             &full
         ),
-        hidden
+        off
     );
     assert_eq!(
         tool(&["-t"], Some("[display]\nno_tools = true"), None, &summary),
         ToolDisplayMode::Full
     );
-    assert_eq!(tool(&["--no-tools"], None, None, &full), hidden);
+    assert_eq!(tool(&["--no-tools"], None, None, &full), off);
     // restore_session = false ignores the state.
     assert_eq!(
         tool(&[], None, Some("[gui]\nrestore_session = false"), &full),
@@ -1653,7 +1909,8 @@ fn copy_dir(from: &Path, to: &Path) {
 /// source, an empty transcript and a malformed line, and never carries the sandbox marker.
 #[test]
 fn the_qa_home_fixture_loads_in_core() {
-    use claude_history_core::history::{Source, load_all_conversations};
+    use claude_history_core::history::model::SourceKind;
+    use claude_history_core::store::load_in_memory;
 
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -1666,8 +1923,8 @@ fn the_qa_home_fixture_loads_in_core() {
     );
     let world = TestWorld::new();
     copy_dir(&fixture, world.home());
-    let conversations = load_all_conversations(&world.env, true, None).expect("the corpus loads");
-    let titles = |source: Source| {
+    let conversations = load_in_memory(&world.env, true).expect("the corpus loads");
+    let titles = |source: SourceKind| {
         let mut titles: Vec<String> = conversations
             .iter()
             .filter(|conversation| conversation.source == source)
@@ -1677,10 +1934,13 @@ fn the_qa_home_fixture_loads_in_core() {
         titles
     };
     assert_eq!(
-        titles(Source::Claude),
+        titles(SourceKind::Claude),
         vec![
             "Add API pagination",
+            "Ask about the LRU size",
+            "Cache eviction review",
             "Deploy pipeline",
+            "Explore: Find cache users",
             "Fix login bug",
             "Malformed line",
             "Rate limit errors",
@@ -1688,8 +1948,28 @@ fn the_qa_home_fixture_loads_in_core() {
             "Worktree cleanup",
         ]
     );
-    assert_eq!(titles(Source::Pi).len(), 1);
-    assert_eq!(titles(Source::Omp).len(), 1);
+    // The session's subagent and `/btw` fork (upstream 3c2ffeb).
+    let by_title = |title: &str| {
+        conversations
+            .iter()
+            .find(|conversation| conversation.summary.as_deref() == Some(title))
+            .unwrap_or_else(|| panic!("{title}"))
+    };
+    let session = by_title("Cache eviction review");
+    let fork = by_title("Ask about the LRU size");
+    let subagent = by_title("Explore: Find cache users");
+    assert!(fork.provenance.branch && subagent.provenance.child);
+    assert!(claude_history_core::history::is_parent_of(session, fork));
+    assert!(claude_history_core::history::is_parent_of(
+        session, subagent
+    ));
+    assert!(session.full_text.contains("how large is the LRU?"));
+    assert_eq!(
+        &*fork.preview_first,
+        "how large is the LRU? ... It holds 512 entries."
+    );
+    assert_eq!(titles(SourceKind::Pi).len(), 1);
+    assert_eq!(titles(SourceKind::Omp).len(), 1);
 }
 
 /// C-023: after the startup dialog's Retry, the fixed settings take effect
@@ -1704,7 +1984,7 @@ fn config_retry_applies_keys_exclusions_preview_and_theme_live(cx: &mut TestAppC
     let list = cx.read(|cx| ws.read(cx).list().clone());
     assert!(cx.read(|cx| list.read(cx).show_last()));
     world.write_config(
-        Some("[keys]\nresume = \"ctrl+t\"\n[display]\nlast = false\n[tui]\nexclude_projects = [\"skipme\"]\n"),
+        Some("[keys]\nresume = \"ctrl+t\"\n[display]\nlast = false\n[tui]\nexclude_projects = [\"skipme\"]\nexclude_paths = ['/tmp/']\n"),
         Some("[gui]\ntheme = \"dark\"\n"),
     );
     cx.update_window(handle, |_, window, cx| {
@@ -1728,6 +2008,7 @@ fn config_retry_applies_keys_exclusions_preview_and_theme_live(cx: &mut TestAppC
         );
         let list = list.read(cx);
         assert!(list.excluded_projects().contains("skipme"));
+        assert_eq!(list.excluded_paths(), ["/tmp/"]);
         assert!(!list.show_last(), "the preview mode follows [display] last");
     });
 }

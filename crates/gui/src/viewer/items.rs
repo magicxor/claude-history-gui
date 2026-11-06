@@ -1,10 +1,11 @@
 //! `ViewerItem`s built from the core `ConversationDocument` (DESIGN §9.2):
 //! stable ids, lanes, ≈100-line chunks, visual-row truncation (K9). WP2.
 //!
-//! One item per ledger block (markdown text, thinking, tool summary, tool
-//! call, tool result, subagent result, expanded summary detail); blocks
-//! longer than the chunk limits are split into chunk items with stable
-//! `(block, chunk)` ids. Gpui-free: the worker thread builds them.
+//! One item per ledger block (markdown text, thinking, tool summary, call
+//! line, tool call, tool result, subagent result, detail of an expanded
+//! summary group or calls row);
+//! blocks longer than the chunk limits are split into chunk items with
+//! stable `(block, chunk)` ids. Gpui-free: the worker thread builds them.
 //!
 //! Truncation (Truncated mode, collapsed) counts ledger rows at `cols`
 //! display cells, never logical lines (P4/K9): a 50 KB single-line result
@@ -16,7 +17,7 @@ use std::sync::Arc;
 
 use claude_history_core::view::{
     ConversationDocument, DocBlock, DocBlockKind, DocMessage, DocSubagentToolResult, DocToolCall,
-    DocToolResult, Fold, LabelRole, ToolOutputId, ViewerModel, fitted_name,
+    DocToolResult, Fold, LabelRole, ToolOutputId, ViewerModel, call_line_suffix, fitted_name,
 };
 
 use super::segments::{self, SegKind, Segment, Style};
@@ -46,6 +47,11 @@ pub enum TextKind {
     Thinking,
     /// The non-clickable tool summary sentence of a mixed message.
     Summary,
+    /// A non-clickable tool call line of a mixed message (calls mode,
+    /// upstream a60dfe9), by its position among the message's id-less call
+    /// lines. A group's call lines have their own row ids (upstream a1c88f8)
+    /// and use [`ItemKey::Tool`].
+    CallLine,
 }
 
 /// Stable identity of a block across rebuilds (preference toggles,
@@ -56,9 +62,10 @@ pub enum ItemKey {
     Text {
         entry: usize,
         kind: TextKind,
-        ordinal: u16,
+        ordinal: u32,
     },
-    /// A tool output (call, result, summary group) by its core id.
+    /// A tool output (call, result, summary group, calls row) by its core
+    /// id.
     Tool(ToolOutputId),
 }
 
@@ -120,6 +127,8 @@ pub enum ItemKind {
     Markdown,
     Thinking,
     ToolSummary,
+    /// One tool call on one row (calls mode), drawn like a summary row.
+    CallLine,
     ToolCall,
     ToolResult,
     SubagentResult,
@@ -230,6 +239,7 @@ pub fn build_with_info(
             show_timing,
             markdown_ordinal: 0,
             thinking_ordinal: 0,
+            call_line_ordinal: 0,
             out: &mut out,
         };
         for (block_index, block) in message.blocks.iter().enumerate() {
@@ -257,8 +267,9 @@ struct MessageCtx<'a> {
     nav_position: Option<usize>,
     cols: usize,
     show_timing: bool,
-    markdown_ordinal: u16,
-    thinking_ordinal: u16,
+    markdown_ordinal: u32,
+    thinking_ordinal: u32,
+    call_line_ordinal: u32,
     out: &'a mut Vec<ViewerItem>,
 }
 
@@ -367,7 +378,11 @@ impl MessageCtx<'_> {
                 });
             }
             DocBlockKind::ToolSummary { id, sentence } => {
-                let segment = segments::styled_line(sentence, Style::TOOL | Style::DIMMED);
+                // A single unrecognized call reads as the call itself, which
+                // has no length limit in the document: keep one row.
+                let clipped = segments::clip_to_cols(sentence, self.cols);
+                let cols_dependent = unicode_width::UnicodeWidthStr::width(sentence.as_str()) > 8;
+                let segment = segments::styled_line(&clipped, Style::TOOL | Style::DIMMED);
                 let key = match id {
                     Some(id) => ItemKey::Tool(id.clone()),
                     None => ItemKey::Text {
@@ -394,7 +409,77 @@ impl MessageCtx<'_> {
                     more: None,
                     group_toggle: None,
                     block: self.block_ref(block_index, None),
-                    cols_dependent: false,
+                    cols_dependent,
+                });
+            }
+            DocBlockKind::ToolCallLine {
+                id,
+                header,
+                hidden_lines,
+            } => {
+                // One row like the summary sentence: the document keeps the
+                // header whole, the row clips it to the content columns.
+                // A call with a body ends with ` (N more lines)`, which stays
+                // whole: the header is clipped to the columns left of it.
+                let suffix = match hidden_lines {
+                    0 => String::new(),
+                    n => call_line_suffix(*n),
+                };
+                let suffix_width = unicode_width::UnicodeWidthStr::width(suffix.as_str());
+                let clipped = format!(
+                    "{}{suffix}",
+                    segments::clip_to_cols(header, self.cols.saturating_sub(suffix_width))
+                );
+                // A narrower window could clip any line wider than the 8-column floor.
+                let cols_dependent =
+                    unicode_width::UnicodeWidthStr::width(header.as_str()) + suffix_width > 8;
+                let segment = segments::styled_line(&clipped, Style::TOOL | Style::DIMMED);
+                // A group's row has its own id (upstream a1c88f8); the lines
+                // of a mixed message have none and go by position.
+                let key = match id {
+                    Some(id) => ItemKey::Tool(id.clone()),
+                    None => {
+                        let ordinal = self.call_line_ordinal;
+                        self.call_line_ordinal += 1;
+                        ItemKey::Text {
+                            entry: message.entry_index,
+                            kind: TextKind::CallLine,
+                            ordinal,
+                        }
+                    }
+                };
+                // A run of call lines reads as one block: the label (and the
+                // stamp, which only the first line carries) on its first line.
+                // An expanded row in between starts a new run.
+                let continues_run = block_index
+                    .checked_sub(1)
+                    .and_then(|previous| message.blocks.get(previous))
+                    .is_some_and(|previous| {
+                        matches!(previous.kind, DocBlockKind::ToolCallLine { .. })
+                    });
+                let lanes = if continues_run {
+                    Lanes::empty(LaneRole::AccentDim, message.dimmed)
+                } else {
+                    Lanes {
+                        timestamp: self.stamp(block),
+                        label: self.label(),
+                        role: LaneRole::AccentDim,
+                        bold: false,
+                        dimmed: message.dimmed,
+                    }
+                };
+                self.emit(Pending {
+                    key,
+                    kind: ItemKind::CallLine,
+                    lanes,
+                    chunks: vec![vec![segment]],
+                    has_header: false,
+                    toggle: id.clone(),
+                    expanded: false,
+                    more: None,
+                    group_toggle: None,
+                    block: self.block_ref(block_index, None),
+                    cols_dependent,
                 });
             }
             DocBlockKind::ToolSummaryDetails { id, items } => {
@@ -641,11 +726,15 @@ fn subagent_pending(
     let header = segments::styled_line(SUBAGENT_RESULT_HEADER, Style::DIMMED);
     let collapsed = is_collapsed(result.fold);
     let mut chunks = Vec::new();
-    if collapsed {
+    if result.text.is_empty() {
+        // An empty result (since upstream 6afae1c a string result is its
+        // text, not a quoted JSON string) has no body row, like the ledger.
+        chunks.push(vec![header]);
+    } else if collapsed {
         let body = segments::plain(&result.visible_text(), true, Some(cols));
         chunks.push(vec![header, body]);
     } else {
-        let body = segments::plain(&result.text, true, None);
+        let body = segments::plain(&result.visible_text(), true, None);
         let mut first = Some(header);
         for piece in line_chunks(body) {
             let mut chunk = Vec::new();
@@ -754,6 +843,7 @@ pub fn is_tool_item(item: &ViewerItem) -> bool {
             | ItemKind::ToolResult
             | ItemKind::SubagentResult
             | ItemKind::ToolSummary
+            | ItemKind::CallLine
     )
 }
 

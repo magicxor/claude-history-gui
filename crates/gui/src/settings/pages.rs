@@ -8,12 +8,17 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use claude_history_core::config::{AgentScopeConfig, LayeredConfig};
-use claude_history_core::program::{ProgramKind, ResolvedProgram};
+use claude_history_core::config::{
+    AgentScopeConfig, ConfigFile, GuiConfigFile, GuiSettings, LayeredConfig, agent_launcher,
+};
+use claude_history_core::history::actions::{ConfiguredAt, config_table};
+use claude_history_core::history::model::SourceKind as AgentKind;
+use claude_history_core::program::{ProgramKind, ResolvedProgram, names_a_path};
 use claude_history_core::resume::terminal::{
     BuildOptions, LaunchSpec, Platform, TerminalLauncher, build_terminal_command, detect_launcher,
 };
 use claude_history_core::search::mode::SearchMode;
+use claude_history_core::settings::InitialToolDisplay;
 use claude_history_core::theme::ThemePreference;
 use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants as _};
 use gpui_kit::component::input::{Input, Textarea};
@@ -43,7 +48,9 @@ const LABEL_REM: f32 = 12.0;
 pub fn placeholder(field: Field, config: &LayeredConfig) -> SharedString {
     match field {
         Field::Terminal => "auto".into(),
-        Field::ClaudePath | Field::PiPath | Field::OmpPath => "resolved from PATH".into(),
+        Field::ClaudePath | Field::PiPath | Field::OmpPath | Field::CodexPath => {
+            "resolved from PATH".into()
+        }
         Field::DefaultWorkspace => "none".into(),
         Field::Key(action) => {
             let effective = draft::effective_keys(&config.cli, &Default::default());
@@ -267,9 +274,10 @@ impl SettingsDialog {
     // -----------------------------------------------------------------
 
     /// The effective value a control shows: the draft's own, else the saved
-    /// configuration's (config.toml, remembered, default).
+    /// configuration's (config.toml, remembered, default) without the keys
+    /// the draft removes.
     pub fn shown(&self, field: Field, cx: &App) -> Value {
-        let source = draft::source_of(field, &self.config, &app_state(cx).ui);
+        let source = draft::draft_source_of(field, &self.draft, &self.config, &app_state(cx).ui);
         draft::shown_value(field, &self.draft.edited, &source)
     }
 
@@ -508,6 +516,7 @@ impl SettingsDialog {
             (Field::ClaudePath, "claude"),
             (Field::PiPath, "pi"),
             (Field::OmpPath, "omp"),
+            (Field::CodexPath, "codex"),
         ] {
             let status = self.note_one_line(self.program_status_text(field), cx);
             let control = self.input_with_browse(field, cx);
@@ -536,7 +545,11 @@ impl SettingsDialog {
         let tools = self.shown(Field::ToolDisplay, cx);
         let tool_display = self.segmented(
             Field::ToolDisplay,
-            vec![("Summary", Value::Bool(true)), ("Full", Value::Bool(false))],
+            vec![
+                ("Off", Value::Tools(InitialToolDisplay::Off)),
+                ("Summary", Value::Tools(InitialToolDisplay::Summary)),
+                ("Full", Value::Tools(InitialToolDisplay::Full)),
+            ],
             &tools,
             cx,
         );
@@ -571,6 +584,7 @@ impl SettingsDialog {
             cx,
         );
         let exclude = self.list_input(Field::ExcludeProjects, 6.0);
+        let exclude_paths = self.list_input(Field::ExcludePaths, 4.0);
         let rows = vec![
             self.row(
                 Field::SearchMode,
@@ -585,7 +599,18 @@ impl SettingsDialog {
                 Field::ExcludeProjects,
                 exclude,
                 Some(self.note(
-                    "One project name per line; `repo` also hides `repo/<worktree>`.",
+                    "One project name per line; `repo` also hides `repo/<worktree>`; also hidden from Deep search.",
+                    cx,
+                )),
+                cx,
+            ),
+            self.row(
+                Field::ExcludePaths,
+                exclude_paths,
+                Some(self.note(
+                    "One prefix of the first recorded working directory per line (literal; \
+                     case-insensitive on Windows, e.g. `/tmp/` or `C:\\Users\\me\\AppData\\Local\\Temp\\`); \
+                     also hidden from Deep search.",
                     cx,
                 )),
                 cx,
@@ -626,17 +651,57 @@ impl SettingsDialog {
     }
 
     fn resume_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let claude_command = self.command_row(Field::ClaudeCommand, cx);
         let args = self.list_input(Field::ResumeArgs, 6.0);
         let row = self.row(
             Field::ResumeArgs,
             args,
             Some(self.note(
-                "One argument per line; used when resuming Claude conversations.",
+                "One argument per line; used when resuming Claude conversations, after the \
+                 command's own.",
                 cx,
             )),
             cx,
         );
-        v_flex().id("settings-resume").child(row).into_any_element()
+        let pi_command = self.command_row(Field::PiCommand, cx);
+        let omp_command = self.command_row(Field::OmpCommand, cx);
+        let codex_command = self.command_row(Field::CodexCommand, cx);
+        let codex_args = self.list_input(Field::CodexResumeArgs, 4.0);
+        let codex_row = self.row(
+            Field::CodexResumeArgs,
+            codex_args,
+            Some(self.note(
+                "One argument per line; passed to codex before resume or fork, for example \
+                 --yolo.",
+                cx,
+            )),
+            cx,
+        );
+        v_flex()
+            .id("settings-resume")
+            .child(div().pb_2().child(self.note(
+                "Commands: one word per line, the program (a name on PATH or a path; ~/ is your \
+                 home, a relative path starts in the folder the app was started from), then the \
+                 arguments that come before the agent's own. Use an executable or a script, not \
+                 a shell alias or function. A command here beats the program path on the \
+                 General page.",
+                cx,
+            )))
+            .child(claude_command)
+            .child(row)
+            .child(pi_command)
+            .child(omp_command)
+            .child(codex_command)
+            .child(codex_row)
+            .into_any_element()
+    }
+
+    /// The row of an agent's `command` (upstream 8a99ccc): the words and
+    /// what starts the agent now.
+    fn command_row(&self, field: Field, cx: &mut Context<Self>) -> AnyElement {
+        let words = self.list_input(field, 4.0);
+        let status = self.note_one_line(self.program_status_text(field), cx);
+        self.row(field, words, Some(status), cx)
     }
 
     fn agent_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -723,8 +788,9 @@ impl SettingsDialog {
             .into_any_element()
     }
 
-    /// `resolved: <path>` / `not found on PATH` for a program field, as last
-    /// probed in the background (no file-system access while rendering).
+    /// `resolved: <path>` / `not found on PATH` for a program path or
+    /// command field, as last probed in the background (no file-system
+    /// access while rendering).
     pub(crate) fn program_status_text(&self, field: Field) -> String {
         self.probes
             .programs
@@ -735,8 +801,15 @@ impl SettingsDialog {
 
     /// [`program_status_for`] for the draft, computed now (tests).
     #[cfg(test)]
-    pub(crate) fn program_status(&self, field: Field, name: &str, cx: &App) -> String {
-        program_status_for(&app_state(cx).env, self.draft.value(field), name)
+    pub(crate) fn program_status(&self, field: Field, cx: &App) -> String {
+        let source = super::probe::program_agent(field).expect("a program field");
+        program_status_for(
+            &app_state(cx).env,
+            &self.config.cli,
+            &self.draft.edited,
+            field,
+            source,
+        )
     }
 
     /// [`terminal_preview_for`] for the draft, computed now (tests).
@@ -746,20 +819,52 @@ impl SettingsDialog {
     }
 }
 
-/// `resolved: <path>` / `not found on PATH` for a program field whose own
-/// path setting is `own` (searches PATH: never call it while rendering).
+/// What starts the agent `source` with the draft's gui.toml (`draft`) over
+/// config.toml (`cli`), as the status of its program path or `command` row
+/// (searches PATH: never call it while rendering): what runs (on a command
+/// row, or when a command applies) and where it is configured when that is
+/// not the row's own key, then `resolved: <path>`, `not found on PATH` or
+/// `not an executable file` (upstream 8a99ccc; precedence of
+/// `config::agent_launcher`).
 pub(crate) fn program_status_for(
     env: &claude_history_core::HistoryEnv,
-    own: Value,
-    name: &str,
+    cli: &ConfigFile,
+    draft: &GuiConfigFile,
+    field: Field,
+    source: AgentKind,
 ) -> String {
-    let own = match own {
-        Value::Text(text) => Some(PathBuf::from(text)),
-        _ => None,
-    };
-    match env.resolve_program(name, own.as_deref().filter(|path| path.is_file())) {
+    let launcher = agent_launcher(env, cli, draft, source);
+    let resolution = match launcher.resolve(env, source) {
         Ok(program) => format!("resolved: {}", program.path.display()),
+        Err(_) if names_a_path(&launcher.program, cfg!(windows)) => {
+            "not an executable file".to_string()
+        }
         Err(_) => "not found on PATH".to_string(),
+    };
+    let command_row = field.command_agent().is_some();
+    let own = if command_row {
+        ConfiguredAt::Gui(config_table(source))
+    } else {
+        ConfiguredAt::GuiPath(GuiSettings::program_path_key(source))
+    };
+    let from_command = matches!(
+        launcher.configured_at,
+        Some(ConfiguredAt::Config(_) | ConfiguredAt::Gui(_))
+    );
+    let mut notes = Vec::new();
+    if command_row || from_command {
+        notes.push(format!("runs {}", launcher.words().join(" ")));
+    }
+    if let Some(at) = launcher.configured_at
+        && at != own
+    {
+        notes.push(format!("from {at}"));
+    }
+    if notes.is_empty() {
+        resolution
+    } else {
+        // What runs first: a long resolved path is cut at the end.
+        format!("{} · {resolution}", notes.join("; "))
     }
 }
 
@@ -785,6 +890,7 @@ pub(crate) fn terminal_preview_for(input: &super::probe::ProbeInput) -> String {
             OsString::from("00000000-0000-4000-8000-000000000000"),
         ],
         cwd: input.cwd.clone(),
+        env: Vec::new(),
     };
     let options = BuildOptions {
         platform,

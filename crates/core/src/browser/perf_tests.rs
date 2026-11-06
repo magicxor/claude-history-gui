@@ -13,7 +13,8 @@
 
 use super::test_helpers::*;
 use super::*;
-use crate::history::{LoaderMessage, Source};
+use crate::history::LoaderMessage;
+use crate::history::model::SourceKind;
 use chrono::{Duration as ChronoDuration, Local, TimeZone};
 use std::time::{Duration, Instant};
 
@@ -54,31 +55,36 @@ fn synthetic(root: &Path, index: usize) -> Conversation {
         index % PROJECTS
     );
     Conversation {
-        source: Source::Claude,
+        source: SourceKind::Claude,
         session_id: uuid(index),
         path,
         index: 0,
         timestamp: Local.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()
             + ChronoDuration::seconds(((index * 7919) % ROWS) as i64 * 60),
-        preview: text.clone(),
-        preview_first: text.clone(),
-        preview_last: text.clone(),
-        search_text_lower: search::normalize_for_search(&text),
-        semantic_turns: vec![text.clone()],
+        preview: text.clone().into(),
+        preview_first: text.clone().into(),
+        preview_last: text.clone().into(),
+        semantic_turns: vec![text.clone()].into(),
         semantic_turn_ranges: vec![crate::agent::refs::MessageRange::single(1)],
-        full_text: text,
-        agent_search_text: String::new(),
-        semantic_route_text: String::new(),
+        full_text: text.into(),
+        own_text: "".into(),
+        agent_search_text: String::new().into(),
+        semantic_route_text: String::new().into(),
         project_name: Some(format!("project-{:02}", index % PROJECTS)),
         project_path: Some(project_dir(index % PROJECTS)),
         cwd: None,
+        cwds: Vec::new(),
         message_count: 2,
+        prompt_count: 1,
+        tool_call_count: 0,
         parse_errors: Vec::new(),
         summary: Some(format!("Summary {index}")),
         custom_title: None,
         model: Some("claude-opus-4-5-20251101".to_string()),
         total_tokens: 1234,
         duration_minutes: Some(3),
+        provenance: Default::default(),
+        parent: None,
     }
 }
 
@@ -208,7 +214,15 @@ fn rename(browser: &mut Browser, row: usize, title: String) -> Duration {
     let target = browser.row(row).unwrap().clone();
     let mut renamed = target.clone();
     renamed.custom_title = Some(title);
-    timed(|| browser.apply_renamed(&target.path, renamed).unwrap()).1
+    // The body is normalized where the rename is prepared (a background
+    // task in the GUI): only the install is timed.
+    let renamed = PreparedSession::new(renamed);
+    timed(|| {
+        browser
+            .apply_renamed_session(&target.path, renamed)
+            .unwrap()
+    })
+    .1
 }
 
 fn delete(browser: &mut Browser, row: usize) -> Duration {
@@ -305,7 +319,7 @@ fn browser_timings_on_20k_rows() {
         refresh_semantic.push(refresh(&sandbox, &mut browser));
         // Stop (and join) the worker that is still embedding 20k
         // conversations, so it does not compete with the next measurements.
-        browser.suspend_semantic();
+        browser.suspend_semantic().join();
         drop(browser);
 
         let (mut browser, install) = initial_load(&sandbox, scoped(), &mut appends, |_| {});

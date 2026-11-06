@@ -7,7 +7,8 @@
 //! ranked row list, the selection, and two background workers:
 //!
 //! * a lexical search worker thread ("search-worker") that coalesces queued
-//!   queries and answers with generation-tagged results;
+//!   queries and answers with generation-tagged results, over the loaded
+//!   corpus or a store generation's index (top page first);
 //! * a lazily spawned semantic worker ([`crate::semantic_worker`]), with
 //!   corpus/scope versioning, prewarming and a lexical fallback while the
 //!   semantic answer is pending.
@@ -15,12 +16,14 @@
 //! Workers post their answers to channels; the GUI calls [`Browser::poll`]
 //! to apply them. [`BrowserOptions::waker`] is called from the worker
 //! threads after each answer, so a GUI can schedule that poll instead of
-//! using a timer. [`HistoryLoader`] drives the streaming history loader into
-//! a browser (initial load and buffered refresh).
+//! using a timer. [`HistoryLoader`] fills a browser: from the store's
+//! generations (generation mode, the GUI's main list), or else with the
+//! streaming history loader (initial load and buffered refresh).
 //!
-//! # Corpus storage
+//! # Corpus storage (in memory)
 //!
-//! Every conversation exists once, as an `Arc<Conversation>` in a
+//! Without a store (no cache directory, a tool, a test) the browser holds
+//! the loaded history. Every conversation exists once, as an `Arc<Conversation>` in a
 //! [`CorpusSnapshot`] shared by the browser, the lexical worker and the
 //! semantic worker (its search data likewise, one `Arc` per conversation).
 //! The lexical worker gets the snapshots with each query and releases them
@@ -39,6 +42,19 @@
 //! to be re-applied (end of a load, a rename, a scope change) is sent to the
 //! lexical worker while the current rows stay visible.
 //!
+//! # Generation mode
+//!
+//! With a store the rows are the cards of the store's current generation
+//! (upstream 358becb): [`Browser::show_snapshot`] lists the newest
+//! [`SNAPSHOT_ROWS`] cards for the first frame, a [`HistoryLoader`] then
+//! installs every card with the generation's search index (opened off the
+//! UI thread) and swaps in each newer generation a reconcile pass publishes,
+//! keeping the query, the scope and the selected session. Cards carry no
+//! text: lexical queries run on the index, and semantic search ranks the
+//! cards with their semantic data, read from the generation on first use
+//! and again after each swap. Deletes and renames are overlays until
+//! a generation holds them (see `cards`).
+//!
 //! # Differences from upstream
 //!
 //! Behavior is kept identical to the TUI except for these documented fixes
@@ -46,8 +62,10 @@
 //!
 //! * **Workspace (D2).** The workspace scope comes from
 //!   [`BrowserOptions::workspace`] (a [`WorkspaceScope`]), never from the
-//!   process working directory. Pi/OMP rows are compared with the workspace
-//!   directory after canonicalization and Windows path normalization (W1).
+//!   process working directory; membership is upstream's
+//!   [`crate::history::Workspace::contains`] (82b355a: the project, or a
+//!   recorded cwd at or below the workspace), which compares canonical paths
+//!   after Windows path normalization (W1).
 //! * **Quirk 6.** A UUID query that matches nothing reports
 //!   [`UuidLookup::NotFound`] through [`Browser::uuid_lookup`]. The previous
 //!   rows stay visible, as upstream.
@@ -55,11 +73,12 @@
 //!   sessions loaded from disk by a UUID jump honor
 //!   [`BrowserOptions::show_last`] for their preview (upstream always used
 //!   the first messages).
-//! * **Quirk 14.** While loading, toggling the workspace scope or the search
-//!   mode (and changing the workspace or exclusions) only re-applies the
-//!   scope and exclusions to the loaded rows. The query is applied when
-//!   loading finishes. Upstream filtered against the not-yet-built search
-//!   index and showed an empty list until loading finished.
+//! * **Quirk 14.** While loading in memory, toggling the workspace scope or
+//!   the search mode (and changing the workspace or exclusions) only
+//!   re-applies the scope and exclusions to the loaded rows; the query is
+//!   applied when loading finishes. Upstream filtered against the
+//!   not-yet-built search index and showed an empty list until loading
+//!   finished.
 //! * **Quirk 16.** A refresh with a non-empty query keeps the previous rows
 //!   (re-mapped to the refreshed corpus by path) until the new results
 //!   arrive. Upstream cleared the list until the worker answered.
@@ -83,6 +102,32 @@
 //!   also forced lexical mode).
 //! * **Failed initial load.** [`LoadEvent::LoadFailed`] leaves the browser
 //!   ready, so [`HistoryLoader::start_refresh`] can retry (upstream exited).
+//! * **All kinds (upstream cb990e6).** [`Browser::set_all_kinds`] also
+//!   applies while loading (to the loaded rows, or the first cards of a
+//!   generation); upstream's Ctrl+G was ignored until the rows were listed.
+//! * **Family (upstream 3c2ffeb).** [`Browser::family_of`] gives the
+//!   parent and the subagents and forks of a conversation as conversations,
+//!   not rows (see `family`).
+//! * **User only (upstream ae7ae39).** [`Browser::set_user_only`] also
+//!   applies while loading (the query runs with it once it can run);
+//!   upstream's Ctrl+V was ignored until the rows were listed. It is a no-op
+//!   in single-file mode, which has no list.
+//! * **Generation mode.** The cards' workspace test
+//!   ([`crate::store::Snapshot::scope`]) uses the [`WorkspaceScope`] (D2,
+//!   W1), not the process cwd. Every card is materialized and the index
+//!   opened off the UI thread, and a swap keeps a query's rows until it
+//!   answers (see `cards`). The store is used only when
+//!   [`LoaderOptions::snapshot`] is on (the GUI's main list; upstream used it
+//!   whenever there was a cache directory). Without it the history loads in
+//!   memory, streamed in the background ([`HistoryLoader`]; upstream loaded
+//!   it synchronously before the first frame).
+//! * **In-memory install (upstream 358becb `show_conversations`: not
+//!   adopted).** Upstream's `show_conversations`, the in-memory install of
+//!   the no-cache-directory initial load and refresh, deduplicates the
+//!   initial load by canonical path. The fork keeps `finish_loading` and
+//!   `replace_conversations` with addendum C2 (the initial load does not
+//!   deduplicate), and `load_all_conversations_streaming` and
+//!   `LoaderMessage`, which upstream removed.
 //!
 //! The other section-12 quirks are presentation or key handling and belong
 //! to the GUI (1-5, 10-12, 15); 13 (Windows worktree names) is fixed in
@@ -94,34 +139,52 @@
 
 use crate::display_format::{HighlightQuery, RowHeaderInput, RowPreviewInput};
 use crate::env::{HistoryEnv, WorkspaceScope};
-use crate::history::{Conversation, format_short_name_from_path, process_conversation_file};
+use crate::history::{Conversation, format_short_name_from_path, process_conversation_file_in};
 use crate::search::{self, LexicalEvidence, SearchableConversation};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
 
+mod cards;
 mod corpus;
+mod family;
 mod index;
+mod list_preview;
 mod list_state;
 mod loader;
 mod mutations;
 mod search_state;
 mod types;
 
-pub use crate::semantic_worker::{SemanticEmbedderFactory, Waker};
-pub use corpus::{CorpusSnapshot, PreparedCorpus};
-pub use loader::{
-    HistoryLoader, LoadEvent, LoaderOptions, LoaderPoll, REFRESHING_STATUS, RefreshPolicy,
+pub use crate::semantic_worker::{SemanticEmbedderFactory, SemanticIndexing, Waker};
+pub use corpus::{CorpusSnapshot, PreparedCorpus, PreparedSession};
+pub use family::{
+    NO_CHILDREN_STATUS, NO_PARENT_STATUS, PARENT_GONE_STATUS, PARENT_NOT_FOUND_STATUS, ViewFamily,
 };
+pub use list_preview::ListHit;
+pub use loader::{
+    DEFAULT_DRAIN_BUDGET, HistoryLoader, LoadEvent, LoaderOptions, LoaderPoll, REFRESHING_STATUS,
+    RefreshPolicy,
+};
+pub use search_state::SemanticWorkerExit;
 pub use types::{
-    DeleteError, DeletedSession, EscapeOutcome, ListSearchMode, LoadingState, RENAMED_STATUS,
-    RenameError, SemanticProgress, SemanticResultMetadata, UuidLookup, query_has_literals,
+    DeleteError, DeletedSession, EscapeOutcome, IndexNotice, ListSearchMode, RENAMED_STATUS,
+    Readiness, ReconcileState, RenameError, SemanticProgress, SemanticResultMetadata, UuidLookup,
+    query_has_literals,
 };
 
 use corpus::{CorpusEdits, SearchSnapshot};
 use index::{CorpusIndex, ScopeSettings};
-use search_state::{SearchCommand, SearchResponse, SemanticSearchState, spawn_search_worker};
+use search_state::{
+    IndexScope, SearchCommand, SearchResponse, SemanticCorpus, SemanticSearchState,
+    spawn_search_worker,
+};
+
+/// Cards materialized for the first frame. Bounded so the first frame costs
+/// the same whatever the corpus size; the full list follows once the
+/// generation is open.
+pub const SNAPSHOT_ROWS: usize = 500;
 
 /// Construction options of a [`Browser`].
 #[derive(Clone)]
@@ -137,6 +200,10 @@ pub struct BrowserOptions {
     pub default_mode: ListSearchMode,
     /// Project names hidden from the list (`[tui].exclude_projects`).
     pub exclude_projects: Vec<String>,
+    /// Working-directory prefixes hidden from the list (`[tui].exclude_paths`,
+    /// upstream 982aea9): literal prefixes (case-insensitive on
+    /// Windows, upstream 59417d1) of a conversation's recorded cwd; empty entries are ignored.
+    pub exclude_paths: Vec<String>,
     /// The workspace for the "project" scope. [`BrowserOptions::new`] takes
     /// it from [`HistoryEnv::workspace`] (a workspace that is not an
     /// absolute path is left out there; validate it with
@@ -144,6 +211,10 @@ pub struct BrowserOptions {
     pub workspace: Option<WorkspaceScope>,
     /// Start with the workspace scope on (upstream `--local`).
     pub workspace_filter: bool,
+    /// Start listing automated (Codex exec) and child (subagent)
+    /// conversations, which are hidden by default (upstream `--all-kinds`,
+    /// `TuiSearchOptions::all_kinds`). Ignored in single-file mode.
+    pub all_kinds: bool,
     /// Whether semantic search can be used (forced off in single-file mode).
     /// When false the browser starts in lexical mode whatever
     /// [`BrowserOptions::default_mode`] says, and never starts the semantic
@@ -166,8 +237,10 @@ impl BrowserOptions {
             show_last: true,
             default_mode: ListSearchMode::Lexical,
             exclude_projects: Vec::new(),
+            exclude_paths: Vec::new(),
             workspace,
             workspace_filter: false,
+            all_kinds: false,
             semantic_available: true,
             waker: None,
             embedder_factory: None,
@@ -189,6 +262,11 @@ impl BrowserOptions {
         self
     }
 
+    pub fn with_exclude_paths(mut self, prefixes: Vec<String>) -> Self {
+        self.exclude_paths = prefixes;
+        self
+    }
+
     pub fn with_workspace(mut self, workspace: Option<WorkspaceScope>) -> Self {
         self.workspace = workspace;
         self
@@ -196,6 +274,11 @@ impl BrowserOptions {
 
     pub fn with_workspace_filter(mut self, enabled: bool) -> Self {
         self.workspace_filter = enabled;
+        self
+    }
+
+    pub fn with_all_kinds(mut self, all_kinds: bool) -> Self {
+        self.all_kinds = all_kinds;
         self
     }
 
@@ -222,8 +305,10 @@ impl std::fmt::Debug for BrowserOptions {
             .field("show_last", &self.show_last)
             .field("default_mode", &self.default_mode)
             .field("exclude_projects", &self.exclude_projects)
+            .field("exclude_paths", &self.exclude_paths)
             .field("workspace", &self.workspace)
             .field("workspace_filter", &self.workspace_filter)
+            .field("all_kinds", &self.all_kinds)
             .field("semantic_available", &self.semantic_available)
             .field("waker", &self.waker.is_some())
             .field("embedder_factory", &self.embedder_factory.is_some())
@@ -237,7 +322,9 @@ pub struct Browser {
     show_last: bool,
     waker: Option<Waker>,
     embedder_factory: Option<SemanticEmbedderFactory>,
-    /// All loaded conversations, shared with the lexical and semantic workers
+    /// Rows of the list. In generation mode (`snapshot` set) the cards
+    /// materialized so far, without text; otherwise every loaded
+    /// conversation, shared with the lexical and semantic workers
     conversations: CorpusSnapshot,
     /// Precomputed search data, parallel to `conversations` once built
     /// (empty while loading and in single-file mode); shared with the
@@ -262,18 +349,46 @@ pub struct Browser {
     selection_anchor: Option<PathBuf>,
     /// Current search query
     query: String,
-    /// Loading state
-    loading_state: LoadingState,
+    /// Which parts of the list are usable
+    readiness: Readiness,
+    /// Progress of the reconcile pass shown as indexing (upstream 04c714b)
+    indexing: Option<crate::store::progress::Indexing>,
+    /// What the last pass shown as indexing, or a failed one, left for the
+    /// status line, until the GUI takes it (upstream: the status message)
+    index_notice: Option<IndexNotice>,
+    /// Generation whose cards are the rows, in generation mode
+    snapshot: Option<crate::store::Snapshot>,
+    /// Generation index lexical queries run against, when there is one
+    search_index: Option<Arc<crate::store::SearchIndex>>,
+    /// The index and the docs a query may return, sent with each lexical
+    /// query while `search_index` is set
+    index_scope: Option<IndexScope>,
+    /// Row of each card of the snapshot, once materialized, while only the
+    /// first cards are shown
+    doc_rows: Vec<Option<usize>>,
+    /// Generation mode's cards, overlays and reconcile request
+    cards: cards::CardRows,
+    /// Cards with their semantic data for semantic search in generation
+    /// mode, read on first use
+    semantic_corpus: SemanticCorpus,
+    /// Batches of the in-memory loader are being appended
+    streaming: bool,
     /// Whether the browser shows a single opened file (no list)
     single_file_mode: bool,
     /// Why the single opened file could not be parsed, if it could not
     single_file_error: Option<String>,
     /// Whether the workspace scope is active
     workspace_filter: bool,
+    /// Whether automated and child conversations are listed
+    all_kinds: bool,
+    /// Whether lexical search matches only the text the person typed
+    user_only: bool,
     /// The workspace for the scope filter (upstream: the process cwd)
     workspace: Option<WorkspaceScope>,
     /// Exact project names hidden from list-mode display
     excluded_projects: HashSet<String>,
+    /// Working-directory prefixes hidden from list-mode display
+    excluded_paths: Vec<String>,
     /// Channel to send commands to the background search worker
     search_tx: mpsc::Sender<SearchCommand>,
     /// Channel to receive results from the background search worker
@@ -282,6 +397,9 @@ pub struct Browser {
     search_generation: u64,
     /// Whether a search is currently in-flight on the worker thread
     search_in_flight: bool,
+    /// Whether `filtered` is the first page of an index search still being
+    /// completed
+    search_page_shown: bool,
     /// Current list search mode
     list_search_mode: ListSearchMode,
     /// Semantic search state
@@ -293,6 +411,44 @@ pub struct Browser {
     /// Rows deleted or renamed while a [`HistoryLoader`] loads; replayed on
     /// the corpus it installs
     corpus_edits: CorpusEdits,
+    /// Helper threads joined when the browser is dropped
+    helpers: HelperThreads,
+}
+
+/// Helper threads of a browser that may outlive the call that started them
+/// (`row-evidence`, a `semantic-corpus` job given up): they read the store's
+/// mapped files, so the browser joins them when it
+/// is dropped and none outlives it (in a test, its sandbox directory).
+#[derive(Default)]
+struct HelperThreads(Vec<std::thread::JoinHandle<()>>);
+
+impl HelperThreads {
+    /// Keeps `thread`, forgetting the threads that have ended.
+    fn push(&mut self, thread: std::thread::JoinHandle<()>) {
+        self.0.retain(|thread| !thread.is_finished());
+        self.0.push(thread);
+    }
+
+    fn join_all(&mut self) {
+        for thread in self.0.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for Browser {
+    /// Gives up a semantic corpus still being read (it stops before its
+    /// next card) and waits for the helper threads. The semantic worker is
+    /// not waited for: its channel closes and its running step is cancelled
+    /// (background indexing stops at its next batch).
+    fn drop(&mut self) {
+        self.retire_semantic_corpus();
+        self.helpers.join_all();
+        self.semantic_search.worker_tx = None;
+        if let Some(cancellation) = &self.semantic_search.cancellation {
+            cancellation.cancel();
+        }
+    }
 }
 
 struct BrowserParts {
@@ -300,7 +456,7 @@ struct BrowserParts {
     searchable: Vec<SearchableConversation>,
     filtered: Vec<usize>,
     selected: Option<usize>,
-    loading_state: LoadingState,
+    readiness: Readiness,
     single_file_mode: bool,
     single_file_error: Option<String>,
     search_tx: mpsc::Sender<SearchCommand>,
@@ -318,22 +474,27 @@ impl Browser {
         } else {
             ListSearchMode::Lexical
         };
-        let (workspace, workspace_filter, excluded_projects) = if parts.single_file_mode {
-            (None, false, HashSet::new())
-        } else {
-            (
-                opts.workspace,
-                opts.workspace_filter,
-                opts.exclude_projects.into_iter().collect(),
-            )
-        };
+        let (workspace, workspace_filter, all_kinds, excluded_projects, excluded_paths) =
+            if parts.single_file_mode {
+                (None, false, false, HashSet::new(), Vec::new())
+            } else {
+                (
+                    opts.workspace,
+                    opts.workspace_filter,
+                    opts.all_kinds,
+                    opts.exclude_projects.into_iter().collect(),
+                    opts.exclude_paths,
+                )
+            };
         let conversations: CorpusSnapshot =
             Arc::new(parts.conversations.into_iter().map(Arc::new).collect());
         let index = CorpusIndex::build(
             &conversations,
             Some(ScopeSettings {
                 excluded: excluded_projects.clone(),
+                excluded_paths: excluded_paths.clone(),
                 workspace: workspace.clone().filter(|_| workspace_filter),
+                all_kinds,
             }),
         );
         let searchable: SearchSnapshot =
@@ -354,16 +515,29 @@ impl Browser {
             selected: parts.selected,
             selection_anchor: None,
             query: String::new(),
-            loading_state: parts.loading_state,
+            readiness: parts.readiness,
+            indexing: None,
+            index_notice: None,
+            snapshot: None,
+            search_index: None,
+            index_scope: None,
+            doc_rows: Vec::new(),
+            cards: cards::CardRows::default(),
+            semantic_corpus: SemanticCorpus::default(),
+            streaming: false,
             single_file_mode: parts.single_file_mode,
             single_file_error: parts.single_file_error,
             workspace_filter,
+            all_kinds,
+            user_only: false,
             workspace,
             excluded_projects,
+            excluded_paths,
             search_tx: parts.search_tx,
             search_rx: parts.search_rx,
             search_generation: 0,
             search_in_flight: false,
+            search_page_shown: false,
             list_search_mode,
             semantic_search: SemanticSearchState {
                 available: semantic_available,
@@ -372,6 +546,7 @@ impl Browser {
             lexical_evidence: HashMap::new(),
             uuid_lookup: None,
             corpus_edits: CorpusEdits::default(),
+            helpers: HelperThreads::default(),
         }
     }
 
@@ -387,7 +562,7 @@ impl Browser {
                 searchable,
                 filtered: Vec::new(),
                 selected: None,
-                loading_state: LoadingState::Ready,
+                readiness: Readiness::ready(),
                 single_file_mode: false,
                 single_file_error: None,
                 search_tx,
@@ -414,7 +589,7 @@ impl Browser {
                 searchable: Vec::new(),
                 filtered: Vec::new(),
                 selected: None,
-                loading_state: LoadingState::Loading { loaded: 0 },
+                readiness: Readiness::default(),
                 single_file_mode: false,
                 single_file_error: None,
                 search_tx,
@@ -426,8 +601,12 @@ impl Browser {
     /// A browser for one opened JSONL file (upstream `App::new_single_file`).
     ///
     /// The file is parsed like a listed session and its project name is
-    /// derived from its `cwd` (or the file path). Semantic search,
-    /// exclusions, the workspace scope and delete are unavailable.
+    /// derived from its `cwd` (or the file path). It is parsed in
+    /// [`BrowserOptions::env`] (`history::process_conversation_file_in`): a
+    /// rollout of that env's Codex home finds its state database through the
+    /// env's `CODEX_SQLITE_HOME`, as the viewer's history service does.
+    /// Semantic search, exclusions, the workspace scope and delete are
+    /// unavailable.
     ///
     /// A file the list would leave out (a clear-only session, or one with
     /// no listable preview such as a Warmup prompt and its reply) yields an
@@ -446,7 +625,7 @@ impl Browser {
         let mut selected = None;
         let mut single_file_error = None;
 
-        match process_conversation_file(path.clone(), modified, None) {
+        match process_conversation_file_in(&opts.env, path.clone(), modified, None) {
             Ok(Some(mut conv)) => {
                 // Set project_name the same way as the loader does
                 let project_path = conv.cwd.clone().unwrap_or_else(|| path.clone());
@@ -456,7 +635,7 @@ impl Browser {
                 filtered.push(0);
                 selected = Some(0);
             }
-            Ok(None) => match single_file_renders_nothing(&path) {
+            Ok(None) => match single_file_renders_nothing(&opts.env, &path) {
                 Ok(false) => {}
                 Ok(true) => {
                     single_file_error = Some(format!(
@@ -476,7 +655,7 @@ impl Browser {
                 searchable: Vec::new(),
                 filtered,
                 selected,
-                loading_state: LoadingState::Ready,
+                readiness: Readiness::ready(),
                 single_file_mode: true,
                 single_file_error,
                 search_tx,
@@ -496,26 +675,29 @@ impl Browser {
     }
 
     /// Change the preview mode (applies to later renames; the rows are
-    /// replaced by the next load).
+    /// replaced by the next load or generation).
     pub fn set_show_last(&mut self, show_last: bool) {
         self.show_last = show_last;
     }
 
     /// Consume the browser and return its conversations (cloned where a
     /// worker still shares them).
-    pub fn into_conversations(self) -> Vec<Conversation> {
-        Arc::unwrap_or_clone(self.conversations)
+    pub fn into_conversations(mut self) -> Vec<Conversation> {
+        Arc::unwrap_or_clone(std::mem::take(&mut self.conversations))
             .into_iter()
             .map(Arc::unwrap_or_clone)
             .collect()
     }
 
-    pub fn loading_state(&self) -> &LoadingState {
-        &self.loading_state
+    /// Which parts of the list are usable.
+    pub fn readiness(&self) -> &Readiness {
+        &self.readiness
     }
 
+    /// Whether there are no rows yet ([`Readiness::list`]): the in-memory
+    /// history is still loading, or no generation is shown yet.
     pub fn is_loading(&self) -> bool {
-        matches!(self.loading_state, LoadingState::Loading { .. })
+        !self.readiness.list
     }
 
     /// Row list: indices into [`Browser::conversations`], in display order.
@@ -523,8 +705,9 @@ impl Browser {
         &self.filtered
     }
 
-    /// Every loaded conversation (including excluded and out-of-scope ones).
-    /// The elements are shared with the search workers.
+    /// Every row's conversation (including excluded and out-of-scope ones):
+    /// the loaded conversations, or the cards in generation mode. The
+    /// elements are shared with the search workers.
     pub fn conversations(&self) -> &[Arc<Conversation>] {
         &self.conversations
     }
@@ -549,9 +732,12 @@ impl Browser {
     }
 
     /// Index (into [`Browser::conversations`]) of the first loaded session
-    /// at `path` (an indexed lookup, CCR-2).
+    /// at `path` (an indexed lookup, CCR-2); never a row hidden by a delete
+    /// in generation mode.
     pub(super) fn position_of_path(&self, path: &Path) -> Option<usize> {
-        self.index.first_path(&self.conversations, path)
+        self.index
+            .first_path(&self.conversations, path)
+            .filter(|&index| !self.is_hidden(index))
     }
 
     /// Selected row (position in [`Browser::filtered`]).
@@ -579,9 +765,24 @@ impl Browser {
         self.workspace_filter
     }
 
+    /// Whether automated (Codex exec) and child (subagent) conversations are
+    /// listed ([`Browser::toggle_all_kinds`]).
+    pub fn all_kinds(&self) -> bool {
+        self.all_kinds
+    }
+
     /// The workspace used by the project scope.
     pub fn workspace(&self) -> Option<&WorkspaceScope> {
         self.workspace.as_ref()
+    }
+
+    /// The workspace folder with the env's home directory written as `~`
+    /// (upstream 82b355a `Workspace::display`, which the TUI's search prompt
+    /// shows while the project scope is on). No file system access.
+    pub fn workspace_display(&self) -> Option<String> {
+        self.workspace.as_ref().map(|scope| {
+            crate::history::path::tilde_path(scope.dir(), self.env.home_dir.as_deref())
+        })
     }
 
     /// Whether a workspace is set (the scope toggle is a no-op without one).
@@ -603,6 +804,11 @@ impl Browser {
         &self.excluded_projects
     }
 
+    /// Working-directory prefixes hidden from the list.
+    pub fn excluded_paths(&self) -> &[String] {
+        &self.excluded_paths
+    }
+
     /// Outcome of the current query if it is a session UUID. A
     /// [`UuidLookup::Found`] index always points into
     /// [`Browser::conversations`]; the lookup is cleared when that session
@@ -611,15 +817,21 @@ impl Browser {
         self.uuid_lookup.as_ref()
     }
 
-    /// Search-bar count text: `"Loading... <n>"`, `"<sel>/<rows>"` or
-    /// `"0/<rows>"` (upstream `render_search_bar`).
+    /// Search-bar count text: `"Loading..."` before there are rows,
+    /// `"<sel>/<rows>"` or `"0/<rows>"` (upstream `render_search_bar`).
+    /// While the in-memory loader streams, `"Loading... <n>"` with the
+    /// conversations received (fork: upstream loaded in memory before the
+    /// first frame).
     pub fn count_text(&self) -> String {
-        match &self.loading_state {
-            LoadingState::Loading { loaded } => format!("Loading... {}", loaded),
-            LoadingState::Ready => match self.selected {
-                Some(selected) => format!("{}/{}", selected + 1, self.filtered.len()),
-                None => format!("0/{}", self.filtered.len()),
-            },
+        if !self.readiness.list {
+            if self.streaming {
+                return format!("Loading... {}", self.conversations.len());
+            }
+            return "Loading...".to_string();
+        }
+        match self.selected {
+            Some(selected) => format!("{}/{}", selected + 1, self.filtered.len()),
+            None => format!("0/{}", self.filtered.len()),
         }
     }
 
@@ -659,6 +871,7 @@ impl Browser {
             query,
             width,
             show_source_label: self.has_multiple_sources(),
+            show_kind_label: true,
             semantic_mode: self.list_search_mode == ListSearchMode::Semantic,
             semantic_metadata: self.semantic_result_metadata(conversation_index),
             now,
@@ -691,9 +904,12 @@ use crate::history::apply_preview_mode;
 
 /// Whether the viewer would show no message for `path` even with every
 /// display toggle on (thinking, full tool output). Used for a single file
-/// the list leaves out: only then is it reported as empty.
-fn single_file_renders_nothing(path: &Path) -> std::io::Result<bool> {
-    let entries = crate::view::parse_conversation_file(path)?;
+/// the list leaves out: only then is it reported as empty. Decoded in `env`,
+/// as the viewer decodes it.
+fn single_file_renders_nothing(env: &HistoryEnv, path: &Path) -> std::io::Result<bool> {
+    let transcript = crate::history::sources::decode_path_in(env, path, None, false)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let entries = crate::view::renderable_entries(&transcript);
     let prefs = crate::view::ViewPrefs {
         tool_display: crate::view::ToolDisplayMode::Full,
         show_thinking: true,
@@ -723,3 +939,6 @@ mod ccr_tests;
 
 #[cfg(test)]
 mod perf_tests;
+
+#[cfg(test)]
+mod snapshot_tests;

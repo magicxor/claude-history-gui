@@ -1,7 +1,7 @@
 use crate::history::Conversation;
+use crate::text_match::{is_word_start, next_lowercase_candidate, nfc};
 use rayon::prelude::*;
 use std::borrow::Borrow;
-use std::collections::VecDeque;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaseMode {
@@ -17,6 +17,8 @@ pub struct Literal {
 
 impl Literal {
     pub fn new(text: String) -> Self {
+        // Conversation texts are NFC (see `history::index`).
+        let text = nfc(&text).into_owned();
         let case_mode = if text.chars().any(char::is_uppercase) {
             CaseMode::Sensitive
         } else {
@@ -33,25 +35,28 @@ impl Literal {
         self.case_mode
     }
 
+    /// Whether the literal occurs in `text` starting at a word start.
     pub fn matches(&self, text: &str) -> bool {
-        if self.text.is_empty() {
-            return false;
-        }
-
-        match self.case_mode {
-            CaseMode::Sensitive => text.contains(&self.text),
-            CaseMode::Insensitive => contains_case_insensitive(text, &self.text),
-        }
+        !self.find_ranges(text, true).is_empty()
     }
 
+    /// Byte ranges of the non-overlapping occurrences in `text` that start at
+    /// a word start.
     pub fn match_ranges(&self, text: &str) -> Vec<(usize, usize)> {
+        self.find_ranges(text, false)
+    }
+
+    /// Occurrences start at a word start: the start of `text` or after a
+    /// non-alphanumeric character, so `_`, `.`, `/`, `-` and whitespace all
+    /// begin words and `streaming` matches in `load_streaming` but not in
+    /// `livestreaming`.
+    fn find_ranges(&self, text: &str, first_only: bool) -> Vec<(usize, usize)> {
         if self.text.is_empty() {
             return Vec::new();
         }
-
         match self.case_mode {
-            CaseMode::Sensitive => find_substring_ranges(text, &self.text),
-            CaseMode::Insensitive => find_case_insensitive_ranges(text, &self.text),
+            CaseMode::Sensitive => find_word_start_ranges(text, &self.text, first_only),
+            CaseMode::Insensitive => find_case_insensitive_ranges(text, &self.text, first_only),
         }
     }
 }
@@ -132,70 +137,73 @@ where
         .map(|entry| (entry.index, conversations[entry.index].borrow().timestamp))
         .collect::<Vec<_>>();
 
-    matches.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    matches.sort_unstable_by_key(|a| std::cmp::Reverse(a.1));
     matches.into_iter().map(|(index, _)| index).collect()
 }
 
-fn contains_case_insensitive(text: &str, needle: &str) -> bool {
-    let needle_chars: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
-    if needle_chars.is_empty() {
-        return false;
-    }
-
-    let mut window = VecDeque::with_capacity(needle_chars.len());
-    for folded in text.chars().flat_map(char::to_lowercase) {
-        window.push_back(folded);
-        if window.len() > needle_chars.len() {
-            window.pop_front();
-        }
-        if window.len() == needle_chars.len()
-            && window.iter().copied().eq(needle_chars.iter().copied())
-        {
-            return true;
-        }
-    }
-    false
-}
-
-fn find_substring_ranges(text: &str, needle: &str) -> Vec<(usize, usize)> {
+fn find_word_start_ranges(text: &str, needle: &str, first_only: bool) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut start = 0;
     while let Some(pos) = text[start..].find(needle) {
         let range_start = start + pos;
-        let range_end = range_start + needle.len();
-        ranges.push((range_start, range_end));
-        start = range_end;
+        if is_word_start(text, range_start) {
+            let range_end = range_start + needle.len();
+            ranges.push((range_start, range_end));
+            if first_only {
+                break;
+            }
+            start = range_end;
+        } else {
+            start = range_start + text[range_start..].chars().next().map_or(1, char::len_utf8);
+        }
     }
     ranges
 }
 
-fn find_case_insensitive_ranges(text: &str, needle: &str) -> Vec<(usize, usize)> {
+fn find_case_insensitive_ranges(text: &str, needle: &str, first_only: bool) -> Vec<(usize, usize)> {
     let needle_chars: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
-    if needle_chars.is_empty() {
+    let Some(&first) = needle_chars.first() else {
         return Vec::new();
-    }
-
-    let mut folded_chars = Vec::new();
-    let mut folded_map = Vec::new();
-    for (start, ch) in text.char_indices() {
-        let end = start + ch.len_utf8();
-        for folded in ch.to_lowercase() {
-            folded_chars.push(folded);
-            folded_map.push((start, end));
-        }
-    }
+    };
 
     let mut ranges = Vec::new();
-    let mut i = 0;
-    while i + needle_chars.len() <= folded_chars.len() {
-        if folded_chars[i..i + needle_chars.len()] == needle_chars[..] {
-            ranges.push((folded_map[i].0, folded_map[i + needle_chars.len() - 1].1));
-            i += needle_chars.len();
-        } else {
-            i += 1;
+    let mut from = 0;
+    while let Some(start) = next_lowercase_candidate(text, from, first) {
+        let rest = &text[start..];
+        let end = (is_word_start(text, start)
+            && rest.chars().next().and_then(|ch| ch.to_lowercase().next()) == Some(first))
+        .then(|| folded_match_end(rest, &needle_chars))
+        .flatten();
+        match end {
+            Some(end) => {
+                ranges.push((start, start + end));
+                if first_only {
+                    break;
+                }
+                from = start + end;
+            }
+            None => from = start + rest.chars().next().map_or(1, char::len_utf8),
         }
     }
     ranges
+}
+
+/// Byte length of the shortest prefix of `text` whose lowercase folding
+/// starts with `needle`, if any.
+fn folded_match_end(text: &str, needle: &[char]) -> Option<usize> {
+    let mut matched = 0;
+    for (offset, ch) in text.char_indices() {
+        for folded in ch.to_lowercase() {
+            if folded != needle[matched] {
+                return None;
+            }
+            matched += 1;
+            if matched == needle.len() {
+                return Some(offset + ch.len_utf8());
+            }
+        }
+    }
+    None
 }
 
 fn literal_text(conversation: &Conversation, include_agent_text: bool) -> String {
@@ -224,6 +232,56 @@ fn push_part(text: &mut String, part: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text_match::starts_word;
+
+    /// Char-by-char reference for `find_case_insensitive_ranges`.
+    fn reference_case_insensitive_ranges(text: &str, needle: &str) -> Vec<(usize, usize)> {
+        let needle_chars: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
+        let Some(&first) = needle_chars.first() else {
+            return Vec::new();
+        };
+        let mut ranges = Vec::new();
+        let mut resume = 0;
+        let mut prev = None;
+        for (start, ch) in text.char_indices() {
+            let word_start = prev.is_none_or(|prev| starts_word(prev, Some(ch)));
+            prev = Some(ch);
+            if start < resume || !word_start || ch.to_lowercase().next() != Some(first) {
+                continue;
+            }
+            if let Some(end) = folded_match_end(&text[start..], &needle_chars) {
+                ranges.push((start, start + end));
+                resume = start + end;
+            }
+        }
+        ranges
+    }
+
+    #[test]
+    fn case_insensitive_ranges_match_the_char_by_char_reference() {
+        const PIECES: &[&str] = &[
+            "a", "A", "b", "ab", "AB", "İ", "i", "I", "K", "\u{212A}", "k", "é", "É", "_", "-",
+            " ", ".", "测", "测试", "ß", "ǅ", "1",
+        ];
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        for _ in 0..3000 {
+            let text: String = (0..next(40)).map(|_| PIECES[next(PIECES.len())]).collect();
+            let needle: String = (0..1 + next(3))
+                .map(|_| PIECES[next(PIECES.len())])
+                .collect();
+            assert_eq!(
+                find_case_insensitive_ranges(&text, &needle, false),
+                reference_case_insensitive_ranges(&text, &needle),
+                "{text:?} {needle:?}"
+            );
+        }
+    }
     use crate::search::test_fixtures::one_message_conversation;
     use chrono::{Duration, Local};
 
@@ -270,6 +328,76 @@ mod tests {
 
         assert!(literal.matches("pre İSTANBUL post"));
         assert!(!literal.matches("pre constantinople post"));
+    }
+
+    #[test]
+    fn literal_matches_only_at_word_starts() {
+        for case in [
+            Literal::new("streaming".to_string()),
+            Literal::new("Streaming".to_string()),
+        ] {
+            assert!(!case.matches("LiveStreaming livestreaming"));
+            assert_eq!(case.match_ranges("liveStreaming"), Vec::new());
+        }
+
+        let literal = Literal::new("conversations_streaming".to_string());
+        assert!(literal.matches("load_all_conversations_streaming()"));
+        assert!(!literal.matches("subconversations_streaming"));
+        for text in [
+            "a_streaming",
+            "a.streaming",
+            "a/streaming",
+            "a-streaming",
+            "streaming",
+        ] {
+            assert!(
+                Literal::new("streaming".to_string()).matches(text),
+                "{text}"
+            );
+        }
+        assert!(Literal::new("ünchen".to_string()).matches("(ünchen)"));
+        assert!(!Literal::new("nchen".to_string()).matches("münchen"));
+    }
+
+    #[test]
+    fn literal_matches_at_letter_digit_transitions() {
+        for (needle, text) in [
+            ("1.2.3", "bump v1.2.3"),
+            ("264", "H264"),
+            ("V", "2V"),
+            ("8", "UTF8"),
+        ] {
+            let literal = Literal::new(needle.to_string());
+            assert!(literal.matches(text), "{needle:?} in {text:?}");
+        }
+        assert_eq!(
+            Literal::new("264".to_string()).match_ranges("h264 x264"),
+            [(1, 4), (6, 9)]
+        );
+        for (needle, text) in [
+            ("Config", "AppConfig"),
+            ("config", "appconfig"),
+            ("64", "h264"),
+        ] {
+            assert!(
+                !Literal::new(needle.to_string()).matches(text),
+                "{needle:?} in {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_ranges_skip_mid_word_occurrences() {
+        let literal = Literal::new("log".to_string());
+
+        assert_eq!(
+            literal.match_ranges("catalog log blog.log"),
+            vec![(8, 11), (17, 20)]
+        );
+        assert_eq!(
+            Literal::new("Log".to_string()).match_ranges("catalog Log blogLog"),
+            vec![(8, 11)]
+        );
     }
 
     #[test]

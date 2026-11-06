@@ -24,6 +24,7 @@ use crate::search::literal::{Literal, match_literal_ranges};
 use crate::search::normalize_for_search;
 use crate::search::query::ParsedQuery;
 use crate::semantic::types::SemanticRationaleKind;
+use crate::text_match::{NormalizedForm, NormalizedText, is_word_separator};
 use chrono::{DateTime, Local};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -86,22 +87,39 @@ pub fn format_tokens_long(tokens: u64) -> String {
     format!("{} tokens", format_tokens(tokens))
 }
 
-/// List-row message count: `"1 msg"` / `"<n> msgs"`.
-pub fn format_msg_count_short(count: usize) -> String {
-    if count == 1 {
-        "1 msg".to_string()
-    } else {
-        format!("{} msgs", count)
+/// `"<count> <singular>"` for a count of 1, else `"<count> <plural>"`
+/// (upstream `tui/ui.rs`, e930cac). The list row shows
+/// `count_label(prompt_count, "prompt", "prompts")`.
+pub fn count_label(count: usize, singular: &str, plural: &str) -> String {
+    format!("{count} {}", if count == 1 { singular } else { plural })
+}
+
+/// Prompts and, when there are any, tool calls, for the conversation header
+/// (upstream `header_counts`, e930cac): `"2 prompts"`,
+/// `"113 prompts · 948 tool calls"`.
+///
+/// Fork: takes the two counts instead of a [`Conversation`], so the GUI's
+/// header model can pass the numbers it keeps; [`header_counts`] is
+/// upstream's form.
+pub fn format_header_counts(prompts: usize, tool_calls: usize) -> String {
+    match header_count_parts(prompts, tool_calls) {
+        (prompts, None) => prompts,
+        (prompts, Some(tools)) => format!("{prompts} · {tools}"),
     }
 }
 
-/// Viewer-header message count: `"1 message"` / `"<n> messages"`.
-pub fn format_msg_count_long(count: usize) -> String {
-    if count == 1 {
-        "1 message".to_string()
-    } else {
-        format!("{} messages", count)
-    }
+/// The two parts of [`format_header_counts`]: the prompts, and the tool
+/// calls when there are any. Fork-only: the GUI draws each as its own
+/// `·`-separated header part.
+pub fn header_count_parts(prompts: usize, tool_calls: usize) -> (String, Option<String>) {
+    let prompts = count_label(prompts, "prompt", "prompts");
+    let tools = (tool_calls > 0).then(|| count_label(tool_calls, "tool call", "tool calls"));
+    (prompts, tools)
+}
+
+/// [`format_header_counts`] of a conversation (upstream `header_counts`).
+pub fn header_counts(conv: &Conversation) -> String {
+    format_header_counts(conv.prompt_count, conv.tool_call_count)
 }
 
 /// Conversation duration: `"<m>m"` below an hour, else `"<h>h <m>m"`.
@@ -113,13 +131,28 @@ pub fn format_duration_minutes(minutes: u64) -> String {
     }
 }
 
+/// `n` with its thousands separated by commas, e.g. "7,185" (upstream
+/// `tui/app.rs` `group_digits`, 04c714b: the indexing status texts).
+pub fn group_digits(n: usize) -> String {
+    let digits = n.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
 /// Viewer-header timestamp: `"%Y-%m-%d %H:%M"` (local time).
 pub fn format_header_timestamp(timestamp: DateTime<Local>) -> String {
     timestamp.format("%Y-%m-%d %H:%M").to_string()
 }
 
 /// Whether the viewer header (with summary) fits on one line of
-/// `terminal_width` cells (upstream byte-length heuristic, kept verbatim).
+/// `terminal_width` cells (upstream heuristic, kept verbatim: byte lengths,
+/// except the counts, which are measured in cells since e930cac).
 pub fn header_fits_single_line(conv: &Conversation, terminal_width: u16) -> bool {
     let summary = match &conv.summary {
         Some(s) => s,
@@ -142,7 +175,7 @@ pub fn header_fits_single_line(conv: &Conversation, terminal_width: u16) -> bool
         .map(|m| format_model_name(m).len() + 3) // + " · "
         .unwrap_or(0);
 
-    let msg_count_len = format_msg_count_long(conv.message_count).len();
+    let msg_count_len = UnicodeWidthStr::width(header_counts(conv).as_str());
 
     // Calculate tokens length if present (use long form for single-line check)
     let tokens_len = if conv.total_tokens > 0 {
@@ -277,29 +310,67 @@ pub fn semantic_row_metadata(metadata: &SemanticResultMetadata) -> String {
     format!("{:.2}", metadata.score_breakdown.hybrid)
 }
 
+/// What the viewer calls `conversation` (upstream 3c2ffeb, `tui/ui.rs`): its
+/// title, else its summary, else its first previewed message, else its
+/// session id. Names a session's parent, subagents and forks.
+pub fn conversation_label(conversation: &Conversation) -> String {
+    let first_message = || {
+        let preview = &conversation.preview_first;
+        sanitize_preview(preview.split(" ... ").next().unwrap_or(preview))
+    };
+    let label = conversation
+        .custom_title
+        .as_deref()
+        .or(conversation.summary.as_deref())
+        .filter(|label| !label.trim().is_empty())
+        .map_or_else(first_message, sanitize_preview);
+    if label.is_empty() {
+        conversation.session_id.clone()
+    } else {
+        label
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Truncation
 // ---------------------------------------------------------------------------
 
-/// Sanitize preview text: drop everything between `<` and `>` (tag-like
-/// text), collapse newlines, tabs and runs of spaces to one space, trim.
+/// Sanitize preview text by removing XML-like tags and normalizing whitespace.
+/// A tag is removed only when its name also occurs as the other kind of tag
+/// (an opening tag with a closing one, or the reverse), so `a < b`, `Vec<T>`
+/// and a typed `<system-reminder>` stay as text.
 pub fn sanitize_preview(text: &str) -> String {
+    let tags: Vec<(usize, usize, &str, bool)> = text
+        .match_indices('<')
+        .filter_map(|(start, _)| {
+            let (len, name, closing) = markup_tag(&text[start..])?;
+            Some((start, start + len, name, closing))
+        })
+        .collect();
+    let paired = |name: &str, closing: bool| {
+        tags.iter()
+            .any(|&(_, _, other, other_closing)| other == name && other_closing != closing)
+    };
     let mut result = String::with_capacity(text.len());
-    let mut in_tag = false;
     let mut last_was_space = false;
+    let mut skip_until = 0;
+    let mut tags = tags
+        .iter()
+        .filter(|&&(_, _, name, closing)| paired(name, closing));
+    let mut next_tag = tags.next();
 
-    for ch in text.chars() {
+    for (i, ch) in text.char_indices() {
+        if let Some(&(start, end, _, _)) = next_tag
+            && i == start
+        {
+            skip_until = end;
+            next_tag = tags.next();
+        }
+        if i < skip_until {
+            continue;
+        }
         match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if in_tag => {}
-            '\n' | '\r' | '\t' => {
-                if !last_was_space {
-                    result.push(' ');
-                    last_was_space = true;
-                }
-            }
-            ' ' => {
+            '\n' | '\r' | '\t' | ' ' => {
                 if !last_was_space {
                     result.push(' ');
                     last_was_space = true;
@@ -313,6 +384,31 @@ pub fn sanitize_preview(text: &str) -> String {
     }
 
     result.trim().to_string()
+}
+
+/// The markup tag `text` starts with: its length, name and whether it closes.
+/// A tag is `<name ...>` or `</name>` on one line, with a name of ASCII
+/// letters, digits, `_`, `-`, `:` and `.` starting with a letter.
+fn markup_tag(text: &str) -> Option<(usize, &str, bool)> {
+    let rest = text.strip_prefix('<')?;
+    let (closing, rest) = match rest.strip_prefix('/') {
+        Some(rest) => (true, rest),
+        None => (false, rest),
+    };
+    let name_len = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '.')))
+        .unwrap_or(rest.len());
+    let name = &rest[..name_len];
+    if !name.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let after = &rest[name_len..];
+    let end = after.find(['>', '<', '\n'])?;
+    if !after[end..].starts_with('>') || (end > 0 && !after.starts_with(char::is_whitespace)) {
+        return None;
+    }
+    let len = text.len() - after.len() + end + 1;
+    Some((len, name, closing))
 }
 
 /// Keep a prefix of `text` that fits `max_width` cells, ending in `…` when
@@ -758,131 +854,118 @@ pub struct TermHit {
     pub term_idx: usize,
 }
 
-/// Text normalized for matching (lowercase, `_` as space) with a mapping
-/// back to byte ranges of the original text, for repeated searches.
-#[derive(Clone, Debug)]
-pub struct NormalizedText {
-    norm_chars: Vec<char>,
-    char_map: Vec<(usize, usize)>,
-}
-
-impl NormalizedText {
-    pub fn new(text: &str) -> Self {
-        let mut norm_chars: Vec<char> = Vec::new();
-        let mut char_map: Vec<(usize, usize)> = Vec::new();
-
-        let mut iter = text.char_indices().peekable();
-        while let Some((byte_start, ch)) = iter.next() {
-            let byte_end = iter.peek().map_or(text.len(), |(i, _)| *i);
-            if ch == '_' {
-                norm_chars.push(' ');
-                char_map.push((byte_start, byte_end));
-            } else {
-                for lc in ch.to_lowercase() {
-                    norm_chars.push(lc);
-                    char_map.push((byte_start, byte_end));
-                }
-            }
-        }
-
-        Self {
-            norm_chars,
-            char_map,
-        }
-    }
-
-    /// All non-overlapping matches of one normalized term, requiring a word
-    /// start when the term starts with an alphanumeric character (`red`
-    /// matches `redaction` but not `fired`). Byte ranges in the original.
-    pub fn find_term_ranges(&self, term: &str) -> Vec<(usize, usize)> {
-        let query_chars: Vec<char> = term.chars().collect();
-        if query_chars.is_empty() {
-            return Vec::new();
-        }
-
-        let query_starts_alnum = query_chars.first().is_some_and(|c| c.is_alphanumeric());
-        let mut matches = Vec::new();
-
-        let mut i = 0;
-        while i + query_chars.len() <= self.norm_chars.len() {
-            if self.norm_chars[i..i + query_chars.len()] == query_chars[..] {
-                let prev_is_alnum = i > 0 && self.norm_chars[i - 1].is_alphanumeric();
-                let valid_start = !query_starts_alnum || !prev_is_alnum;
-
-                if valid_start {
-                    let start_byte = self.char_map[i].0;
-                    let end_byte = self.char_map[i + query_chars.len() - 1].1;
-                    matches.push((start_byte, end_byte));
-                    i += query_chars.len();
-                } else {
-                    i += 1;
-                }
-            } else {
-                i += 1;
-            }
-        }
-
-        matches
-    }
-
-    /// Matches of every whitespace-separated term, sorted and merged;
-    /// ranges separated only by ` _ - /` are merged into one (so
-    /// `run with loader` highlights `run_with_loader` as one span).
-    pub fn find_all_ranges(&self, query_normalized: &str) -> Vec<(usize, usize)> {
-        let terms: Vec<&str> = query_normalized.split_whitespace().collect();
-        if terms.is_empty() {
-            return Vec::new();
-        }
-
-        let mut all_matches = Vec::new();
-        for term in &terms {
-            all_matches.extend(self.find_term_ranges(term));
-        }
-
-        // Sort and merge overlapping or separator-adjacent ranges.
-        // This ensures "run_with_loader" highlights as one span including the underscores
-        // when searching "run with loader" (underscores normalized to spaces).
-        all_matches.sort_unstable_by_key(|m| m.0);
-        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(all_matches.len());
-        for m in all_matches {
-            if let Some(last) = merged.last_mut() {
-                if m.0 <= last.1 {
-                    // Overlapping — merge
-                    last.1 = last.1.max(m.1);
-                    continue;
-                }
-                // Check if the gap between ranges is only separators (_, -, /)
-                let gap = &self.norm_chars[..];
-                let gap_start = self.byte_to_char_index(last.1);
-                let gap_end = self.byte_to_char_index(m.0);
-                if gap_start < gap_end
-                    && gap[gap_start..gap_end]
-                        .iter()
-                        .all(|c| *c == ' ' || *c == '_' || *c == '-' || *c == '/')
-                {
-                    last.1 = m.1;
-                    continue;
-                }
-            }
-            merged.push(m);
-        }
-
-        merged
-    }
-
-    /// Convert a byte offset in the original text to a char index in norm_chars
-    fn byte_to_char_index(&self, byte_offset: usize) -> usize {
-        self.char_map
-            .iter()
-            .position(|(start, _)| *start >= byte_offset)
-            .unwrap_or(self.char_map.len())
-    }
-}
-
-/// All matches of `query_normalized` in `text` (see
-/// [`NormalizedText::find_all_ranges`]), as byte ranges of `text`.
+/// All matches of `query_normalized` in `text` (words matched as keyword
+/// search matches them, see [`NormalizedText::query_ranges`]), as byte
+/// ranges of `text`; ranges separated only by word separators are merged
+/// (see [`merge_separated_ranges`]).
 pub fn find_normalized_match_ranges(text: &str, query_normalized: &str) -> Vec<(usize, usize)> {
-    NormalizedText::new(text).find_all_ranges(query_normalized)
+    merge_separated_ranges(
+        text,
+        NormalizedText::new(text).query_ranges(query_normalized),
+    )
+}
+
+/// Sorted `ranges` with those that overlap or are separated only by word
+/// separators merged, so `run_with_loader` highlights as one span for
+/// `run with loader`.
+fn merge_separated_ranges(text: &str, ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut()
+            && (start <= last.1 || text[last.1..start].chars().all(is_word_separator))
+        {
+            last.1 = last.1.max(end);
+            continue;
+        }
+        merged.push((start, end));
+    }
+    merged
+}
+
+/// [`merge_separated_ranges`] that keeps ranges on different lines apart, so
+/// each line of a multi-line text gets the ranges it would get on its own
+/// (fork addition, see [`ViewSearchQuery::match_ranges_in`]).
+fn merge_separated_ranges_in_lines(text: &str, ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut()
+            && (start <= last.1
+                || text[last.1..start]
+                    .chars()
+                    .all(|c| c != '\n' && is_word_separator(c)))
+        {
+            last.1 = last.1.max(end);
+            continue;
+        }
+        merged.push((start, end));
+    }
+    merged
+}
+
+// ---------------------------------------------------------------------------
+// Viewer search query
+// ---------------------------------------------------------------------------
+
+/// A viewer `/` search: query words match lines as they match conversations
+/// in the list, and quoted literals match exactly (upstream d2c0f07,
+/// `tui/ui.rs`).
+///
+/// A line matches when any query word matches it as keyword search matches
+/// conversations (normalized and case-folded, at word starts, anywhere when
+/// the query has CJK text) or a quoted or `_` literal matches it (word start,
+/// smart case), as [`HighlightQuery::has_match`].
+///
+/// Fork additions for viewers that search multi-line texts (the GUI's
+/// segments, [`crate::view::DocSearchIndex`]): [`Self::match_ranges`] and
+/// [`Self::match_ranges_in`] give each line the ranges
+/// [`HighlightQuery::match_ranges`] gives it on its own (separator-joined
+/// words merge into one range within a line, never across lines, as the TUI
+/// matched each rendered line), and [`Self::match_ranges_in`] reuses a
+/// [`NormalizedForm`] kept beside the text.
+#[derive(Clone, Debug, Default)]
+pub struct ViewSearchQuery(HighlightQuery);
+
+impl ViewSearchQuery {
+    pub fn parse(query: &str) -> Self {
+        Self(HighlightQuery::parse(query))
+    }
+
+    /// Whether the query has no words or literals (finds nothing).
+    pub fn is_empty(&self) -> bool {
+        self.0.unquoted.is_empty() && self.0.literals.is_empty()
+    }
+
+    /// Whether `text` has a match.
+    pub fn has_match(&self, text: &str) -> bool {
+        self.0.has_match(text)
+    }
+
+    /// Whether `matched` holds every word and literal of the query
+    /// ([`HighlightQuery::covers_all_terms`]).
+    pub fn covers_all_terms(&self, matched: &str) -> bool {
+        self.0.covers_all_terms(matched)
+    }
+
+    /// Whether `text` holds every word and literal of the query.
+    pub fn has_full_match(&self, text: &str) -> bool {
+        self.has_match(text) && self.covers_all_terms(text)
+    }
+
+    /// Merged byte ranges of the matches in `text`, per line (see the type).
+    pub fn match_ranges(&self, text: &str) -> Vec<(usize, usize)> {
+        self.match_ranges_in(text, &NormalizedForm::new(text))
+    }
+
+    /// [`Self::match_ranges`] with `form`, the [`NormalizedForm`] of `text`.
+    pub fn match_ranges_in(&self, text: &str, form: &NormalizedForm) -> Vec<(usize, usize)> {
+        let mut ranges = if self.0.unquoted.is_empty() {
+            Vec::new()
+        } else {
+            merge_separated_ranges_in_lines(text, form.query_ranges(text, &self.0.unquoted))
+        };
+        ranges.extend(match_literal_ranges(text, &self.0.literals));
+        merge_match_ranges(ranges)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -892,7 +975,7 @@ pub fn find_normalized_match_ranges(text: &str, query_normalized: &str) -> Vec<(
 /// A list query prepared for highlighting.
 ///
 /// Literals are the quoted literals plus unquoted terms containing `_`
-/// (identifier literals: exact substring, smart case). The remaining
+/// (identifier literals: matched at word starts, smart case). The remaining
 /// unquoted terms are normalized with
 /// [`crate::search::normalize_for_search`].
 #[derive(Clone, Debug, Default)]
@@ -983,6 +1066,17 @@ impl HighlightQuery {
             .collect()
     }
 
+    /// Whether `matched` holds every word and literal of the query, as a
+    /// match of the whole query, not one of its words, does (upstream
+    /// 949ec4e).
+    pub fn covers_all_terms(&self, matched: &str) -> bool {
+        let normalized = normalize_for_search(matched);
+        self.unquoted
+            .split_whitespace()
+            .all(|term| normalized.contains(term))
+            && self.literals.iter().all(|literal| literal.matches(matched))
+    }
+
     /// Whether any term or literal matches `text`.
     pub fn has_match(&self, text: &str) -> bool {
         !find_normalized_match_ranges(text, &self.unquoted).is_empty()
@@ -1021,9 +1115,9 @@ impl HighlightQuery {
 /// A term searched for in context snippets.
 #[derive(Clone, Debug)]
 pub enum ContextMatchSpec {
-    /// A normalized term (word-start, case-insensitive matching).
+    /// A normalized term, matched as keyword search counts it (folded; at word starts, or anywhere when it has CJK text; see [`NormalizedText::query_ranges`]).
     Normalized(String),
-    /// A literal (exact substring, smart case).
+    /// A literal (matched at word starts, smart case).
     Literal(Literal),
 }
 
@@ -1041,12 +1135,13 @@ impl ContextMatchSpec {
     pub fn find_ranges(
         &self,
         text: &str,
-        normalized: Option<&NormalizedText>,
+        normalized: Option<&NormalizedText<'_>>,
     ) -> Vec<(usize, usize)> {
         match self {
-            Self::Normalized(term) => normalized
-                .map(|normalized| normalized.find_all_ranges(term))
-                .unwrap_or_else(|| find_normalized_match_ranges(text, term)),
+            Self::Normalized(term) => match normalized {
+                Some(normalized) => merge_separated_ranges(text, normalized.query_ranges(term)),
+                None => find_normalized_match_ranges(text, term),
+            },
             Self::Literal(literal) => literal.match_ranges(text),
         }
     }
@@ -1075,7 +1170,7 @@ pub fn dedupe_context_specs(specs: &[ContextMatchSpec]) -> Vec<ContextMatchSpec>
 pub fn find_all_spec_hits(
     text: &str,
     specs: &[ContextMatchSpec],
-    normalized: Option<&NormalizedText>,
+    normalized: Option<&NormalizedText<'_>>,
 ) -> Vec<TermHit> {
     let mut all_hits = Vec::new();
     for (term_idx, spec) in specs.iter().enumerate() {
@@ -1242,7 +1337,7 @@ pub fn build_row_preview(input: &RowPreviewInput<'_>) -> RowPreview {
         .flatten();
     let lexical_context = lexical_evidence.and_then(|evidence| {
         build_context_segments_from_ranges(
-            &conv.full_text,
+            &evidence.text,
             &evidence.context_ranges,
             max_preview_len,
         )
@@ -1299,6 +1394,12 @@ pub struct RowHeaderInput<'a> {
     /// Prefix the project with the source label
     /// ([`crate::browser::Browser::has_multiple_sources`]).
     pub show_source_label: bool,
+    /// Prefix the project with the kind tag of an automated (`auto`) or
+    /// child (`sub`) conversation, after the source label
+    /// ([`crate::history::Provenance::list_label`], upstream cb990e6). Such
+    /// rows are listed only while [`crate::browser::Browser::all_kinds`] is
+    /// on.
+    pub show_kind_label: bool,
     /// Whether the list is in semantic mode.
     pub semantic_mode: bool,
     /// [`crate::browser::Browser::semantic_result_metadata`] of the row.
@@ -1310,15 +1411,19 @@ pub struct RowHeaderInput<'a> {
 /// The parts of a list row's header line, already fitted to the width.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RowHeader {
-    /// `project_name`, prefixed with `"CC  · "`, `"Pi  · "` or `"OMP · "`
-    /// for mixed sources; truncated with `…`. Empty without a project name.
+    /// `project_name`, prefixed with `"auto · "` or `"sub · "` for an
+    /// automated or child conversation, and with `"CC  · "`, `"Pi  · "`,
+    /// `"OMP · "` or `"CX  · "` for mixed sources; truncated with `…`. Empty
+    /// without a project name.
     pub project: HighlightedText,
     /// Custom title (shown after `" · "`), when there is room for it.
     pub custom_title: Option<HighlightedText>,
     /// Generated summary (shown after `" · "`), when there is room for it.
     pub summary: Option<HighlightedText>,
-    /// `"1 msg"` / `"<n> msgs"`.
-    pub message_count: String,
+    /// `"1 prompt"` / `"<n> prompts"`: the conversation's
+    /// [`Conversation::prompt_count`] (upstream e930cac; it showed every
+    /// message, tool calls and results included, as `"<n> msgs"` before).
+    pub prompt_count: String,
     /// Hybrid semantic score (semantic mode, rows at least 70 cells wide).
     pub semantic_score: Option<String>,
     /// Conversation duration, if known.
@@ -1332,7 +1437,7 @@ pub struct RowHeader {
 }
 
 /// Compose a row header for `width` cells (upstream `render_list`,
-/// inventory 4.3): the right block (message count, semantic score,
+/// inventory 4.3): the right block (prompt count, semantic score,
 /// duration, timestamp, separated by `" · "`) is kept whole; the project
 /// name is truncated first, rows narrower than 90 cells reserve
 /// `clamp(left/3, 10, 24)` cells for the title/summary, the title is shown
@@ -1344,7 +1449,7 @@ pub fn build_row_header(input: &RowHeaderInput<'_>) -> RowHeader {
     let conv = input.conversation;
     let width = input.width;
     let (timestamp, recency) = format_timestamp(conv.timestamp, input.now);
-    let message_count = format_msg_count_short(conv.message_count);
+    let prompt_count = count_label(conv.prompt_count, "prompt", "prompts");
     let duration = conv.duration_minutes.map(format_duration_minutes);
 
     let semantic_score = (input.semantic_mode && width >= 70)
@@ -1358,7 +1463,7 @@ pub fn build_row_header(input: &RowHeaderInput<'_>) -> RowHeader {
         .as_ref()
         .map(|d| UnicodeWidthStr::width(d.as_str()) + 3)
         .unwrap_or(0);
-    let right_len = UnicodeWidthStr::width(message_count.as_str())
+    let right_len = UnicodeWidthStr::width(prompt_count.as_str())
         + duration_len
         + semantic_meta_len
         + 3
@@ -1369,10 +1474,18 @@ pub fn build_row_header(input: &RowHeaderInput<'_>) -> RowHeader {
         .project_name
         .as_ref()
         .map(|name| {
+            let name = match conv
+                .provenance
+                .list_label()
+                .filter(|_| input.show_kind_label)
+            {
+                Some(kind) => format!("{kind} · {name}"),
+                None => name.to_string(),
+            };
             if input.show_source_label {
                 format!("{:<3} · {name}", conv.source.list_label())
             } else {
-                name.to_string()
+                name
             }
         })
         .unwrap_or_default();
@@ -1419,7 +1532,7 @@ pub fn build_row_header(input: &RowHeaderInput<'_>) -> RowHeader {
         project: HighlightedText::new(project_part, input.query),
         custom_title: custom_title_part.map(|text| HighlightedText::new(text, input.query)),
         summary: summary_part.map(|text| HighlightedText::new(text, input.query)),
-        message_count,
+        prompt_count,
         semantic_score,
         duration,
         timestamp,

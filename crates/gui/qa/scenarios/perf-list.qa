@@ -2,17 +2,28 @@
 # synth::corpus layout: 10 projects, 20k single-exchange sessions). Release
 # build, DESIGN 15.8 targets (FEATURES S-037, X-008, X-009, X-010):
 #   * UI-thread time per typed key <= 2 ms (list.ui_busy_max, milliseconds)
-#   * the pane's share of the install at the end of the load <= 16 ms
-#     (list.install_pane_max). The loader's share (list.loader_install_max) is
-#     core's Browser install: reported, not asserted (CCR in the hand-off).
+#   * the install at the end of the load <= 16 ms: the whole install, core's
+#     Browser install included (list.install_busy_max), and the pane's share
+#     of it (list.install_pane_max). The loader's share (list.loader_install_max)
+#     is core's and is gated through install_busy_max.
 #   * holding PageDown / Down through the whole list keeps the frame p95 <= 16 ms
 #     (the pane's and the main window's)
 #   * the UUID below is typed (36 keystrokes, each one set_query): the worst
 #     case of a paste; then pasted (one keystroke, `busy.paste` = the whole
 #     UI-thread update of the paste <= 2 ms; integrator, Phase C).
+# Store mode (upstream 358becb): the sandbox has no store yet, so the list is
+# ready once the initial reconcile pass published its first generation (the
+# newest sessions); the pass then swaps in a generation every few seconds.
+# Everything below waits until the pass has listed every session and its last
+# generation is shown. Every swap of a generation is an install: install_busy_max
+# (the whole poll that installed it, loader share included) covers the swaps of
+# the full 20k cards, install_pane_max only the pane's share of them.
 wait-loaded 180s
+wait-for list.total > 19999 600s
+wait-for list.reconciling == false 600s
 expect list.total > 19000
 timing list.install_pane_max < 16ms
+timing list.install_busy_max < 16ms
 type "synthetic"
 wait 50ms
 wait-for list.searching == false 10s

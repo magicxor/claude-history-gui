@@ -118,7 +118,7 @@ impl ListPane {
                 if !browser.filtered().is_empty() {
                     return None;
                 }
-                if browser.conversations().is_empty() {
+                if browser.history_is_empty() {
                     let mut actions = vec![StateAction::Refresh];
                     if self.time_filter.is_active() {
                         actions.push(StateAction::ClearTimeFilter);
@@ -160,27 +160,25 @@ impl ListPane {
                             .actions(&[StateAction::ClearSearch]),
                     );
                 }
-                if !self.exclude_projects.is_empty() {
-                    // L-079: `[tui] exclude_projects` keeps hiding rows (the core
-                    // keeps excluded rows in `conversations()`), so Show all alone
-                    // cannot help: name the cause and offer Settings.
-                    let list = self.exclude_projects.join(", ");
+                if let Some(exclusions) = self.exclusions() {
+                    // L-079: `[tui] exclude_projects` and `exclude_paths` keep
+                    // hiding rows (the core keeps excluded rows in
+                    // `conversations()`), so Show all alone cannot help: name the
+                    // cause and offer Settings.
                     if self.scope_is_workspace() {
                         return Some(
                             EmptyState::new(StateKind::Info, "No conversations in this scope")
                                 .description(format!(
-                                    "Switch to All or change the workspace. Excluded projects stay hidden: {list}."
+                                    "Switch to All or change the workspace. Excluded {} stay hidden: {}.",
+                                    exclusions.noun, exclusions.values
                                 ))
                                 .actions(&[StateAction::ShowAll, StateAction::OpenSettings]),
                         );
                     }
                     return Some(
-                        EmptyState::new(
-                            StateKind::Info,
-                            "Every conversation is in an excluded project",
-                        )
-                        .description(format!("Excluded in Settings (exclude_projects): {list}."))
-                        .actions(&[StateAction::OpenSettings]),
+                        EmptyState::new(StateKind::Info, exclusions.title)
+                            .description(format!("Excluded in Settings {}.", exclusions.keyed))
+                            .actions(&[StateAction::OpenSettings]),
                     );
                 }
                 Some(
@@ -190,6 +188,46 @@ impl ListPane {
                 )
             }
         }
+    }
+
+    /// The `[tui]` exclusions in effect, worded for the L-079 states; `None`
+    /// without any.
+    fn exclusions(&self) -> Option<Exclusions> {
+        let paths = self.browser.excluded_paths();
+        let parts: Vec<(&str, String)> = [
+            ("exclude_projects", self.exclude_projects.as_slice()),
+            ("exclude_paths", paths),
+        ]
+        .into_iter()
+        .filter(|(_, list)| !list.is_empty())
+        .map(|(key, list)| (key, list.join(", ")))
+        .collect();
+        let (title, noun) = match (self.exclude_projects.is_empty(), paths.is_empty()) {
+            (true, true) => return None,
+            (false, true) => ("Every conversation is in an excluded project", "projects"),
+            (true, false) => (
+                "Every conversation is in an excluded working directory",
+                "working directories",
+            ),
+            (false, false) => (
+                "Every conversation is excluded",
+                "projects and working directories",
+            ),
+        };
+        Some(Exclusions {
+            title,
+            noun,
+            values: parts
+                .iter()
+                .map(|(_, list)| list.as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+            keyed: parts
+                .iter()
+                .map(|(key, list)| format!("({key}): {list}"))
+                .collect::<Vec<_>>()
+                .join("; "),
+        })
     }
 
     /// Run a recovery action of an empty state.
@@ -276,4 +314,16 @@ impl EmptyState {
             .child(empty)
             .into_any_element()
     }
+}
+
+/// The exclusions behind an L-079 state.
+struct Exclusions {
+    /// The All-scope title.
+    title: &'static str,
+    /// What is excluded (`projects`, `working directories`).
+    noun: &'static str,
+    /// The excluded values (`a, b; /tmp/`).
+    values: String,
+    /// The values by key (`(exclude_projects): a, b; (exclude_paths): /tmp/`).
+    keyed: String,
 }

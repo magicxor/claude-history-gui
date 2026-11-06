@@ -123,7 +123,7 @@ pub(crate) fn test_semantic_metadata(
 /// A minimal Claude conversation at `path` (session id = file stem).
 pub(crate) fn plain_conversation(path: PathBuf) -> Conversation {
     Conversation {
-        source: crate::history::Source::Claude,
+        source: crate::history::model::SourceKind::Claude,
         session_id: path
             .file_stem()
             .and_then(|name| name.to_str())
@@ -132,25 +132,30 @@ pub(crate) fn plain_conversation(path: PathBuf) -> Conversation {
         path,
         index: 0,
         timestamp: chrono::Local::now(),
-        preview: String::new(),
-        preview_first: String::new(),
-        preview_last: String::new(),
-        full_text: String::new(),
-        agent_search_text: String::new(),
-        semantic_route_text: String::new(),
-        semantic_turns: Vec::new(),
+        preview: String::new().into(),
+        preview_first: String::new().into(),
+        preview_last: String::new().into(),
+        full_text: String::new().into(),
+        own_text: "".into(),
+        agent_search_text: String::new().into(),
+        semantic_route_text: String::new().into(),
+        semantic_turns: Vec::new().into(),
         semantic_turn_ranges: Vec::new(),
-        search_text_lower: String::new(),
         project_name: None,
         project_path: None,
         cwd: None,
+        cwds: Vec::new(),
         message_count: 0,
+        prompt_count: 0,
+        tool_call_count: 0,
         parse_errors: Vec::new(),
         summary: None,
         custom_title: None,
         model: None,
         total_tokens: 0,
         duration_minutes: None,
+        provenance: Default::default(),
+        parent: None,
     }
 }
 

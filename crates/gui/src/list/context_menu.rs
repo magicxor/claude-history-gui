@@ -16,7 +16,7 @@ use gpui_kit::{App, Pixels, Point, SharedString, Window};
 
 use crate::actions::RowMenu;
 use crate::keymap::binding_labels;
-use crate::model::{ConversationTarget, RowMenuItem};
+use crate::model::{ConversationTarget, RowMenuItem, SessionAct};
 use crate::services::services;
 use crate::workspace::routing::row_menu_action;
 
@@ -93,9 +93,22 @@ impl RowMenuModel {
 }
 
 /// The menu for `target` (§5.2). Resume, Fork, Rename and Delete need a known
-/// source and are disabled while the initial load runs (AD6).
-pub fn build(token: u64, target: &ConversationTarget, loading: bool, cx: &App) -> RowMenuModel {
-    let modify_disabled = loading || !target.can_modify();
+/// source whose capabilities allow them (upstream eea6d37: no Rename for a
+/// Codex thread, nothing for an orphaned one). While the initial load runs
+/// (`loading`) Rename and Delete are disabled; Resume and Fork only until
+/// the rows are listed newest first (`list_ready`: snapshot cards, AD6,
+/// upstream 3708bb6).
+pub fn build(
+    token: u64,
+    target: &ConversationTarget,
+    loading: bool,
+    list_ready: bool,
+    cx: &App,
+) -> RowMenuModel {
+    let resume_disabled = !list_ready || !target.allows(SessionAct::Resume);
+    let fork_disabled = !list_ready || !target.allows(SessionAct::Fork);
+    let rename_disabled = loading || !target.allows(SessionAct::Rename);
+    let delete_disabled = loading || !target.allows(SessionAct::Delete);
     let item = |label: &'static str, item: RowMenuItem, disabled: bool| {
         let action = row_menu_action(item);
         let shortcut = binding_labels(action.as_ref(), MENU_STACK, cx)
@@ -110,9 +123,9 @@ pub fn build(token: u64, target: &ConversationTarget, loading: bool, cx: &App) -
     };
     let mut entries = vec![
         item("Open", RowMenuItem::Open, false),
-        item("Resume", RowMenuItem::Resume, modify_disabled),
-        item("Fork", RowMenuItem::Fork, modify_disabled),
-        item("Rename…", RowMenuItem::Rename, modify_disabled),
+        item("Resume", RowMenuItem::Resume, resume_disabled),
+        item("Fork", RowMenuItem::Fork, fork_disabled),
+        item("Rename…", RowMenuItem::Rename, rename_disabled),
         item("Export…", RowMenuItem::Export, false),
         MenuEntry::Submenu {
             label: "Copy to clipboard".into(),
@@ -158,7 +171,7 @@ pub fn build(token: u64, target: &ConversationTarget, loading: bool, cx: &App) -
     ));
     entries.push(item("Outline", RowMenuItem::Outline, false));
     entries.push(MenuEntry::Separator);
-    entries.push(item("Delete…", RowMenuItem::Delete, modify_disabled));
+    entries.push(item("Delete…", RowMenuItem::Delete, delete_disabled));
     RowMenuModel {
         token,
         path: target.path.clone(),

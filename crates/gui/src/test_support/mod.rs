@@ -54,13 +54,15 @@ use crate::workspace::Workspace;
 static REDIRECT_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 /// Variables the redirect points into the temp root (relative to its `home`).
-pub const REDIRECTED_VARS: [(&str, &str); 10] = [
+pub const REDIRECTED_VARS: [(&str, &str); 12] = [
     ("HOME", ""),
     ("USERPROFILE", ""),
     ("CLAUDE_CONFIG_DIR", ".claude"),
     ("PI_CODING_AGENT_DIR", ".pi/agent"),
     ("PI_CODING_AGENT_SESSION_DIR", ".pi/sessions"),
     ("PI_CONFIG_DIR", ".omp"),
+    ("CODEX_HOME", ".codex"),
+    ("CODEX_SQLITE_HOME", ".codex"),
     ("XDG_DATA_HOME", ".local/share"),
     ("XDG_CONFIG_HOME", ".config"),
     ("XDG_CACHE_HOME", ".cache"),
@@ -231,10 +233,21 @@ impl Global for TestLaunch {}
 // ---------------------------------------------------------------------------
 
 /// A sandbox home with Claude/Pi/OMP data, config and caches in a temp dir.
+/// The directory is removed once the world and every list pane opened on it
+/// are gone (see [`WorldDir`]).
 pub struct TestWorld {
-    pub tmp: tempfile::TempDir,
+    pub tmp: Arc<tempfile::TempDir>,
     pub env: HistoryEnv,
 }
+
+/// The world's directory, held by each list pane of the test app: the pane's
+/// loader (dropped first) gives up and joins its reconcile pass before the
+/// directory can go, so no pass writes into a removed world (the app, and
+/// its panes, outlive the test function's locals).
+#[derive(Clone)]
+pub struct WorldDir(pub Arc<tempfile::TempDir>);
+
+impl gpui_kit::Global for WorldDir {}
 
 impl Default for TestWorld {
     fn default() -> Self {
@@ -251,7 +264,10 @@ impl TestWorld {
         let env = HistoryEnv::sandbox(tmp.path());
         std::fs::create_dir_all(tmp.path().join(".claude").join("projects"))
             .expect("create the projects dir");
-        Self { tmp, env }
+        Self {
+            tmp: Arc::new(tmp),
+            env,
+        }
     }
 
     /// The sandbox home.
@@ -425,6 +441,21 @@ fn ensure_app(cx: &mut TestAppContext, world: &TestWorld, args: &[&str]) {
     cx.executor().allow_parking();
 }
 
+/// The transcript of the session file `path`, decoded as a loose file (core
+/// `history::sources::decode_path`): the input of an expected export.
+pub fn transcript(path: &Path) -> claude_history_core::history::model::Transcript {
+    claude_history_core::history::sources::decode_path(path, None, false)
+        .expect("the session decodes")
+}
+
+/// Initialise the test app on `world` with `args` and the list's store off:
+/// the window opened next loads the history in memory (tests of that path;
+/// `app::init_for_test` turns the store on).
+pub fn use_memory_list(cx: &mut TestAppContext, world: &TestWorld, args: &[&str]) {
+    ensure_app(cx, world, args);
+    cx.update(|cx| cx.set_global(crate::list::ListSnapshots(false)));
+}
+
 /// Open the production main window on `world` with command-line `args`.
 /// The window is activated like the real app's window (the GPUI test
 /// platform starts windows inactive, and an inactive window reports no
@@ -506,6 +537,20 @@ pub fn recording(cx: &TestAppContext) -> Arc<RecordingServices> {
             .recording
             .expect("tests run with RecordingServices")
     })
+}
+
+/// Every terminal command `recording` saw, as the text that holds its command
+/// line: the display string, or for a launch through a script (macOS
+/// Terminal.app: `open -a Terminal <fresh path>`) the script itself.
+pub fn terminal_command_lines(recording: &RecordingServices) -> Vec<String> {
+    recording
+        .terminal_commands()
+        .iter()
+        .map(|command| match &command.script {
+            Some(script) => script.contents.clone(),
+            None => command.display(),
+        })
+        .collect()
 }
 
 /// The platform label of a keystroke as the keymap and the hints show it

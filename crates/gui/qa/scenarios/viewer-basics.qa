@@ -22,13 +22,25 @@ expect viewer.indicator == "[1/9]"
 set-theme light
 shot viewer-basics-light-summary
 
-# t cycles sum → trn → all → sum; T and i toggle (V-010, V-048, V-062).
+# t cycles sum → cal → trn → all → off → sum; T and i toggle (V-010, V-048, V-062). Calls
+# (upstream a60dfe9) lists each tool call on one row; Off (upstream d0aca95) shows the
+# conversation text only.
+key t
+wait-for viewer.loading == false 5s
+expect viewer.tool_display == cal
+expect viewer.items > 0
+shot viewer-basics-light-calls
 key t
 wait-for viewer.loading == false 5s
 expect viewer.tool_display == trn
 key t
 wait-for viewer.loading == false 5s
 expect viewer.tool_display == all
+key t
+wait-for viewer.loading == false 5s
+expect viewer.tool_display == off
+expect viewer.items > 0
+shot viewer-basics-light-off
 key t
 wait-for viewer.loading == false 5s
 expect viewer.tool_display == sum
@@ -43,6 +55,9 @@ wait-for viewer.loading == false 5s
 expect viewer.timing == false
 
 # Truncated tool output with thinking (light).
+key t
+wait-for viewer.loading == false 5s
+expect viewer.tool_display == cal
 key t
 wait-for viewer.loading == false 5s
 expect viewer.tool_display == trn
@@ -91,6 +106,9 @@ expect focus == viewer
 
 # A narrow window: the header summary moves to its own line, the wide table scrolls (V-004,
 # V-018), and truncation follows the new width (V-080).
+key t
+wait-for viewer.loading == false 5s
+expect viewer.tool_display == off
 key t
 wait-for viewer.loading == false 5s
 expect viewer.tool_display == sum

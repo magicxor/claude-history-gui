@@ -128,21 +128,32 @@ fn continue_read_lines_become_commands() {
     assert!(continue_commands("nothing to continue").is_empty());
 }
 
-/// D-014: candidates carry the full ref, computed from the directory and
-/// file of the candidate line.
+/// D-014: candidates carry the full ref of the discovered key matching the
+/// directory and file of the candidate line (429d123: refs digest the
+/// source instance, so no key means the handle stays).
 #[test]
 fn candidate_handles_expand_to_full_refs() {
-    use claude_history_core::agent::refs::AgentConversationRef;
-    let full = AgentConversationRef::from_parts("-proj", "a.jsonl").full_ref();
+    use claude_history_core::agent::refs::AgentConversationKey;
+    let claude = AgentConversationKey::new(
+        "-proj",
+        "a.jsonl",
+        std::path::PathBuf::from("/projects/-proj/a.jsonl"),
+    );
+    let full = claude.conversation_ref().full_ref();
     let detail = "ambiguous conversation ref; retry with one of these ch_ handles; candidates: ch_aaaaaaaaaaaa project=pr_1 source=claude directory=-proj file=a.jsonl\n  ch_bbbbbbbbbbbb project=pr_2 source=pi directory=x file=a.jsonl";
-    let expanded = expand_handles(detail, &[]);
+    assert_eq!(
+        expand_handles(detail, &[]),
+        detail,
+        "candidates without a discovered key keep their handle"
+    );
+    let expanded = expand_handles(detail, std::slice::from_ref(&claude));
     assert!(
         expanded.contains(&format!("candidates: {full} project=pr_1")),
         "{expanded}"
     );
     assert!(
         expanded.contains("\n  ch_bbbbbbbbbbbb project=pr_2"),
-        "non-Claude candidates without a discovered key keep their handle: {expanded}"
+        "a candidate without a matching key keeps its handle: {expanded}"
     );
     // With the discovered keys a Pi candidate becomes a durable full ref too.
     let mut pi = claude_history_core::agent::refs::AgentConversationKey::new(
@@ -150,9 +161,9 @@ fn candidate_handles_expand_to_full_refs() {
         "a.jsonl",
         std::path::PathBuf::from("x/a.jsonl"),
     );
-    pi.source = claude_history_core::history::Source::Pi;
+    pi.source = claude_history_core::history::model::SourceKind::Pi;
     pi.session_id = "pi-session".to_string();
-    let with_keys = expand_handles(detail, std::slice::from_ref(&pi));
+    let with_keys = expand_handles(detail, &[claude.clone(), pi.clone()]);
     let pi_full = pi.conversation_ref().full_ref();
     assert!(
         with_keys.contains(&format!("\n  {pi_full} project=pr_2")),
@@ -165,6 +176,27 @@ fn candidate_handles_expand_to_full_refs() {
     assert_eq!(
         crate::deep_search::results::ambiguous_candidates(&expanded)[0],
         full
+    );
+}
+
+/// 9718bf8: a Codex candidate becomes a durable full ref through its
+/// discovered key (the ref digests the canonical Codex home and the thread id).
+#[test]
+fn codex_candidate_handles_expand_through_discovered_keys() {
+    let detail = "ambiguous conversation ref; retry with one of these ch_ handles; candidates: ch_cccccccccccc project=pr_3 source=codex directory=/work/x file=rollout-a.jsonl";
+    assert_eq!(expand_handles(detail, &[]), detail);
+    let mut codex = claude_history_core::agent::refs::AgentConversationKey::new(
+        "/work/x",
+        "rollout-a.jsonl",
+        std::path::PathBuf::from("rollout-a.jsonl"),
+    );
+    codex.source = claude_history_core::history::model::SourceKind::Codex;
+    codex.session_id = "01a00000-0000-7000-8000-000000000003".to_string();
+    let expanded = expand_handles(detail, std::slice::from_ref(&codex));
+    let full = codex.conversation_ref().full_ref();
+    assert!(
+        expanded.contains(&format!("candidates: {full} project=pr_3")),
+        "{expanded}"
     );
 }
 

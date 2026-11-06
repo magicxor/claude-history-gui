@@ -11,7 +11,9 @@ use gpui_kit::{Focusable as _, Keystroke, ScrollDelta, TestAppContext, point, px
 use crate::exit;
 use crate::keymap;
 use crate::list::ListPaneEvent;
-use crate::test_support::fixtures_list::{ListFixture, listed_corpus, workspace_corpus};
+use crate::test_support::fixtures_list::{
+    ListFixture, SessionSpec, listed_corpus, workspace_corpus,
+};
 use crate::test_support::{TestWorld, recording, synth};
 
 fn corpus(n: usize) -> TestWorld {
@@ -404,9 +406,14 @@ fn clicking_the_selected_row_previews_it_again(cx: &mut TestAppContext) {
 fn loading_gates_the_modifying_actions(cx: &mut TestAppContext) {
     let world = TestWorld::new();
     listed_corpus(&world);
+    // Store off: the in-memory loader streams batches.
+    crate::test_support::use_memory_list(cx, &world, &[]);
     let f = ListFixture::open_paused(cx, &world, &[]);
-    f.step_until(cx, "the first batch", |list| {
-        !list.loading_snapshots().is_empty()
+    // Two rows while loading (the first batch can be a single Pi row).
+    f.step_until(cx, "two rows while loading", |list| {
+        list.loading_snapshots()
+            .iter()
+            .any(|snapshot| snapshot.rows >= 2)
     });
     assert!(f.read(cx, |list, _| list.is_loading()));
     // A terminal stdout makes an ungated Ctrl+O open the print confirmation
@@ -609,7 +616,16 @@ fn scope_toggles_with_tab_and_a_workspace(cx: &mut TestAppContext) {
     );
     assert!(f.read(cx, |list, _| list.has_workspace()));
     assert!(f.read(cx, |list, _| list.scope_is_workspace()), "C-003");
-    assert_eq!(f.read(cx, |list, _| list.prompt_text()), "Project ❯");
+    assert_eq!(
+        f.read(cx, |list, _| list.prompt_text()),
+        format!(
+            "{} ❯",
+            std::path::Path::new("~")
+                .join("work")
+                .join("proj")
+                .display()
+        )
+    );
     f.wait_idle(cx);
     let titles = f.titles(cx);
     assert_eq!(titles.len(), 4, "{titles:?}: proj and its worktree only");
@@ -630,6 +646,49 @@ fn scope_toggles_with_tab_and_a_workspace(cx: &mut TestAppContext) {
     f.wait_idle(cx);
     assert!(f.read(cx, |list, _| list.scope_is_workspace()));
     assert_eq!(f.titles(cx), titles);
+}
+
+/// L-044, L-045 (upstream 82b355a): the Workspace scope also lists a
+/// conversation stored under another project that worked in the workspace
+/// or a folder below it, but not one that only worked beside it.
+#[gpui_kit::test]
+fn workspace_scope_lists_conversations_that_worked_in_it(cx: &mut TestAppContext) {
+    let world = TestWorld::new();
+    let (proj, _worktree, _api) = workspace_corpus(&world);
+    let work = proj.parent().unwrap().to_path_buf();
+    let messages = [
+        ("user", "started in the parent"),
+        ("assistant", "ok"),
+        ("user", "then moved"),
+    ];
+    for (number, summary, moved_to) in [
+        (201, "moved session", proj.join("src")),
+        (202, "sibling session", work.join("proj-other")),
+    ] {
+        SessionSpec::new("work", number)
+            .cwd(work.clone())
+            .moves_to(moved_to)
+            .messages(&messages)
+            .summary(summary)
+            .write(&world);
+    }
+    let f = ListFixture::open_loaded(
+        cx,
+        &world,
+        &["--workspace", &proj.display().to_string(), "-L"],
+    );
+    f.wait_idle(cx);
+    let titles = f.titles(cx);
+    assert!(titles.iter().any(|t| t == "moved session"), "{titles:?}");
+    assert!(!titles.iter().any(|t| t == "sibling session"), "{titles:?}");
+    assert_eq!(
+        titles.len(),
+        5,
+        "{titles:?}: proj, its worktree and the moved one"
+    );
+    f.press(cx, "tab");
+    f.wait_idle(cx);
+    assert_eq!(f.paths(cx).len(), 8);
 }
 
 /// L-046: without a workspace Tab does not toggle the scope and moves focus on.
@@ -671,6 +730,44 @@ fn excluded_projects_are_hidden(cx: &mut TestAppContext) {
         names.iter().flatten().any(|name| name == "api"),
         "other projects stay listed: {names:?}"
     );
+}
+
+/// L-107 (upstream 982aea9): the shared `[tui] exclude_paths` hides the
+/// conversations whose recorded working directory starts with a listed
+/// prefix, Claude, Pi and OMP alike (a prefix also covers the worktrees
+/// below it); a pasted session ID still shows one (L-050), and clearing the
+/// query hides it again.
+#[gpui_kit::test]
+fn excluded_working_directories_are_hidden(cx: &mut TestAppContext) {
+    let world = TestWorld::new();
+    listed_corpus(&world);
+    let proj = synth::cwd_base().join("proj");
+    world.write_config(
+        Some(&format!(
+            "[tui]\nexclude_paths = ['/tmp/', '{}']\n",
+            proj.display()
+        )),
+        None,
+    );
+    let f = ListFixture::open_loaded(cx, &world, &[]);
+    let names = |cx: &TestAppContext| -> Vec<Option<String>> {
+        f.read(cx, |list, _| {
+            (0..list.browser().filtered().len())
+                .map(|pos| list.browser().row(pos).unwrap().project_name.clone())
+                .collect()
+        })
+    };
+    assert_eq!(
+        names(cx),
+        vec![Some("api".to_string()), Some("api".to_string())],
+        "only the conversations outside /tmp/ and the proj tree stay"
+    );
+    f.type_text(cx, &synth::uuid(1));
+    f.wait_idle(cx);
+    assert_eq!(f.paths(cx).len(), 1, "the session ID opens an excluded row");
+    f.press(cx, "escape");
+    f.wait_idle(cx);
+    assert_eq!(names(cx).len(), 2, "the excluded row is hidden again");
 }
 
 /// L-023: the preview shows the last messages first, or the first with `--first`.
@@ -793,4 +890,29 @@ fn a_row_click_takes_the_focus_back(cx: &mut TestAppContext) {
         );
     })
     .unwrap();
+}
+
+/// §10.5: a kept selection whose row moved (refreshed semantic results keep the
+/// path, not the index) is scrolled back into view without a new event.
+#[gpui_kit::test]
+fn a_selected_row_that_moved_is_scrolled_into_view(cx: &mut TestAppContext) {
+    let world = corpus(200);
+    let f = ListFixture::open_loaded(cx, &world, &[]);
+    cx.update_window(f.handle, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    let before = f.read(cx, |list, _| list.scroll_offset());
+    f.list.update(cx, |list, cx| {
+        list.browser.select(150);
+        // The row was at another index when the path was last emitted.
+        list.emitted_selection = list.browser.selected_path();
+        list.emitted_position = Some(0);
+        list.emit_selection(false, cx);
+    });
+    cx.update_window(f.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let after = f.read(cx, |list, _| list.scroll_offset());
+    assert_ne!(before, after, "the viewport followed the moved row");
 }

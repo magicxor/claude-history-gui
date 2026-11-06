@@ -3,7 +3,8 @@
 use super::Browser;
 use super::index::{ScopeFilter, ScopeIndex, ScopeSettings};
 use crate::env::WorkspaceScope;
-use crate::history::{Conversation, Source};
+use crate::history::Conversation;
+use crate::history::model::SourceKind;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,6 +28,8 @@ impl Browser {
             indices,
             &self.conversations,
             &self.excluded_projects,
+            &self.excluded_paths,
+            self.all_kinds,
             self.workspace_filter,
             self.workspace.as_ref(),
         )
@@ -42,7 +45,9 @@ impl Browser {
     pub(super) fn scope_settings(&self) -> ScopeSettings {
         ScopeSettings {
             excluded: self.excluded_projects.clone(),
+            excluded_paths: self.excluded_paths.clone(),
             workspace: self.effective_workspace().cloned(),
+            all_kinds: self.all_kinds,
         }
     }
 
@@ -50,7 +55,9 @@ impl Browser {
     pub(super) fn scope_is_current(&self) -> bool {
         self.index.scope.is_current(
             &self.excluded_projects,
+            &self.excluded_paths,
             self.effective_workspace(),
+            self.all_kinds,
             self.conversations.len(),
         )
     }
@@ -59,7 +66,12 @@ impl Browser {
     /// in a way an incremental update could not follow (O(n)).
     pub(super) fn ensure_scope(&mut self) {
         if !self.scope_is_current() {
-            self.index.scope = ScopeIndex::compute(&self.conversations, self.scope_settings());
+            if self.snapshot.is_some() {
+                // Generation mode: from the cards' scope.
+                self.set_generation_scope();
+            } else {
+                self.index.scope = ScopeIndex::compute(&self.conversations, self.scope_settings());
+            }
         }
     }
 
@@ -198,7 +210,7 @@ impl Browser {
     }
 
     /// Source of the selected conversation.
-    pub fn selected_source(&self) -> Option<Source> {
+    pub fn selected_source(&self) -> Option<SourceKind> {
         self.selected_conversation_index()
             .map(|index| self.conversations[index].source)
     }
@@ -216,9 +228,13 @@ impl Browser {
             .map(|index| self.conversations[index].as_ref())
     }
 
-    /// Whether the loaded corpus mixes Claude, Pi and OMP sessions (rows
-    /// then show a `CC`/`Pi`/`OMP` source label).
+    /// Whether the loaded corpus (or the generation shown) mixes Claude, Pi
+    /// and OMP sessions (rows then show a `CC`/`Pi`/`OMP` source label).
     pub fn has_multiple_sources(&self) -> bool {
+        if self.snapshot.is_some() && !self.generation_open() {
+            // Only the first cards are rows: ask the generation (upstream).
+            return self.cards_mixed_sources();
+        }
         self.index.mixed_sources()
     }
 
@@ -232,19 +248,27 @@ impl Browser {
     }
 }
 
-/// Exclusions first, then the workspace scope (upstream
+/// Hidden kinds (unless `all_kinds`), project and working-directory
+/// exclusions, then the workspace scope (upstream
 /// `filter_conversation_indices`); see [`ScopeFilter`] for the rules.
 pub(super) fn filter_conversation_indices<I>(
     indices: I,
     conversations: &[Arc<Conversation>],
     excluded_projects: &HashSet<String>,
+    excluded_paths: &[String],
+    all_kinds: bool,
     workspace_filter: bool,
     workspace: Option<&WorkspaceScope>,
 ) -> Vec<usize>
 where
     I: IntoIterator<Item = usize>,
 {
-    let mut filter = ScopeFilter::new(excluded_projects, workspace.filter(|_| workspace_filter));
+    let mut filter = ScopeFilter::new(
+        excluded_projects,
+        excluded_paths,
+        workspace.filter(|_| workspace_filter),
+        all_kinds,
+    );
     indices
         .into_iter()
         .filter(|&idx| filter.passes(&conversations[idx]))

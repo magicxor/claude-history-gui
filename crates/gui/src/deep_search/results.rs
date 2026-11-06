@@ -113,8 +113,9 @@ pub fn project_label(
         .and_then(|info| lookup.and_then(|lookup| lookup(&info.path)))
         .filter(|label| !label.is_empty());
     let decoded = || {
-        let info =
-            info.filter(|info| info.source == claude_history_core::history::Source::Claude)?;
+        let info = info.filter(|info| {
+            info.source == claude_history_core::history::model::SourceKind::Claude
+        })?;
         let dir = info.path.parent()?.file_name()?.to_str()?;
         Some(claude_history_core::history::format_short_name_from_path(
             std::path::Path::new(&claude_history_core::history::path::decode_project_dir_name(dir)),

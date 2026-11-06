@@ -22,7 +22,7 @@ use crate::agent::protocol::{OutlineItem, ProtocolFocus, ProtocolOptions, ReadMe
 use crate::agent::refs::ResolvedConversation;
 use crate::agent::search::{AgentOutputHit, AgentProtocolKind, AgentSearchOutput};
 use crate::agent::service::AgentNotice;
-use crate::history::Source;
+use crate::history::model::SourceKind;
 use std::path::PathBuf;
 
 /// A conversation referenced by a result, with where it lives.
@@ -36,7 +36,7 @@ pub struct AgentConversationInfo {
     pub uuid: String,
     /// The protocol's project id.
     pub project_id: String,
-    pub source: Source,
+    pub source: SourceKind,
     /// Session id (Claude: file stem; Pi/OMP: header id).
     pub session_id: String,
     /// Transcript file name.

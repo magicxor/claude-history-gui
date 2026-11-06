@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use claude_history_core::history::Source;
+use claude_history_core::history::model::SourceKind;
 use claude_history_core::maintenance::{execute_session_delete, plan_session_delete};
 use gpui_kit::{AppContext as _, TestAppContext};
 
@@ -96,7 +96,7 @@ fn delete_plan_lists_every_copy_and_folder(cx: &mut TestAppContext) {
     let f = OpsFixture::open(cx, &world, &[]);
 
     let env = cx.read(|cx| crate::globals::app_state(cx).env_with_workspace());
-    let plan = plan_session_delete(&env, &copies.first, Source::Claude).unwrap();
+    let plan = plan_session_delete(&env, &copies.first, SourceKind::Claude).unwrap();
     let items = delete::plan_items(&plan);
     let paths: Vec<PathBuf> = items.iter().map(|item| item.path.clone()).collect();
     for expected in [
@@ -119,10 +119,10 @@ fn delete_plan_lists_every_copy_and_folder(cx: &mut TestAppContext) {
     f.press(cx, "n");
     f.settle(cx);
 
-    let pi_plan = plan_session_delete(&env, &f.target(cx, &pi).path, Source::Pi).unwrap();
+    let pi_plan = plan_session_delete(&env, &f.target(cx, &pi).path, SourceKind::Pi).unwrap();
     assert_eq!(delete::plan_items(&pi_plan).len(), 1);
     assert_eq!(delete::consequence_text(&pi_plan), "This can't be undone.");
-    let omp_plan = plan_session_delete(&env, &f.target(cx, &omp).path, Source::Omp).unwrap();
+    let omp_plan = plan_session_delete(&env, &f.target(cx, &omp).path, SourceKind::Omp).unwrap();
     assert_eq!(
         delete::plan_items(&omp_plan).len(),
         2,
@@ -382,7 +382,7 @@ fn tampered_plans_are_refused(cx: &mut TestAppContext) {
     let f = OpsFixture::open(cx, &world, &[]);
     let _ = f;
     let env = world.env.clone();
-    let mut plan = plan_session_delete(&env, &path, Source::Claude).unwrap();
+    let mut plan = plan_session_delete(&env, &path, SourceKind::Claude).unwrap();
     plan.files.push(victim.clone());
     let failure = execute_session_delete(&env, &plan).unwrap_err();
     assert!(failure.partial.removed_files.is_empty());

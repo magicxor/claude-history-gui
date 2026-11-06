@@ -1,8 +1,9 @@
 //! claude-history-core: the UI-agnostic core of claude-history-gui.
 //!
 //! Derived from claude-history (<https://github.com/raine/claude-history>,
-//! v0.1.76, commit 8d4cf67), Copyright (c) 2024 Raine, MIT licensed; see
-//! `LICENSE-MIT` in this crate. The upstream terminal UI, CLI parsing and
+//! v0.1.76, commit 8d4cf67; backported commit by commit up to v0.1.80, commit
+//! 38b1267, see the README's "Upstream sync"), Copyright (c) 2024 Raine, MIT
+//! licensed; see `LICENSE-MIT` in this crate. The upstream terminal UI, CLI parsing and
 //! self-updater are not part of this crate.
 //!
 //! Every input that upstream read from the process (home directory,
@@ -10,17 +11,9 @@
 //! an explicit [`env::HistoryEnv`]; see that module for the default data
 //! locations, which are isolated from the installed CLI.
 
-// Style lints that newer clippy versions raise on code kept verbatim from
-// upstream. Allowed crate-wide to keep the diff against upstream minimal.
-#![allow(
-    clippy::derivable_impls,
-    clippy::needless_return,
-    clippy::obfuscated_if_else,
-    clippy::unnecessary_sort_by,
-    clippy::useless_vec
-)]
-
 pub mod agent;
+pub mod bench;
+pub mod case_fold;
 pub mod claude;
 pub mod commands;
 pub mod config;
@@ -33,6 +26,7 @@ pub mod markdown;
 pub mod program;
 pub mod search;
 pub mod semantic;
+pub mod store;
 pub mod syntax;
 pub mod text_match;
 pub mod theme;

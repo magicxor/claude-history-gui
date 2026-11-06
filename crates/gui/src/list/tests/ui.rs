@@ -2,8 +2,6 @@
 //! picker banner and the row layout in a window (L-011…L-013, L-040,
 //! L-041, L-048, L-049, L-068, L-081, L-084, L-089, L-090).
 
-use std::sync::atomic::Ordering;
-
 use chrono::{Duration, Utc};
 use claude_history_core::config::{KeyBindings, parse_key_binding};
 use claude_history_core::export::ExportFormat;
@@ -14,8 +12,10 @@ use gpui_kit::{Entity, TestAppContext, px};
 use crate::keymap;
 use crate::list::ListPaneEvent;
 use crate::list::context_menu::MenuEntry;
-use crate::list::footer::{ChipKind, FooterModel};
-use crate::list::toolbar::{NO_WORKSPACE_TOOLTIP, WORKSPACE_TOOLTIP};
+use crate::list::footer::{ChipKind, FooterModel, chip_width_rem};
+use crate::list::toolbar::{
+    NO_WORKSPACE_TOOLTIP, USER_ONLY_SEMANTIC_TOOLTIP, USER_ONLY_TOOLTIP, WORKSPACE_TOOLTIP,
+};
 use crate::list::workspace_picker::IS_DIR_CALLS;
 use crate::model::RowMenuItem;
 use crate::test_support::fixtures_list::{ListFixture, SessionSpec, listed_corpus};
@@ -49,6 +49,8 @@ fn chip(model: &FooterModel, kind: ChipKind) -> Option<String> {
 fn footer_hints_follow_the_keymap_and_the_focus(cx: &mut TestAppContext) {
     let world = TestWorld::new();
     listed_corpus(&world);
+    // Store off: the in-memory loader streams batches.
+    crate::test_support::use_memory_list(cx, &world, &[]);
     let f = ListFixture::open_paused(cx, &world, &[]);
     f.step_until(cx, "the first batch", |list| {
         !list.loading_snapshots().is_empty()
@@ -318,7 +320,7 @@ fn the_row_menu_disables_modifying_items_while_loading(cx: &mut TestAppContext) 
     listed_corpus(&world);
     let f = ListFixture::open_loaded(cx, &world, &[]);
     let target = f.read(cx, |list, _| list.selected_target()).unwrap();
-    let model = cx.read(|cx| crate::list::context_menu::build(1, &target, true, cx));
+    let model = cx.read(|cx| crate::list::context_menu::build(1, &target, true, false, cx));
     for label in ["Resume", "Fork", "Rename…", "Delete…"] {
         assert!(model.is_disabled(label), "{label}");
     }
@@ -326,13 +328,341 @@ fn the_row_menu_disables_modifying_items_while_loading(cx: &mut TestAppContext) 
     // An unknown source disables them too.
     let mut unknown = target.clone();
     unknown.source = None;
-    let model = cx.read(|cx| crate::list::context_menu::build(2, &unknown, false, cx));
+    let model = cx.read(|cx| crate::list::context_menu::build(2, &unknown, false, true, cx));
     assert!(model.is_disabled("Resume") && model.is_disabled("Delete…"));
     // The header session ID differs only for Pi/OMP-style ids.
     assert!(
         !model.labels().iter().any(|l| l == "Copy header session ID")
             || unknown.header_id_differs()
     );
+}
+
+/// PD3 rule 3 (c): a directory recorded only by automated or child Codex
+/// threads (hidden from the list) is no recorded cwd; a listed thread's is.
+#[gpui_kit::test]
+fn recorded_agent_cwds_skip_hidden_codex_threads(cx: &mut TestAppContext) {
+    let hidden = TestWorld::new();
+    for (name, bytes) in [
+        (
+            "rollout-2026-09-02T11-00-00-01a00000-0000-7000-8000-000000000006.jsonl",
+            &include_bytes!(
+                "../../../../core/tests/fixtures/codex/sessions/2026/09/02/rollout-2026-09-02T11-00-00-01a00000-0000-7000-8000-000000000006.jsonl"
+            )[..],
+        ),
+        (
+            "rollout-2026-09-02T12-00-00-01a00000-0000-7000-8000-000000000007.jsonl",
+            &include_bytes!(
+                "../../../../core/tests/fixtures/codex/sessions/2026/09/02/rollout-2026-09-02T12-00-00-01a00000-0000-7000-8000-000000000007.jsonl"
+            )[..],
+        ),
+    ] {
+        hidden.add_fixture(&format!(".codex/sessions/2026/09/02/{name}"), bytes);
+    }
+    let f = ListFixture::open_loaded(cx, &hidden, &[]);
+    let (total, cwds) = cx.read(|cx| {
+        let list = f.list.read(cx);
+        (
+            list.browser().conversations().len(),
+            list.recorded_agent_cwds(),
+        )
+    });
+    assert_eq!(total, 2, "both hidden threads are in the corpus");
+    assert!(cwds.is_empty(), "{cwds:?}");
+}
+
+/// The listed Codex thread 002 and the hidden exec (006) and subagent (007)
+/// threads of core's Codex fixtures.
+fn codex_kinds_world() -> TestWorld {
+    let world = TestWorld::new();
+    for (day, name, bytes) in [
+        (
+            "01",
+            "rollout-2026-09-01T10-00-00-01a00000-0000-7000-8000-000000000002.jsonl",
+            &include_bytes!(
+                "../../../../core/tests/fixtures/codex/sessions/2026/09/01/rollout-2026-09-01T10-00-00-01a00000-0000-7000-8000-000000000002.jsonl"
+            )[..],
+        ),
+        (
+            "02",
+            "rollout-2026-09-02T11-00-00-01a00000-0000-7000-8000-000000000006.jsonl",
+            &include_bytes!(
+                "../../../../core/tests/fixtures/codex/sessions/2026/09/02/rollout-2026-09-02T11-00-00-01a00000-0000-7000-8000-000000000006.jsonl"
+            )[..],
+        ),
+        (
+            "02",
+            "rollout-2026-09-02T12-00-00-01a00000-0000-7000-8000-000000000007.jsonl",
+            &include_bytes!(
+                "../../../../core/tests/fixtures/codex/sessions/2026/09/02/rollout-2026-09-02T12-00-00-01a00000-0000-7000-8000-000000000007.jsonl"
+            )[..],
+        ),
+    ] {
+        world.add_fixture(&format!(".codex/sessions/2026/09/{day}/{name}"), bytes);
+    }
+    world
+}
+
+/// The thread number (last UUID digits) of each listed row and its kind tag.
+fn codex_rows(f: &ListFixture, cx: &TestAppContext) -> Vec<(String, Option<&'static str>)> {
+    f.read(cx, |list, _| {
+        let rows = list.filtered_paths().len();
+        list.row_models(0..rows, 480.0)
+            .into_iter()
+            .map(|row| {
+                let stem = row.stem.clone();
+                (stem[stem.len() - 3..].to_string(), row.kind_label)
+            })
+            .collect()
+    })
+}
+
+/// L-104 (upstream cb990e6): Ctrl+G lists the automated (exec) and subagent
+/// Codex threads, tagged `auto` / `sub` on line 2, keeping the query and the
+/// selected conversation; again Ctrl+G hides them. The View menu item and the
+/// footer's `all kinds` chip follow the toggle.
+#[gpui_kit::test]
+fn ctrl_g_lists_automated_and_subagent_threads(cx: &mut TestAppContext) {
+    let world = codex_kinds_world();
+    let f = ListFixture::open_loaded(cx, &world, &[]);
+    assert_eq!(codex_rows(&f, cx), [("002".to_string(), None)]);
+    let probe = |cx: &TestAppContext| f.read(cx, |list, cx| list.qa_probe("list.all_kinds", cx));
+    assert_eq!(probe(cx).as_deref(), Some("false"));
+    assert!(!cx.read(|cx| crate::menus::current_checks(cx).all_kinds));
+    let wide_footer = |cx: &mut TestAppContext| {
+        cx.update_window(f.handle, |_, window, cx| {
+            window.render_frame(cx);
+            f.list.read(cx).footer_model_for_width(120.0, window, cx)
+        })
+        .unwrap()
+    };
+    assert_eq!(chip(&wide_footer(cx), ChipKind::AllKinds), None);
+    let selected = f.selected_path(cx);
+    assert!(selected.is_some());
+
+    f.press(cx, "ctrl-g");
+    f.wait_idle(cx);
+    assert_eq!(probe(cx).as_deref(), Some("true"));
+    // Newest first; the listed thread moves down and stays selected.
+    assert_eq!(
+        codex_rows(&f, cx),
+        [
+            ("007".to_string(), Some("sub")),
+            ("006".to_string(), Some("auto")),
+            ("002".to_string(), None),
+        ]
+    );
+    assert_eq!(f.selected_path(cx), selected, "the selection is kept");
+    assert!(cx.read(|cx| crate::menus::current_checks(cx).all_kinds));
+    assert_eq!(
+        chip(&wide_footer(cx), ChipKind::AllKinds),
+        Some(format!("{} all kinds", kbd("ctrl-g")))
+    );
+    let tagged = f.read(cx, |list, _| {
+        let rows = list.filtered_paths().len();
+        list.row_models(0..rows, 480.0)
+            .into_iter()
+            .find(|row| row.kind_label.is_some())
+            .map(|row| (row.meta_text(), row.tooltip.clone()))
+            .unwrap()
+    });
+    assert!(tagged.0.starts_with("sub · "), "{}", tagged.0);
+    assert!(tagged.1.starts_with("sub · "), "{}", tagged.1);
+
+    // "iguana" is only in the exec thread: the query stays across toggles.
+    f.type_text(cx, "iguana");
+    f.wait_idle(cx);
+    assert_eq!(codex_rows(&f, cx), [("006".to_string(), Some("auto"))]);
+    f.press(cx, "ctrl-g");
+    f.wait_idle(cx);
+    assert_eq!(probe(cx).as_deref(), Some("false"));
+    assert!(codex_rows(&f, cx).is_empty());
+    assert_eq!(f.read(cx, |list, cx| list.query(cx).to_string()), "iguana");
+    f.press(cx, "ctrl-g");
+    f.wait_idle(cx);
+    assert_eq!(codex_rows(&f, cx), [("006".to_string(), Some("auto"))]);
+
+    f.press(cx, "escape");
+    f.press(cx, "ctrl-g");
+    f.wait_idle(cx);
+    assert_eq!(codex_rows(&f, cx), [("002".to_string(), None)]);
+    assert!(!cx.read(|cx| crate::menus::current_checks(cx).all_kinds));
+}
+
+/// C-068: `--all-kinds` starts with the hidden kinds listed; `[keys]
+/// all_kinds` rebinds the toggle.
+#[gpui_kit::test]
+fn the_all_kinds_flag_and_key_binding(cx: &mut TestAppContext) {
+    let world = codex_kinds_world();
+    world.write_config(Some("[keys]\nall_kinds = \"alt+k\"\n"), None);
+    let f = ListFixture::open_loaded(cx, &world, &["--all-kinds"]);
+    assert_eq!(codex_rows(&f, cx).len(), 3);
+    f.press(cx, "ctrl-g");
+    f.wait_idle(cx);
+    assert_eq!(codex_rows(&f, cx).len(), 3, "ctrl-g is no longer bound");
+    f.press(cx, "alt-k");
+    f.wait_idle(cx);
+    assert_eq!(codex_rows(&f, cx), [("002".to_string(), None)]);
+}
+
+/// Two conversations that mention `walrus`: `asked` in what the user typed,
+/// `answered` only in the assistant's reply (twice, so it ranks first).
+fn walrus_world() -> (TestWorld, std::path::PathBuf, std::path::PathBuf) {
+    let world = TestWorld::new();
+    let start = Utc::now() - Duration::hours(3);
+    let asked = SessionSpec::new("alpha", 1)
+        .messages(&[
+            ("user", "how does the walrus work"),
+            ("assistant", "it assigns a value"),
+        ])
+        .start(start)
+        .write(&world);
+    let answered = SessionSpec::new("beta", 2)
+        .messages(&[
+            ("user", "explain this operator"),
+            ("assistant", "the walrus assigns, the walrus returns"),
+        ])
+        .start(start + Duration::hours(1))
+        .write(&world);
+    (world, asked, answered)
+}
+
+/// S-039 (upstream ae7ae39): Alt+U searches only the user's own messages,
+/// keeping the query and the selected conversation; Alt+U again searches
+/// everything. The toolbar's `You only` toggle, the View menu item and the
+/// footer's `you only` chip follow; in semantic mode, which ignores it, the
+/// chip and the tooltip say so.
+#[gpui_kit::test]
+fn alt_u_searches_only_your_own_messages(cx: &mut TestAppContext) {
+    let (world, asked, answered) = walrus_world();
+    ListFixture::init_app(cx, &world, &[]);
+    let _control = crate::test_support::fixtures_list::install_fake_embedder(cx);
+    let f = ListFixture::open_loaded(cx, &world, &[]);
+    let probe = |cx: &TestAppContext| f.read(cx, |list, cx| list.qa_probe("list.user_only", cx));
+    let wide_footer = |cx: &mut TestAppContext| {
+        cx.update_window(f.handle, |_, window, cx| {
+            window.render_frame(cx);
+            f.list.read(cx).footer_model_for_width(120.0, window, cx)
+        })
+        .unwrap()
+    };
+    assert_eq!(probe(cx).as_deref(), Some("false"));
+    assert_eq!(chip(&wide_footer(cx), ChipKind::UserOnly), None);
+
+    f.type_text(cx, "walrus");
+    f.wait_idle(cx);
+    assert_eq!(f.paths(cx), [answered.clone(), asked.clone()]);
+
+    f.press(cx, "alt-u");
+    f.wait_idle(cx);
+    assert_eq!(probe(cx).as_deref(), Some("true"));
+    assert_eq!(f.paths(cx), std::slice::from_ref(&asked));
+    assert_eq!(f.read(cx, |list, cx| list.query(cx).to_string()), "walrus");
+    assert!(cx.read(|cx| crate::menus::current_checks(cx).user_only));
+    let toolbar = f.read(cx, |list, _| list.toolbar_model());
+    assert!(toolbar.user_only);
+    assert_eq!(toolbar.user_only_tooltip, USER_ONLY_TOOLTIP);
+    let chip_text = chip(&wide_footer(cx), ChipKind::UserOnly);
+    assert_eq!(chip_text, Some(format!("{} you only", kbd("alt-u"))));
+    assert_eq!(f.selected_path(cx), Some(asked.clone()));
+
+    // Everything again: the query stays and so does the selection.
+    f.press(cx, "alt-u");
+    f.wait_idle(cx);
+    assert_eq!(probe(cx).as_deref(), Some("false"));
+    assert_eq!(f.paths(cx), [answered.clone(), asked.clone()]);
+    assert_eq!(
+        f.selected_path(cx),
+        Some(asked.clone()),
+        "the selection is kept"
+    );
+    assert!(!cx.read(|cx| crate::menus::current_checks(cx).user_only));
+    assert_eq!(chip(&wide_footer(cx), ChipKind::UserOnly), None);
+
+    // Semantic search ignores the toggle; the chip and the tooltip say so.
+    f.press(cx, "alt-u");
+    f.press(cx, "ctrl-t");
+    f.wait_idle(cx);
+    let toolbar = f.read(cx, |list, _| list.toolbar_model());
+    assert!(toolbar.user_only);
+    assert_eq!(toolbar.user_only_tooltip, USER_ONLY_SEMANTIC_TOOLTIP);
+    assert_eq!(
+        chip(&wide_footer(cx), ChipKind::UserOnly),
+        Some(format!("{} you only: not in semantic", kbd("alt-u")))
+    );
+    // 18rem with all kinds on too: the pinned chips and help stay and fit.
+    f.press(cx, "ctrl-g");
+    f.wait_idle(cx);
+    let narrow = cx
+        .update_window(f.handle, |_, window, cx| {
+            window.render_frame(cx);
+            f.list.read(cx).footer_model_for_width(18.0, window, cx)
+        })
+        .unwrap();
+    for kind in [ChipKind::AllKinds, ChipKind::UserOnly, ChipKind::Help] {
+        assert!(chip(&narrow, kind).is_some(), "{kind:?}: {narrow:?}");
+    }
+    let width: f32 = narrow
+        .chips
+        .iter()
+        .map(|chip| {
+            let key = if chip.keyless {
+                0
+            } else {
+                chip.key.chars().count()
+            };
+            chip_width_rem(key, chip.label.chars().count())
+        })
+        .sum::<f32>()
+        + (narrow.chips.len() - 1) as f32 * 0.75;
+    let count = narrow.count.chars().count() as f32 * 0.35 + 1.0;
+    assert!(width + count + 1.5 <= 18.0, "{width} {narrow:?}");
+    f.press(cx, "ctrl-g");
+    f.wait_idle(cx);
+    f.press(cx, "ctrl-t");
+    f.wait_idle(cx);
+    assert_eq!(f.paths(cx), [asked], "lexical again: only yours");
+}
+
+/// C-070: upstream's default `[keys] user_only = "ctrl+v"` is paste in the
+/// GUI: it is rejected and Alt+U stays.
+#[gpui_kit::test]
+fn the_user_only_key_binding(cx: &mut TestAppContext) {
+    let (world, asked, _) = walrus_world();
+    world.write_config(Some("[keys]\nuser_only = \"ctrl+v\"\n"), None);
+    let f = ListFixture::open_loaded(cx, &world, &[]);
+    f.type_text(cx, "walrus");
+    f.press(cx, "alt-u");
+    f.wait_idle(cx);
+    assert_eq!(f.paths(cx), [asked]);
+    f.press(cx, "alt-u");
+    f.wait_idle(cx);
+    assert_eq!(f.paths(cx).len(), 2);
+}
+
+/// C-070: `gui.toml` `[keys] user_only` rebinds the toggle.
+#[gpui_kit::test]
+fn gui_toml_rebinds_the_user_only_key(cx: &mut TestAppContext) {
+    let (world, asked, _) = walrus_world();
+    world.write_config(None, Some("[keys]\nuser_only = \"alt+y\"\n"));
+    let f = ListFixture::open_loaded(cx, &world, &[]);
+    f.type_text(cx, "walrus");
+    f.press(cx, "alt-y");
+    f.wait_idle(cx);
+    assert_eq!(f.paths(cx), [asked]);
+}
+
+#[gpui_kit::test]
+fn recorded_agent_cwds_keep_listed_codex_threads(cx: &mut TestAppContext) {
+    let listed = TestWorld::new();
+    listed.add_fixture(
+        ".codex/sessions/2026/09/01/rollout-2026-09-01T10-00-00-01a00000-0000-7000-8000-000000000002.jsonl",
+        include_bytes!(
+            "../../../../core/tests/fixtures/codex/sessions/2026/09/01/rollout-2026-09-01T10-00-00-01a00000-0000-7000-8000-000000000002.jsonl"
+        ),
+    );
+    let f = ListFixture::open_loaded(cx, &listed, &[]);
+    let cwds = cx.read(|cx| f.list.read(cx).recorded_agent_cwds());
+    assert_eq!(cwds, vec![std::path::PathBuf::from("/work/demo")]);
 }
 
 /// L-081: the workspace picker shows Recent and Projects from cached data,
@@ -368,10 +698,10 @@ fn the_workspace_picker_uses_cached_paths(cx: &mut TestAppContext) {
     f.wait_until(cx, "the cached paths", |list, _| {
         list.project_paths().len() == 2 && !list.recent_existing.is_empty()
     });
-    let calls = IS_DIR_CALLS.load(Ordering::SeqCst);
+    let calls = IS_DIR_CALLS.with(std::cell::Cell::get);
     let model = cx.read(|cx| f.list.read(cx).workspace_picker_model(cx));
     assert_eq!(
-        IS_DIR_CALLS.load(Ordering::SeqCst),
+        IS_DIR_CALLS.with(std::cell::Cell::get),
         calls,
         "building the menu makes no file-system call"
     );
@@ -422,6 +752,8 @@ fn the_time_filter_is_applied_kept_and_reverted(cx: &mut TestAppContext) {
         .summary("Old")
         .start(Utc::now() - Duration::days(30))
         .write(&world);
+    // Store off: an in-memory reload reads the files again and can fail (in store mode the cards are re-scoped).
+    crate::test_support::use_memory_list(cx, &world, &["--since", "1d"]);
     let f = ListFixture::open_loaded(cx, &world, &["--since", "1d"]);
     assert_eq!(f.titles(cx), vec!["Recent".to_string()]);
     assert_eq!(
@@ -477,6 +809,8 @@ fn the_time_filter_is_applied_kept_and_reverted(cx: &mut TestAppContext) {
 fn a_failing_workspace_reload_reverts(cx: &mut TestAppContext) {
     let world = TestWorld::new();
     SessionSpec::new("proj", 1).summary("One").write(&world);
+    // Store off: an in-memory reload reads the files again and can fail.
+    crate::test_support::use_memory_list(cx, &world, &[]);
     let f = ListFixture::open_loaded(cx, &world, &[]);
     let dir = world.home().join("some-workspace");
     std::fs::create_dir_all(&dir).unwrap();
@@ -500,6 +834,51 @@ fn a_failing_workspace_reload_reverts(cx: &mut TestAppContext) {
         last.text
     );
     assert_eq!(f.paths(cx).len(), 1);
+}
+
+/// §15.4 rule 6: under the sandbox gate, a workspace whose Pi settings lead
+/// outside the sandbox home is refused with an error toast and the current
+/// workspace stays; one that stays inside is applied.
+#[gpui_kit::test]
+fn the_sandbox_gate_refuses_a_workspace_that_leads_outside(cx: &mut TestAppContext) {
+    let world = TestWorld::new();
+    SessionSpec::new("proj", 1).summary("One").write(&world);
+    let f = ListFixture::open_loaded(cx, &world, &[]);
+    cx.update(|cx| {
+        crate::globals::update_app_state(cx, |state, _| state.launch.sandbox_gate = true)
+    });
+    let dir = world.home().join("gated-workspace");
+    let settings = dir.join(".pi").join("settings.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(
+        &settings,
+        serde_json::json!({ "sessionDir": outside.path() }).to_string(),
+    )
+    .unwrap();
+    f.with_window(cx, |list, window, cx| {
+        list.apply_workspace_choice(dir.clone(), window, cx)
+    });
+    cx.run_until_parked();
+    assert!(!f.read(cx, |list, _| list.has_workspace()), "not applied");
+    assert!(cx.read(|cx| crate::globals::app_state(cx).workspace.is_none()));
+    let last = f.read(cx, |list, _| list.toasts().last().cloned()).unwrap();
+    assert!(
+        last.text.starts_with(&format!(
+            "Couldn't switch the workspace: sessionDir in {}",
+            settings.display()
+        )),
+        "{}",
+        last.text
+    );
+    assert_eq!(f.paths(cx).len(), 1, "the rows are kept");
+
+    std::fs::write(&settings, r#"{"sessionDir":"sessions"}"#).unwrap();
+    f.with_window(cx, |list, window, cx| {
+        list.apply_workspace_choice(dir.clone(), window, cx)
+    });
+    f.wait_loaded(cx);
+    assert!(f.read(cx, |list, _| list.has_workspace()), "applied");
 }
 
 /// L-049: the custom range dialog validates inline and Apply stays disabled.
@@ -602,6 +981,8 @@ fn a_queued_time_filter_reverts_to_the_committed_one(cx: &mut TestAppContext) {
         .summary("Very old")
         .start(Utc::now() - Duration::days(800))
         .write(&world);
+    // Store off: an in-memory reload reads the files again and can fail (in store mode the cards are re-scoped).
+    crate::test_support::use_memory_list(cx, &world, &[]);
     let f = ListFixture::open_loaded(cx, &world, &[]);
     assert_eq!(f.titles(cx).len(), 2);
     std::fs::remove_dir_all(world.projects_root()).unwrap();

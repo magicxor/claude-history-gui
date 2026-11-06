@@ -1,10 +1,9 @@
 //! Core tests named by the FEATURES.md rows owned by WP-C that no earlier
 //! test covered exactly (row id in each test name): history loading,
-//! caching, parsing rules and Pi/OMP specifics. Every file lives in a
+//! parsing rules and Pi/OMP specifics. Every file lives in a
 //! temporary directory.
 
 use super::*;
-use crate::history::cache;
 use serde_json::json;
 use std::io::Write;
 use std::path::Path;
@@ -41,7 +40,10 @@ fn set_mtime(path: &Path, time: SystemTime) {
 }
 
 #[test]
-fn l008_project_cache_hits_invalidates_keeps_negative_entries_and_rewrites_atomically() {
+fn l008_the_project_loader_parses_every_file_and_writes_no_cache() {
+    // Upstream 75df2d4 retired the per-project caches: every load parses
+    // the files, so an edit shows even with the size and mtime unchanged,
+    // and nothing is written to the cache root.
     let home = tempfile::tempdir().unwrap();
     let env = HistoryEnv::sandbox(home.path());
     let project = env.claude_projects_root().unwrap().join("-work-p");
@@ -54,7 +56,7 @@ fn l008_project_cache_hits_invalidates_keeps_negative_entries_and_rewrites_atomi
             assistant("answer", "2024-01-01T00:01:00Z"),
         ],
     );
-    // Parses to nothing: a negative entry.
+    // Parses to nothing.
     write_lines(
         &empty,
         &[json!({"type": "summary", "summary": "only metadata"})],
@@ -63,59 +65,27 @@ fn l008_project_cache_hits_invalidates_keeps_negative_entries_and_rewrites_atomi
     set_mtime(&listed, fixed);
     set_mtime(&empty, fixed);
 
-    let first = load_conversations(&env, &project, true, "-work-p", None).unwrap();
+    let first = loader::load_conversations(&project, true, None).unwrap();
     assert_eq!(first.len(), 1);
-    let entries = cache::read_project_cache(&env, "-work-p").expect("cache written");
-    assert_eq!(entries.len(), 2);
-    let empty_name = empty.file_name().unwrap().to_str().unwrap();
-    assert!(entries[empty_name].is_empty, "negative entry");
-    let listed_name = listed.file_name().unwrap().to_str().unwrap();
-    assert!(!entries[listed_name].is_empty);
+    assert!(first[0].preview.contains("original question"));
 
-    // A hit is served from the cache (prove it with a marked entry whose
-    // size and mtime still match the file).
-    let mut marked = entries.clone();
-    marked.get_mut(listed_name).unwrap().preview_last = "FROM CACHE".to_string();
-    cache::write_project_cache(&env, "-work-p", marked);
-    let hit = load_conversations(&env, &project, true, "-work-p", None).unwrap();
-    assert_eq!(hit[0].preview, "FROM CACHE");
-
-    // A different size invalidates the entry.
+    // Same size and mtime, other text.
     write_lines(
         &listed,
         &[
-            user("edited question that is longer", "2024-01-01T00:00:00Z"),
+            user("replaced question", "2024-01-01T00:00:00Z"),
             assistant("answer", "2024-01-01T00:01:00Z"),
         ],
     );
     set_mtime(&listed, fixed);
-    let resized = load_conversations(&env, &project, true, "-work-p", None).unwrap();
+    let second = loader::load_conversations(&project, true, None).unwrap();
+    assert_eq!(second.len(), 1);
     assert!(
-        resized[0].preview.contains("edited question"),
+        second[0].preview.contains("replaced question"),
         "{}",
-        resized[0].preview
+        second[0].preview
     );
-
-    // A different mtime (same size) invalidates it too.
-    let mut marked = cache::read_project_cache(&env, "-work-p").unwrap();
-    marked.get_mut(listed_name).unwrap().preview_last = "STALE".to_string();
-    cache::write_project_cache(&env, "-work-p", marked);
-    set_mtime(&listed, fixed + Duration::from_secs(60));
-    let touched = load_conversations(&env, &project, true, "-work-p", None).unwrap();
-    assert!(touched[0].preview.contains("edited question"));
-
-    // The rewrite is atomic: a corrupt cache file is replaced whole, and no
-    // temporary file is left next to it.
-    let cache_file = cache::cache_path_for_project(&env, "-work-p").unwrap();
-    std::fs::write(&cache_file, b"garbage").unwrap();
-    assert!(cache::read_project_cache(&env, "-work-p").is_none());
-    load_conversations(&env, &project, true, "-work-p", None).unwrap();
-    assert_eq!(cache::read_project_cache(&env, "-work-p").unwrap().len(), 2);
-    let leftovers = std::fs::read_dir(cache_file.parent().unwrap())
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    assert_eq!(leftovers, vec!["-work-p.bin".to_string()]);
+    assert!(!env.cache_root().unwrap().exists(), "no cache written");
 }
 
 #[test]
@@ -177,14 +147,29 @@ fn l092_transcripts_without_listable_parts_parse_to_none() {
 }
 
 #[test]
-fn l093_row_timestamps_follow_the_mtime_or_the_latest_record() {
+fn l093_row_timestamps_follow_the_latest_message() {
     let dir = tempfile::tempdir().unwrap();
     let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_650_000_000);
 
-    // Claude: the file's modification time, whatever the records say.
+    // Claude: the latest user/assistant record (ccec847), whatever the file's
+    // modification time says ...
     let claude = dir.path().join("claude.jsonl");
     write_lines(&claude, &[user("hello", "2030-01-01T00:00:00Z")]);
     let conversation = process_conversation_file(claude, Some(mtime), None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        conversation.timestamp.to_utc().to_rfc3339(),
+        "2030-01-01T00:00:00+00:00"
+    );
+
+    // ... else the modification time.
+    let untimed = dir.path().join("claude-untimed.jsonl");
+    write_lines(
+        &untimed,
+        &[serde_json::json!({"type":"user","message":{"role":"user","content":"hello"}})],
+    );
+    let conversation = process_conversation_file(untimed, Some(mtime), None)
         .unwrap()
         .unwrap();
     assert_eq!(conversation.timestamp.timestamp(), 1_650_000_000);
@@ -289,7 +274,6 @@ fn x012_searchable_text_is_never_truncated() {
         .unwrap();
     assert!(conversation.full_text.len() > 400_000);
     assert!(conversation.full_text.contains("closingneedle"));
-    assert!(conversation.search_text_lower.contains("closingneedle"));
     let conversations = vec![conversation];
     let searchable = crate::search::precompute_search_text(&conversations);
     assert_eq!(
@@ -304,7 +288,7 @@ fn x012_searchable_text_is_never_truncated() {
 }
 
 #[test]
-fn x034_thinking_without_signature_drops_the_line_and_subagent_files_are_not_read() {
+fn x034_thinking_without_signature_drops_the_line_and_subagent_files_are_their_own_conversations() {
     let home = tempfile::tempdir().unwrap();
     let env = HistoryEnv::sandbox(home.path());
     let project = env.claude_projects_root().unwrap().join("-work-x");
@@ -333,7 +317,9 @@ fn x034_thinking_without_signature_drops_the_line_and_subagent_files_are_not_rea
             }),
         ],
     );
-    // Neither agent-*.jsonl files nor <uuid>/subagents/*.jsonl are read.
+    // A root agent-*.jsonl file is not read; <uuid>/subagents/agent-*.jsonl
+    // is a conversation of its own, a hidden child of the session (upstream
+    // 3c2ffeb), and never part of the session's text.
     write_lines(
         &project.join("agent-abc.jsonl"),
         &[user("AGENTFILE question", "2024-01-01T00:00:00Z")],
@@ -343,9 +329,25 @@ fn x034_thinking_without_signature_drops_the_line_and_subagent_files_are_not_rea
         &[user("SUBAGENTFILE question", "2024-01-01T00:00:00Z")],
     );
 
-    let conversations = load_conversations(&env, &project, true, "-work-x", None).unwrap();
-    assert_eq!(conversations.len(), 1, "agent-*.jsonl is not listed");
-    let conversation = &conversations[0];
+    let conversations = loader::load_conversations(&project, true, None).unwrap();
+    assert_eq!(
+        conversations.len(),
+        2,
+        "the root agent-*.jsonl is not listed"
+    );
+    let (sidecars, sessions): (Vec<_>, Vec<_>) = conversations
+        .iter()
+        .partition(|conversation| conversation.provenance.child);
+    let [conversation] = sessions.as_slice() else {
+        panic!("one session: {conversations:?}");
+    };
+    let [subagent] = sidecars.as_slice() else {
+        panic!("one subagent: {conversations:?}");
+    };
+    assert_eq!(subagent.parent.as_deref(), Some(uuid));
+    assert_eq!(subagent.session_id, "x");
+    assert!(subagent.full_text.contains("SUBAGENTFILE"));
+    assert!(is_parent_of(conversation, subagent));
     assert!(!conversation.full_text.contains("DROPPEDLINE"));
     assert!(conversation.full_text.contains("kept answer"));
     assert_eq!(conversation.parse_errors.len(), 1);
@@ -374,6 +376,7 @@ fn x035_pi_and_omp_tool_errors_keep_the_error_prefix() {
         conversation.full_text
     );
     let viewer = crate::view::ViewerModel::open(
+        &service::HistoryService::default(),
         &fixture,
         crate::view::ViewPrefs {
             tool_display: crate::view::ToolDisplayMode::Full,

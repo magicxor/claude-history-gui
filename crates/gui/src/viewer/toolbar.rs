@@ -1,11 +1,13 @@
-//! The viewer toolbar (DESIGN §9.10): Summary|Truncated|Full, Thinking,
-//! Timing, find bar, Outline, Resume, Fork, ⋯ menu. WP2.
+//! The viewer toolbar (DESIGN §9.10): Off|Summary|Calls|Truncated|Full,
+//! Thinking, Timing, find bar, Outline, Resume, Fork, ⋯ menu. WP2.
 //!
 //! Every control dispatches the same action as its key (V-096) from the
 //! transcript's focus, so the viewer's own handlers (and the menus' enabled
 //! state) apply. Single-file windows have no Resume / Fork / Rename /
 //! Delete; a target with an unknown source shows them disabled with the
-//! tooltip `Unknown conversation type`.
+//! tooltip `Unknown conversation type`, and one whose capabilities refuse
+//! an action (upstream eea6d37: Rename of a Codex thread, everything for an
+//! orphaned one) with core's refusal text.
 
 use claude_history_core::view::{ToolDisplayMode, ViewPrefs};
 use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants as _};
@@ -21,11 +23,61 @@ use gpui_kit::{
 use super::ViewerPane;
 use crate::actions::*;
 use crate::keymap::CTX_VIEWER;
-use crate::model::ViewerMode;
+use crate::model::{ConversationTarget, SessionAct, ViewerMode};
 use crate::qa_ext::QaExt as _;
 
 /// The disabled tooltip of actions that need a known source.
-pub const UNKNOWN_SOURCE_TOOLTIP: &str = "Unknown conversation type";
+pub const UNKNOWN_SOURCE_TOOLTIP: &str = crate::model::UNKNOWN_SOURCE;
+
+/// The tool display modes in cycle order (upstream d0aca95 put Off first,
+/// a60dfe9 added Calls after Summary), with the toolbar button id and the
+/// label of the toolbar button and of View → Tool display. The toolbar and
+/// the menu are built from this table.
+pub const TOOL_DISPLAY_MODES: [(ToolDisplayMode, &str, &str); 5] = [
+    (ToolDisplayMode::Off, "tools-off", "Off"),
+    (ToolDisplayMode::Summary, "tools-summary", "Summary"),
+    (ToolDisplayMode::Calls, "tools-calls", "Calls"),
+    (ToolDisplayMode::Truncated, "tools-truncated", "Truncated"),
+    (ToolDisplayMode::Full, "tools-full", "Full"),
+];
+
+/// The `SetTools*` action that selects `mode`.
+pub fn set_tools_action(mode: ToolDisplayMode) -> Box<dyn Action> {
+    match mode {
+        ToolDisplayMode::Off => Box::new(SetToolsOff),
+        ToolDisplayMode::Summary => Box::new(SetToolsSummary),
+        ToolDisplayMode::Calls => Box::new(SetToolsCalls),
+        ToolDisplayMode::Truncated => Box::new(SetToolsTruncated),
+        ToolDisplayMode::Full => Box::new(SetToolsFull),
+    }
+}
+
+/// Why Resume, Fork, Rename and Delete are unavailable for the open
+/// conversation (`None`: available): [`ConversationTarget::refusal`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Refusals {
+    pub resume: Option<SharedString>,
+    pub fork: Option<SharedString>,
+    pub rename: Option<SharedString>,
+    pub delete: Option<SharedString>,
+}
+
+impl Refusals {
+    /// The refusals for `target` (none without a target: the toolbar is
+    /// disabled then).
+    pub fn of(target: Option<&ConversationTarget>) -> Self {
+        let Some(target) = target else {
+            return Self::default();
+        };
+        let refusal = |act| target.refusal(act).map(SharedString::from);
+        Self {
+            resume: refusal(SessionAct::Resume),
+            fork: refusal(SessionAct::Fork),
+            rename: refusal(SessionAct::Rename),
+            delete: refusal(SessionAct::Delete),
+        }
+    }
+}
 
 /// What the toolbar shows.
 pub struct ToolbarModel {
@@ -33,8 +85,8 @@ pub struct ToolbarModel {
     pub mode: ViewerMode,
     /// A conversation is open.
     pub has_target: bool,
-    /// Its source is known (Resume/Fork/Rename/Delete allowed).
-    pub can_modify: bool,
+    /// Why Resume/Fork/Rename/Delete are unavailable.
+    pub refusals: Refusals,
     /// The header session ID differs from the file stem.
     pub header_id_differs: bool,
     /// The find input while a search is typed.
@@ -69,19 +121,19 @@ pub fn render_toolbar(
 ) -> impl IntoElement + use<> {
     let tool = model.prefs.tool_display;
     let enabled = model.has_target;
-    let mode_button =
-        |id: &'static str, label: &'static str, value: ToolDisplayMode, action: Box<dyn Action>| {
-            let focus = focus.clone();
-            Button::new(id)
-                .label(label)
-                .xsmall()
-                .selected(tool == value)
-                .disabled(!enabled)
-                .on_click(move |_, window, cx| {
-                    focus.focus(window, cx);
-                    window.dispatch_action(action.boxed_clone(), cx);
-                })
-        };
+    let mode_button = |(value, id, label): (ToolDisplayMode, &'static str, &'static str)| {
+        let focus = focus.clone();
+        let action = set_tools_action(value);
+        Button::new(id)
+            .label(label)
+            .xsmall()
+            .selected(tool == value)
+            .disabled(!enabled)
+            .on_click(move |_, window, cx| {
+                focus.focus(window, cx);
+                window.dispatch_action(action.boxed_clone(), cx);
+            })
+    };
     let toggle_button =
         |id: &'static str, label: &'static str, on: bool, action: Box<dyn Action>| {
             let focus = focus.clone();
@@ -98,7 +150,7 @@ pub fn render_toolbar(
                 })
         };
     let main = model.mode == ViewerMode::Main;
-    let can_modify = model.can_modify;
+    let refusals = model.refusals;
     let header_id_differs = model.header_id_differs;
     let menu_focus = focus.clone();
     h_flex()
@@ -117,24 +169,7 @@ pub fn render_toolbar(
                     ButtonGroup::new("viewer-tools")
                         .outline()
                         .compact()
-                        .child(mode_button(
-                            "tools-summary",
-                            "Summary",
-                            ToolDisplayMode::Hidden,
-                            Box::new(SetToolsSummary),
-                        ))
-                        .child(mode_button(
-                            "tools-truncated",
-                            "Truncated",
-                            ToolDisplayMode::Truncated,
-                            Box::new(SetToolsTruncated),
-                        ))
-                        .child(mode_button(
-                            "tools-full",
-                            "Full",
-                            ToolDisplayMode::Full,
-                            Box::new(SetToolsFull),
-                        )),
+                        .children(TOOL_DISPLAY_MODES.map(mode_button)),
                 ),
         )
         .child(toggle_button(
@@ -169,16 +204,16 @@ pub fn render_toolbar(
         .when(main, |this| {
             this.child(
                 action_button("toolbar-resume", "Resume", Box::new(Resume), focus)
-                    .disabled(!enabled || !can_modify)
-                    .when(enabled && !can_modify, |b| {
-                        b.tooltip(UNKNOWN_SOURCE_TOOLTIP)
+                    .disabled(!enabled || refusals.resume.is_some())
+                    .when_some(refusals.resume.clone().filter(|_| enabled), |b, text| {
+                        b.tooltip(text)
                     }),
             )
             .child(
                 action_button("toolbar-fork", "Fork", Box::new(Fork), focus)
-                    .disabled(!enabled || !can_modify)
-                    .when(enabled && !can_modify, |b| {
-                        b.tooltip(UNKNOWN_SOURCE_TOOLTIP)
+                    .disabled(!enabled || refusals.fork.is_some())
+                    .when_some(refusals.fork.clone().filter(|_| enabled), |b, text| {
+                        b.tooltip(text)
                     }),
             )
         })
@@ -194,7 +229,7 @@ pub fn render_toolbar(
                     more_menu(
                         menu,
                         main,
-                        can_modify,
+                        &refusals,
                         header_id_differs,
                         &menu_focus,
                         window,
@@ -208,7 +243,7 @@ pub fn render_toolbar(
 fn more_menu(
     menu: PopupMenu,
     main: bool,
-    can_modify: bool,
+    refusals: &Refusals,
     header_id_differs: bool,
     focus: &FocusHandle,
     window: &mut Window,
@@ -233,7 +268,7 @@ fn more_menu(
         .menu("Reveal in file manager", Box::new(RevealInFileManager))
         .separator()
         .when(main, |menu| {
-            menu.menu_with_disabled("Rename…", Box::new(Rename), !can_modify)
+            menu.menu_with_disabled("Rename…", Box::new(Rename), refusals.rename.is_some())
         })
         .menu(
             "Search within conversation…",
@@ -242,7 +277,7 @@ fn more_menu(
         .menu("Read range…", Box::new(ReadRange));
     if main {
         menu.separator()
-            .menu_with_disabled("Delete…", Box::new(Delete), !can_modify)
+            .menu_with_disabled("Delete…", Box::new(Delete), refusals.delete.is_some())
     } else {
         menu
     }

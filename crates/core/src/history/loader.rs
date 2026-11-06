@@ -3,23 +3,23 @@
 //! This module handles loading conversations from Claude project directories,
 //! both synchronously and via streaming for the TUI.
 
-use super::cache;
-use super::messages::blocks_count_as_message;
+use super::messages::parts_count_as_message;
+use super::model::{EventKind, Part, Role, SourceKind};
 use super::parser::process_conversation_file;
 use super::path::{
     decode_project_dir_name, decode_project_dir_name_to_path, format_short_name_from_path,
 };
+use super::sources::Registry;
 use super::{Conversation, LoaderMessage, Project};
-use crate::claude::{LogEntry, extract_search_text_from_user, parse_agent_progress};
+use crate::agent::transcript::bounded_tool_result_text;
 use crate::debug;
 use crate::debug::DebugLevel;
 use crate::env::{HistoryEnv, WorkspaceScope};
 use crate::error::{AppError, Result};
+use crate::text_match::nfc;
 use crate::time_filter::TimeFilter;
 use rayon::prelude::*;
-use std::collections::HashMap;
-use std::fs::{File, read_dir};
-use std::io::{BufRead, BufReader};
+use std::fs::read_dir;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -50,129 +50,15 @@ pub struct DeleteEmptySummary {
     pub deleted: usize,
 }
 
-/// Load conversations from ALL projects globally
-pub fn load_all_conversations(
-    env: &HistoryEnv,
-    show_last: bool,
-    debug_level: Option<DebugLevel>,
-) -> Result<Vec<Conversation>> {
-    let pi_root = super::pi_loader::session_root(env).ok();
-    let pi_available = pi_root.as_ref().is_some_and(|root| root.path.exists());
-    let (mut pi_conversations, pi_error) =
-        match super::pi_loader::load_pi_conversations(env, show_last, debug_level) {
-            Ok(conversations) => (conversations, None),
-            Err(error) => (Vec::new(), Some(error)),
-        };
-    let omp_root = super::omp_loader::session_root(env).ok();
-    let omp_available = omp_root.as_ref().is_some_and(|root| root.path.exists());
-    let (mut omp_conversations, omp_error) =
-        match super::omp_loader::load_omp_conversations(env, show_last, debug_level) {
-            Ok(conversations) => (conversations, None),
-            Err(error) => (Vec::new(), Some(error)),
-        };
-    let auxiliary_usable =
-        (pi_available && pi_error.is_none()) || (omp_available && omp_error.is_none());
-    let root = match env.claude_projects_root() {
-        Ok(root) => root,
-        Err(error) => {
-            if auxiliary_usable {
-                pi_conversations.append(&mut omp_conversations);
-                finalize_conversations(&mut pi_conversations);
-                return Ok(pi_conversations);
-            }
-            return Err(pi_error.or(omp_error).unwrap_or(error));
-        }
-    };
-    if !root.exists() {
-        if auxiliary_usable {
-            pi_conversations.append(&mut omp_conversations);
-            return Ok(pi_conversations);
-        }
-        if let Some(error) = pi_error.or(omp_error) {
-            return Err(error);
-        }
-        return Err(AppError::ProjectsDirNotFound(root.display().to_string()));
-    }
-    if let Some(error) = pi_error {
-        debug::warn(debug_level, &format!("Failed to load Pi history: {error}"));
-    }
-    if let Some(error) = omp_error {
-        debug::warn(debug_level, &format!("Failed to load OMP history: {error}"));
-    }
-    let projects = list_projects(&root)?;
-
-    debug::info(
-        debug_level,
-        &format!("Loading global history from {} projects", projects.len()),
-    );
-
-    // Load conversations from all projects in parallel
-    let mut all_conversations: Vec<Conversation> = projects
-        .par_iter()
-        .flat_map(|project| {
-            let project_dir = root.join(&project.name);
-            match load_conversations(env, &project_dir, show_last, &project.name, debug_level) {
-                Ok(mut convs) => {
-                    // Fallback path for old JSONL files without cwd field
-                    let fallback_path = decode_project_dir_name_to_path(&project.name);
-
-                    // Inject project info into each conversation
-                    for conv in &mut convs {
-                        // Prefer the cwd extracted from the JSONL file (accurate), fall back to decoded path
-                        let project_path =
-                            conv.cwd.clone().unwrap_or_else(|| fallback_path.clone());
-                        conv.project_name = Some(format_short_name_from_path(&project_path));
-                        conv.project_path = Some(project_path);
-                    }
-                    convs
-                }
-                Err(e) => {
-                    debug::warn(
-                        debug_level,
-                        &format!("Failed to load project {}: {}", project.display_name, e),
-                    );
-                    Vec::new()
-                }
-            }
-        })
-        .collect();
-
-    all_conversations.append(&mut pi_conversations);
-    all_conversations.append(&mut omp_conversations);
-    finalize_conversations(&mut all_conversations);
-
-    debug::info(
-        debug_level,
-        &format!(
-            "Total global conversations loaded: {}",
-            all_conversations.len()
-        ),
-    );
-
-    Ok(all_conversations)
-}
-
-fn finalize_conversations(conversations: &mut Vec<Conversation>) {
-    deduplicate_conversations(conversations);
-    conversations.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
-    for (index, conversation) in conversations.iter_mut().enumerate() {
-        conversation.index = index;
-    }
-}
-
-fn deduplicate_conversations(conversations: &mut Vec<Conversation>) {
-    let mut paths = std::collections::HashSet::new();
-    conversations.retain(|conversation| {
-        let path = conversation
-            .path
-            .canonicalize()
-            .unwrap_or_else(|_| conversation.path.clone());
-        paths.insert(path)
-    });
-}
-
 /// Start loading all conversations in the background
 /// Returns a receiver that will receive LoaderMessage updates
+///
+/// Fork note: kept for the in-memory fallback (no store), which upstream
+/// 358becb removed together with [`LoaderMessage`]. Claude projects stream
+/// one batch per project, as upstream's loader did; every other instance
+/// the env configures (Pi, OMP and, since upstream 9597669, Codex) is
+/// parsed through the registry like upstream's `store::load_in_memory`
+/// and sent in batches of [`AUXILIARY_BATCH`], newest first.
 pub fn load_all_conversations_streaming(
     env: Arc<HistoryEnv>,
     show_last: bool,
@@ -181,12 +67,26 @@ pub fn load_all_conversations_streaming(
 ) -> Receiver<LoaderMessage> {
     let (tx, rx) = mpsc::channel();
 
-    thread::spawn(move || {
-        load_all_streaming_inner(&env, tx, show_last, debug_level, time);
-    });
+    let failed = tx.clone();
+    let spawned = thread::Builder::new()
+        .name("history-loader".into())
+        .stack_size(LOADER_STACK_SIZE)
+        .spawn(move || {
+            load_all_streaming_inner(&env, tx, show_last, debug_level, time);
+        });
+    if let Err(error) = spawned {
+        let _ = failed.send(LoaderMessage::Fatal(AppError::from(error)));
+    }
 
     rx
 }
+
+/// Stack of the loader threads (DESIGN section 7.5: named threads, 8 MiB).
+const LOADER_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+/// How many conversations of the instances other than Claude's one
+/// [`LoaderMessage::Batch`] holds.
+const AUXILIARY_BATCH: usize = 32;
 
 fn load_all_streaming_inner(
     env: &HistoryEnv,
@@ -195,78 +95,75 @@ fn load_all_streaming_inner(
     debug_level: Option<DebugLevel>,
     time: TimeFilter,
 ) {
-    let pi_root = super::pi_loader::session_root(env).ok();
-    let pi_available = pi_root.as_ref().is_some_and(|root| root.path.exists());
-    let (mut pi_conversations, pi_error) =
-        match super::pi_loader::load_pi_conversations(env, show_last, debug_level) {
-            Ok(conversations) => (conversations, None),
-            Err(error) => (Vec::new(), Some(error)),
-        };
-    let omp_root = super::omp_loader::session_root(env).ok();
-    let omp_available = omp_root.as_ref().is_some_and(|root| root.path.exists());
-    let (mut omp_conversations, omp_error) =
-        match super::omp_loader::load_omp_conversations(env, show_last, debug_level) {
-            Ok(conversations) => (conversations, None),
-            Err(error) => (Vec::new(), Some(error)),
-        };
-    let auxiliary_usable =
-        (pi_available && pi_error.is_none()) || (omp_available && omp_error.is_none());
-    pi_conversations.append(&mut omp_conversations);
-    deduplicate_conversations(&mut pi_conversations);
-    if time.is_active() {
-        pi_conversations.retain(|conversation| time.matches(conversation.timestamp));
-    }
-    if !pi_conversations.is_empty() {
-        let _ = tx.send(LoaderMessage::Batch(pi_conversations));
-    }
-
-    let root = match env.claude_projects_root() {
-        Ok(root) => root,
-        Err(error) => {
-            if auxiliary_usable {
-                let _ = tx.send(LoaderMessage::Done);
-            } else {
-                let _ = tx.send(LoaderMessage::Fatal(
-                    pi_error.or(omp_error).unwrap_or(error),
-                ));
+    thread::scope(|scope| {
+        let claude = thread::Builder::new()
+            .name("history-loader-claude".into())
+            .stack_size(LOADER_STACK_SIZE)
+            .spawn_scoped(scope, || {
+                load_claude_streaming(env, &tx, show_last, debug_level, time)
+            });
+        let claude = match claude {
+            Ok(handle) => handle,
+            Err(error) => {
+                let _ = tx.send(LoaderMessage::Fatal(AppError::from(error)));
+                return;
             }
-            return;
+        };
+        let mut paths = std::collections::HashSet::new();
+        let mut emit = |mut conversations: Vec<Conversation>| {
+            conversations.retain(|conversation| {
+                let path = conversation
+                    .path
+                    .canonicalize()
+                    .unwrap_or_else(|_| conversation.path.clone());
+                paths.insert(path) && (!time.is_active() || time.matches(conversation.timestamp))
+            });
+            if !conversations.is_empty() {
+                let _ = tx.send(LoaderMessage::Batch(conversations));
+            }
+        };
+        let auxiliary = Registry::from_env(env).filtered(|kind| kind != SourceKind::Claude);
+        let auxiliary_usable = auxiliary
+            .adapters()
+            .iter()
+            .any(|adapter| adapter.instance().root.exists());
+        let mut conversations = crate::store::reconcile::parse_everything(&auxiliary);
+        conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
+        for conversation in &mut conversations {
+            conversation.preview = if show_last {
+                conversation.preview_last.clone()
+            } else {
+                conversation.preview_first.clone()
+            };
         }
-    };
+        let mut conversations = conversations.into_iter().peekable();
+        while conversations.peek().is_some() {
+            emit(conversations.by_ref().take(AUXILIARY_BATCH).collect());
+        }
 
-    if !root.exists() {
-        if auxiliary_usable {
-            let _ = tx.send(LoaderMessage::Done);
-        } else {
-            let error = pi_error
-                .or(omp_error)
-                .unwrap_or_else(|| AppError::ProjectsDirNotFound(root.display().to_string()));
+        let claude_result = claude.join().expect("Claude loader thread");
+        if let Err(error) = claude_result
+            && !auxiliary_usable
+        {
             let _ = tx.send(LoaderMessage::Fatal(error));
-        }
-        return;
-    }
-
-    if let Some(error) = pi_error {
-        debug::warn(debug_level, &format!("Failed to load Pi history: {error}"));
-        let _ = tx.send(LoaderMessage::ProjectError);
-    }
-    if let Some(error) = omp_error {
-        debug::warn(debug_level, &format!("Failed to load OMP history: {error}"));
-        let _ = tx.send(LoaderMessage::ProjectError);
-    }
-
-    let projects = match list_projects(&root) {
-        Ok(p) => p,
-        Err(error) => {
-            if auxiliary_usable {
-                let _ = tx.send(LoaderMessage::Done);
-            } else {
-                let _ = tx.send(LoaderMessage::Fatal(error));
-            }
             return;
         }
-    };
+        let _ = tx.send(LoaderMessage::Done);
+    });
+}
 
+fn load_claude_streaming(
+    env: &HistoryEnv,
+    tx: &Sender<LoaderMessage>,
+    show_last: bool,
+    debug_level: Option<DebugLevel>,
+    time: TimeFilter,
+) -> Result<()> {
+    let root = env.claude_projects_root()?;
+    if !root.exists() {
+        return Err(AppError::ProjectsDirNotFound(root.display().to_string()));
+    }
+    let projects = list_projects(&root)?;
     debug::info(
         debug_level,
         &format!("Loading global history from {} projects", projects.len()),
@@ -276,7 +173,7 @@ fn load_all_streaming_inner(
     projects.par_iter().for_each(|project| {
         let project_dir = root.join(&project.name);
 
-        match load_conversations(env, &project_dir, show_last, &project.name, debug_level) {
+        match load_conversations(&project_dir, show_last, debug_level) {
             Ok(mut convs) => {
                 if convs.is_empty() {
                     return;
@@ -286,14 +183,12 @@ fn load_all_streaming_inner(
 
                 for conv in &mut convs {
                     let project_path = conv.cwd.clone().unwrap_or_else(|| fallback_path.clone());
-                    conv.project_name = Some(format_short_name_from_path(&project_path));
+                    conv.project_name =
+                        Some(nfc(&format_short_name_from_path(&project_path)).into_owned());
                     conv.project_path = Some(project_path);
                 }
 
-                // Filtered here rather than inside load_conversations, whose
-                // per-project cache is rebuilt from the vec it returns —
-                // dropping conversations earlier would evict their cache
-                // entries and force a re-parse on every later run.
+                // Only conversations in the time range are sent.
                 if time.is_active() {
                     convs.retain(|conv| time.matches(conv.timestamp));
                     if convs.is_empty() {
@@ -314,7 +209,7 @@ fn load_all_streaming_inner(
         }
     });
 
-    let _ = tx.send(LoaderMessage::Done);
+    Ok(())
 }
 
 /// Find a session JSONL file by UUID across all projects.
@@ -351,7 +246,8 @@ pub fn find_all_jsonl_by_uuid(env: &HistoryEnv, uuid: &str) -> Result<Vec<PathBu
 }
 
 /// Delete a session by UUID across all projects.
-/// Removes both the .jsonl file and the session subdirectory (tool-results/, subagents/).
+/// Removes both the .jsonl file and the session subdirectory (tool-results/,
+/// subagents/), keeping the `/btw` forks among its subagents.
 /// Returns the number of files deleted.
 pub fn delete_session_by_uuid(env: &HistoryEnv, uuid: &str) -> Result<usize> {
     // Validate format to prevent path traversal
@@ -372,7 +268,7 @@ pub fn delete_session_by_uuid(env: &HistoryEnv, uuid: &str) -> Result<usize> {
         if let Some(session_dir) = session_artifact_dir(jsonl_path, uuid)
             && session_dir.is_dir()
         {
-            std::fs::remove_dir_all(&session_dir)?;
+            super::sources::claude::remove_session_dir(&session_dir)?;
         }
     }
 
@@ -425,7 +321,8 @@ pub enum EmptyTranscriptDeletion {
 }
 
 /// Delete one empty transcript and its `<project>/<session id>/` directory
-/// ([`session_artifact_dir`]), after re-reading it: a transcript that gained
+/// ([`session_artifact_dir`]; the `/btw` forks there are kept, upstream
+/// 3c2ffeb), after re-reading it: a transcript that gained
 /// an assistant message since the scan is kept. Upstream scanned and deleted
 /// in one pass; a GUI shows the scan and deletes after a confirmation.
 pub fn delete_empty_transcript(transcript: &EmptyTranscript) -> Result<EmptyTranscriptDeletion> {
@@ -441,7 +338,7 @@ pub fn delete_empty_transcript(transcript: &EmptyTranscript) -> Result<EmptyTran
     if let Some(session_dir) = session_artifact_dir(&transcript.path, &transcript.session_id)
         && session_dir.is_dir()
     {
-        std::fs::remove_dir_all(session_dir)?;
+        super::sources::claude::remove_session_dir(&session_dir)?;
     }
     Ok(EmptyTranscriptDeletion::Deleted)
 }
@@ -529,29 +426,41 @@ pub fn find_empty_transcripts(
     Ok(candidates)
 }
 
+/// The text a user message is found by: its text and the bounded text of
+/// its tool results.
+fn user_search_text(parts: &[Part]) -> String {
+    parts
+        .iter()
+        .filter_map(|part| match part {
+            Part::Text(text) => Some(text.clone()),
+            Part::ToolResult {
+                output: Some(output),
+                ..
+            } => bounded_tool_result_text(output),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn empty_transcript_from_path(path: &Path, project_name: &str) -> Result<Option<EmptyTranscript>> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut line_count = 0;
+    let transcript = super::sources::decode_path(path, None, false)?;
+    if transcript.source != SourceKind::Claude {
+        return Ok(None);
+    }
+    let line_count = transcript.records + transcript.diagnostics.len();
     let mut user_messages = 0;
     let mut assistant_messages = 0;
     let mut preview = None;
 
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        line_count += 1;
-
-        let entry = match serde_json::from_str::<LogEntry>(&line) {
-            Ok(entry) => entry,
-            Err(_) => continue,
+    for event in &transcript.events {
+        let message = match &event.kind {
+            EventKind::Message(message) | EventKind::Subagent { message, .. } => message,
+            _ => continue,
         };
-
-        match entry {
-            LogEntry::User { message, .. } => {
-                let text = extract_search_text_from_user(&message);
+        match (&event.kind, message.role) {
+            (EventKind::Message(_), Role::User) => {
+                let text = user_search_text(&message.parts);
                 if !text.trim().is_empty() {
                     user_messages += 1;
                     if preview.is_none() {
@@ -559,21 +468,8 @@ fn empty_transcript_from_path(path: &Path, project_name: &str) -> Result<Option<
                     }
                 }
             }
-            LogEntry::Assistant { message, .. } => {
-                if blocks_count_as_message(&message.content) {
-                    assistant_messages += 1;
-                }
-            }
-            LogEntry::Progress { data, .. } => {
-                if let Some(progress) = parse_agent_progress(&data)
-                    && progress.message.message_type == "assistant"
-                {
-                    let crate::claude::AgentContent::Blocks(blocks) =
-                        progress.message.message.content;
-                    if blocks_count_as_message(&blocks) {
-                        assistant_messages += 1;
-                    }
-                }
+            (_, Role::Assistant) if parts_count_as_message(&message.parts) => {
+                assistant_messages += 1;
             }
             _ => {}
         }
@@ -651,24 +547,22 @@ pub fn list_projects(root: &Path) -> Result<Vec<Project>> {
         .collect();
 
     // Sort by recently modified
-    projects.sort_by(|a, b| b.modified.cmp(&a.modified));
+    projects.sort_by_key(|a| std::cmp::Reverse(a.modified));
 
     Ok(projects)
 }
 
-/// Find and process all conversation files in one pass, using per-project cache
-pub fn load_conversations(
-    env: &HistoryEnv,
+/// Find and process all conversation files of a project directory, with
+/// the sidecars of its sessions (upstream 3c2ffeb).
+///
+/// Fork: the Claude half of [`load_all_conversations_streaming`]; upstream
+/// 9597669 removed it with its in-memory loader.
+pub(crate) fn load_conversations(
     projects_dir: &Path,
     show_last: bool,
-    project_dir_name: &str,
     debug_level: Option<DebugLevel>,
 ) -> Result<Vec<Conversation>> {
-    // Load existing cache for this project
-    let cached_entries = cache::read_project_cache(env, project_dir_name).unwrap_or_default();
-
-    // Find all JSONL files and capture metadata in one pass
-    let mut files_with_meta = Vec::new();
+    let mut files = Vec::new();
     let mut skipped_agent_files = 0;
 
     for entry in read_dir(projects_dir)? {
@@ -684,11 +578,17 @@ pub fn load_conversations(
                 continue;
             }
 
-            let metadata = entry.metadata().ok();
-            let modified = metadata.as_ref().and_then(|m| m.modified().ok());
-            let file_size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
-
-            files_with_meta.push((path, modified, file_size));
+            let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
+            files.push((path, modified));
+        } else if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            // The session's subagent and `/btw` fork transcripts (upstream
+            // 3c2ffeb), listed like the Claude adapter's discovery does.
+            for sidecar in super::sources::claude::session_sidecars(&path) {
+                let modified = std::fs::metadata(&sidecar)
+                    .ok()
+                    .and_then(|m| m.modified().ok());
+                files.push((sidecar, modified));
+            }
         }
     }
 
@@ -696,107 +596,47 @@ pub fn load_conversations(
         debug_level,
         &format!(
             "Found {} conversation files ({} agent files skipped)",
-            files_with_meta.len(),
+            files.len(),
             skipped_agent_files
         ),
     );
 
-    // Sort by modification time (newest first)
-    files_with_meta.sort_by_key(|(_, modified, _)| modified.unwrap_or(SystemTime::UNIX_EPOCH));
-    files_with_meta.reverse();
+    let mut conversations: Vec<Conversation> = files
+        .into_par_iter()
+        .filter_map(|(path, modified)| {
+            let filename = path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("unknown")
+                .to_owned();
 
-    // Partition into cache hits and misses
-    let mut dirty = false;
-    let mut conversations: Vec<Conversation> = Vec::with_capacity(files_with_meta.len());
-    let mut files_to_parse: Vec<(PathBuf, Option<SystemTime>, u64)> = Vec::new();
-
-    for (path, modified, file_size) in &files_with_meta {
-        let filename = path
-            .file_name()
-            .and_then(|f| f.to_str())
-            .unwrap_or("unknown");
-
-        if let Some(mtime) = modified
-            && let Some(entry) = cached_entries.get(filename)
-            && cache::entry_matches(entry, *file_size, *mtime)
-        {
-            if entry.is_empty {
-                // Negative cache hit — file was previously parsed and yielded nothing
-                debug::debug(debug_level, &format!("Cache hit (empty) {}", filename));
-            } else {
-                let conv = cache::conversation_from_entry(entry, path.clone(), show_last);
-                debug::debug(
-                    debug_level,
-                    &format!("Cache hit {}: {}", filename, conv.preview),
-                );
-                conversations.push(conv);
-            }
-        } else {
-            dirty = true;
-            files_to_parse.push((path.clone(), *modified, *file_size));
-        }
-    }
-
-    if !dirty && files_with_meta.len() != cached_entries.len() {
-        // Files were deleted — need to rewrite cache to remove stale entries
-        dirty = true;
-    }
-
-    debug::info(
-        debug_level,
-        &format!(
-            "Cache: {} hits, {} misses",
-            conversations.len(),
-            files_to_parse.len()
-        ),
-    );
-
-    // Parse only cache misses in parallel
-    // Returns (Option<Conversation>, filename, file_size, mtime) — None for empty/filtered files
-    let parse_results: Vec<(Option<Conversation>, String, u64, Option<SystemTime>)> =
-        files_to_parse
-            .into_par_iter()
-            .map(|(path, modified, file_size)| {
-                let filename = path
-                    .file_name()
-                    .and_then(|f| f.to_str())
-                    .unwrap_or("unknown")
-                    .to_owned();
-
-                match process_conversation_file(path, modified, debug_level) {
-                    Ok(Some(mut conversation)) => {
-                        conversation.preview = if show_last {
-                            conversation.preview_last.clone()
-                        } else {
-                            conversation.preview_first.clone()
-                        };
-                        debug::debug(
-                            debug_level,
-                            &format!("Parsed {}: {}", filename, conversation.preview),
-                        );
-                        (Some(conversation), filename, file_size, modified)
-                    }
-                    Ok(None) => (None, filename, file_size, modified),
-                    Err(e) => {
-                        debug::warn(
-                            debug_level,
-                            &format!("Error processing {}: {}", filename, e),
-                        );
-                        (None, filename, file_size, modified)
-                    }
+            match process_conversation_file(path, modified, debug_level) {
+                Ok(Some(mut conversation)) => {
+                    conversation.preview = if show_last {
+                        conversation.preview_last.clone()
+                    } else {
+                        conversation.preview_first.clone()
+                    };
+                    debug::debug(
+                        debug_level,
+                        &format!("Parsed {}: {}", filename, conversation.preview),
+                    );
+                    Some(conversation)
                 }
-            })
-            .collect();
-
-    // Separate conversations from empty results (for negative caching)
-    for (conv, _, _, _) in &parse_results {
-        if let Some(conv) = conv {
-            conversations.push(conv.clone());
-        }
-    }
+                Ok(None) => None,
+                Err(e) => {
+                    debug::warn(
+                        debug_level,
+                        &format!("Error processing {}: {}", filename, e),
+                    );
+                    None
+                }
+            }
+        })
+        .collect();
 
     // Ensure deterministic ordering after parallel processing
-    conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    conversations.sort_by_key(|a| std::cmp::Reverse(a.timestamp));
 
     // Inject project info into each conversation
     let fallback_path = projects_dir
@@ -807,46 +647,11 @@ pub fn load_conversations(
     for (idx, conv) in conversations.iter_mut().enumerate() {
         conv.index = idx;
 
-        // Prefer the cwd extracted from the JSONL file, fall back to decoded path
+        // Prefer the cwd extracted from the JSONL file, fall back to decoded
+        // path. The name is NFC like the indexer's (upstream a76d5df).
         let project_path = conv.cwd.clone().unwrap_or_else(|| fallback_path.clone());
-        conv.project_name = Some(format_short_name_from_path(&project_path));
+        conv.project_name = Some(nfc(&format_short_name_from_path(&project_path)).into_owned());
         conv.project_path = Some(project_path);
-    }
-
-    // Write updated cache if anything changed
-    if dirty {
-        let mut new_cache: HashMap<String, cache::CacheEntry> = HashMap::new();
-
-        // Add existing conversations (both cache hits and fresh parses)
-        for conv in &conversations {
-            let filename = conv
-                .path
-                .file_name()
-                .and_then(|f| f.to_str())
-                .unwrap_or("unknown");
-
-            if let Some((_, modified, file_size)) = files_with_meta
-                .iter()
-                .find(|(p, _, _)| p.file_name() == conv.path.file_name())
-                && let Some(mtime) = modified
-            {
-                new_cache.insert(
-                    filename.to_owned(),
-                    cache::entry_from_conversation(conv, *file_size, *mtime),
-                );
-            }
-        }
-
-        // Add negative cache entries for files that parsed to nothing
-        for (conv, filename, file_size, modified) in &parse_results {
-            if conv.is_none()
-                && let Some(mtime) = modified
-            {
-                new_cache.insert(filename.to_owned(), cache::empty_entry(*file_size, *mtime));
-            }
-        }
-
-        cache::write_project_cache(env, project_dir_name, new_cache);
     }
 
     debug::info(
@@ -860,7 +665,166 @@ pub fn load_conversations(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::io::Write;
+
+    /// T-026: delete by ID and delete-empty remove a session's own files and
+    /// leave its `/btw` forks (3c2ffeb).
+    #[test]
+    fn deleting_a_session_by_id_or_as_empty_keeps_its_forks() {
+        let user = r#"{"type":"user","cwd":"/work","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"hello"}}"#;
+        let put = |path: &Path| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                path,
+                format!(
+                    "{user}
+"
+                ),
+            )
+            .unwrap();
+        };
+        let root = tempfile::tempdir().unwrap();
+        let env = HistoryEnv::sandbox(root.path());
+        let projects = env.claude_projects_root().unwrap();
+        let project = projects.join("-work");
+        let layout = |id: &str| {
+            let session = project.join(format!("{id}.jsonl"));
+            let sidecars = project.join(id).join("subagents");
+            let fork = sidecars.join("agent-afork-1.jsonl");
+            let subagent = sidecars.join("agent-a2.jsonl");
+            put(&session);
+            put(&fork);
+            std::fs::write(
+                fork.with_extension("meta.json"),
+                r#"{"agentType":"fork","isFork":true,"description":"btw"}"#,
+            )
+            .unwrap();
+            put(&subagent);
+            std::fs::write(
+                subagent.with_extension("meta.json"),
+                r#"{"agentType":"Explore"}"#,
+            )
+            .unwrap();
+            std::fs::create_dir_all(project.join(id).join("tool-results")).unwrap();
+            std::fs::write(project.join(id).join("tool-results/out.txt"), "x").unwrap();
+            (session, fork, subagent)
+        };
+        let check = |session: &Path, fork: &Path, subagent: &Path| {
+            assert!(!session.exists());
+            assert!(fork.is_file() && fork.with_extension("meta.json").is_file());
+            assert!(!subagent.exists() && !subagent.with_extension("meta.json").exists());
+            assert!(!session.with_extension("").join("tool-results").exists());
+        };
+
+        let (session, fork, subagent) = layout("s1");
+        assert_eq!(delete_session_by_uuid(&env, "s1").unwrap(), 1);
+        check(&session, &fork, &subagent);
+
+        // A session with no assistant message is empty.
+        let (session, fork, subagent) = layout("s2");
+        let empty = EmptyTranscript {
+            path: session.clone(),
+            session_id: "s2".into(),
+            project_name: "work".into(),
+            user_messages: 1,
+            line_count: 1,
+            preview: None,
+        };
+        assert_eq!(
+            delete_empty_transcript(&empty).unwrap(),
+            EmptyTranscriptDeletion::Deleted
+        );
+        check(&session, &fork, &subagent);
+    }
+
+    fn result(output: Option<serde_json::Value>) -> Part {
+        Part::ToolResult {
+            call_id: "id".into(),
+            output,
+        }
+    }
+
+    #[test]
+    fn user_search_text_includes_tool_result_string() {
+        let parts = [
+            Part::Text("hello".into()),
+            result(Some(json!("tool output here"))),
+        ];
+        let text = user_search_text(&parts);
+        assert!(text.contains("hello"));
+        assert!(text.contains("tool output here"));
+    }
+
+    #[test]
+    fn user_search_text_includes_tool_result_array() {
+        let parts = [result(Some(json!([
+            {"type": "text", "text": "line one"},
+            {"type": "text", "text": "line two"}
+        ])))];
+        let text = user_search_text(&parts);
+        assert!(text.contains("line one"));
+        assert!(text.contains("line two"));
+    }
+
+    #[test]
+    fn user_search_text_ignores_non_text_blocks_in_array() {
+        let parts = [result(Some(json!([
+            {"type": "text", "text": "visible"},
+            {"type": "image", "source": {"data": "base64..."}}
+        ])))];
+        let text = user_search_text(&parts);
+        assert!(text.contains("visible"));
+        assert!(!text.contains("base64"));
+    }
+
+    #[test]
+    fn user_search_text_handles_missing_and_empty_results() {
+        assert_eq!(user_search_text(&[result(None)]), "");
+        assert_eq!(user_search_text(&[result(Some(json!("")))]), "");
+    }
+
+    #[test]
+    fn project_names_and_texts_are_nfc() {
+        // The indexer keeps texts and project names in NFC (upstream
+        // a76d5df); this loader names projects itself, the same way.
+        let dir = tempfile::tempdir().unwrap();
+        let lines = [
+            json!({
+                "type": "user",
+                "cwd": "/work/cafe\u{301}",
+                "timestamp": "2024-01-01T00:00:00Z",
+                "message": {"role": "user", "content": "Cafe\u{301} menu"}
+            }),
+            json!({
+                "type": "assistant",
+                "timestamp": "2024-01-01T00:01:00Z",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}
+            }),
+        ];
+        let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        std::fs::write(
+            dir.path()
+                .join("11111111-1111-4111-8111-111111111111.jsonl"),
+            text,
+        )
+        .unwrap();
+
+        let conversations = load_conversations(dir.path(), false, None).unwrap();
+        assert_eq!(conversations.len(), 1);
+        let conversation = &conversations[0];
+        assert_eq!(conversation.project_name.as_deref(), Some("caf\u{e9}"));
+        assert!(
+            conversation.full_text.contains("Caf\u{e9} menu"),
+            "{}",
+            conversation.full_text
+        );
+        // The recorded working directory stays as recorded.
+        assert_eq!(
+            conversation.cwd.as_deref(),
+            Some(Path::new("/work/cafe\u{301}"))
+        );
+    }
 
     fn write_transcript(lines: &[&str]) -> tempfile::NamedTempFile {
         let mut file = tempfile::Builder::new()

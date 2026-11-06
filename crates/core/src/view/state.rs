@@ -25,65 +25,83 @@ use super::ViewPrefs;
 use super::document::{ConversationDocument, DocBlockKind, build_document};
 use super::ledger::{
     MessageRange, RenderableEntry, RenderedConversation, RenderedLine, ToolDisplayMode,
-    ToolOutputId, parse_conversation_file, parse_conversation_file_cancellable,
-    render_parsed_conversation,
+    ToolOutputId, open_conversation, render_parsed_conversation, renderable_entries,
 };
+use crate::display_format::ViewSearchQuery;
 use crate::export::{ExportOptions, MESSAGE_NOT_FOUND};
+use crate::history::model::Transcript;
+use crate::history::service::HistoryService;
+use crate::history::view;
+use crate::text_match::NormalizedForm;
 
 // ---------------------------------------------------------------------
 // ViewerModel
 // ---------------------------------------------------------------------
 
-/// An open conversation: its parsed entries (cached when opened, so the view
-/// keeps rendering and toggling after the file is deleted or changed), the
-/// display preferences and the expanded tool outputs.
+/// An open conversation: its transcript (decoded once when opened, so the
+/// view keeps rendering and toggling after the file is deleted or changed),
+/// the display preferences and the expanded tool outputs.
 #[derive(Clone, Debug)]
 pub struct ViewerModel {
     pub path: PathBuf,
-    pub entries: Arc<Vec<RenderableEntry>>,
+    pub transcript: Arc<Transcript>,
     pub prefs: ViewPrefs,
     pub expanded: BTreeSet<ToolOutputId>,
+    /// `(entry_index, ordinal)` of every entry placed as an agent message
+    /// ([`agent_ordinals`]), placed once when the model is built (on the
+    /// thread that decodes it) rather than on each reveal.
+    agent_ordinals: Arc<[(usize, usize)]>,
 }
 
 impl ViewerModel {
-    /// Parse `path` (upstream `enter_view_mode`). Expanded outputs start
-    /// empty. On failure upstream showed `"Failed to open: {e}"`.
-    pub fn open(path: &Path, prefs: ViewPrefs) -> std::io::Result<Self> {
-        let entries = parse_conversation_file(path)?;
-        Ok(Self::from_entries(
-            path.to_path_buf(),
-            Arc::new(entries),
-            prefs,
-        ))
+    /// Open `path` through `history`, the service of the GUI's environment
+    /// (upstream `enter_view_mode`, through its process-wide service).
+    /// Expanded outputs start empty. On failure upstream showed
+    /// `"Failed to open: {e}"`.
+    pub fn open(history: &HistoryService, path: &Path, prefs: ViewPrefs) -> std::io::Result<Self> {
+        let transcript = open_conversation(history, path)?;
+        Ok(Self::from_transcript(path.to_path_buf(), transcript, prefs))
     }
 
-    /// [`Self::open`] that abandons the parse (`Ok(None)`) once `cancelled`
-    /// returns true (polled every 64 lines).
+    /// [`Self::open`] that abandons the decode (`Ok(None)`) once `cancelled`
+    /// returns true (checked while the session file is read, V-101).
     pub fn open_cancellable(
+        history: &HistoryService,
         path: &Path,
         prefs: ViewPrefs,
         cancelled: &dyn Fn() -> bool,
     ) -> std::io::Result<Option<Self>> {
-        Ok(parse_conversation_file_cancellable(path, cancelled)?
-            .map(|entries| Self::from_entries(path.to_path_buf(), Arc::new(entries), prefs)))
-    }
-
-    /// A model over already parsed entries.
-    pub fn from_entries(
-        path: PathBuf,
-        entries: Arc<Vec<RenderableEntry>>,
-        prefs: ViewPrefs,
-    ) -> Self {
-        Self {
-            path,
-            entries,
-            prefs,
-            expanded: BTreeSet::new(),
+        match history.open_path_cancellable(path, cancelled) {
+            Ok((_, transcript)) => Ok(Some(Self::from_transcript(
+                path.to_path_buf(),
+                transcript,
+                prefs,
+            ))),
+            Err(error) if crate::history::adapter::is_cancelled(&error) => Ok(None),
+            Err(error) => Err(std::io::Error::other(error.to_string())),
         }
     }
 
-    /// `t`: summary → truncated → full → summary. Returns the new mode
-    /// (its status label is [`ToolDisplayMode::status_label`]).
+    /// A model over an already decoded transcript.
+    pub fn from_transcript(path: PathBuf, transcript: Arc<Transcript>, prefs: ViewPrefs) -> Self {
+        let agent_ordinals = agent_ordinals(&transcript).into();
+        Self {
+            path,
+            transcript,
+            prefs,
+            expanded: BTreeSet::new(),
+            agent_ordinals,
+        }
+    }
+
+    /// The entries shown, numbered as tool outputs and message ranges refer
+    /// to them ([`super::ledger::renderable_entries`]).
+    pub fn entries(&self) -> Vec<RenderableEntry<'_>> {
+        renderable_entries(&self.transcript)
+    }
+
+    /// `t`: off → summary → calls → truncated → full → off. Returns the new
+    /// mode (its status label is [`ToolDisplayMode::status_label`]).
     pub fn cycle_tool_display(&mut self) -> ToolDisplayMode {
         self.prefs.tool_display = self.prefs.tool_display.next();
         self.prefs.tool_display
@@ -120,14 +138,14 @@ impl ViewerModel {
 
     /// The layout-free document for the current preferences.
     pub fn document(&self) -> ConversationDocument {
-        build_document(&self.entries, &self.prefs, &self.expanded)
+        build_document(&self.entries(), &self.prefs, &self.expanded)
     }
 
     /// The ledger rendering at `content_width_cols` columns (see
     /// [`super::content_width_for_frame`]).
     pub fn ledger(&self, content_width_cols: usize) -> RenderedConversation {
         render_parsed_conversation(
-            &self.entries,
+            &self.entries(),
             &self
                 .prefs
                 .render_options(content_width_cols, &self.expanded),
@@ -146,31 +164,23 @@ impl ViewerModel {
     }
 
     /// The clipboard text of the message at `entry_index` (upstream `y` in
-    /// navigation mode), from the cached entries: the raw markdown source,
-    /// tools and thinking per [`Self::export_options`].
-    ///
-    /// Upstream re-read the file ([`crate::export::extract_message_text`],
-    /// still available); reading the cache copies what is displayed, also
-    /// after the file changed or was deleted. An empty string means
-    /// [`crate::export::NO_TEXT_CONTENT`] (always the case for a summary
-    /// group, whose tools are hidden in summary mode).
+    /// navigation mode, [`crate::export::extract_message_text`]) from the
+    /// open transcript: the raw markdown source, tools and thinking per
+    /// [`Self::export_options`], also after the file changed or was deleted.
+    /// An empty string means [`crate::export::NO_TEXT_CONTENT`] (always the
+    /// case for a summary group, whose tools are hidden in summary mode).
     pub fn message_text(&self, entry_index: usize) -> Result<String, String> {
-        self.entries
-            .binary_search_by_key(&entry_index, |entry| entry.entry_index)
-            .map(|position| {
-                crate::export::message_text(self.entries[position].entry(), self.export_options())
-            })
-            .map_err(|_| MESSAGE_NOT_FOUND.to_string())
+        view::entries(&self.transcript)
+            .get(entry_index)
+            .map(|entry| crate::export::message_text(entry, self.export_options()))
+            .ok_or_else(|| MESSAGE_NOT_FOUND.to_string())
     }
 
-    /// The CLI `--plain` text of the cached entries
+    /// The CLI `--plain` text of the open transcript
     /// ([`crate::export::plain_display`]), with tools and thinking per the
     /// view.
     pub fn plain_display(&self) -> String {
-        crate::export::plain_display_entries(
-            self.entries.iter().map(RenderableEntry::entry),
-            self.export_options(),
-        )
+        crate::export::plain_display(&self.transcript, self.export_options())
     }
 
     /// The entry ([`RenderableEntry::entry_index`]) of agent message `mN`
@@ -179,13 +189,13 @@ impl ViewerModel {
     ///
     /// Ordinals are placed exactly as [`crate::agent::transcript`] places
     /// them (shared rules of `history::messages::MessageOrdinals`), over the
-    /// cached entries. A streamed assistant message whose later records
+    /// transcript's events. A streamed assistant message whose later records
     /// replace it maps to the first entry with that ordinal.
     pub fn entry_for_agent_ordinal(&self, ordinal: usize) -> Option<usize> {
-        self.agent_ordinals()
-            .into_iter()
+        self.agent_ordinals
+            .iter()
             .find(|(_, placed)| *placed == ordinal)
-            .map(|(entry_index, _)| entry_index)
+            .map(|&(entry_index, _)| entry_index)
     }
 
     /// The agent message ordinal (`mN`) of the entry `entry_index`, or
@@ -193,64 +203,74 @@ impl ViewerModel {
     /// Warmup exchange, `/clear`, an entry without content). Every record
     /// of a replaced streaming message has its ordinal.
     pub fn agent_ordinal_for_entry(&self, entry_index: usize) -> Option<usize> {
-        self.agent_ordinals()
-            .into_iter()
+        self.agent_ordinals
+            .iter()
             .find(|(placed_entry, _)| *placed_entry == entry_index)
-            .map(|(_, ordinal)| ordinal)
+            .map(|&(_, ordinal)| ordinal)
     }
+}
 
-    /// `(entry_index, ordinal)` of every entry placed as an agent message,
-    /// in entry order.
-    fn agent_ordinals(&self) -> Vec<(usize, usize)> {
-        use crate::claude::{LogEntry, parse_agent_progress};
-        use crate::history::{MessageOrdinals, Placement};
+/// `(entry_index, ordinal)` of every entry of `transcript` placed as an
+/// agent message, in entry order.
+///
+/// Ordinals are placed over the transcript's dialogue events, as the agent
+/// transcript reader places them, and each placed event is mapped to the
+/// entry that shows it ([`view::entries_with_events`]).
+fn agent_ordinals(transcript: &Transcript) -> Vec<(usize, usize)> {
+    use crate::history::model::Visibility;
+    use crate::history::{MessageOrdinals, Placement};
 
-        let mut ordinals = MessageOrdinals::new();
-        let mut placed = Vec::new();
-        for parsed in self.entries.iter() {
-            let placement = match parsed.entry() {
-                LogEntry::Progress { data, .. } => match parse_agent_progress(data) {
-                    Some(progress) => ordinals.place_subagent(&progress),
-                    None => Placement::Control,
-                },
-                entry => ordinals.place(entry),
-            };
-            match placement {
-                Placement::Message(ordinal) | Placement::Replaces(ordinal) => {
-                    placed.push((parsed.entry_index, ordinal));
-                }
-                Placement::Control => {}
-            }
+    let mut entry_of = vec![None; transcript.events.len()];
+    for (entry_index, (event, _)) in view::entries_with_events(transcript)
+        .into_iter()
+        .enumerate()
+    {
+        if let Some(event) = event {
+            entry_of[event] = Some(entry_index);
         }
-        placed
     }
+    let mut ordinals = MessageOrdinals::new();
+    let mut placed = Vec::new();
+    for (index, event) in transcript.events.iter().enumerate() {
+        if event.visibility != Visibility::Dialogue {
+            continue;
+        }
+        match ordinals.place(event) {
+            Placement::Message(ordinal) | Placement::Replaces(ordinal) => {
+                if let Some(entry_index) = entry_of[index] {
+                    placed.push((entry_index, ordinal));
+                }
+            }
+            Placement::Control => {}
+        }
+    }
+    placed
 }
 
 // ---------------------------------------------------------------------
 // Ledger (line-based) helpers, verbatim from upstream view_state.rs
 // ---------------------------------------------------------------------
 
-/// Whether a rendered ledger line contains `query_lower` (already
-/// lowercased): case-insensitive substring match over the concatenated span
-/// text, including the name column, separator and timestamp (upstream
-/// quirk).
-pub fn line_matches_query(line: &RenderedLine, query_lower: &str) -> bool {
+/// Whether `line` has a match for `query`, by the list's matching rules.
+/// The concatenated span text is searched, including the name column,
+/// separator and timestamp (upstream quirk).
+pub fn line_matches_query(line: &RenderedLine, query: &ViewSearchQuery) -> bool {
     let full_text: String = line.spans.iter().map(|(text, _)| text.as_str()).collect();
-    full_text.to_lowercase().contains(query_lower)
+    query.has_match(&full_text)
 }
 
 /// Indices of the ledger lines matching `query` (upstream
-/// `update_search_results`); empty for an empty query. Counts are lines, not
-/// occurrences.
+/// `update_search_results`, parsed as a [`ViewSearchQuery`]); empty for a
+/// query without words or literals. Counts are lines, not occurrences.
 pub fn search_lines(lines: &[RenderedLine], query: &str) -> Vec<usize> {
-    let query_lower = query.to_lowercase();
-    if query_lower.is_empty() {
+    let query = ViewSearchQuery::parse(query);
+    if query.is_empty() {
         return Vec::new();
     }
     lines
         .iter()
         .enumerate()
-        .filter(|(_, line)| line_matches_query(line, &query_lower))
+        .filter(|(_, line)| line_matches_query(line, &query))
         .map(|(i, _)| i)
         .collect()
 }
@@ -707,13 +727,16 @@ impl<M: Clone> ViewSearch<M> {
         self.update(find)
     }
 
-    /// Enter: keep the search active only when there are matches.
-    pub fn commit(&mut self) {
-        self.mode = if self.matches.is_empty() {
-            ViewSearchMode::Off
-        } else {
-            ViewSearchMode::Active
-        };
+    /// Enter: keep the search active only when there are matches. A query
+    /// with text but no matches returns upstream's status message
+    /// `No matches for /<query>` (d2c0f07).
+    pub fn commit(&mut self) -> Option<String> {
+        if !self.matches.is_empty() {
+            self.mode = ViewSearchMode::Active;
+            return None;
+        }
+        self.mode = ViewSearchMode::Off;
+        (!self.query.trim().is_empty()).then(|| format!("No matches for /{}", self.query))
     }
 
     /// `n` (active search only): the next match, wrapping around. The GUI
@@ -825,22 +848,20 @@ struct SearchTarget {
     block: usize,
     item: Option<usize>,
     text: String,
-    folded: String,
-    /// For each byte of `folded`, the start of the original character; only
-    /// when lowercasing changed byte lengths (identity otherwise).
-    origin: Option<Vec<usize>>,
+    form: NormalizedForm,
 }
 
 /// The searchable text of a document: every block's (or summary item's)
-/// plain text, lowercased once. Build it when the document changes and run
-/// [`DocSearchIndex::find`] on each keystroke.
+/// plain text, search-normalized once. Build it when the document changes
+/// and run [`DocSearchIndex::find`] on each keystroke.
 ///
-/// Matching is a case-insensitive substring search (Greek final sigma
-/// matches `σ`/`Σ`) over the text the block shows ([`super::DocBlock::plain_text`]): collapsed tool output, hidden
-/// thinking and other content that is not displayed is not searchable, as
-/// in the ledger. Unlike the ledger search, labels and timestamps are not
-/// part of the text, and every occurrence is a match (the ledger counts
-/// matching lines).
+/// Matching follows the list's keyword rules ([`ViewSearchQuery`], upstream
+/// d2c0f07) over the text the block shows
+/// ([`super::DocBlock::plain_text`]): collapsed tool output, hidden thinking
+/// and other content that is not displayed is not searchable, as in the
+/// ledger. Unlike the ledger search, labels and timestamps are not part of
+/// the text, and every match range is a match (the ledger counts matching
+/// lines); separator-joined words on one line are one range.
 #[derive(Clone, Debug, Default)]
 pub struct DocSearchIndex {
     targets: Vec<SearchTarget>,
@@ -883,21 +904,21 @@ impl DocSearchIndex {
             .map(|t| t.text.as_str())
     }
 
-    /// All non-overlapping occurrences of `query`, case-insensitively, in
-    /// document order. Empty for an empty query.
+    /// Every match of `query` ([`ViewSearchQuery::match_ranges_in`]) in
+    /// document order. Empty for a query without words or literals.
     pub fn find(&self, query: &str) -> Vec<SearchMatch> {
-        let query: String = query.chars().flat_map(fold_char).collect();
+        let query = ViewSearchQuery::parse(query);
         if query.is_empty() {
             return Vec::new();
         }
         let mut matches = Vec::new();
         for target in &self.targets {
-            for (start, found) in target.folded.match_indices(&query) {
+            for (start, end) in query.match_ranges_in(&target.text, &target.form) {
                 matches.push(SearchMatch {
                     message: target.message,
                     block: target.block,
                     item: target.item,
-                    range: target.original_range(start..start + found.len()),
+                    range: start..end,
                 });
             }
         }
@@ -905,52 +926,16 @@ impl DocSearchIndex {
     }
 }
 
-/// Lowercase one character for search. Final sigma folds to `σ` as well, so
-/// that "ΟΔΟΣ", "Οδος" and "οδος" match each other in either direction:
-/// per-character lowercasing never yields `ς`, while lowercase text spells
-/// the word-final sigma `ς` (the ledger's `str::to_lowercase` applies the
-/// final-sigma rule instead, which misses some of these pairs). `ς` and `σ`
-/// are both two bytes, so byte offsets are unchanged.
-fn fold_char(ch: char) -> impl Iterator<Item = char> {
-    ch.to_lowercase().map(|c| if c == 'ς' { 'σ' } else { c })
-}
-
 impl SearchTarget {
     fn new(message: usize, block: usize, item: Option<usize>, text: String) -> Self {
-        let mut folded = String::with_capacity(text.len());
-        let mut identity = true;
-        for ch in text.chars() {
-            let before = folded.len();
-            folded.extend(fold_char(ch));
-            identity &= folded.len() - before == ch.len_utf8();
-        }
-        let origin = (!identity).then(|| {
-            let mut origin = Vec::with_capacity(folded.len());
-            for (start, ch) in text.char_indices() {
-                let added: usize = fold_char(ch).map(char::len_utf8).sum();
-                origin.extend(std::iter::repeat_n(start, added));
-            }
-            origin
-        });
+        let form = NormalizedForm::new(&text);
         Self {
             message,
             block,
             item,
             text,
-            folded,
-            origin,
+            form,
         }
-    }
-
-    /// Map a non-empty byte range of `folded` to whole characters of `text`.
-    fn original_range(&self, folded: Range<usize>) -> Range<usize> {
-        let Some(origin) = &self.origin else {
-            return folded;
-        };
-        let start = origin[folded.start];
-        let last = origin[folded.end - 1];
-        let end = last + self.text[last..].chars().next().map_or(0, char::len_utf8);
-        start..end
     }
 }
 

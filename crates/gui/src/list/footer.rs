@@ -3,9 +3,26 @@
 //! then key hints from the live keymap, priority-trimmed, `F1 help` always
 //! kept. WP1.
 //!
+//! The store's indexing progress (upstream 04c714b) is an activity too:
+//! `Indexing conversations… 2,345 / 7,185` with a progress bar, then
+//! `Finishing index… 7,185 conversations` with a spinner, in place of the
+//! refresh indicator and after the semantic activity (upstream showed the
+//! semantic activity instead), with `  ·  results may be incomplete` while a
+//! query is typed.
+//!
+//! The semantic worker's background indexing (upstream c6d0421) is the
+//! semantic activity `sem indexing 40%  12/30 chunks` with a progress bar,
+//! while no search has an activity of its own.
+//!
 //! The hint chips are only shown while the list has focus and no activity is
-//! displayed; the five action chips are dimmed while the initial load runs
-//! (AD6). Refresh is never advertised (L-041).
+//! displayed. While the initial load runs (AD6) the rename and delete chips
+//! are dimmed, and open, resume and fork until the rows are listed newest
+//! first (snapshot cards, upstream 3708bb6). Refresh is never advertised
+//! (L-041). While automated and subagent conversations are listed, an
+//! active `all kinds` chip says so (upstream cb990e6's `^G·all kinds`), and
+//! while search is limited to the user's own messages an active `you only`
+//! chip (upstream ae7ae39's `^V·you only`; `you only: not in semantic` in
+//! semantic mode, which ignores it).
 
 use claude_history_core::browser::{ListSearchMode, SemanticProgress};
 use gpui_kit::component::kbd::Kbd;
@@ -21,13 +38,19 @@ use gpui_kit::{
 };
 
 use crate::actions::{
-    ClearQuery, Delete, Fork, OpenConversation, Rename, Resume, ShowShortcuts, ToggleScope,
-    ToggleSearchMode,
+    ClearQuery, Delete, Fork, OpenConversation, Rename, Resume, ShowShortcuts, ToggleAllKinds,
+    ToggleScope, ToggleSearchMode, ToggleUserOnly,
 };
 use crate::keymap::{CTX_LIST, CTX_WORKSPACE, binding_labels};
 use crate::theme_tokens::roles;
 
 use super::ListPane;
+
+/// The `you only` chip's label while search is limited to the user's own
+/// messages (upstream ae7ae39's status-bar marker).
+pub const USER_ONLY_CHIP: &str = "you only";
+/// The chip's label in semantic mode, which ignores the toggle.
+pub const USER_ONLY_SEMANTIC_CHIP: &str = "you only: not in semantic";
 
 /// The context stack the list's hints are looked up in (outermost first).
 const HINT_STACK: &str = "Workspace ConversationList";
@@ -112,6 +135,10 @@ pub enum ChipKind {
     Rename,
     Delete,
     Scope,
+    /// Shown only while automated and subagent conversations are listed.
+    AllKinds,
+    /// Shown only while search is limited to the user's own messages.
+    UserOnly,
     Mode,
     Help,
 }
@@ -127,11 +154,16 @@ pub struct FooterChip {
     pub dimmed: bool,
     /// The chip shows the non-default value (`Prj`, `sem`): accent and bold (§8.7).
     pub active: bool,
+    /// The key part is left out (a narrow footer keeping the pinned chips).
+    pub keyless: bool,
 }
 
 impl FooterChip {
     /// `Ctrl+R resume`
     pub fn text(&self) -> String {
+        if self.keyless {
+            return self.label.to_string();
+        }
         format!("{} {}", self.key, self.label)
     }
 }
@@ -143,10 +175,17 @@ pub struct FooterModel {
     pub count: String,
     /// `Refreshing conversations…`
     pub refreshing: bool,
-    /// `sem preparing embeddings` / `sem embedding 40%  12/30 chunks`
+    /// `sem preparing embeddings` / `sem embedding 40%  12/30 chunks` /
+    /// `sem indexing 40%  12/30 chunks`
     pub semantic_activity: Option<String>,
-    /// The embedding progress in percent, when known.
+    /// The embedding or indexing progress in percent, when known.
     pub semantic_percent: Option<f32>,
+    /// `Indexing conversations… 2,345 / 7,185` / `Finishing index… 7,185
+    /// conversations` while a reconcile pass is shown as indexing
+    /// (`Browser::indexing_status_text`).
+    pub indexing: Option<String>,
+    /// The indexing progress in percent, while files are parsed.
+    pub indexing_percent: Option<f32>,
     /// Hint chips (empty while an activity shows or the list lacks focus).
     pub chips: Vec<FooterChip>,
 }
@@ -154,7 +193,7 @@ pub struct FooterModel {
 impl FooterModel {
     /// Whether an activity replaces the hints.
     pub fn has_activity(&self) -> bool {
-        self.refreshing || self.semantic_activity.is_some()
+        self.refreshing || self.semantic_activity.is_some() || self.indexing.is_some()
     }
 }
 
@@ -202,37 +241,56 @@ impl ListPane {
     /// are trimmed to it).
     pub fn footer_model_for_width(&self, pane_rem: f32, window: &Window, cx: &App) -> FooterModel {
         let activity = self.browser.semantic_activity_status_text();
-        let percent = match self.browser.semantic_progress() {
-            SemanticProgress::Embedding { completed, total } if activity.is_some() => {
-                Some(if *total == 0 {
+        // The counts the activity text shows (`sem embedding`, `sem indexing`).
+        let percent = self
+            .browser
+            .semantic_activity_counts()
+            .map(|(completed, total)| {
+                if total == 0 {
                     100.0
                 } else {
-                    (*completed).min(*total) as f32 * 100.0 / *total as f32
-                })
-            }
-            _ => None,
-        };
+                    completed.min(total) as f32 * 100.0 / total as f32
+                }
+            });
+        let indexing = self
+            .browser
+            .indexing_status_text()
+            .map(|text| crate::notify::gui_text(&text));
+        let indexing_percent = self
+            .browser
+            .index_progress()
+            .filter(|progress| indexing.is_some() && progress.done < progress.total)
+            .map(|progress| progress.done as f32 * 100.0 / progress.total as f32);
         let mut model = FooterModel {
             count: crate::notify::gui_text(&self.browser.search_status_text()),
             refreshing: self.is_refreshing(),
             semantic_activity: activity,
             semantic_percent: percent,
+            indexing,
+            indexing_percent,
             chips: Vec::new(),
         };
         if !model.has_activity() && self.contains_focus(window, cx) {
             let specs = self.chip_specs(cx);
-            let kept = fit_chips(&specs, &model.count, pane_rem);
+            let fit = fit_chips(&specs, &model.count, pane_rem);
             model.chips = specs
                 .into_iter()
-                .zip(kept)
+                .zip(fit.keep)
                 .filter(|(_, keep)| *keep)
                 .map(|(spec, _)| FooterChip {
                     kind: spec.kind,
                     key: spec.key,
-                    label: spec.label,
-                    dimmed: spec.dimmed,
+                    keyless: fit.keyless && pinned_kind(spec.kind),
+                    // The ignored toggle shows dimmed instead of the long label.
+                    dimmed: spec.dimmed || (fit.short_semantic && spec.kind == ChipKind::UserOnly),
+                    label: if fit.short_semantic && spec.kind == ChipKind::UserOnly {
+                        USER_ONLY_CHIP.into()
+                    } else {
+                        spec.label
+                    },
                     active: match spec.kind {
                         ChipKind::Scope => self.scope_is_workspace(),
+                        ChipKind::AllKinds | ChipKind::UserOnly => true,
                         ChipKind::Mode => self.mode() == ListSearchMode::Semantic,
                         _ => false,
                     },
@@ -243,7 +301,9 @@ impl ListPane {
     }
 
     fn chip_specs(&self, cx: &App) -> Vec<ChipSpec> {
+        // Rows can be opened before loading finishes, edited only after.
         let loading = self.is_loading();
+        let not_ready = !self.list_ready();
         let picker = crate::exit::is_picker(cx);
         let mut specs = Vec::new();
         let spec = |kind: ChipKind,
@@ -281,7 +341,7 @@ impl ListPane {
             CTX_LIST,
             HINT_STACK,
             "open",
-            loading,
+            not_ready,
         ));
         specs.extend(spec(
             ChipKind::Resume,
@@ -289,7 +349,7 @@ impl ListPane {
             CTX_LIST,
             HINT_STACK,
             "resume",
-            loading,
+            not_ready,
         ));
         specs.extend(spec(
             ChipKind::Fork,
@@ -297,7 +357,7 @@ impl ListPane {
             CTX_LIST,
             HINT_STACK,
             "fork",
-            loading,
+            not_ready,
         ));
         specs.extend(spec(
             ChipKind::Rename,
@@ -330,6 +390,32 @@ impl ListPane {
                 false,
             ));
         }
+        if self.all_kinds() {
+            specs.extend(spec(
+                ChipKind::AllKinds,
+                Box::new(ToggleAllKinds),
+                CTX_LIST,
+                HINT_STACK,
+                "all kinds",
+                false,
+            ));
+        }
+        if self.user_only() {
+            // Semantic search ignores the toggle; the chip says so.
+            let label = if self.searches_user_only() {
+                USER_ONLY_CHIP
+            } else {
+                USER_ONLY_SEMANTIC_CHIP
+            };
+            specs.extend(spec(
+                ChipKind::UserOnly,
+                Box::new(ToggleUserOnly),
+                CTX_LIST,
+                HINT_STACK,
+                label,
+                false,
+            ));
+        }
         let mode = match self.mode() {
             ListSearchMode::Lexical => "lex",
             ListSearchMode::Semantic => "sem",
@@ -354,21 +440,87 @@ impl ListPane {
     }
 }
 
+/// The chips that stay whatever the width: `Ctrl+G all kinds` and
+/// `Alt+U you only` are the footer's only signs of their toggles' state.
+fn pinned_kind(kind: ChipKind) -> bool {
+    matches!(kind, ChipKind::AllKinds | ChipKind::UserOnly)
+}
+
+/// Which chips a footer shows and how the pinned ones are drawn.
+struct Fit {
+    keep: Vec<bool>,
+    /// The pinned chips drop their key part.
+    keyless: bool,
+    /// The semantic `you only: not in semantic` chip shrinks to a dimmed
+    /// `you only`.
+    short_semantic: bool,
+}
+
 /// Which chips fit a pane `pane_rem` wide: the lowest priority goes first,
-/// `F1 help` stays.
-fn fit_chips(specs: &[ChipSpec], count: &str, pane_rem: f32) -> Vec<bool> {
+/// `F1 help` stays. While a pinned chip is shown, `Enter open` may go too,
+/// and when the pinned chips and help still do not fit, the pinned chips
+/// lose their key and the long semantic label.
+fn fit_chips(specs: &[ChipSpec], count: &str, pane_rem: f32) -> Fit {
     let count_rem = count.chars().count() as f32 * CHAR_REM + 1.0;
     let available = pane_rem - FOOTER_PADDING_REM - count_rem;
-    let widths: Vec<f32> = specs
-        .iter()
-        .map(|spec| chip_width_rem(spec.key.chars().count(), spec.label.chars().count()))
-        .collect();
-    trim_chips(&widths, available)
+    let any_pinned = specs.iter().any(|spec| pinned_kind(spec.kind));
+    let build = |keyless: bool, short_semantic: bool| {
+        let width_of = |spec: &ChipSpec| {
+            let key = if keyless && pinned_kind(spec.kind) {
+                0
+            } else {
+                spec.key.chars().count()
+            };
+            let label = if short_semantic && spec.kind == ChipKind::UserOnly {
+                USER_ONLY_CHIP.chars().count()
+            } else {
+                spec.label.chars().count()
+            };
+            chip_width_rem(key, label)
+        };
+        let pinned_rem: f32 = specs
+            .iter()
+            .filter(|spec| pinned_kind(spec.kind))
+            .map(|spec| width_of(spec) + CHIP_GAP_REM)
+            .sum();
+        let widths: Vec<f32> = specs
+            .iter()
+            .filter(|spec| !pinned_kind(spec.kind))
+            .map(width_of)
+            .collect();
+        let (kept, fits) = trim_chips_pinned(&widths, available - pinned_rem, !any_pinned);
+        let mut kept = kept.into_iter();
+        let keep: Vec<bool> = specs
+            .iter()
+            .map(|spec| pinned_kind(spec.kind) || kept.next().unwrap_or(true))
+            .collect();
+        (
+            Fit {
+                keep,
+                keyless,
+                short_semantic,
+            },
+            fits,
+        )
+    };
+    for keyless in [false, true] {
+        let (fit, fits) = build(keyless, false);
+        if fits || !any_pinned {
+            return fit;
+        }
+    }
+    build(true, true).0
 }
 
 /// The estimated width of a chip (rem).
 pub fn chip_width_rem(key_chars: usize, label_chars: usize) -> f32 {
-    (key_chars + label_chars) as f32 * CHAR_REM + CHIP_CHROME_REM
+    // Without a key there is no kbd box: only the label's own gap remains.
+    let chrome = if key_chars == 0 {
+        CHIP_CHROME_REM / 3.0
+    } else {
+        CHIP_CHROME_REM
+    };
+    (key_chars + label_chars) as f32 * CHAR_REM + chrome
 }
 
 /// Which of the chips (priority order, the last one is `F1 help`) fit
@@ -376,6 +528,12 @@ pub fn chip_width_rem(key_chars: usize, label_chars: usize) -> f32 {
 /// first chip and the last (`help`) always stay when at all possible, so the
 /// result keeps at least `help`.
 pub fn trim_chips(widths: &[f32], available_rem: f32) -> Vec<bool> {
+    trim_chips_pinned(widths, available_rem, true).0
+}
+
+/// [`trim_chips`] with the first chip droppable (`keep_first` false), and
+/// whether what is kept fits `available_rem`.
+fn trim_chips_pinned(widths: &[f32], available_rem: f32, keep_first: bool) -> (Vec<bool>, bool) {
     let mut keep = vec![true; widths.len()];
     let total = |keep: &[bool]| -> f32 {
         let chosen: Vec<f32> = widths
@@ -387,12 +545,14 @@ pub fn trim_chips(widths: &[f32], available_rem: f32) -> Vec<bool> {
         chosen.iter().sum::<f32>() + chosen.len().saturating_sub(1) as f32 * CHIP_GAP_REM
     };
     // Drop from the second-to-last backwards (the last chip is help).
+    let floor = if keep_first { 1 } else { 0 };
     let mut ix = widths.len().saturating_sub(1);
-    while total(&keep) > available_rem && ix > 1 {
+    while total(&keep) > available_rem && ix > floor {
         ix -= 1;
         keep[ix] = false;
     }
-    keep
+    let fits = total(&keep) <= available_rem;
+    (keep, fits)
 }
 
 /// The footer element.
@@ -416,7 +576,7 @@ pub fn render_footer(list: &ListPane, window: &Window, cx: &App) -> impl IntoEle
                 h_flex()
                     .gap_1()
                     .when(chip.dimmed, |this| this.opacity(0.5))
-                    .child(kbd)
+                    .when(!chip.keyless, |this| this.child(kbd))
                     .child(if chip.active {
                         div()
                             .text_color(accent)
@@ -431,7 +591,8 @@ pub fn render_footer(list: &ListPane, window: &Window, cx: &App) -> impl IntoEle
     let activity = h_flex()
         .gap_2()
         .items_center()
-        .when(model.refreshing, |this| {
+        // The indexing progress says more than the refresh indicator.
+        .when(model.refreshing && model.indexing.is_none(), |this| {
             this.child(
                 h_flex()
                     .id("footer-refreshing")
@@ -457,6 +618,25 @@ pub fn render_footer(list: &ListPane, window: &Window, cx: &App) -> impl IntoEle
                         )
                     })
                     .when(model.semantic_percent.is_none(), |this| {
+                        this.child(Spinner::new().xsmall().color(muted))
+                    })
+                    .child(div().text_color(muted).child(text)),
+            )
+        })
+        .when_some(model.indexing.clone(), |this, text| {
+            this.child(
+                h_flex()
+                    .id("footer-indexing")
+                    .gap_1()
+                    .items_center()
+                    .when_some(model.indexing_percent, |this, percent| {
+                        this.child(
+                            div()
+                                .w_12()
+                                .child(Progress::new("indexing-progress").value(percent)),
+                        )
+                    })
+                    .when(model.indexing_percent.is_none(), |this| {
                         this.child(Spinner::new().xsmall().color(muted))
                     })
                     .child(div().text_color(muted).child(text)),
@@ -490,5 +670,15 @@ mod unit_tests {
         assert_eq!(tight.iter().filter(|keep| **keep).count(), 2);
         // Nothing fits: help is still kept.
         assert_eq!(trim_chips(&widths, 0.5).last(), Some(&true));
+    }
+
+    #[test]
+    fn dropping_the_first_chip_keeps_help_and_reports_the_fit() {
+        let widths = [3.0, 3.0, 3.0, 3.0];
+        let (keep, fits) = trim_chips_pinned(&widths, 4.0, false);
+        assert_eq!(keep, vec![false, false, false, true]);
+        assert!(fits);
+        let (keep, _) = trim_chips_pinned(&widths, 4.0, true);
+        assert!(keep[0] && keep[3]);
     }
 }

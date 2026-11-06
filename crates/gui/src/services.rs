@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use claude_history_core::resume::terminal::RunOutput;
 use claude_history_core::resume::{LaunchSpec, TerminalCommand};
 use claude_history_core::update::UpdateStatus;
 use gpui_kit::base::{Root, RootPlugin, TextSelection};
@@ -80,6 +81,11 @@ pub trait PlatformServices: Send + Sync + 'static {
     /// returns `Ok(())` to stand for that success: callers treat `Ok` as
     /// "the launching terminal took over" and quit with exit 0 and no output.
     fn exec_in_current_terminal(&self, spec: &LaunchSpec) -> Result<(), String>;
+    /// Blocking (until the program exits); call from a background task. Run
+    /// an agent's CLI without a terminal (Codex: `codex delete --force <id>`,
+    /// upstream eea6d37). Real: core `terminal::run_to_completion` after the
+    /// debug-build launch guard. `Err` = could not run it.
+    fn run_program(&self, spec: &LaunchSpec) -> Result<RunOutput, String>;
     /// `Redirected | Terminal | None` (after `AttachConsole` on Windows).
     fn stdout_kind(&self) -> StdoutKind;
     /// Unix picker exec decision (PD5); always `false` on Windows.
@@ -184,6 +190,8 @@ pub enum ServiceCall {
     ClipboardWrite(String),
     Terminal(TerminalCommand),
     Exec(LaunchSpec),
+    /// A program run to completion ([`PlatformServices::run_program`]).
+    Run(LaunchSpec),
     Stdout(String),
     /// A `write_stdout` that failed (no stdout); nothing was written.
     StdoutFailed(String),
@@ -202,6 +210,7 @@ struct RecordingState {
     release: Result<UpdateStatus, String>,
     spawn_result: Result<Option<i32>, String>,
     exec_result: Result<(), String>,
+    run_result: Result<RunOutput, String>,
     login_shell_path: Option<OsString>,
     /// `--qa-real-console`: stdout/stderr (and their kinds) are the real
     /// console's; the calls are still recorded.
@@ -237,6 +246,11 @@ impl RecordingServices {
                 release: Err("no release scripted (RecordingServices::set_release)".to_string()),
                 spawn_result: Ok(None),
                 exec_result: Ok(()),
+                run_result: Ok(RunOutput {
+                    success: true,
+                    status: "exit status: 0".to_string(),
+                    stderr: String::new(),
+                }),
                 login_shell_path: None,
                 real_console: false,
             }),
@@ -291,6 +305,24 @@ impl RecordingServices {
     /// `Ok(())` = the exec succeeded; see the trait method).
     pub fn set_exec_result(&self, result: Result<(), String>) {
         self.state().exec_result = result;
+    }
+
+    /// The result of every following `run_program` (default: the program
+    /// exited with status 0).
+    pub fn set_run_result(&self, result: Result<RunOutput, String>) {
+        self.state().run_result = result;
+    }
+
+    /// The recorded program runs.
+    pub fn program_runs(&self) -> Vec<LaunchSpec> {
+        self.state()
+            .calls
+            .iter()
+            .filter_map(|call| match call {
+                ServiceCall::Run(spec) => Some(spec.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     pub fn set_login_shell_path(&self, path: Option<OsString>) {
@@ -425,6 +457,12 @@ impl PlatformServices for RecordingServices {
         let mut state = self.state();
         state.calls.push(ServiceCall::Exec(spec.clone()));
         state.exec_result.clone()
+    }
+
+    fn run_program(&self, spec: &LaunchSpec) -> Result<RunOutput, String> {
+        let mut state = self.state();
+        state.calls.push(ServiceCall::Run(spec.clone()));
+        state.run_result.clone()
     }
 
     fn stdout_kind(&self) -> StdoutKind {
@@ -627,16 +665,17 @@ impl RealServices {
 /// Test builds never reach the network or the desktop through `RealServices`.
 const REFUSED_IN_TESTS: &str = "RealServices is refused in test builds";
 
-/// The variable that lets a debug build start a real `claude`/`pi`/`omp`.
+/// The variable that lets a debug build start a real `claude`/`pi`/`omp`/
+/// `codex`.
 pub const ALLOW_REAL_LAUNCH_VAR: &str = "CHG_ALLOW_REAL_LAUNCH";
 
 /// Programs a debug build never starts for real without an override (§15.4).
-const GUARDED_PROGRAMS: [&str; 3] = ["claude", "pi", "omp"];
+const GUARDED_PROGRAMS: [&str; 4] = ["claude", "pi", "omp", "codex"];
 
 /// The debug-build launch guard (§15.4, X-037) on the text of a launch
-/// (a terminal command line, a launch script, an exec line): a word whose file
-/// stem is `claude`, `pi` or `omp` and that is not an existing directory is a
-/// guarded program. It is allowed only when `allow_real` is set
+/// (a terminal command line, a launch script, an exec line, a program run): a
+/// word whose file stem is `claude`, `pi`, `omp` or `codex` and that is not an
+/// existing directory is a guarded program. It is allowed only when `allow_real` is set
 /// (`CHG_ALLOW_REAL_LAUNCH=1`) or the word is a path inside the sandbox home
 /// (a `[gui] <prog>_path` override pointing at a harmless recorder).
 pub fn launch_guard(
@@ -704,6 +743,19 @@ fn guard_launch(command_text: &str) -> Result<(), String> {
     }
     let allow = std::env::var(ALLOW_REAL_LAUNCH_VAR).as_deref() == Ok("1");
     launch_guard(command_text, allow, sandbox_home().as_deref())
+}
+
+/// The words of a program run a guard looks at: the program and its
+/// arguments.
+fn launch_spec_text(spec: &LaunchSpec) -> String {
+    std::iter::once(spec.program.path.to_string_lossy().into_owned())
+        .chain(
+            spec.args
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned()),
+        )
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The words of a terminal command a guard looks at: its command line and
@@ -810,17 +862,10 @@ impl PlatformServices for RealServices {
     #[cfg(unix)]
     fn exec_in_current_terminal(&self, spec: &LaunchSpec) -> Result<(), String> {
         use std::os::unix::process::CommandExt as _;
-        let line = std::iter::once(spec.program.path.to_string_lossy().into_owned())
-            .chain(
-                spec.args
-                    .iter()
-                    .map(|arg| arg.to_string_lossy().into_owned()),
-            )
-            .collect::<Vec<_>>()
-            .join(" ");
-        guard_launch(&line)?;
+        guard_launch(&launch_spec_text(spec))?;
         let mut command = std::process::Command::new(&spec.program.path);
         command.args(&spec.args);
+        command.envs(spec.env.iter().map(|(name, value)| (name, value)));
         if let Some(cwd) = spec.cwd.as_ref().filter(|cwd| cwd.is_dir()) {
             command.current_dir(cwd);
         }
@@ -832,6 +877,12 @@ impl PlatformServices for RealServices {
     #[cfg(not(unix))]
     fn exec_in_current_terminal(&self, _spec: &LaunchSpec) -> Result<(), String> {
         Err("Resuming in the launching terminal is only available on macOS and Linux".to_string())
+    }
+
+    fn run_program(&self, spec: &LaunchSpec) -> Result<RunOutput, String> {
+        guard_launch(&launch_spec_text(spec))?;
+        claude_history_core::resume::terminal::run_to_completion(spec)
+            .map_err(|error| error.to_string())
     }
 
     fn stdout_kind(&self) -> StdoutKind {
@@ -980,7 +1031,14 @@ mod tests {
 
     #[test]
     fn guard_covers_pi_and_omp_and_bare_names() {
-        for program in ["pi", "omp", "/usr/local/bin/pi", "omp.exe"] {
+        for program in [
+            "pi",
+            "omp",
+            "/usr/local/bin/pi",
+            "omp.exe",
+            "codex",
+            "codex.cmd",
+        ] {
             let line = format!("xterm -e {program} --session x");
             assert!(launch_guard(&line, false, None).is_err(), "{line}");
         }
@@ -1026,9 +1084,24 @@ mod tests {
             cwd: None,
             script: None,
             hide_console: false,
+            env: Vec::new(),
         };
         let result = RealServices::new().spawn_terminal(&command, Duration::from_millis(10));
         assert_eq!(result, Err(REFUSED_IN_TESTS.to_string()));
+        // `codex delete` (upstream eea6d37) is never run by a test either.
+        let spec = LaunchSpec {
+            program: claude_history_core::program::ResolvedProgram {
+                path: PathBuf::from("codex"),
+                kind: claude_history_core::program::ProgramKind::Executable,
+            },
+            args: vec![OsString::from("delete")],
+            cwd: None,
+            env: Vec::new(),
+        };
+        assert_eq!(
+            RealServices::new().run_program(&spec),
+            Err(REFUSED_IN_TESTS.to_string())
+        );
     }
 
     #[test]

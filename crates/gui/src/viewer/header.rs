@@ -3,17 +3,19 @@
 //!
 //! Order (upstream `render_view_header`): project (accent bold, `Unknown`
 //! fallback) · custom title (only when set) · model (only when known) ·
-//! `1 message` / `N messages` · duration (only when known) · tokens (only
-//! when `total_tokens > 0`: `926k tokens` when the line has room, else
+//! `1 prompt` / `N prompts` · `1 tool call` / `M tool calls` (only when
+//! there are any; upstream e930cac) · duration (only when known) · tokens
+//! (only when `total_tokens > 0`: `926k tokens` when the line has room, else
 //! `926k`) · timestamp; the summary follows on the same line when the whole
 //! line fits, else on a second line. A conversation that is not in the
 //! corpus shows its file stem only (V-006). `parse_error_count > 0` adds a
 //! `⚠ N` badge that opens Debug log → Parse errors (V-008).
 
 use claude_history_core::display_format::{
-    format_duration_minutes, format_header_timestamp, format_model_name, format_msg_count_long,
-    format_tokens, format_tokens_long,
+    format_duration_minutes, format_header_counts, format_header_timestamp, format_model_name,
+    format_tokens, format_tokens_long, header_count_parts,
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::model::HeaderInfo;
 
@@ -100,11 +102,15 @@ pub fn layout(info: Option<&HeaderInfo>, file_stem: &str, width: usize) -> Heade
         .unwrap_or_else(|| "Unknown".to_string());
     let custom_title = info.custom_title.as_ref().map(|t| t.to_string());
     let model = info.model.as_deref().map(format_model_name);
-    let messages = format_msg_count_long(info.message_count);
+    let (prompts, tool_calls) = header_count_parts(info.prompt_count, info.tool_call_count);
     let duration = info.duration_minutes.map(format_duration_minutes);
     let timestamp = format_header_timestamp(info.timestamp);
 
-    // Upstream's width heuristic (bytes, " · " separators, 2 leading spaces).
+    // Upstream's width heuristic (bytes, " · " separators, 2 leading spaces;
+    // the counts in cells, e930cac).
+    let counts_len = UnicodeWidthStr::width(
+        format_header_counts(info.prompt_count, info.tool_call_count).as_str(),
+    );
     let base_len = 2
         + project.len()
         + 3
@@ -112,7 +118,7 @@ pub fn layout(info: Option<&HeaderInfo>, file_stem: &str, width: usize) -> Heade
             .as_ref()
             .map_or(0, |title| title.chars().count() + 3)
         + model.as_ref().map_or(0, |m| m.len() + 3)
-        + messages.len()
+        + counts_len
         + duration.as_ref().map_or(0, |d| d.len() + 3)
         + 3
         + timestamp.len();
@@ -151,9 +157,15 @@ pub fn layout(info: Option<&HeaderInfo>, file_stem: &str, width: usize) -> Heade
         });
     }
     parts.push(HeaderPart {
-        text: messages,
+        text: prompts,
         role: HeaderRole::Secondary,
     });
+    if let Some(tool_calls) = tool_calls {
+        parts.push(HeaderPart {
+            text: tool_calls,
+            role: HeaderRole::Secondary,
+        });
+    }
     if let Some(duration) = duration {
         parts.push(HeaderPart {
             text: duration,
@@ -176,4 +188,90 @@ pub fn layout(info: Option<&HeaderInfo>, file_stem: &str, width: usize) -> Heade
         summary_inline,
         parse_errors: info.parse_error_count,
     }
+}
+
+/// Characters of a parent's label on the family line (upstream 3c2ffeb
+/// cuts it at 60 columns).
+pub const FAMILY_LABEL_CHARS: usize = 60;
+
+/// The family line under the header (upstream 3c2ffeb `family_line`): the
+/// conversation this one came from and the count of its subagents and
+/// forks. `None` when it has neither.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FamilyLine {
+    /// `↳ fork of ` / `↳ subagent of `, then the parent's label (a link), or
+    /// the whole text when the parent is not found.
+    pub parent: Option<FamilyParent>,
+    /// `2 subagents, 1 fork` (a button opening the picker).
+    pub children: Option<String>,
+}
+
+/// The parent half of the [`FamilyLine`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FamilyParent {
+    pub prefix: String,
+    /// The parent's label (`None`: not found, `prefix` says so).
+    pub label: Option<String>,
+}
+
+impl FamilyLine {
+    /// The line as plain text (probes, tests).
+    pub fn text(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(parent) = &self.parent {
+            parts.push(format!(
+                "{}{}",
+                parent.prefix,
+                parent.label.as_deref().unwrap_or_default()
+            ));
+        }
+        if let Some(children) = &self.children {
+            parts.push(children.clone());
+        }
+        parts.join(" · ")
+    }
+}
+
+/// `1 subagent, 2 forks` (subagents first, a zero count left out).
+pub fn children_count_text(children: &[crate::model::FamilyMember]) -> String {
+    let forks = children.iter().filter(|child| child.fork).count();
+    let subagents = children.len() - forks;
+    [
+        (subagents, "subagent", "subagents"),
+        (forks, "fork", "forks"),
+    ]
+    .into_iter()
+    .filter(|(count, _, _)| *count > 0)
+    .map(|(count, one, many)| format!("{count} {}", if count == 1 { one } else { many }))
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
+/// Lay out the family line of `info`.
+pub fn family_line(info: Option<&HeaderInfo>) -> Option<FamilyLine> {
+    let family = &info?.family;
+    if family.is_empty() {
+        return None;
+    }
+    let parent = family.parent_id.as_ref().map(|parent_id| {
+        let kind = if family.is_fork { "fork" } else { "subagent" };
+        match &family.parent {
+            Some(parent) => FamilyParent {
+                prefix: format!("↳ {kind} of "),
+                label: Some(crate::model::truncate_chars(
+                    &parent.label,
+                    FAMILY_LABEL_CHARS,
+                )),
+            },
+            None => FamilyParent {
+                prefix: format!(
+                    "↳ {kind} of session {} (not found)",
+                    crate::model::short_session_id(parent_id)
+                ),
+                label: None,
+            },
+        }
+    });
+    let children = (!family.children.is_empty()).then(|| children_count_text(&family.children));
+    Some(FamilyLine { parent, children })
 }

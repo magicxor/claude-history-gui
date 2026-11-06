@@ -35,7 +35,7 @@ fn s001_parsed_query_predicates() {
 
 fn searchable(title: &str, summary: &str, project: &str, body: &str) -> SearchableConversation {
     SearchableConversation {
-        text_lower: format!("{body} {project}"),
+        body_lower: body.into(),
         title_lower: title.to_string(),
         summary_lower: summary.to_string(),
         project_lower: project.to_string(),
@@ -48,7 +48,7 @@ fn s013_score_uses_upstream_field_weights_adjacency_and_freshness() {
     let now = Local::now();
     let ln2 = 2f64.ln();
     let s = searchable("alpha", "alpha", "alpha", "alpha");
-    let debug = score_text_debug(&s, "alpha", &["alpha"], &[], now, now).unwrap();
+    let debug = score_text_debug(&s, &["alpha"], &[], now, now).unwrap();
     let weights = debug
         .fields
         .iter()
@@ -73,22 +73,14 @@ fn s013_score_uses_upstream_field_weights_adjacency_and_freshness() {
 
     // Term frequency saturates at 10 matches: ln(11).
     let body = "alpha ".repeat(25);
-    let debug = score_text_debug(
-        &searchable("", "", "", &body),
-        &body,
-        &["alpha"],
-        &[],
-        now,
-        now,
-    )
-    .unwrap();
+    let debug =
+        score_text_debug(&searchable("", "", "", &body), &["alpha"], &[], now, now).unwrap();
     assert!((debug.fields[0].tf_score - 11f64.ln()).abs() < 1e-9);
 
     // Adjacent query words add weight × 2 per adjacent occurrence (≤ 3).
     let pairs = vec!["cache warming".to_string()];
     let debug = score_text_debug(
         &searchable("", "", "", "cache warming"),
-        "cache warming",
         &["cache", "warming"],
         &pairs,
         now,
@@ -100,7 +92,6 @@ fn s013_score_uses_upstream_field_weights_adjacency_and_freshness() {
     // Freshness halves every 7 days: 2 · 2^(−age/7).
     let week_old = score_text_debug(
         &searchable("", "", "", "alpha"),
-        "alpha",
         &["alpha"],
         &[],
         now - Duration::days(7),
@@ -150,24 +141,41 @@ fn s019_hidden_match_context_is_clustered_into_at_most_three_ranges() {
         "visible start{far} needle one{far} needle two{far} needle three{far} needle four{far} needle five"
     );
     let mut conversation = one_message_conversation(&text, now, None, None, None);
-    conversation.preview = "visible start".to_string();
-    let evidence = build_lexical_evidence(&conversation, &ParsedQuery::parse("needle")).unwrap();
+    conversation.preview = "visible start".to_string().into();
+    let evidence = build_lexical_evidence(
+        &conversation.full_text,
+        &conversation.preview,
+        &ParsedQuery::parse("needle"),
+    )
+    .unwrap();
     assert_eq!(evidence.context_ranges.len(), 3);
     let mut previous_end = 0;
     for (start, end) in &evidence.context_ranges {
         assert!(*start >= previous_end, "ordered and disjoint");
-        assert!(conversation.full_text[*start..*end].contains("needle"));
+        assert!(evidence.text[*start..*end].contains("needle"));
         previous_end = *end;
     }
     // Hits close together merge into one cluster.
     let close = one_message_conversation("needle needle needle", now, None, None, None);
     let mut close = close;
-    close.preview = "other".to_string();
-    let evidence = build_lexical_evidence(&close, &ParsedQuery::parse("needle")).unwrap();
+    close.preview = "other".to_string().into();
+    let evidence = build_lexical_evidence(
+        &close.full_text,
+        &close.preview,
+        &ParsedQuery::parse("needle"),
+    )
+    .unwrap();
     assert_eq!(evidence.context_ranges.len(), 1);
     // Nothing hidden: no evidence.
     let shown = one_message_conversation("needle", now, None, None, None);
     let mut shown = shown;
-    shown.preview = "needle".to_string();
-    assert!(build_lexical_evidence(&shown, &ParsedQuery::parse("needle")).is_none());
+    shown.preview = "needle".to_string().into();
+    assert!(
+        build_lexical_evidence(
+            &shown.full_text,
+            &shown.preview,
+            &ParsedQuery::parse("needle")
+        )
+        .is_none()
+    );
 }

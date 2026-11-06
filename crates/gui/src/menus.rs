@@ -23,11 +23,18 @@ use crate::list::ListPane;
 use crate::model::PaneFocus;
 use crate::single_file::SingleFileWindow;
 use crate::viewer::ViewerPane;
+use crate::viewer::toolbar::{TOOL_DISPLAY_MODES, set_tools_action};
 
 /// The menu names, in order (Windows/Linux menu bar).
 pub const MENU_NAMES: [&str; 6] = ["File", "Edit", "View", "Session", "Tools", "Help"];
 /// The macOS application menu name.
 pub const APP_MENU_NAME: &str = "Claude History";
+/// View → the toggle of automated and subagent conversations (upstream
+/// cb990e6; also the shortcuts dialog's label).
+pub const ALL_KINDS_LABEL: &str = "Show automated and subagent conversations";
+/// View → the toggle of searching only the user's own messages (upstream
+/// ae7ae39; also the shortcuts dialog's and Settings → Keys' label).
+pub const USER_ONLY_LABEL: &str = "Search only your own messages";
 
 const MAC: bool = cfg!(target_os = "macos");
 
@@ -36,12 +43,17 @@ const MAC: bool = cfg!(target_os = "macos");
 pub struct MenuChecks {
     pub theme: ThemePreference,
     pub list_collapsed: bool,
-    /// 0 = Summary, 1 = Truncated, 2 = Full (None: no conversation open).
-    pub tool_display: Option<u8>,
+    /// The viewer's tool display (None: no conversation open).
+    pub tool_display: Option<ToolDisplayMode>,
     pub show_thinking: bool,
     pub show_timing: bool,
     pub semantic_mode: bool,
     pub workspace_scope: bool,
+    /// The list shows automated and subagent conversations (upstream
+    /// cb990e6).
+    pub all_kinds: bool,
+    /// List search matches only the user's own messages (upstream ae7ae39).
+    pub user_only: bool,
     pub picker: bool,
     /// The active conversation's header session ID differs from its file
     /// stem (Pi/OMP): Session → Copy header session ID is listed (A-042;
@@ -64,11 +76,7 @@ pub fn current_checks(cx: &App) -> MenuChecks {
     let (window, viewer, list) = active_panes(cx);
     checks.header_session_id = active_target_has_header_id(cx, window, &viewer, &list);
     if let Some(prefs) = viewer.and_then(|viewer| viewer.read(cx).prefs()) {
-        checks.tool_display = Some(match prefs.tool_display {
-            ToolDisplayMode::Hidden => 0,
-            ToolDisplayMode::Truncated => 1,
-            ToolDisplayMode::Full => 2,
-        });
+        checks.tool_display = Some(prefs.tool_display);
         checks.show_thinking = prefs.show_thinking;
         checks.show_timing = prefs.show_timing;
     }
@@ -76,6 +84,8 @@ pub fn current_checks(cx: &App) -> MenuChecks {
         let list = list.read(cx);
         checks.semantic_mode = list.mode() == ListSearchMode::Semantic;
         checks.workspace_scope = list.scope_is_workspace();
+        checks.all_kinds = list.all_kinds();
+        checks.user_only = list.user_only();
     }
     checks
 }
@@ -291,16 +301,13 @@ pub fn build_tree_with(checks: &MenuChecks, app_menu_items: bool) -> Vec<Menu> {
         item("Find in all conversations…", FocusDeepSearch),
     ];
 
-    let tools_display = [("Summary", 0u8), ("Truncated", 1u8), ("Full", 2u8)]
-        .into_iter()
-        .map(|(name, value)| {
-            let checked = checks.tool_display == Some(value);
-            match value {
-                0 => item(name, SetToolsSummary).checked(checked),
-                1 => item(name, SetToolsTruncated).checked(checked),
-                _ => item(name, SetToolsFull).checked(checked),
-            }
-        });
+    let tools_display = TOOL_DISPLAY_MODES.map(|(mode, _, name)| MenuItem::Action {
+        name: name.into(),
+        action: set_tools_action(mode),
+        os_action: None,
+        checked: checks.tool_display == Some(mode),
+        disabled: false,
+    });
 
     let view = vec![
         item("Conversations", FocusConversations),
@@ -320,6 +327,8 @@ pub fn build_tree_with(checks: &MenuChecks, app_menu_items: bool) -> Vec<Menu> {
             item("All", SetScopeAll).checked(!checks.workspace_scope),
             item("Workspace", SetScopeWorkspace).checked(checks.workspace_scope),
         ])),
+        item(ALL_KINDS_LABEL, ToggleAllKinds).checked(checks.all_kinds),
+        item(USER_ONLY_LABEL, ToggleUserOnly).checked(checks.user_only),
         MenuItem::separator(),
         MenuItem::submenu(Menu::new("Theme").items([
             item("System", SetThemeSystem).checked(checks.theme == ThemePreference::System),
@@ -349,6 +358,9 @@ pub fn build_tree_with(checks: &MenuChecks, app_menu_items: bool) -> Vec<Menu> {
     session.extend([
         item("Show file path", ShowPath),
         item("Reveal in file manager", RevealInFileManager),
+        MenuItem::separator(),
+        item("Open parent conversation", OpenParentConversation),
+        item("Subagents and forks…", ShowSubagentsAndForks),
         MenuItem::separator(),
         item("Search within conversation…", SearchWithinConversation),
         item("Outline", ToggleOutline),
@@ -644,6 +656,56 @@ mod tests {
         assert!(!listed(&MenuChecks::default()));
         assert!(listed(&MenuChecks {
             header_session_id: true,
+            ..MenuChecks::default()
+        }));
+    }
+
+    /// L-104: View lists the all-kinds toggle, checked while it is on.
+    #[test]
+    fn the_view_menu_checks_the_all_kinds_toggle() {
+        let checked = |checks: &MenuChecks| {
+            build_tree(checks)
+                .iter()
+                .find(|menu| menu.name.as_ref() == "View")
+                .unwrap()
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    MenuItem::Action { name, checked, .. } if name.as_ref() == ALL_KINDS_LABEL => {
+                        Some(*checked)
+                    }
+                    _ => None,
+                })
+                .expect("listed")
+        };
+        assert!(!checked(&MenuChecks::default()));
+        assert!(checked(&MenuChecks {
+            all_kinds: true,
+            ..MenuChecks::default()
+        }));
+    }
+
+    /// S-039: View lists the user-only toggle, checked while it is on.
+    #[test]
+    fn the_view_menu_checks_the_user_only_toggle() {
+        let checked = |checks: &MenuChecks| {
+            build_tree(checks)
+                .iter()
+                .find(|menu| menu.name.as_ref() == "View")
+                .unwrap()
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    MenuItem::Action { name, checked, .. } if name.as_ref() == USER_ONLY_LABEL => {
+                        Some(*checked)
+                    }
+                    _ => None,
+                })
+                .expect("listed")
+        };
+        assert!(!checked(&MenuChecks::default()));
+        assert!(checked(&MenuChecks {
+            user_only: true,
             ..MenuChecks::default()
         }));
     }

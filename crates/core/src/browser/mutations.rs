@@ -1,8 +1,9 @@
 //! Rename and delete (upstream `tui/app/dialog_state.rs::submit_rename` and
 //! the delete branch of `tui/runtime.rs`).
 
-use super::{Browser, DeleteError, DeletedSession, ListSearchMode, RenameError};
-use crate::history::{self, Conversation, Source};
+use super::{Browser, DeleteError, DeletedSession, ListSearchMode, PreparedSession, RenameError};
+use crate::history::sources::Registry;
+use crate::history::{self, Conversation};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -47,20 +48,46 @@ impl Browser {
     /// data change. Semantic metadata and lexical evidence are cleared.
     /// The query is re-applied (a lexical query in the background, keeping
     /// the rows) and the renamed session stays selected when it is shown.
-    /// [`RenameError::NoTarget`] when `path` is no longer loaded (deleted
+    /// [`RenameError::NoTarget`] when `path` is no longer listed (deleted
     /// or refreshed away meanwhile).
     ///
     /// The path is found through the path index and the browse rows come
     /// from the cached scope (CCR-2): the caller's thread does no work per
     /// conversation besides copying pointers and row numbers.
+    ///
+    /// In generation mode only the row's title changes, kept as an overlay
+    /// until a generation holds it, and a reconcile pass is asked for; the
+    /// index keeps the old title until then and the rows stay (upstream
+    /// 358becb).
+    ///
+    /// Synchronous convenience: it normalizes the session's text on the
+    /// caller's thread ([`PreparedSession::new`]); a GUI prepares the
+    /// session in the background and calls [`Browser::apply_renamed_session`].
     pub fn apply_renamed(&mut self, path: &Path, renamed: Conversation) -> Result<(), RenameError> {
+        self.apply_renamed_session(path, PreparedSession::new(renamed))
+    }
+
+    /// [`Browser::apply_renamed`] for a session prepared off this thread:
+    /// no text is normalized here.
+    pub fn apply_renamed_session(
+        &mut self,
+        path: &Path,
+        renamed: PreparedSession,
+    ) -> Result<(), RenameError> {
         let index = self.position_of_path(path).ok_or(RenameError::NoTarget)?;
+        if self.snapshot.is_some() {
+            self.retitle_row(index, path, renamed.conversation.custom_title);
+            return Ok(());
+        }
         let previous = &self.conversations[index];
-        let mut renamed = renamed;
+        let PreparedSession {
+            conversation: mut renamed,
+            body_lower,
+        } = renamed;
         renamed.index = index;
         renamed.project_name = previous.project_name.clone();
         renamed.project_path = previous.project_path.clone();
-        self.replace_conversation_at(index, Arc::new(renamed));
+        self.replace_conversation_at(index, Arc::new(renamed), body_lower);
         if self.is_loading() {
             // No search data or query results yet: the row just shows the
             // new title.
@@ -94,19 +121,24 @@ impl Browser {
     /// Delete the loaded session at `path` from disk and from the list
     /// (capture the path when the confirmation opens; addendum A1).
     ///
-    /// The implementation follows that conversation's own source (A2):
+    /// The adapter of that conversation's own source (A2) deletes it
+    /// (`Adapter::delete`, upstream 9799550):
     ///
     /// * Claude: every `<uuid>.jsonl` with the file's stem in **all** Claude
     ///   project directories (cross-project fork copies) and each
     ///   `<project>/<uuid>/` session directory;
     /// * Pi: the file, if it parses as a Pi session;
     /// * OMP: the file, if it parses as an OMP session, and its artifact
-    ///   directory.
+    ///   directory;
+    /// * Codex: `codex delete --force <thread id>` through `terminal::run_to_completion`
+    ///   (refused in tests and hermetic builds; the GUI uses plan/`execute_session_delete_with`
+    ///   instead).
     ///
-    /// On success the row is removed (other copies of the same session
-    /// already in the list stay until a refresh, as upstream). On failure
-    /// nothing changes, the upstream debug-log line is written, and the
-    /// error is returned so the GUI can show it.
+    /// [`DeleteError::Unsupported`] when the adapter cannot delete (nothing
+    /// changes). On success the row is removed (other copies of the same
+    /// session already in the list stay until a refresh, as upstream). On
+    /// failure nothing changes, the upstream debug-log line is written, and
+    /// the error is returned so the GUI can show it.
     ///
     /// Synchronous convenience; a GUI uses
     /// [`crate::maintenance::plan_session_delete`] and
@@ -120,15 +152,14 @@ impl Browser {
             .position_of_path(path)
             .map(|idx| (idx, self.conversations[idx].source))
             .ok_or(DeleteError::NoTarget)?;
-        let result = match source {
-            Source::Claude => {
-                let uuid = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                history::delete_session_by_uuid(&self.env, uuid)
-            }
-            Source::Pi => history::pi_loader::delete_session(path).map(|()| 1),
-            Source::Omp => history::omp_loader::delete_session(path).map(|()| 1),
-        };
-        match result {
+        let adapter = Registry::from_env(&self.env).for_path(source, path);
+        if !adapter.capabilities().delete {
+            return Err(DeleteError::Unsupported(source));
+        }
+        // The agent's own binary: a `Browser` has no configuration (the GUI
+        // deletes through `maintenance` with `LayeredConfig::launcher`).
+        let launcher = crate::history::actions::Launcher::default_for(source);
+        match adapter.delete(&self.env, path, &launcher) {
             Ok(files_removed) => {
                 self.remove_conversation(idx);
                 Ok(DeletedSession {

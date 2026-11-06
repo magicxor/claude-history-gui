@@ -264,6 +264,20 @@ impl DeepSearchPane {
         cx.notify();
     }
 
+    /// Include automated (Codex exec) and subagent conversations
+    /// (`--all-kinds`, upstream cb990e6).
+    pub fn set_all_kinds(&mut self, all_kinds: bool, cx: &mut Context<Self>) {
+        self.form.all_kinds = all_kinds;
+        cx.notify();
+    }
+
+    /// Search only the person's own messages (`--user-only`, upstream
+    /// dcd3978).
+    pub fn set_user_only(&mut self, user_only: bool, cx: &mut Context<Self>) {
+        self.form.user_only = user_only;
+        cx.notify();
+    }
+
     pub fn set_no_budget(&mut self, no_budget: bool, cx: &mut Context<Self>) {
         self.form.no_budget = no_budget;
         cx.notify();
@@ -468,6 +482,8 @@ impl DeepSearchPane {
             "deep.groups" => results.counts().0.to_string(),
             "deep.mode" => self.form.mode.name().to_string(),
             "deep.scope" => self.form.scope.name().to_string(),
+            "deep.all_kinds" => self.form.all_kinds.to_string(),
+            "deep.user_only" => self.form.user_only.to_string(),
             "deep.mode_label" => self.form.mode.label(&defaults),
             "deep.scope_label" => self.form.scope.label(&defaults),
             "deep.query" => self.query.read(cx).value().to_string(),
@@ -695,7 +711,33 @@ impl Render for DeepSearchPane {
                                     let texts = TimeTexts::from_label(choice.label.as_deref());
                                     view.update(cx, |this, cx| this.set_time(texts, cx));
                                 }
-                            })),
+                            }))
+                            .child(checkbox(
+                                "deep-all-kinds",
+                                "Include exec and subagent runs",
+                                self.form.all_kinds,
+                                false,
+                                Some(help::ALL_KINDS.into()),
+                                Rc::new({
+                                    let view = view.clone();
+                                    move |checked, _, cx| {
+                                        view.update(cx, |this, cx| this.set_all_kinds(checked, cx));
+                                    }
+                                }),
+                            ))
+                            .child(checkbox(
+                                "deep-user-only",
+                                "Only my messages",
+                                self.form.user_only,
+                                false,
+                                Some(help::USER_ONLY.into()),
+                                Rc::new({
+                                    let view = view.clone();
+                                    move |checked, _, cx| {
+                                        view.update(cx, |this, cx| this.set_user_only(checked, cx));
+                                    }
+                                }),
+                            )),
                     )
                     .child(
                         h_flex()

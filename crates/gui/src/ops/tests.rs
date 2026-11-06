@@ -2,9 +2,11 @@
 //!
 //! One module per action family; the helpers every module shares live here.
 
+mod codex_tests;
 mod copy_tests;
 mod delete_tests;
 mod export_tests;
+mod family_tests;
 mod launcher_tests;
 mod rename_tests;
 mod resume_tests;

@@ -11,11 +11,13 @@
 use std::path::PathBuf;
 
 use claude_history_core::config::{
-    AgentOverrides, AgentScopeConfig, ConfigFile, DisplayConfig, GuiConfigFile, GuiSettings,
-    KeyBindings, KeyChord, KeysConfig, LayeredConfig, ResumeConfig, SearchConfig, TuiOverrides,
-    parse_key_binding,
+    AgentCommand, AgentOverrides, AgentResumeConfig, AgentScopeConfig, ConfigFile, DisplayConfig,
+    GuiConfigFile, GuiSettings, KeyBindings, KeyChord, KeysConfig, LauncherConfig, LayeredConfig,
+    ResumeConfig, SearchConfig, TuiOverrides, parse_key_binding,
 };
+use claude_history_core::history::model::SourceKind as AgentKind;
 use claude_history_core::search::mode::SearchMode;
+use claude_history_core::settings::InitialToolDisplay;
 use claude_history_core::theme::ThemePreference;
 
 use crate::model::{KeyAction, SettingsPage};
@@ -29,6 +31,7 @@ pub enum Field {
     ClaudePath,
     PiPath,
     OmpPath,
+    CodexPath,
     DefaultWorkspace,
     RestoreSession,
     PreviewLast,
@@ -37,8 +40,15 @@ pub enum Field {
     Plain,
     SearchMode,
     ExcludeProjects,
+    ExcludePaths,
     Key(KeyAction),
+    /// `[resume] command` (upstream 8a99ccc), and the other agents' below.
+    ClaudeCommand,
     ResumeArgs,
+    PiCommand,
+    OmpCommand,
+    CodexCommand,
+    CodexResumeArgs,
     AgentScope,
     AgentMode,
     AgentOutputChars,
@@ -74,12 +84,13 @@ impl Field {
     }
 
     /// Every field, page by page, in display order.
-    pub const ALL: [Field; 30] = [
+    pub const ALL: [Field; 39] = [
         Field::Theme,
         Field::Terminal,
         Field::ClaudePath,
         Field::PiPath,
         Field::OmpPath,
+        Field::CodexPath,
         Field::DefaultWorkspace,
         Field::RestoreSession,
         Field::PreviewLast,
@@ -88,12 +99,20 @@ impl Field {
         Field::Plain,
         Field::SearchMode,
         Field::ExcludeProjects,
+        Field::ExcludePaths,
         Field::Key(KeyAction::Resume),
         Field::Key(KeyAction::Fork),
         Field::Key(KeyAction::Rename),
         Field::Key(KeyAction::Delete),
         Field::Key(KeyAction::Refresh),
+        Field::Key(KeyAction::AllKinds),
+        Field::Key(KeyAction::UserOnly),
+        Field::ClaudeCommand,
         Field::ResumeArgs,
+        Field::PiCommand,
+        Field::OmpCommand,
+        Field::CodexCommand,
+        Field::CodexResumeArgs,
         Field::AgentScope,
         Field::AgentMode,
         Field::AgentOutputChars,
@@ -115,14 +134,22 @@ impl Field {
             | Field::ClaudePath
             | Field::PiPath
             | Field::OmpPath
+            | Field::CodexPath
             | Field::DefaultWorkspace
             | Field::RestoreSession => SettingsPage::General,
             Field::PreviewLast | Field::ToolDisplay | Field::ShowThinking | Field::Plain => {
                 SettingsPage::Display
             }
-            Field::SearchMode | Field::ExcludeProjects => SettingsPage::Search,
+            Field::SearchMode | Field::ExcludeProjects | Field::ExcludePaths => {
+                SettingsPage::Search
+            }
             Field::Key(_) => SettingsPage::Keys,
-            Field::ResumeArgs => SettingsPage::Resume,
+            Field::ClaudeCommand
+            | Field::ResumeArgs
+            | Field::PiCommand
+            | Field::OmpCommand
+            | Field::CodexCommand
+            | Field::CodexResumeArgs => SettingsPage::Resume,
             _ => SettingsPage::Agent,
         }
     }
@@ -135,6 +162,7 @@ impl Field {
             Field::ClaudePath => "claude program",
             Field::PiPath => "pi program",
             Field::OmpPath => "omp program",
+            Field::CodexPath => "codex program",
             Field::DefaultWorkspace => "Default workspace",
             Field::RestoreSession => "Restore last session",
             Field::PreviewLast => "Preview shows",
@@ -143,8 +171,14 @@ impl Field {
             Field::Plain => "Ctrl+O prints plain text",
             Field::SearchMode => "Default search mode",
             Field::ExcludeProjects => "Excluded projects",
+            Field::ExcludePaths => "Excluded working directories",
             Field::Key(action) => action.label(),
+            Field::ClaudeCommand => "Claude Code command",
             Field::ResumeArgs => "Default arguments",
+            Field::PiCommand => "Pi command",
+            Field::OmpCommand => "OMP command",
+            Field::CodexCommand => "Codex command",
+            Field::CodexResumeArgs => "Codex default arguments",
             Field::AgentScope => "Scope",
             Field::AgentMode => "Mode",
             Field::AgentOutputChars => "Output budget (chars)",
@@ -167,6 +201,7 @@ impl Field {
             Field::ClaudePath => "[gui] claude_path",
             Field::PiPath => "[gui] pi_path",
             Field::OmpPath => "[gui] omp_path",
+            Field::CodexPath => "[gui] codex_path",
             Field::DefaultWorkspace => "[gui] default_workspace",
             Field::RestoreSession => "[gui] restore_session",
             Field::PreviewLast => "[display] last",
@@ -175,12 +210,20 @@ impl Field {
             Field::Plain => "[display] plain",
             Field::SearchMode => "[search] mode",
             Field::ExcludeProjects => "[tui] exclude_projects",
+            Field::ExcludePaths => "[tui] exclude_paths",
             Field::Key(KeyAction::Resume) => "[keys] resume",
             Field::Key(KeyAction::Fork) => "[keys] fork",
             Field::Key(KeyAction::Rename) => "[keys] rename",
             Field::Key(KeyAction::Delete) => "[keys] delete",
             Field::Key(KeyAction::Refresh) => "[keys] refresh",
+            Field::Key(KeyAction::AllKinds) => "[keys] all_kinds",
+            Field::Key(KeyAction::UserOnly) => "[keys] user_only",
+            Field::ClaudeCommand => "[resume] command",
             Field::ResumeArgs => "[resume] default_args",
+            Field::PiCommand => "[resume.pi] command",
+            Field::OmpCommand => "[resume.omp] command",
+            Field::CodexCommand => "[resume.codex] command",
+            Field::CodexResumeArgs => "[resume.codex] default_args",
             Field::AgentScope => "[agent] scope",
             Field::AgentMode => "[agent] mode",
             Field::AgentOutputChars => "[agent] output_chars",
@@ -212,11 +255,18 @@ impl Field {
     pub fn applies(self) -> &'static str {
         match self {
             Field::Theme | Field::ExcludeProjects | Field::Key(_) => "Applies immediately",
+            Field::ExcludePaths => "Applies immediately; Deep search at its next run",
             Field::Terminal
             | Field::ClaudePath
             | Field::PiPath
             | Field::OmpPath
-            | Field::ResumeArgs => "Applies to the next resume",
+            | Field::CodexPath
+            | Field::ClaudeCommand
+            | Field::ResumeArgs
+            | Field::PiCommand
+            | Field::OmpCommand
+            | Field::CodexCommand
+            | Field::CodexResumeArgs => "Applies to the next resume",
             Field::DefaultWorkspace | Field::RestoreSession => "Applies at the next start",
             Field::PreviewLast => "Applies when the list refreshes",
             Field::ToolDisplay | Field::ShowThinking => {
@@ -233,6 +283,39 @@ impl Field {
     pub fn is_gui_table_field(self) -> bool {
         matches!(self, Field::Theme | Field::RestoreSession)
     }
+
+    /// The agent whose `command` this field sets (upstream 8a99ccc).
+    pub fn command_agent(self) -> Option<AgentKind> {
+        match self {
+            Field::ClaudeCommand => Some(AgentKind::Claude),
+            Field::PiCommand => Some(AgentKind::Pi),
+            Field::OmpCommand => Some(AgentKind::Omp),
+            Field::CodexCommand => Some(AgentKind::Codex),
+            _ => None,
+        }
+    }
+
+    /// The `command` field of `agent`.
+    pub fn command_of(agent: AgentKind) -> Field {
+        match agent {
+            AgentKind::Claude => Field::ClaudeCommand,
+            AgentKind::Pi => Field::PiCommand,
+            AgentKind::Omp => Field::OmpCommand,
+            AgentKind::Codex => Field::CodexCommand,
+        }
+    }
+}
+
+/// A configured command as a list value (its words, one per line).
+fn command_value(command: Option<&AgentCommand>) -> Value {
+    command.map_or(Value::Unset, |command| {
+        Value::List(command.words().to_vec())
+    })
+}
+
+/// The `command` of `agent` in a `[resume]` table.
+fn resume_command(resume: Option<&ResumeConfig>, agent: AgentKind) -> Value {
+    command_value(resume.and_then(|resume| resume.command(agent)))
 }
 
 /// The value of a [`Field`]: [`Value::Unset`] = the key is absent.
@@ -247,6 +330,10 @@ pub enum Value {
     Mode(SearchMode),
     Scope(AgentScopeConfig),
     Key(KeyChord),
+    /// `[display] no_tools` as the tool display it starts the viewer in
+    /// (upstream d0aca95): `true` = Off, `false` = Full. Summary has no key
+    /// (unset = Summary), so setting it removes the key.
+    Tools(InitialToolDisplay),
 }
 
 impl Value {
@@ -268,6 +355,17 @@ fn text_or_unset(text: Option<&String>) -> Value {
     text.map_or(Value::Unset, |text| Value::Text(text.clone()))
 }
 
+/// `[display] no_tools` as a [`Value::Tools`].
+fn no_tools_value(no_tools: Option<bool>) -> Value {
+    opt(no_tools, |no_tools| {
+        Value::Tools(if no_tools {
+            InitialToolDisplay::Off
+        } else {
+            InitialToolDisplay::Full
+        })
+    })
+}
+
 /// The value of `field` in a gui.toml model.
 pub fn get(field: Field, gui: &GuiConfigFile) -> Value {
     let settings = gui.gui_settings();
@@ -280,10 +378,11 @@ pub fn get(field: Field, gui: &GuiConfigFile) -> Value {
         Field::ClaudePath => some_text(&settings.claude_path),
         Field::PiPath => some_text(&settings.pi_path),
         Field::OmpPath => some_text(&settings.omp_path),
+        Field::CodexPath => some_text(&settings.codex_path),
         Field::DefaultWorkspace => some_text(&settings.default_workspace),
         Field::RestoreSession => opt(settings.restore_session, Value::Bool),
         Field::PreviewLast => opt(display.last, Value::Bool),
-        Field::ToolDisplay => opt(display.no_tools, Value::Bool),
+        Field::ToolDisplay => no_tools_value(display.no_tools),
         Field::ShowThinking => opt(display.show_thinking, Value::Bool),
         Field::Plain => opt(display.plain, Value::Bool),
         Field::SearchMode => opt(gui.search.as_ref().and_then(|s| s.mode), Value::Mode),
@@ -293,15 +392,31 @@ pub fn get(field: Field, gui: &GuiConfigFile) -> Value {
                 .and_then(|tui| tui.exclude_projects.clone()),
             Value::List,
         ),
+        Field::ExcludePaths => opt(
+            gui.tui.as_ref().and_then(|tui| tui.exclude_paths.clone()),
+            Value::List,
+        ),
         Field::Key(KeyAction::Resume) => opt(keys.resume, Value::Key),
         Field::Key(KeyAction::Fork) => opt(keys.fork, Value::Key),
         Field::Key(KeyAction::Rename) => opt(keys.rename, Value::Key),
         Field::Key(KeyAction::Delete) => opt(keys.delete, Value::Key),
         Field::Key(KeyAction::Refresh) => opt(keys.refresh, Value::Key),
+        Field::Key(KeyAction::AllKinds) => opt(keys.all_kinds, Value::Key),
+        Field::Key(KeyAction::UserOnly) => opt(keys.user_only, Value::Key),
         Field::ResumeArgs => opt(
             gui.resume.as_ref().and_then(|r| r.default_args.clone()),
             Value::List,
         ),
+        Field::CodexResumeArgs => opt(
+            gui.resume
+                .as_ref()
+                .and_then(|r| r.codex.as_ref())
+                .and_then(|codex| codex.default_args.clone()),
+            Value::List,
+        ),
+        Field::ClaudeCommand | Field::PiCommand | Field::OmpCommand | Field::CodexCommand => {
+            resume_command(gui.resume.as_ref(), field.command_agent().unwrap())
+        }
         Field::AgentScope => opt(agent.scope, Value::Scope),
         Field::AgentMode => opt(agent.mode, Value::Mode),
         Field::AgentOutputChars => opt(agent.output_chars, Value::Number),
@@ -383,9 +498,17 @@ pub fn set(field: Field, gui: &mut GuiConfigFile, value: Value) {
         Field::ClaudePath => gui_table(gui).claude_path = path(&value),
         Field::PiPath => gui_table(gui).pi_path = path(&value),
         Field::OmpPath => gui_table(gui).omp_path = path(&value),
+        Field::CodexPath => gui_table(gui).codex_path = path(&value),
         Field::DefaultWorkspace => gui_table(gui).default_workspace = path(&value),
         Field::PreviewLast => display(gui).last = flag(&value),
-        Field::ToolDisplay => display(gui).no_tools = flag(&value),
+        Field::ToolDisplay => {
+            display(gui).no_tools = match value {
+                Value::Tools(InitialToolDisplay::Off) => Some(true),
+                Value::Tools(InitialToolDisplay::Full) => Some(false),
+                // Summary is what an absent key means.
+                _ => None,
+            }
+        }
         Field::ShowThinking => display(gui).show_thinking = flag(&value),
         Field::Plain => display(gui).plain = flag(&value),
         Field::SearchMode => {
@@ -396,15 +519,56 @@ pub fn set(field: Field, gui: &mut GuiConfigFile, value: Value) {
                 .get_or_insert_with(TuiOverrides::default)
                 .exclude_projects = list(&value)
         }
+        Field::ExcludePaths => {
+            gui.tui
+                .get_or_insert_with(TuiOverrides::default)
+                .exclude_paths = list(&value)
+        }
         Field::Key(KeyAction::Resume) => keys(gui).resume = key(&value),
         Field::Key(KeyAction::Fork) => keys(gui).fork = key(&value),
         Field::Key(KeyAction::Rename) => keys(gui).rename = key(&value),
         Field::Key(KeyAction::Delete) => keys(gui).delete = key(&value),
         Field::Key(KeyAction::Refresh) => keys(gui).refresh = key(&value),
+        Field::Key(KeyAction::AllKinds) => keys(gui).all_kinds = key(&value),
+        Field::Key(KeyAction::UserOnly) => keys(gui).user_only = key(&value),
         Field::ResumeArgs => {
             gui.resume
                 .get_or_insert_with(ResumeConfig::default)
                 .default_args = list(&value)
+        }
+        Field::CodexResumeArgs => {
+            gui.resume
+                .get_or_insert_with(ResumeConfig::default)
+                .codex
+                .get_or_insert_with(AgentResumeConfig::default)
+                .default_args = list(&value)
+        }
+        // A list that names no program (empty, blank first word) removes
+        // the key, as config files refuse it.
+        Field::ClaudeCommand => {
+            gui.resume.get_or_insert_with(ResumeConfig::default).command =
+                list(&value).and_then(AgentCommand::new)
+        }
+        Field::PiCommand => {
+            gui.resume
+                .get_or_insert_with(ResumeConfig::default)
+                .pi
+                .get_or_insert_with(LauncherConfig::default)
+                .command = list(&value).and_then(AgentCommand::new)
+        }
+        Field::OmpCommand => {
+            gui.resume
+                .get_or_insert_with(ResumeConfig::default)
+                .omp
+                .get_or_insert_with(LauncherConfig::default)
+                .command = list(&value).and_then(AgentCommand::new)
+        }
+        Field::CodexCommand => {
+            gui.resume
+                .get_or_insert_with(ResumeConfig::default)
+                .codex
+                .get_or_insert_with(AgentResumeConfig::default)
+                .command = list(&value).and_then(AgentCommand::new)
         }
         Field::AgentScope => {
             agent(gui).scope = match value {
@@ -440,7 +604,7 @@ pub fn cli_value(field: Field, cli: &ConfigFile) -> Value {
     };
     match field {
         Field::PreviewLast => opt(display.last, Value::Bool),
-        Field::ToolDisplay => opt(display.no_tools, Value::Bool),
+        Field::ToolDisplay => no_tools_value(display.no_tools),
         Field::ShowThinking => opt(display.show_thinking, Value::Bool),
         Field::Plain => opt(display.plain, Value::Bool),
         Field::SearchMode => opt(cli.search.as_ref().and_then(|s| s.mode), Value::Mode),
@@ -450,15 +614,33 @@ pub fn cli_value(field: Field, cli: &ConfigFile) -> Value {
                 .map(|tui| tui.exclude_projects.clone())
                 .unwrap_or_default(),
         ),
+        Field::ExcludePaths => non_empty(
+            cli.tui
+                .as_ref()
+                .map(|tui| tui.exclude_paths.clone())
+                .unwrap_or_default(),
+        ),
         Field::Key(KeyAction::Resume) => opt(keys.resume, Value::Key),
         Field::Key(KeyAction::Fork) => opt(keys.fork, Value::Key),
         Field::Key(KeyAction::Rename) => opt(keys.rename, Value::Key),
         Field::Key(KeyAction::Delete) => opt(keys.delete, Value::Key),
         Field::Key(KeyAction::Refresh) => opt(keys.refresh, Value::Key),
+        Field::Key(KeyAction::AllKinds) => opt(keys.all_kinds, Value::Key),
+        Field::Key(KeyAction::UserOnly) => opt(keys.user_only, Value::Key),
         Field::ResumeArgs => opt(
             cli.resume.as_ref().and_then(|r| r.default_args.clone()),
             Value::List,
         ),
+        Field::CodexResumeArgs => opt(
+            cli.resume
+                .as_ref()
+                .and_then(|r| r.codex.as_ref())
+                .and_then(|codex| codex.default_args.clone()),
+            Value::List,
+        ),
+        Field::ClaudeCommand | Field::PiCommand | Field::OmpCommand | Field::CodexCommand => {
+            resume_command(cli.resume.as_ref(), field.command_agent().unwrap())
+        }
         Field::AgentScope => opt(agent.scope, Value::Scope),
         Field::AgentMode => opt(agent.mode, Value::Mode),
         Field::AgentOutputChars => opt(agent.output_chars, Value::Number),
@@ -481,7 +663,7 @@ pub fn default_value(field: Field) -> Value {
         Field::Theme => Value::Theme(ThemePreference::System),
         Field::RestoreSession => Value::Bool(true),
         Field::PreviewLast => Value::Bool(true),
-        Field::ToolDisplay => Value::Bool(true),
+        Field::ToolDisplay => Value::Tools(InitialToolDisplay::Summary),
         Field::ShowThinking | Field::Plain => Value::Bool(false),
         Field::SearchMode => Value::Mode(SearchMode::Lexical),
         Field::Key(KeyAction::Resume) => Value::Key(keys.resume),
@@ -489,6 +671,8 @@ pub fn default_value(field: Field) -> Value {
         Field::Key(KeyAction::Rename) => Value::Key(keys.rename),
         Field::Key(KeyAction::Delete) => Value::Key(keys.delete),
         Field::Key(KeyAction::Refresh) => Value::Key(keys.refresh),
+        Field::Key(KeyAction::AllKinds) => Value::Key(keys.all_kinds),
+        Field::Key(KeyAction::UserOnly) => Value::Key(keys.user_only),
         Field::AgentScope => Value::Scope(AgentScopeConfig::Global),
         Field::AgentOutputChars => Value::Number(6000),
         Field::AgentTop => Value::Number(10),
@@ -499,6 +683,10 @@ pub fn default_value(field: Field) -> Value {
         | Field::AgentThinking
         | Field::AgentSubagents => Value::Bool(false),
         Field::Terminal => Value::Text("auto".to_string()),
+        // The agent's own binary (upstream 8a99ccc's defaults).
+        Field::ClaudeCommand | Field::PiCommand | Field::OmpCommand | Field::CodexCommand => {
+            Value::List(vec![field.command_agent().unwrap().label().to_string()])
+        }
         _ => Value::Unset,
     }
 }
@@ -507,17 +695,19 @@ pub fn default_value(field: Field) -> Value {
 pub fn describe(field: Field, value: &Value) -> String {
     match value {
         Value::Unset => match field {
-            Field::ClaudePath | Field::PiPath | Field::OmpPath => "resolved from PATH".into(),
+            Field::ClaudePath | Field::PiPath | Field::OmpPath | Field::CodexPath => {
+                "resolved from PATH".into()
+            }
             Field::AgentMode => "from [search] mode, else automatic".into(),
             _ => "not set".into(),
         },
         Value::Bool(flag) => match field {
             Field::PreviewLast => if *flag { "Last" } else { "First" }.into(),
-            // `no_tools = true` shows the summary.
-            Field::ToolDisplay => if *flag { "Summary" } else { "Full" }.into(),
             _ => if *flag { "on" } else { "off" }.into(),
         },
         Value::Text(text) => text.clone(),
+        // A command reads as it would be typed.
+        Value::List(words) if field.command_agent().is_some() => words.join(" "),
         Value::List(list) => {
             if list.is_empty() {
                 "none".into()
@@ -539,6 +729,12 @@ pub fn describe(field: Field, value: &Value) -> String {
         }
         .into(),
         Value::Key(chord) => chord.config_string(),
+        Value::Tools(tools) => match tools {
+            InitialToolDisplay::Off => "Off",
+            InitialToolDisplay::Summary => "Summary",
+            InitialToolDisplay::Full => "Full",
+        }
+        .into(),
     }
 }
 
@@ -563,12 +759,17 @@ pub struct Source {
 
 fn remembered(field: Field, ui: &UiState) -> Value {
     match field {
-        Field::ToolDisplay => match ui.view.tool_display {
-            // The Settings control is Summary/Full; Truncated reads as Summary.
-            Some(RememberedToolDisplay::Full) => Value::Bool(false),
-            Some(_) => Value::Bool(true),
-            None => Value::Unset,
-        },
+        Field::ToolDisplay => opt(ui.view.tool_display, |tools| {
+            Value::Tools(match tools {
+                RememberedToolDisplay::Off => InitialToolDisplay::Off,
+                RememberedToolDisplay::Full => InitialToolDisplay::Full,
+                // The Settings control is Off/Summary/Full; Calls and
+                // Truncated read as Summary.
+                RememberedToolDisplay::Summary
+                | RememberedToolDisplay::Calls
+                | RememberedToolDisplay::Truncated => InitialToolDisplay::Summary,
+            })
+        }),
         Field::ShowThinking => opt(ui.view.show_thinking, Value::Bool),
         Field::SearchMode => match ui.search_mode {
             Some(RememberedSearchMode::Lexical) => Value::Mode(SearchMode::Lexical),
@@ -656,6 +857,23 @@ pub fn source_of(field: Field, config: &LayeredConfig, ui: &UiState) -> Source {
     }
 }
 
+/// [`source_of`] as the draft would leave it: a key the draft removes from
+/// gui.toml (Reset, or Summary of the tool display, which has no key) no
+/// longer counts, so the control shows what applies without it before Save.
+pub fn draft_source_of(
+    field: Field,
+    draft: &SettingsDraft,
+    config: &LayeredConfig,
+    ui: &UiState,
+) -> Source {
+    if draft.value(field).is_unset() && !get(field, &config.gui_file).is_unset() {
+        let mut without = config.clone();
+        set(field, &mut without.gui_file, Value::Unset);
+        return source_of(field, &without, ui);
+    }
+    source_of(field, config, ui)
+}
+
 /// The value a control shows: the draft's own value, else the effective one.
 pub fn shown_value(field: Field, draft: &GuiConfigFile, source: &Source) -> Value {
     let own = get(field, draft);
@@ -713,6 +931,8 @@ pub fn effective_keys(cli: &ConfigFile, draft: &GuiConfigFile) -> KeyBindings {
         rename: gui_keys.rename.or(cli_keys.rename),
         delete: gui_keys.delete.or(cli_keys.delete),
         refresh: gui_keys.refresh.or(cli_keys.refresh),
+        all_kinds: gui_keys.all_kinds.or(cli_keys.all_kinds),
+        user_only: gui_keys.user_only.or(cli_keys.user_only),
     }))
 }
 

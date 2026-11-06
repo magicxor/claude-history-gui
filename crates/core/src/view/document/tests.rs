@@ -5,24 +5,84 @@
 //! the first timing slot.
 
 use super::*;
+use crate::history::model::{Event, EventKind, Origin, SourceKind, Transcript, Visibility};
+use crate::history::view;
 use crate::theme;
 use crate::view::ledger::{
     LineStyle, NAME_WIDTH, RenderedConversation, RenderedLine, TIMESTAMP_WIDTH,
     render_parsed_conversation,
 };
-use crate::view::{fitted_name, parse_conversation_file};
+use crate::view::{fitted_name, renderable_entries};
 use chrono::{Local, TimeZone};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // -----------------------------------------------------------------
 // Fixtures and helpers
 // -----------------------------------------------------------------
 
-fn entry(entry_index: usize, json: &str) -> RenderableEntry {
-    RenderableEntry::new(entry_index, serde_json::from_str(json).unwrap())
+/// A conversation of one record, shown as the entry at `entry_index`, or
+/// (`entry_index: None`) a whole session file, its entries numbered as the
+/// viewer numbers them. The upstream ledger tests' helper (9597669).
+struct Owned {
+    entry_index: Option<usize>,
+    transcript: Transcript,
 }
 
-fn user_entry(entry_index: usize, text: &str, timestamp: Option<&str>) -> RenderableEntry {
+/// One Claude record. A record naming Pi as its agent reads as a Pi
+/// session, and a `pi-metadata` record (the fork's fixtures; Claude records
+/// have no notes since upstream 9597669) as a Pi session holding that note.
+fn entry(entry_index: usize, json: &str) -> Owned {
+    let record: serde_json::Value = serde_json::from_str(json).unwrap();
+    let mut transcript = crate::history::sources::claude::decode_test_reader(
+        Path::new("test.jsonl"),
+        if record["type"] == "pi-metadata" {
+            String::new()
+        } else {
+            record.to_string()
+        }
+        .as_bytes(),
+    )
+    .unwrap();
+    if record["type"] == "pi-metadata" {
+        transcript.source = SourceKind::Pi;
+        transcript.events.push(Event {
+            origin: Origin::default(),
+            timestamp: record["timestamp"]
+                .as_str()
+                .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+                .map(|timestamp| timestamp.to_utc()),
+            visibility: Visibility::Dialogue,
+            kind: EventKind::Note {
+                label: record["label"].as_str().unwrap().to_owned(),
+                text: record["text"].as_str().unwrap().to_owned(),
+                searchable: record["searchable"].as_bool().unwrap_or(true),
+                usage: None,
+            },
+        });
+    }
+    if json.contains(r#""agent":"Pi""#) {
+        transcript.source = SourceKind::Pi;
+    }
+    Owned {
+        entry_index: Some(entry_index),
+        transcript,
+    }
+}
+
+fn renderable(entries: &[Owned]) -> Vec<RenderableEntry<'_>> {
+    entries
+        .iter()
+        .flat_map(|owned| match owned.entry_index {
+            Some(entry_index) => view::entries(&owned.transcript)
+                .into_iter()
+                .map(|entry| RenderableEntry::new(entry_index, entry))
+                .collect(),
+            None => renderable_entries(&owned.transcript),
+        })
+        .collect()
+}
+
+fn user_entry(entry_index: usize, text: &str, timestamp: Option<&str>) -> Owned {
     let ts_field = match timestamp {
         Some(t) => format!(r#","timestamp":"{}""#, t),
         None => String::new(),
@@ -36,11 +96,7 @@ fn user_entry(entry_index: usize, text: &str, timestamp: Option<&str>) -> Render
     )
 }
 
-fn assistant_text_entry(
-    entry_index: usize,
-    text: &str,
-    timestamp: Option<&str>,
-) -> RenderableEntry {
+fn assistant_text_entry(entry_index: usize, text: &str, timestamp: Option<&str>) -> Owned {
     let ts_field = match timestamp {
         Some(t) => format!(r#","timestamp":"{}""#, t),
         None => String::new(),
@@ -54,7 +110,7 @@ fn assistant_text_entry(
     )
 }
 
-fn tool_summary_entries() -> Vec<RenderableEntry> {
+fn tool_summary_entries() -> Vec<Owned> {
     vec![
         entry(
             0,
@@ -75,7 +131,35 @@ fn tool_summary_entries() -> Vec<RenderableEntry> {
     ]
 }
 
-fn pi_thinking_entries() -> Vec<RenderableEntry> {
+/// Upstream d0aca95's `conversation_with_tool_only_turns`: a user message,
+/// the tool-only entries of [`tool_summary_entries`] (shifted to 1..=4), an
+/// assistant message with text and a tool call, its result, and a text
+/// answer.
+fn conversation_with_tool_only_turns() -> Vec<Owned> {
+    let mut entries = vec![entry(
+        0,
+        r#"{"type":"user","message":{"role":"user","content":"please check the build"}}"#,
+    )];
+    entries.extend(tool_summary_entries().into_iter().map(|mut owned| {
+        owned.entry_index = owned.entry_index.map(|index| index + 1);
+        owned
+    }));
+    entries.push(entry(
+        5,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Running the tests now."},{"type":"tool_use","id":"toolu_4","name":"Bash","input":{"command":"cargo build"}}]}}"#,
+    ));
+    entries.push(entry(
+        6,
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_4","content":"build output"}]}}"#,
+    ));
+    entries.push(entry(
+        7,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The build passes."}]}}"#,
+    ));
+    entries
+}
+
+fn pi_thinking_entries() -> Vec<Owned> {
     vec![
         entry(
             0,
@@ -96,7 +180,7 @@ fn pi_thinking_entries() -> Vec<RenderableEntry> {
     ]
 }
 
-fn subagent_entries() -> Vec<RenderableEntry> {
+fn subagent_entries() -> Vec<Owned> {
     vec![
         entry(
             0,
@@ -109,7 +193,7 @@ fn subagent_entries() -> Vec<RenderableEntry> {
     ]
 }
 
-fn reordered_blocks_entry() -> RenderableEntry {
+fn reordered_blocks_entry() -> Owned {
     entry(
         0,
         r#"{"type":"assistant","message":{"role":"assistant","content":[
@@ -120,7 +204,7 @@ fn reordered_blocks_entry() -> RenderableEntry {
     )
 }
 
-fn agent_progress_entries() -> Vec<RenderableEntry> {
+fn agent_progress_entries() -> Vec<Owned> {
     vec![
         entry(
             0,
@@ -147,7 +231,7 @@ fn agent_progress_entries() -> Vec<RenderableEntry> {
 }
 
 /// A conversation exercising every message kind and truncation path.
-fn mixed_entries() -> Vec<RenderableEntry> {
+fn mixed_entries() -> Vec<Owned> {
     vec![
         user_entry(0, "Hello **there**", Some("2026-09-04T12:34:56Z")),
         entry(
@@ -227,8 +311,12 @@ fn mixed_entries() -> Vec<RenderableEntry> {
     ]
 }
 
-fn fixture_entries(path: &str) -> Vec<RenderableEntry> {
-    parse_conversation_file(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path)).unwrap()
+fn fixture_entries(path: &str) -> Vec<Owned> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path);
+    vec![Owned {
+        entry_index: None,
+        transcript: crate::history::sources::decode_path(&path, None, false).unwrap(),
+    }]
 }
 
 fn prefs(tool_display: ToolDisplayMode) -> ViewPrefs {
@@ -239,8 +327,8 @@ fn prefs(tool_display: ToolDisplayMode) -> ViewPrefs {
     }
 }
 
-fn build(entries: &[RenderableEntry], prefs: &ViewPrefs) -> ConversationDocument {
-    build_document(entries, prefs, &BTreeSet::new())
+fn build(entries: &[Owned], prefs: &ViewPrefs) -> ConversationDocument {
+    build_document(&renderable(entries), prefs, &BTreeSet::new())
 }
 
 fn all_blocks(doc: &ConversationDocument) -> Vec<&DocBlock> {
@@ -294,6 +382,29 @@ fn name_span(line: &RenderedLine) -> &(String, LineStyle) {
         .position(|(text, _)| text == " │ ")
         .unwrap_or_else(|| panic!("no separator in {:?}", line_text(line)));
     &line.spans[separator - 1]
+}
+
+/// The content of a ledger row (the spans after `" │ "`; a row without a
+/// separator, such as a blank one, is all content).
+fn row_content(line: &RenderedLine) -> String {
+    let start = line
+        .spans
+        .iter()
+        .position(|(text, _)| text == " │ ")
+        .map_or(0, |separator| separator + 1);
+    line.spans[start..]
+        .iter()
+        .map(|(text, _)| text.as_str())
+        .collect()
+}
+
+/// Check the timing column of a ledger row against a block's slot.
+fn assert_timing_span(line: &RenderedLine, timing: &DocTiming, context: &str) {
+    match timing {
+        DocTiming::Stamp(stamp) => assert_eq!(line.spans[0].0, format!(" {stamp} "), "{context}"),
+        DocTiming::Pad => assert_eq!(line.spans[0].0, " ".repeat(TIMESTAMP_WIDTH), "{context}"),
+        DocTiming::Disabled => assert_eq!(line.spans[0].0.chars().count(), NAME_WIDTH, "{context}"),
+    }
 }
 
 /// The ledger label of a message's first row, derived from its first block.
@@ -355,10 +466,11 @@ fn doc_hidden_counts(doc: &ConversationDocument) -> Vec<usize> {
 /// Check that the document and the ledger (at width 80) agree for these
 /// entries, preferences and expanded set. Returns the document.
 fn assert_ledger_parity(
-    entries: &[RenderableEntry],
+    entries: &[Owned],
     prefs: &ViewPrefs,
     expanded: &BTreeSet<ToolOutputId>,
 ) -> ConversationDocument {
+    let entries = &renderable(entries);
     let doc = build_document(entries, prefs, expanded);
     let rendered = render_parsed_conversation(entries, &prefs.render_options(80, expanded));
     let context = format!(
@@ -407,10 +519,40 @@ fn assert_ledger_parity(
             assert_eq!(style.bold, message.bold, "{context}");
             assert_eq!(style.dimmed, message.dimmed, "{context}");
         }
-        match &message.blocks[0].timing {
-            DocTiming::Stamp(stamp) => assert_eq!(first.spans[0].0, format!(" {stamp} ")),
-            DocTiming::Pad => assert_eq!(first.spans[0].0, " ".repeat(TIMESTAMP_WIDTH)),
-            DocTiming::Disabled => assert_eq!(first.spans[0].0.chars().count(), NAME_WIDTH),
+        assert_timing_span(first, &message.blocks[0].timing, &context);
+
+        // Call lines (calls mode, upstream a60dfe9) are ledger rows of the
+        // message, in order; a collapsed group is nothing but its call lines,
+        // one row each with the line's timing slot. The fixtures keep every
+        // header narrower than 80 columns, so the ledger does not cut them.
+        let call_lines: Vec<(&DocTiming, String)> = message
+            .blocks
+            .iter()
+            .filter_map(|block| match &block.kind {
+                DocBlockKind::ToolCallLine { .. } => Some((&block.timing, block.plain_text())),
+                _ => None,
+            })
+            .collect();
+        let rows: Vec<String> = rendered.lines[range.start_line..range.end_line]
+            .iter()
+            .map(row_content)
+            .collect();
+        let mut next_row = 0;
+        for (_, header) in &call_lines {
+            let found = rows[next_row..]
+                .iter()
+                .position(|row| row == header)
+                .unwrap_or_else(|| panic!("call line {header:?} not in the ledger\n{context}"));
+            next_row += found + 1;
+        }
+        if !call_lines.is_empty() && call_lines.len() == message.blocks.len() {
+            assert_eq!(rows.len(), call_lines.len(), "call line rows\n{context}");
+            for (line, (timing, _)) in rendered.lines[range.start_line..range.end_line]
+                .iter()
+                .zip(&call_lines)
+            {
+                assert_timing_span(line, timing, &context);
+            }
         }
     }
 
@@ -443,15 +585,17 @@ fn assert_ledger_parity(
     doc
 }
 
-const MODES: [ToolDisplayMode; 3] = [
-    ToolDisplayMode::Hidden,
+const MODES: [ToolDisplayMode; 5] = [
+    ToolDisplayMode::Off,
+    ToolDisplayMode::Summary,
+    ToolDisplayMode::Calls,
     ToolDisplayMode::Truncated,
     ToolDisplayMode::Full,
 ];
 
 /// Parity for every mode / thinking / timing combination, collapsed, with
 /// each toggle id expanded on its own, and with all of them expanded.
-fn assert_parity_everywhere(entries: &[RenderableEntry]) {
+fn assert_parity_everywhere(entries: &[Owned]) {
     for tool_display in MODES {
         for show_thinking in [false, true] {
             for show_timing in [false, true] {
@@ -479,7 +623,7 @@ fn assert_parity_everywhere(entries: &[RenderableEntry]) {
 
 #[test]
 fn parity_with_ledger_for_all_fixtures_and_preferences() {
-    let fixtures: Vec<Vec<RenderableEntry>> = vec![
+    let fixtures: Vec<Vec<Owned>> = vec![
         tool_summary_entries(),
         pi_thinking_entries(),
         subagent_entries(),
@@ -489,6 +633,26 @@ fn parity_with_ledger_for_all_fixtures_and_preferences() {
         vec![
             user_entry(0, "Hello", None),
             assistant_text_entry(1, "Hi there", None),
+        ],
+        conversation_with_tool_only_turns(),
+        vec![
+            entry(
+                0,
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]}}"#,
+            ),
+            entry(
+                1,
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}}"#,
+            ),
+            entry(2, r#"{"type":"last-prompt","lastPrompt":"x"}"#),
+            entry(
+                3,
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"next","signature":""}]}}"#,
+            ),
+            entry(
+                4,
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Bash","input":{"command":"pwd"}}]}}"#,
+            ),
         ],
     ];
     for entries in fixtures {
@@ -513,12 +677,12 @@ fn parity_with_ledger_for_pi_and_omp_fixture_files() {
 // -----------------------------------------------------------------
 
 #[test]
-fn hidden_tool_mode_renders_activity_summary() {
+fn summary_tool_mode_renders_activity_summary() {
     let entries = [entry(
         0,
         r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Grep","input":{"pattern":"one"}},{"type":"tool_use","id":"toolu_2","name":"Grep","input":{"pattern":"two"}},{"type":"tool_use","id":"toolu_3","name":"Read","input":{"file_path":"src/main.rs"}}]}}"#,
     )];
-    let doc = build(&entries, &prefs(ToolDisplayMode::Hidden));
+    let doc = build(&entries, &prefs(ToolDisplayMode::Summary));
 
     assert_eq!(doc.messages.len(), 1);
     let message = &doc.messages[0];
@@ -536,8 +700,198 @@ fn hidden_tool_mode_renders_activity_summary() {
 }
 
 #[test]
-fn hidden_tool_mode_coalesces_tool_only_entries_across_results() {
-    let doc = build(&tool_summary_entries(), &prefs(ToolDisplayMode::Hidden));
+fn summary_tool_mode_coalesces_tool_calls_across_records_that_show_nothing() {
+    let entries = [
+        entry(
+            0,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]}}"#,
+        ),
+        entry(
+            1,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}}"#,
+        ),
+        entry(2, r#"{"type":"last-prompt","lastPrompt":"x"}"#),
+        entry(
+            3,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"next","signature":""}]}}"#,
+        ),
+        entry(
+            4,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Bash","input":{"command":"pwd"}}]}}"#,
+        ),
+    ];
+    let doc = build(&entries, &prefs(ToolDisplayMode::Summary));
+
+    let text = doc_text(&doc);
+    assert!(text.contains("Ran 2 shell commands"), "{text}");
+    assert!(!text.contains("Ran 1 shell command"), "{text}");
+    assert_eq!(doc.messages.len(), 1);
+}
+
+/// Upstream a60dfe9 and a1c88f8: calls mode groups like summary mode but
+/// lists each call on its own line, without results; every line carries its
+/// own row id, so a click expands just that call and its result.
+#[test]
+fn calls_tool_mode_lists_each_call_on_one_line_without_results() {
+    let entries = tool_summary_entries();
+    let doc = assert_ledger_parity(&entries, &prefs(ToolDisplayMode::Calls), &BTreeSet::new());
+
+    assert_eq!(doc.messages.len(), 1);
+    let message = &doc.messages[0];
+    assert_eq!(message.kind, DocMessageKind::ToolSummaryGroup);
+    assert_eq!(message.label, "Claude");
+    assert_eq!(message.label_role, LabelRole::AccentDim);
+    let row_id = |entry: usize, block: usize, call: &str| {
+        make_tool_output_id(entry, None, block, ToolOutputKind::CallRow, Some(call))
+    };
+    let row_ids = [
+        row_id(0, 0, "toolu_1"),
+        row_id(2, 0, "toolu_2"),
+        row_id(2, 1, "toolu_3"),
+    ];
+    assert_eq!(
+        row_ids[2].0,
+        "entry:2:parent:top:block:1:kind:row:id:toolu_3"
+    );
+    let lines: Vec<&DocBlockKind> = message.blocks.iter().map(|block| &block.kind).collect();
+    let line = |id: &ToolOutputId, header: &str| DocBlockKind::ToolCallLine {
+        id: Some(id.clone()),
+        header: header.to_string(),
+        hidden_lines: 0,
+    };
+    assert_eq!(
+        lines,
+        [
+            &line(&row_ids[0], r#"Grep: "one" in ."#),
+            &line(&row_ids[1], "Read: src/main.rs"),
+            &line(&row_ids[2], "Bash: cargo test"),
+        ]
+    );
+    let toggles: Vec<Option<&ToolOutputId>> =
+        message.blocks.iter().map(DocBlock::toggle_id).collect();
+    assert_eq!(toggles, row_ids.iter().map(Some).collect::<Vec<_>>());
+    let text = doc_text(&doc);
+    assert!(!text.contains("Result"), "{text}");
+    assert!(!text.contains("grep result"), "{text}");
+
+    // The group's own id no longer expands anything in calls mode.
+    let summary_id = make_tool_summary_output_id(0, None);
+    assert_eq!(
+        build_document(
+            &renderable(&entries),
+            &prefs(ToolDisplayMode::Calls),
+            &BTreeSet::from([summary_id]),
+        ),
+        doc
+    );
+
+    // Expanding the Bash row shows its call and result; the other rows stay
+    // collapsed.
+    let expanded = assert_ledger_parity(
+        &entries,
+        &prefs(ToolDisplayMode::Calls),
+        &BTreeSet::from([row_ids[2].clone()]),
+    );
+    let text = doc_text(&expanded);
+    assert!(text.contains("bash result"), "{text}");
+    assert!(!text.contains("grep result"), "{text}");
+    let blocks = &expanded.messages[0].blocks;
+    assert_eq!(blocks.len(), 3);
+    assert_eq!(blocks[0].kind, line(&row_ids[0], r#"Grep: "one" in ."#));
+    assert_eq!(blocks[1].kind, line(&row_ids[1], "Read: src/main.rs"));
+    let DocBlockKind::ToolSummaryDetails { id, items } = &blocks[2].kind else {
+        panic!("expanded row: {:?}", blocks[2]);
+    };
+    assert_eq!(id, &row_ids[2]);
+    assert_eq!(blocks[2].toggle_id(), Some(&row_ids[2]));
+    let item_ids: Vec<&str> = items
+        .iter()
+        .map(|item| item.tool_output_id().unwrap().0.as_str())
+        .collect();
+    assert_eq!(
+        item_ids,
+        [
+            "entry:2:parent:top:block:1:kind:call:id:toolu_3",
+            "entry:3:parent:top:block:0:kind:result:id:toolu_3",
+        ]
+    );
+    let DocBlockKind::ToolCall(call) = &items[0].kind else {
+        panic!("call: {:?}", items[0]);
+    };
+    assert!(call.dimmed);
+    assert_eq!(call.header, "Bash: cargo test");
+    let DocBlockKind::ToolResult(result) = &items[1].kind else {
+        panic!("result: {:?}", items[1]);
+    };
+    assert_eq!(result.text, "bash result");
+
+    // A call whose result is not in the group shows just the call.
+    let read = assert_ledger_parity(
+        &entries,
+        &prefs(ToolDisplayMode::Calls),
+        &BTreeSet::from([row_ids[1].clone()]),
+    );
+    let DocBlockKind::ToolSummaryDetails { items, .. } = &read.messages[0].blocks[1].kind else {
+        panic!("expanded row: {:?}", read.messages[0].blocks[1]);
+    };
+    assert!(
+        matches!(&items[..], [DocBlock { kind: DocBlockKind::ToolCall(call), .. }] if call.header == "Read: src/main.rs")
+    );
+}
+
+/// Calls mode: the first line of a group carries the stamp, later lines
+/// pad under it (the ledger's continuation rows), an expanded row included;
+/// without timing every line has no column.
+#[test]
+fn calls_tool_mode_lines_after_the_first_pad_the_timing_column() {
+    let timestamp = Local.with_ymd_and_hms(2026, 9, 4, 13, 59, 0).unwrap();
+    let entries = [
+        entry(
+            0,
+            &format!(
+                r#"{{"type":"assistant","timestamp":"{}","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_1","name":"Bash","input":{{"command":"pwd"}}}},{{"type":"tool_use","id":"toolu_2","name":"Read","input":{{"file_path":"a.rs"}}}}]}}}}"#,
+                timestamp.to_rfc3339()
+            ),
+        ),
+        entry(
+            1,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"/tmp"},{"type":"tool_result","tool_use_id":"toolu_2","content":"fn main() {}"}]}}"#,
+        ),
+    ];
+    let mut prefs = prefs(ToolDisplayMode::Calls);
+    prefs.show_timing = true;
+    let doc = assert_ledger_parity(&entries, &prefs, &BTreeSet::new());
+    let slots: Vec<&DocTiming> = doc.messages[0].blocks.iter().map(|b| &b.timing).collect();
+    let stamp = DocTiming::Stamp("Sep 04 13:59".to_string());
+    assert_eq!(slots, [&stamp, &DocTiming::Pad]);
+
+    // Expanded rows keep their row's slot; their result pads.
+    let ids = doc_toggle_ids(&doc);
+    let expanded = assert_ledger_parity(&entries, &prefs, &ids);
+    let blocks = &expanded.messages[0].blocks;
+    let slots: Vec<&DocTiming> = blocks.iter().map(|b| &b.timing).collect();
+    assert_eq!(slots, [&stamp, &DocTiming::Pad]);
+    for (block, first) in blocks.iter().zip([&stamp, &DocTiming::Pad]) {
+        let DocBlockKind::ToolSummaryDetails { items, .. } = &block.kind else {
+            panic!("expanded row: {block:?}");
+        };
+        let slots: Vec<&DocTiming> = items.iter().map(|item| &item.timing).collect();
+        assert_eq!(slots, [first, &DocTiming::Pad]);
+    }
+
+    prefs.show_timing = false;
+    let doc = assert_ledger_parity(&entries, &prefs, &BTreeSet::new());
+    assert!(
+        doc.messages[0]
+            .blocks
+            .iter()
+            .all(|block| block.timing == DocTiming::Disabled)
+    );
+}
+
+#[test]
+fn summary_tool_mode_coalesces_tool_only_entries_across_results() {
+    let doc = build(&tool_summary_entries(), &prefs(ToolDisplayMode::Summary));
 
     assert_eq!(doc.messages.len(), 1);
     let message = &doc.messages[0];
@@ -552,6 +906,64 @@ fn hidden_tool_mode_coalesces_tool_only_entries_across_results() {
     assert!(!doc_text(&doc).contains("Result"));
 }
 
+/// Upstream d0aca95: off mode renders no tool call, result or summary.
+#[test]
+fn off_tool_mode_hides_tool_calls_results_and_summaries() {
+    let entries = conversation_with_tool_only_turns();
+    let doc = assert_ledger_parity(&entries, &prefs(ToolDisplayMode::Off), &BTreeSet::new());
+    let text = doc_text(&doc);
+
+    assert!(text.contains("please check the build"));
+    assert!(text.contains("Running the tests now."));
+    assert!(text.contains("The build passes."));
+    for hidden in [
+        "Searched",
+        "Grep",
+        "Bash",
+        "cargo",
+        "grep result",
+        "bash result",
+        "build output",
+    ] {
+        assert!(!text.contains(hidden), "{hidden:?} leaked into:\n{text}");
+    }
+    assert!(
+        all_blocks(&doc)
+            .iter()
+            .all(|block| matches!(block.kind, DocBlockKind::Markdown { .. })),
+        "{doc:#?}"
+    );
+}
+
+/// Upstream d0aca95: tool-only entries leave no empty message behind, so
+/// message navigation skips them.
+#[test]
+fn off_tool_mode_leaves_no_empty_messages() {
+    let entries = conversation_with_tool_only_turns();
+    let doc = assert_ledger_parity(&entries, &prefs(ToolDisplayMode::Off), &BTreeSet::new());
+
+    let entry_indices: Vec<usize> = doc.messages.iter().map(|m| m.entry_index).collect();
+    assert_eq!(entry_indices, [0, 5, 7]);
+    assert_eq!(doc.navigable_entry_indices(), [0, 5, 7]);
+    assert!(doc.messages.iter().all(|m| !m.blocks.is_empty()));
+    assert_eq!(
+        doc.messages.iter().filter(|m| m.label == "Claude").count(),
+        2
+    );
+    assert!(doc_toggle_ids(&doc).is_empty());
+
+    // Thinking stays visible without its tool calls.
+    let mut thinking = prefs(ToolDisplayMode::Off);
+    thinking.show_thinking = true;
+    let doc = assert_ledger_parity(&[reordered_blocks_entry()], &thinking, &BTreeSet::new());
+    let texts: Vec<String> = doc.messages[0]
+        .blocks
+        .iter()
+        .map(|block| block.plain_text())
+        .collect();
+    assert_eq!(texts, ["TEXT_BLOCK", "THINK_BLOCK"]);
+}
+
 #[test]
 fn collapsed_tool_summary_uses_fixed_timestamp_format() {
     let timestamp = Local.with_ymd_and_hms(2026, 9, 4, 13, 59, 0).unwrap();
@@ -562,7 +974,7 @@ fn collapsed_tool_summary_uses_fixed_timestamp_format() {
             timestamp.to_rfc3339()
         ),
     )];
-    let mut prefs = prefs(ToolDisplayMode::Hidden);
+    let mut prefs = prefs(ToolDisplayMode::Summary);
     prefs.show_timing = true;
 
     let doc = assert_ledger_parity(&entries, &prefs, &BTreeSet::new());
@@ -571,10 +983,7 @@ fn collapsed_tool_summary_uses_fixed_timestamp_format() {
         doc.messages[0].blocks[0].timing,
         DocTiming::Stamp("Sep 04 13:59".to_string())
     );
-    assert_eq!(
-        doc.messages[0].raw_timestamp.as_deref(),
-        Some(timestamp.to_rfc3339().as_str())
-    );
+    assert_eq!(doc.messages[0].raw_timestamp, Some(timestamp.to_utc()));
 }
 
 #[test]
@@ -591,17 +1000,17 @@ fn tool_summary_uses_source_agent_label() {
     ];
     let summary_id = make_tool_summary_output_id(0, None);
 
-    let collapsed = build(&entries, &prefs(ToolDisplayMode::Hidden));
+    let collapsed = build(&entries, &prefs(ToolDisplayMode::Summary));
     assert_eq!(collapsed.messages.len(), 1);
     assert_eq!(collapsed.messages[0].label, "Pi");
     assert_eq!(
         collapsed.messages[0].blocks[0].plain_text(),
-        "Called 1 tool"
+        "Ran 1 shell command"
     );
 
     let expanded = build_document(
-        &entries,
-        &prefs(ToolDisplayMode::Hidden),
+        &renderable(&entries),
+        &prefs(ToolDisplayMode::Summary),
         &BTreeSet::from([summary_id.clone()]),
     );
     assert_eq!(expanded.messages[0].label, "Pi");
@@ -615,11 +1024,45 @@ fn tool_summary_uses_source_agent_label() {
 }
 
 #[test]
+fn single_unknown_tool_call_summary_is_the_call_itself() {
+    let single = entry(
+        0,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"clock__sleep","input":{"duration_ms":20000}}]}}"#,
+    );
+    let doc = build(&[single], &prefs(ToolDisplayMode::Summary));
+    assert_eq!(
+        doc.messages[0].blocks[0].plain_text(),
+        r#"clock__sleep: { "duration_ms": 20000 }"#
+    );
+
+    // Two calls keep the counted sentence.
+    let two = entry(
+        0,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"a__b","input":{}},{"type":"tool_use","id":"toolu_2","name":"a__c","input":{}}]}}"#,
+    );
+    let doc = build(&[two], &prefs(ToolDisplayMode::Summary));
+    assert_eq!(doc.messages[0].blocks[0].plain_text(), "Called a__b, a__c");
+}
+
+#[test]
+fn summary_tool_mode_names_unknown_tools_in_group() {
+    let e = entry(
+        0,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"mcp__docs__search","input":{"query":"x"}},{"type":"tool_use","id":"toolu_2","name":"clock__sleep","input":{"duration_ms":1}},{"type":"tool_use","id":"toolu_3","name":"clock__sleep","input":{"duration_ms":2}},{"type":"tool_use","id":"toolu_4","name":"Read","input":{"file_path":"src/main.rs"}}]}}"#,
+    );
+    let doc = build(&[e], &prefs(ToolDisplayMode::Summary));
+    assert_eq!(
+        doc.messages[0].blocks[0].plain_text(),
+        "Read 1 file, called mcp__docs__search, clock__sleep ×2"
+    );
+}
+
+#[test]
 fn hidden_pi_thinking_allows_clickable_grouped_tool_summary() {
     let entries = pi_thinking_entries();
     let summary_id = make_tool_summary_output_id(0, None);
 
-    let collapsed = build(&entries, &prefs(ToolDisplayMode::Hidden));
+    let collapsed = build(&entries, &prefs(ToolDisplayMode::Summary));
     assert_eq!(collapsed.messages.len(), 1);
     assert_eq!(collapsed.messages[0].label, "Pi");
     assert_eq!(
@@ -628,12 +1071,12 @@ fn hidden_pi_thinking_allows_clickable_grouped_tool_summary() {
     );
     assert_eq!(
         collapsed.messages[0].blocks[0].plain_text(),
-        "Called 2 tools"
+        "Ran 2 shell commands"
     );
 
     let expanded = build_document(
-        &entries,
-        &prefs(ToolDisplayMode::Hidden),
+        &renderable(&entries),
+        &prefs(ToolDisplayMode::Summary),
         &BTreeSet::from([summary_id]),
     );
     let text = doc_text(&expanded);
@@ -650,8 +1093,8 @@ fn expanded_tool_summary_renders_truncated_details() {
     let entries = tool_summary_entries();
     let summary_id = make_tool_summary_output_id(0, None);
     let doc = build_document(
-        &entries,
-        &prefs(ToolDisplayMode::Hidden),
+        &renderable(&entries),
+        &prefs(ToolDisplayMode::Summary),
         &BTreeSet::from([summary_id.clone()]),
     );
 
@@ -690,7 +1133,7 @@ fn expanded_tool_summary_renders_truncated_details() {
 fn subagent_summary_label_parity() {
     let entries = subagent_entries();
     let summary_id = make_tool_summary_output_id(0, Some("toolu_parent_abc"));
-    let mut prefs = prefs(ToolDisplayMode::Hidden);
+    let mut prefs = prefs(ToolDisplayMode::Summary);
     prefs.show_thinking = true;
 
     let collapsed = build(&entries, &prefs);
@@ -700,7 +1143,7 @@ fn subagent_summary_label_parity() {
     assert!(message.dimmed && message.is_subagent);
     assert_eq!(message.blocks[0].toggle_id(), Some(&summary_id));
 
-    let expanded = build_document(&entries, &prefs, &BTreeSet::from([summary_id]));
+    let expanded = build_document(&renderable(&entries), &prefs, &BTreeSet::from([summary_id]));
     assert_eq!(expanded.messages[0].label, "↳parent_");
     let text = doc_text(&expanded);
     assert!(text.contains("Grep: \"one\" in ."));
@@ -735,7 +1178,7 @@ fn tool_output_ids_use_stable_literal_format() {
         ]
     );
 
-    let grouped = build(&entries[..1], &self::prefs(ToolDisplayMode::Hidden));
+    let grouped = build(&entries[..1], &self::prefs(ToolDisplayMode::Summary));
     assert_eq!(
         grouped.messages[0].blocks[0].tool_output_id().unwrap().0,
         "entry:0:parent:top:kind:summary"
@@ -743,7 +1186,7 @@ fn tool_output_ids_use_stable_literal_format() {
 }
 
 #[test]
-fn parse_conversation_file_preserves_entry_indices() {
+fn entries_are_numbered_as_shown() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("conversation.jsonl");
     std::fs::write(
@@ -761,15 +1204,21 @@ fn parse_conversation_file_preserves_entry_indices() {
     )
     .unwrap();
 
-    let entries = parse_conversation_file(&path).unwrap();
-    let doc = build(&entries, &prefs(ToolDisplayMode::Hidden));
+    // A file-history snapshot is no entry (upstream 9597669: entries are
+    // numbered among the transcript's entries, not the file's records).
+    let transcript = crate::history::sources::decode_path(&path, None, false).unwrap();
+    let entries = vec![Owned {
+        entry_index: None,
+        transcript,
+    }];
+    let doc = build(&entries, &prefs(ToolDisplayMode::Summary));
 
     let indices: Vec<usize> = doc.messages.iter().map(|m| m.entry_index).collect();
-    assert_eq!(indices, [0, 2]);
+    assert_eq!(indices, [0, 1]);
     // The same index space as the export copy of a single message.
     let options = crate::export::ExportOptions::default();
     assert_eq!(
-        crate::export::extract_message_text(&path, 2, options).unwrap(),
+        crate::export::extract_message_text(&entries[0].transcript, 1, options).unwrap(),
         "second"
     );
 }
@@ -786,10 +1235,10 @@ fn show_thinking_controls_subagent_entries() {
             r#"{"type":"progress","data":{"type":"agent_progress","agentId":"agent-abcdef123456","message":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"agent progress text"}]}}}}"#,
         ),
     ];
-    let hidden = build(&entries, &prefs(ToolDisplayMode::Hidden));
+    let hidden = build(&entries, &prefs(ToolDisplayMode::Summary));
     assert!(hidden.messages.is_empty());
 
-    let mut prefs = prefs(ToolDisplayMode::Hidden);
+    let mut prefs = prefs(ToolDisplayMode::Summary);
     prefs.show_thinking = true;
     let shown = build(&entries, &prefs);
     assert_eq!(shown.messages.len(), 2);
@@ -836,7 +1285,7 @@ fn tool_call_metadata_tracks_truncated_and_expanded_state() {
     );
 
     let expanded = build_document(
-        &entries,
+        &renderable(&entries),
         &prefs(ToolDisplayMode::Truncated),
         &BTreeSet::from([id]),
     );
@@ -923,7 +1372,7 @@ fn single_result_document(content: &str, prefs: &ViewPrefs, expanded: bool) -> D
         return result.clone();
     }
     let ids = BTreeSet::from([result.id.clone()]);
-    let doc = build_document(&entries, prefs, &ids);
+    let doc = build_document(&renderable(&entries), prefs, &ids);
     let DocBlockKind::ToolResult(result) = &doc.messages[1].blocks[0].kind else {
         panic!("expected a result: {doc:#?}");
     };
@@ -991,7 +1440,7 @@ fn message_ranges_track_user_and_assistant_entries() {
         user_entry(0, "Hello", None),
         assistant_text_entry(1, "Hi there", None),
     ];
-    let doc = build(&entries, &prefs(ToolDisplayMode::Hidden));
+    let doc = build(&entries, &prefs(ToolDisplayMode::Summary));
     assert_eq!(doc.messages.len(), 2);
     assert_eq!(doc.messages[0].entry_index, 0);
     assert_eq!(doc.messages[0].kind, DocMessageKind::User);
@@ -1007,7 +1456,7 @@ fn message_ranges_skip_non_message_entries() {
         entry(0, r#"{"type":"summary","summary":"ignored"}"#),
         user_entry(1, "Hello", None),
     ];
-    let doc = build(&entries, &prefs(ToolDisplayMode::Hidden));
+    let doc = build(&entries, &prefs(ToolDisplayMode::Summary));
     assert_eq!(doc.messages.len(), 1);
     assert_eq!(doc.messages[0].entry_index, 1);
 }
@@ -1016,7 +1465,7 @@ fn message_ranges_skip_non_message_entries() {
 fn timing_enabled_stamps_first_block_and_disabled_omits_it() {
     let timestamp = Local.with_ymd_and_hms(2026, 9, 4, 12, 34, 56).unwrap();
     let entries = [user_entry(0, "Hello", Some(&timestamp.to_rfc3339()))];
-    let mut timed = prefs(ToolDisplayMode::Hidden);
+    let mut timed = prefs(ToolDisplayMode::Summary);
     timed.show_timing = true;
 
     let doc = build(&entries, &timed);
@@ -1026,7 +1475,7 @@ fn timing_enabled_stamps_first_block_and_disabled_omits_it() {
         DocTiming::Stamp("Sep 04 12:34".to_string())
     );
 
-    let doc = build(&entries, &prefs(ToolDisplayMode::Hidden));
+    let doc = build(&entries, &prefs(ToolDisplayMode::Summary));
     assert_eq!(doc.messages[0].timestamp, None);
     assert_eq!(doc.messages[0].blocks[0].timing, DocTiming::Disabled);
     assert!(doc.messages[0].raw_timestamp.is_some());
@@ -1035,15 +1484,13 @@ fn timing_enabled_stamps_first_block_and_disabled_omits_it() {
 #[test]
 fn invalid_timestamp_disables_timing_column() {
     let entries = [user_entry(0, "Hello", Some("not-a-timestamp"))];
-    let mut prefs = prefs(ToolDisplayMode::Hidden);
+    let mut prefs = prefs(ToolDisplayMode::Summary);
     prefs.show_timing = true;
     let doc = assert_ledger_parity(&entries, &prefs, &BTreeSet::new());
     assert_eq!(doc.messages[0].timestamp, None);
     assert_eq!(doc.messages[0].blocks[0].timing, DocTiming::Disabled);
-    assert_eq!(
-        doc.messages[0].raw_timestamp.as_deref(),
-        Some("not-a-timestamp")
-    );
+    // The transcript keeps no time it could not read.
+    assert_eq!(doc.messages[0].raw_timestamp, None);
 }
 
 #[test]
@@ -1094,7 +1541,7 @@ fn user_and_assistant_label_roles() {
             user_entry(0, "Hello", None),
             assistant_text_entry(1, "Hi", None),
         ],
-        &prefs(ToolDisplayMode::Hidden),
+        &prefs(ToolDisplayMode::Summary),
     );
     assert_eq!(doc.messages[0].label, "You");
     assert_eq!(doc.messages[0].label_role, LabelRole::TextPrimary);
@@ -1110,7 +1557,7 @@ fn user_and_assistant_label_roles() {
 
 #[test]
 fn assistant_block_order_hidden_mode_text_then_summary_then_thinking() {
-    let mut prefs = prefs(ToolDisplayMode::Hidden);
+    let mut prefs = prefs(ToolDisplayMode::Summary);
     prefs.show_thinking = true;
     let doc = build(&[reordered_blocks_entry()], &prefs);
     let kinds: Vec<String> = doc.messages[0]
@@ -1121,6 +1568,74 @@ fn assistant_block_order_hidden_mode_text_then_summary_then_thinking() {
     assert_eq!(kinds, ["TEXT_BLOCK", "Ran 1 shell command", "THINK_BLOCK"]);
     // A mixed text + tools message has a non-clickable sentence.
     assert_eq!(doc.messages[0].blocks[1].toggle_id(), None);
+}
+
+/// Calls mode: a mixed text + tools message lists its calls where summary
+/// mode has the sentence, as non-clickable lines.
+#[test]
+fn assistant_block_order_calls_mode_text_then_call_lines_then_thinking() {
+    let mut prefs = prefs(ToolDisplayMode::Calls);
+    prefs.show_thinking = true;
+    let doc = assert_ledger_parity(&[reordered_blocks_entry()], &prefs, &BTreeSet::new());
+    let kinds: Vec<String> = doc.messages[0]
+        .blocks
+        .iter()
+        .map(|block| block.plain_text())
+        .collect();
+    assert_eq!(kinds, ["TEXT_BLOCK", "Bash: echo hi", "THINK_BLOCK"]);
+    assert_eq!(
+        doc.messages[0].blocks[1].kind,
+        DocBlockKind::ToolCallLine {
+            id: None,
+            header: "Bash: echo hi".to_string(),
+            hidden_lines: 0,
+        }
+    );
+    assert_eq!(doc.messages[0].blocks[1].toggle_id(), None);
+}
+
+/// Calls mode: a call with a body (a multi-line command) carries the count
+/// of lines its row hides, apart from the header, and the plain text ends
+/// with the same `(N more lines)` as the ledger row.
+#[test]
+fn calls_mode_call_lines_carry_hidden_line_counts() {
+    let tools = r#"{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"python3 - <<'EOF'\nprint(1)\nEOF"}},{"type":"tool_use","id":"toolu_2","name":"Bash","input":{"command":"ls"}}"#;
+    let grouped = entry(
+        0,
+        &format!(r#"{{"type":"assistant","message":{{"role":"assistant","content":[{tools}]}}}}"#),
+    );
+    let mixed = entry(
+        1,
+        &format!(
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"TEXT"}},{tools}]}}}}"#
+        ),
+    );
+    for entry in [grouped, mixed] {
+        let doc = assert_ledger_parity(&[entry], &prefs(ToolDisplayMode::Calls), &BTreeSet::new());
+        let lines: Vec<(&str, usize, String)> = doc.messages[0]
+            .blocks
+            .iter()
+            .filter_map(|block| match &block.kind {
+                DocBlockKind::ToolCallLine {
+                    header,
+                    hidden_lines,
+                    ..
+                } => Some((header.as_str(), *hidden_lines, block.plain_text())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                (
+                    "Bash: python3 - <<'EOF'",
+                    2,
+                    "Bash: python3 - <<'EOF' (2 more lines)".to_string()
+                ),
+                ("Bash: ls", 0, "Bash: ls".to_string()),
+            ]
+        );
+    }
 }
 
 #[test]
@@ -1176,7 +1691,7 @@ fn skill_marker_user_message_renders_dimmed_but_top_level() {
         0,
         r#"{"type":"user","message":{"role":"user","content":"Base directory for this skill: /tmp/x"}}"#,
     )];
-    let doc = build(&entries, &prefs(ToolDisplayMode::Hidden));
+    let doc = build(&entries, &prefs(ToolDisplayMode::Summary));
     let message = &doc.messages[0];
     assert_eq!(message.label, "You");
     assert!(message.dimmed);
@@ -1215,8 +1730,10 @@ fn dimmed_skill_message_keeps_its_tool_results_un_muted_like_the_ledger() {
         "{doc:#?}"
     );
 
-    let rendered =
-        render_parsed_conversation(&entries, &prefs.render_options(80, &BTreeSet::new()));
+    let rendered = render_parsed_conversation(
+        &renderable(&entries),
+        &prefs.render_options(80, &BTreeSet::new()),
+    );
     // The message's own text row is muted...
     assert!(name_span(&rendered.lines[0]).1.dimmed);
     // ...but the result row is not: neither its label nor its text.
@@ -1257,8 +1774,9 @@ fn agent_progress_user_with_text_and_result_keeps_template_order() {
     let DocBlockKind::SubagentToolResult(result) = &message.blocks[1].kind else {
         panic!("expected a subagent result: {doc:#?}");
     };
-    // Subagent results are the raw content as pretty JSON.
-    assert_eq!(result.text, "\"result body\"");
+    // Subagent results show the same display text as top-level results
+    // (upstream 6afae1c), not a JSON-quoted string.
+    assert_eq!(result.text, "result body");
     assert_eq!(
         result.id.0,
         "entry:0:parent:agent-abc1234:block:1:kind:result:id:toolu_1"
@@ -1267,7 +1785,7 @@ fn agent_progress_user_with_text_and_result_keeps_template_order() {
 
 #[test]
 fn agent_progress_assistant_has_summary_calls_and_no_thinking() {
-    let mut prefs = prefs(ToolDisplayMode::Hidden);
+    let mut prefs = prefs(ToolDisplayMode::Summary);
     prefs.show_thinking = true;
     let doc = build(&agent_progress_entries(), &prefs);
     // Agent-progress entries are never grouped.
@@ -1299,23 +1817,21 @@ fn agent_progress_assistant_has_summary_calls_and_no_thinking() {
 }
 
 #[test]
-fn agent_progress_keeps_raw_timestamp_but_never_stamps() {
+fn agent_progress_never_stamps() {
     let entries = [entry(
         0,
         r#"{"type":"progress","timestamp":"2026-09-04T12:34:56Z","data":{"type":"agent_progress","agentId":"agent-1","message":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}}}"#,
     )];
     let prefs = ViewPrefs {
-        tool_display: ToolDisplayMode::Hidden,
+        tool_display: ToolDisplayMode::Summary,
         show_thinking: true,
         show_timing: true,
     };
     let doc = assert_ledger_parity(&entries, &prefs, &BTreeSet::new());
     let message = &doc.messages[0];
     assert_eq!(message.timestamp, None);
-    assert_eq!(
-        message.raw_timestamp.as_deref(),
-        Some("2026-09-04T12:34:56Z")
-    );
+    // The record's time is not the subagent message's (upstream 9597669).
+    assert_eq!(message.raw_timestamp, None);
     assert_eq!(message.blocks[0].timing, DocTiming::Pad);
 }
 
@@ -1353,7 +1869,7 @@ fn pending_summary_flushes_at_eof() {
         0,
         r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Grep","input":{"pattern":"x"}}]}}"#,
     )];
-    let doc = build(&entries, &prefs(ToolDisplayMode::Hidden));
+    let doc = build(&entries, &prefs(ToolDisplayMode::Summary));
     assert_eq!(doc.messages.len(), 1);
     assert_eq!(doc.messages[0].entry_index, 0);
     assert_eq!(
@@ -1371,7 +1887,7 @@ fn pending_summary_flushes_before_non_tool_message() {
         ),
         user_entry(1, "follow up", None),
     ];
-    let doc = build(&entries, &prefs(ToolDisplayMode::Hidden));
+    let doc = build(&entries, &prefs(ToolDisplayMode::Summary));
     let indices: Vec<usize> = doc.messages.iter().map(|m| m.entry_index).collect();
     assert_eq!(indices, [0, 1]);
     assert_eq!(doc.messages[0].kind, DocMessageKind::ToolSummaryGroup);
@@ -1402,7 +1918,7 @@ fn groups_split_on_parent_or_agent_change_and_absorb_results() {
             r#"{"type":"assistant","agent":"Pi","message":{"role":"assistant","content":[{"type":"tool_use","id":"c","name":"Write","input":{}}]}}"#,
         ),
     ];
-    let doc = assert_ledger_parity(&entries, &prefs(ToolDisplayMode::Hidden), &BTreeSet::new());
+    let doc = assert_ledger_parity(&entries, &prefs(ToolDisplayMode::Summary), &BTreeSet::new());
     let summary: Vec<(usize, &str, String)> = doc
         .messages
         .iter()
@@ -1419,7 +1935,7 @@ fn groups_split_on_parent_or_agent_change_and_absorb_results() {
 
 #[test]
 fn user_text_blocks_are_command_processed_and_joined() {
-    let doc = build(&mixed_entries(), &prefs(ToolDisplayMode::Hidden));
+    let doc = build(&mixed_entries(), &prefs(ToolDisplayMode::Summary));
     let texts: Vec<(usize, String)> = doc
         .messages
         .iter()
@@ -1441,7 +1957,7 @@ fn user_text_blocks_are_command_processed_and_joined() {
         assert!(doc.messages.iter().all(|m| m.entry_index != skipped));
     }
     let metadata = doc.messages.iter().find(|m| m.entry_index == 5).unwrap();
-    assert_eq!(metadata.kind, DocMessageKind::PiMetadata);
+    assert_eq!(metadata.kind, DocMessageKind::Note);
     assert_eq!(metadata.label, "notice");
     assert_eq!(metadata.label_role, LabelRole::TextSecondary);
     assert!(metadata.dimmed && !metadata.navigable);
@@ -1526,7 +2042,7 @@ fn truncation_counts_unwrapped_rows_and_ledger_helpers_count_wrapped_rows() {
 
     // The ledger agrees with the helpers at that width.
     let rendered = render_parsed_conversation(
-        &entries,
+        &renderable(&entries),
         &prefs(ToolDisplayMode::Truncated).render_options(40, &BTreeSet::new()),
     );
     assert_eq!(indicator_counts(&rendered), [2, 1]);
@@ -1571,8 +2087,10 @@ fn result_visible_text_and_markdown_follow_the_fold() {
         subagent[0].visible_text(),
         "{\n  \"a\": 1,\n  \"b\": [\n    1,"
     );
-    assert_eq!(subagent[1].text, "\"r1\\nr2\\nr3\\nr4\\nr5\"");
-    assert_eq!(subagent[1].hidden_lines(), None);
+    // A string result is its text, so its lines count (upstream 6afae1c).
+    assert_eq!(subagent[1].text, "r1\nr2\nr3\nr4\nr5");
+    assert_eq!(subagent[1].hidden_lines(), Some(1));
+    assert_eq!(subagent[1].visible_text(), "r1\nr2\nr3\nr4");
 }
 
 #[test]
@@ -1588,7 +2106,7 @@ fn markdown_plain_text_hides_markup_like_the_ledger() {
 
 #[test]
 fn nav_positions_map_between_document_and_ledger() {
-    let doc = build(&mixed_entries(), &prefs(ToolDisplayMode::Hidden));
+    let doc = build(&mixed_entries(), &prefs(ToolDisplayMode::Summary));
     let navigable = doc.navigable_indices();
     for (position, &index) in navigable.iter().enumerate() {
         assert_eq!(doc.nav_position(index), Some(position));
@@ -1597,7 +2115,7 @@ fn nav_positions_map_between_document_and_ledger() {
     let metadata = doc
         .messages
         .iter()
-        .position(|m| m.kind == DocMessageKind::PiMetadata)
+        .position(|m| m.kind == DocMessageKind::Note)
         .unwrap();
     assert_eq!(doc.nav_position(metadata), None);
     assert_eq!(doc.message_at_nav_position(navigable.len()), None);
@@ -1609,7 +2127,7 @@ fn nav_positions_map_between_document_and_ledger() {
 // -----------------------------------------------------------------
 
 /// A user entry holding one tool result with this string content.
-fn tool_result_entry(entry_index: usize, tool_use_id: &str, content: &str) -> RenderableEntry {
+fn tool_result_entry(entry_index: usize, tool_use_id: &str, content: &str) -> Owned {
     entry(
         entry_index,
         &serde_json::json!({
@@ -1632,7 +2150,7 @@ fn tool_results(doc: &ConversationDocument) -> Vec<&DocToolResult> {
         .collect()
 }
 
-fn row_entries() -> Vec<RenderableEntry> {
+fn row_entries() -> Vec<Owned> {
     vec![
         user_entry(0, "hi", None),
         // Trailing line break: the ledger shows 4 rows and "(1 more lines...)".
@@ -1682,7 +2200,11 @@ fn tool_result_truncation_counts_rendered_rows() {
 
     // Expanded: everything is shown and the click collapses again.
     let expanded: BTreeSet<ToolOutputId> = BTreeSet::from([trailing.id.clone()]);
-    let doc = build_document(&entries, &prefs(ToolDisplayMode::Truncated), &expanded);
+    let doc = build_document(
+        &renderable(&entries),
+        &prefs(ToolDisplayMode::Truncated),
+        &expanded,
+    );
     let trailing = tool_results(&doc)[0];
     assert_eq!(trailing.hidden_lines(), None);
     assert!(trailing.expandable());
@@ -1871,7 +2393,7 @@ fn v026_image_and_document_blocks_produce_no_rows() {
             ]}}"#,
         ),
     ];
-    for mode in [ToolDisplayMode::Hidden, ToolDisplayMode::Full] {
+    for mode in [ToolDisplayMode::Summary, ToolDisplayMode::Full] {
         let doc = build(&entries, &prefs(mode));
         let text = doc_text(&doc);
         assert_eq!(doc.messages.len(), 1, "{text}");
@@ -1890,7 +2412,7 @@ fn v030_warmup_exchange_is_rendered_in_the_viewer() {
         assistant_text_entry(1, "Ready to help", None),
         user_entry(2, "real question", None),
     ];
-    let doc = build(&entries, &prefs(ToolDisplayMode::Hidden));
+    let doc = build(&entries, &prefs(ToolDisplayMode::Summary));
     assert_eq!(doc.messages.len(), 3);
     let text = doc_text(&doc);
     assert!(
@@ -1900,29 +2422,47 @@ fn v030_warmup_exchange_is_rendered_in_the_viewer() {
 }
 
 #[test]
-fn v058_image_only_read_result_shows_pretty_json_with_the_base64_data() {
+fn v058_image_results_show_a_placeholder_without_the_base64_data() {
+    // Upstream 6afae1c: an image result shows `[image: <media type>]`, also
+    // next to text (which used to drop the image), and a tool error reads
+    // `Error: ...` without its tags.
     let entries = [
         entry(
             0,
-            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"shot.png"}}]}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[
+                {"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"shot.png"}},
+                {"type":"tool_use","id":"toolu_2","name":"Read","input":{"file_path":"page.png"}},
+                {"type":"tool_use","id":"toolu_3","name":"Edit","input":{"file_path":"a.md","old_string":"x","new_string":"y"}}
+            ]}}"#,
         ),
         entry(
             1,
-            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"QkFTRTY0REFUQQ=="}}]}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"QkFTRTY0REFUQQ=="}}]},
+                {"type":"tool_result","tool_use_id":"toolu_2","content":[{"type":"text","text":"caption"},{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"T1RIRVJEQVRB"}}]},
+                {"type":"tool_result","tool_use_id":"toolu_3","content":"<tool_use_error>String to replace not found in file.</tool_use_error>"}
+            ]}}"#,
         ),
     ];
     let doc = build(&entries, &prefs(ToolDisplayMode::Full));
-    let DocBlockKind::ToolResult(result) = &doc.messages[1].blocks[0].kind else {
-        panic!("expected a result: {doc:#?}");
-    };
-    let parsed: serde_json::Value = serde_json::from_str(&result.text).expect("pretty JSON");
+    let texts: Vec<&str> = doc.messages[1]
+        .blocks
+        .iter()
+        .filter_map(|block| match &block.kind {
+            DocBlockKind::ToolResult(result) => Some(result.text.as_str()),
+            _ => None,
+        })
+        .collect();
     assert_eq!(
-        parsed[0]["source"]["data"],
-        serde_json::json!("QkFTRTY0REFUQQ==")
+        texts,
+        [
+            "[image: image/png]",
+            "caption\n\n[image: image/jpeg]",
+            "Error: String to replace not found in file.",
+        ]
     );
-    assert!(
-        result.text.contains('\n'),
-        "pretty-printed: {}",
-        result.text
-    );
+    let text = doc_text(&doc);
+    for secret in ["QkFTRTY0REFUQQ==", "T1RIRVJEQVRB", "tool_use_error"] {
+        assert!(!text.contains(secret), "{secret} in {text}");
+    }
 }

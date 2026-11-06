@@ -3,26 +3,29 @@
 //! Plans with core `maintenance::plan_session_delete` (off the UI thread),
 //! confirms with `widgets::open_destructive_confirm` + `widgets::PathList`
 //! (Enter ignored, `y`/`Y` confirm, `n`/`N`/Esc cancel), executes with
-//! `execute_session_delete` and broadcasts `CorpusNotice::Deleted`. The
+//! `execute_session_delete_with` (the services' `run_program` is the runner, used for the
+//! Codex CLI) and broadcasts `CorpusNotice::Deleted`. The
 //! source comes from the captured target, never from the live selection
 //! (A2), and the plan lists every file the execution removes.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use claude_history_core::history::Source;
+use claude_history_core::history::model::SourceKind;
 use claude_history_core::maintenance::{
-    DeletePlan, delete_by_uuid_message, execute_session_delete, plan_session_delete,
+    DeletePlan, delete_by_uuid_message, execute_session_delete_with, plan_session_delete,
 };
+use claude_history_core::resume::LaunchSpec;
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::{App, IntoElement as _, ParentElement as _, Styled as _, Window, div};
 
 use crate::globals::{
     BusySpan, BusyTimer, CorpusBus, CorpusNotice, OpenTargets, UiBusy, app_state,
 };
-use crate::model::{ConversationTarget, short_session_id};
+use crate::model::{ConversationTarget, SessionAct, short_session_id};
 use crate::notify::Toast;
-use crate::ops::copy::{can_act, clear_dialog, live_target};
+use crate::ops::copy::{can_act, clear_dialog, live_target, still_allowed};
+use crate::services::services;
 use crate::widgets::{
     ConfirmControl, ConfirmOptions, ConfirmOutcome, PathItem, PathList, open_destructive_confirm,
 };
@@ -31,12 +34,13 @@ use crate::workspace::startup::register_dialog;
 /// The QA / probe id of the dialog.
 pub const DIALOG_ID: &str = "delete";
 
-/// `Claude Code`, `Pi` or `OMP`.
-pub fn source_label(source: Source) -> &'static str {
+/// `Claude Code`, `Pi`, `OMP` or `Codex`.
+pub fn source_label(source: SourceKind) -> &'static str {
     match source {
-        Source::Claude => "Claude Code",
-        Source::Pi => "Pi",
-        Source::Omp => "OMP",
+        SourceKind::Claude => "Claude Code",
+        SourceKind::Pi => "Pi",
+        SourceKind::Omp => "OMP",
+        SourceKind::Codex => "Codex",
     }
 }
 
@@ -45,9 +49,45 @@ pub fn dialog_title(target: &ConversationTarget) -> String {
     format!("Delete \"{}\"?", target.title)
 }
 
-/// `N copies across projects. This can't be undone.` / `This can't be undone.`
+/// `N copies across projects. This can't be undone.` / `This can't be undone.`;
+/// for a Codex thread, what the Codex CLI does (upstream eea6d37); for a
+/// Claude session with `/btw` forks, that they stay (upstream 3c2ffeb).
 pub fn consequence_text(plan: &DeletePlan) -> String {
-    if plan.source == Source::Claude && plan.files.len() > 1 {
+    let text = consequence(plan);
+    match kept_forks_note(plan) {
+        Some(note) => format!("{note} {text}"),
+        None => text,
+    }
+}
+
+/// `Its /btw fork stays, a conversation of its own.` when deleting a Claude
+/// session keeps forks (`DeletePlan::kept`, upstream 3c2ffeb).
+pub fn kept_forks_note(plan: &DeletePlan) -> Option<String> {
+    let forks = plan
+        .kept
+        .iter()
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .count();
+    match forks {
+        0 => None,
+        1 => Some("Its /btw fork stays, a conversation of its own.".to_string()),
+        n => Some(format!(
+            "Its {n} /btw forks stay, conversations of their own."
+        )),
+    }
+}
+
+fn consequence(plan: &DeletePlan) -> String {
+    if plan.source == SourceKind::Codex {
+        format!(
+            "Runs the Codex CLI's delete --force {}, which removes the thread and its state. This can't \
+             be undone.",
+            plan.session_id
+        )
+    } else if plan.source == SourceKind::Claude && plan.files.len() > 1 {
         format!(
             "{} copies across projects. This can't be undone.",
             plan.files.len()
@@ -57,10 +97,12 @@ pub fn consequence_text(plan: &DeletePlan) -> String {
     }
 }
 
-/// The rows of the path list: every transcript, then every folder.
+/// The rows of the path list: every transcript and other file (a sidecar's
+/// metadata file), then every folder.
 pub fn plan_items(plan: &DeletePlan) -> Vec<PathItem> {
     plan.files
         .iter()
+        .chain(&plan.metadata)
         .map(PathItem::file)
         .chain(plan.dirs.iter().map(PathItem::folder))
         .collect()
@@ -68,7 +110,7 @@ pub fn plan_items(plan: &DeletePlan) -> Vec<PathItem> {
 
 /// Plan and confirm the deletion of the captured `target`.
 pub fn open_delete_dialog(target: ConversationTarget, window: &mut Window, cx: &mut App) {
-    if !can_act(&target) {
+    if !can_act(&target, SessionAct::Delete) {
         return;
     }
     let Some(source) = target.source else {
@@ -87,7 +129,9 @@ pub fn open_delete_dialog(target: ConversationTarget, window: &mut Window, cx: &
                     // The captured title may predate a rename (this runs outside
                     // the list's update, so the live entry can be read).
                     let target = live_target(target, cx);
-                    open_confirmation(target, plan, window, cx)
+                    if still_allowed(&target, SessionAct::Delete, window, cx) {
+                        open_confirmation(target, plan, window, cx)
+                    }
                 }
                 Err(error) => Toast::error(error.to_string()).show(window, cx),
             })
@@ -200,13 +244,21 @@ fn execute(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let env = app_state(cx).env_with_workspace();
+    let state = app_state(cx);
+    let env = state.env_with_workspace();
+    // A Codex thread is deleted by the Codex CLI (upstream eea6d37), run
+    // through the platform services (recorded in tests and QA, refused by
+    // the debug-build launch guard), started as configured (upstream
+    // 8a99ccc: `[resume.codex] command`, `[gui] codex_path`, else `codex`).
+    let codex = state.config.launcher(&env, SourceKind::Codex);
+    let services = services(cx);
     let task = {
         let plan = plan.clone();
         cx.background_executor().spawn(async move {
+            let mut run = |spec: &LaunchSpec| services.run_program(spec);
             // A failure carries the partial report: the transcripts core
             // already removed must still leave the list.
-            match execute_session_delete(&env, &plan) {
+            match execute_session_delete_with(&env, &plan, &codex, &mut run) {
                 Ok(_) => (Ok(()), plan.files.clone()),
                 Err(failure) => {
                     let mut gone = failure.partial.removed_files;
@@ -241,7 +293,7 @@ fn execute(
                 match result {
                     Ok(()) => {
                         CorpusBus::broadcast(CorpusNotice::Deleted(gone), cx);
-                        let message = if plan.files.len() > 1 {
+                        let message = if plan.source == SourceKind::Claude && plan.files.len() > 1 {
                             delete_by_uuid_message(&plan.session_id, plan.files.len())
                         } else {
                             format!("Deleted \"{title}\"")

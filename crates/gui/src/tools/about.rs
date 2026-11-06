@@ -17,7 +17,7 @@ use crate::services::services;
 /// The QA id of the dialog.
 pub const DIALOG_ID: &str = "about";
 /// The one-line description.
-pub const TAGLINE: &str = "A desktop browser for Claude Code, Pi and OMP history.";
+pub const TAGLINE: &str = "A desktop browser for Claude Code, Codex, Pi and OMP history.";
 /// The license line.
 pub const LICENSE_LINE: &str =
     "License: Unlicense. Core derived from claude-history (MIT, © 2024 Raine).";
@@ -194,6 +194,11 @@ pub fn open_about(window: &mut Window, cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tagline_names_codex() {
+        assert!(TAGLINE.contains("Codex"));
+    }
 
     #[test]
     fn versions_are_read_from_the_manifests() {

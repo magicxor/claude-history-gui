@@ -6,6 +6,109 @@
 
 use std::path::{Path, PathBuf};
 
+/// Whether paths that differ only in letter case name the same file. True on
+/// Windows, whose filesystems are case-insensitive and case-preserving, so a
+/// shell can reach one directory as both `MyProject` and `myproject`. False
+/// elsewhere, where those can be distinct directories.
+const PATHS_IGNORE_CASE: bool = cfg!(windows);
+
+fn fold_case(text: &str) -> impl Iterator<Item = char> + '_ {
+    text.chars().flat_map(char::to_lowercase)
+}
+
+fn path_str_eq(a: &str, b: &str, ignore_case: bool) -> bool {
+    if ignore_case {
+        fold_case(a).eq(fold_case(b))
+    } else {
+        a == b
+    }
+}
+
+fn path_str_starts_with(text: &str, prefix: &str, ignore_case: bool) -> bool {
+    if !ignore_case {
+        return text.starts_with(prefix);
+    }
+    let mut text = fold_case(text);
+    fold_case(prefix).all(|c| text.next() == Some(c))
+}
+
+fn paths_eq(a: &Path, b: &Path, ignore_case: bool) -> bool {
+    if !ignore_case {
+        return a == b;
+    }
+    let fold = |component: std::path::Component<'_>| {
+        fold_case(&component.as_os_str().to_string_lossy()).collect::<String>()
+    };
+    a.components().map(fold).eq(b.components().map(fold))
+}
+
+/// Whether two paths name the same location, ignoring letter case where the
+/// platform's filesystems do. Neither path is resolved.
+pub fn same_path(a: &Path, b: &Path) -> bool {
+    paths_eq(a, b, PATHS_IGNORE_CASE)
+}
+
+/// Match literal prefixes of the recorded working directory without resolving
+/// paths, ignoring letter case where the platform's filesystems do.
+pub(crate) fn cwd_is_excluded(cwd: Option<&Path>, prefixes: &[String]) -> bool {
+    cwd_has_prefix(cwd, prefixes, PATHS_IGNORE_CASE)
+}
+
+fn cwd_has_prefix(cwd: Option<&Path>, prefixes: &[String], ignore_case: bool) -> bool {
+    cwd.is_some_and(|cwd| {
+        let cwd = cwd.to_string_lossy();
+        prefixes
+            .iter()
+            .any(|prefix| !prefix.is_empty() && path_str_starts_with(&cwd, prefix, ignore_case))
+    })
+}
+
+/// Whether `path` is `dir` or a directory below it, ignoring letter case
+/// where the platform's filesystems do. Compares whole path components, so
+/// `/a/repo` is not within `/a/re`, and resolves nothing. Workspace scope
+/// compares recorded paths only through this.
+pub(crate) fn path_is_within(path: &Path, dir: &Path) -> bool {
+    path_within(path, dir, PATHS_IGNORE_CASE)
+}
+
+fn path_within(path: &Path, dir: &Path, ignore_case: bool) -> bool {
+    if !ignore_case {
+        return path.starts_with(dir);
+    }
+    let mut components = path.components();
+    dir.components().all(|component| {
+        components.next().is_some_and(|other| {
+            path_str_eq(
+                &component.as_os_str().to_string_lossy(),
+                &other.as_os_str().to_string_lossy(),
+                true,
+            )
+        })
+    })
+}
+
+/// `path` with the home directory written as `~`.
+pub fn tilde_path(path: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|home| path.strip_prefix(home).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => Path::new("~").join(rest).display().to_string(),
+        None => path.display().to_string(),
+    }
+}
+
+/// Whether `[tui] exclude_projects` hides the project named `project_name`
+/// (`Conversation::project_name`): the name or, for `parent/child` names,
+/// the parent is listed.
+pub(crate) fn project_is_excluded(
+    project_name: &str,
+    excluded_projects: &std::collections::HashSet<String>,
+) -> bool {
+    excluded_projects.contains(project_name)
+        || project_name
+            .split_once('/')
+            .is_some_and(|(parent, _)| excluded_projects.contains(parent))
+}
+
 /// Convert the current working directory into Claude's project directory name.
 pub fn convert_path_to_project_dir_name(path: &Path) -> String {
     path.to_string_lossy()
@@ -114,9 +217,19 @@ pub fn encoded_project_root(encoded: &str) -> &str {
 ///
 /// Two names are considered part of the same project if they share the same
 /// encoded project root (i.e., stripping any workmux `--worktrees-<branch>`
-/// suffix yields the same string).
+/// suffix yields the same string). Letter case is ignored where the platform's
+/// filesystems do, since the encoding keeps the casing the path was reached
+/// with (`C--Users-Foo-MyProject` vs `C--Users-Foo-myproject`).
 pub fn is_same_project(a: &str, b: &str) -> bool {
-    encoded_project_root(a) == encoded_project_root(b)
+    project_roots_match(a, b, PATHS_IGNORE_CASE)
+}
+
+fn project_roots_match(a: &str, b: &str, ignore_case: bool) -> bool {
+    path_str_eq(
+        encoded_project_root(a),
+        encoded_project_root(b),
+        ignore_case,
+    )
 }
 
 /// Decode a project directory name back to a path (simple heuristic fallback).
@@ -258,6 +371,44 @@ fn decode_display_with(encoded: &str, separator: char) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cwd_exclusions_use_literal_nonempty_prefixes() {
+        let prefixes = vec![
+            "".to_string(),
+            "/tmp/".to_string(),
+            "/private/tmp/".to_string(),
+        ];
+        for cwd in [
+            "/tmp/eval-random",
+            "/tmp/deleted/nested",
+            "/private/tmp/eval",
+        ] {
+            assert!(cwd_is_excluded(Some(Path::new(cwd)), &prefixes), "{cwd}");
+        }
+        for cwd in ["/tmp", "/tmp-other/eval", "/work/project", ""] {
+            assert!(!cwd_is_excluded(Some(Path::new(cwd)), &prefixes), "{cwd}");
+        }
+        // Letter case matters only where the platform's paths ignore it.
+        assert_eq!(
+            cwd_is_excluded(Some(Path::new("/TMP/eval")), &prefixes),
+            cfg!(windows)
+        );
+        assert!(!cwd_is_excluded(None, &prefixes));
+        assert!(!cwd_is_excluded(Some(Path::new("/tmp/eval")), &[]));
+        assert!(cwd_is_excluded(
+            Some(Path::new("/tmp/eval")),
+            &["/tmp/ev".into()]
+        ));
+        assert!(cwd_is_excluded(
+            Some(Path::new("/tmp-other")),
+            &["/tmp".into()]
+        ));
+        assert!(!cwd_is_excluded(
+            Some(Path::new("/home/user/eval")),
+            &["~/".into()]
+        ));
+    }
 
     // === Encoding tests ===
 
@@ -458,6 +609,37 @@ mod tests {
     }
 
     #[test]
+    fn path_within_ignores_case_only_when_asked() {
+        let dir = Path::new("/Users/Foo/MyProject");
+        let below = Path::new("/users/foo/myproject/src");
+        assert!(path_within(below, dir, true));
+        assert!(!path_within(below, dir, false));
+        assert!(!path_within(Path::new("/users/foo/myproject2"), dir, true));
+        assert!(!path_within(Path::new("/users/foo"), dir, true));
+    }
+
+    #[test]
+    fn path_is_within_matches_whole_components() {
+        let repo = Path::new("/a/repo");
+        assert!(path_is_within(Path::new("/a/repo"), repo));
+        assert!(path_is_within(Path::new("/a/repo/"), repo));
+        assert!(path_is_within(Path::new("/a/repo/src/x"), repo));
+        assert!(!path_is_within(Path::new("/a/repo-other"), repo));
+        assert!(!path_is_within(Path::new("/a"), repo));
+        assert!(!path_is_within(Path::new("/b/a/repo"), repo));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tilde_path_abbreviates_home() {
+        let home = Some(Path::new("/home/me"));
+        assert_eq!(tilde_path(Path::new("/home/me"), home), "~");
+        assert_eq!(tilde_path(Path::new("/home/me/code/x"), home), "~/code/x");
+        assert_eq!(tilde_path(Path::new("/home/meow"), home), "/home/meow");
+        assert_eq!(tilde_path(Path::new("/srv/x"), None), "/srv/x");
+    }
+
+    #[test]
     fn is_same_project_matches_main_and_worktree() {
         let main = "-Users-raine-code-project";
         let worktree = "-Users-raine-code-project--worktrees-fix-search";
@@ -564,5 +746,59 @@ mod tests {
         assert_eq!(decode_to_path_impl("C--Users-x", false), "C__Users/x");
         assert_eq!(decode_display_impl("C--Users-x", false), "C__Users/x");
         assert_eq!(decode_to_path_impl("C---x", true), "C/__x");
+    }
+
+    #[test]
+    fn project_roots_ignore_case_only_when_asked() {
+        let main = "C--Users-Foo-MyProject";
+        let lower = "C--Users-Foo-myproject";
+        let drive = "c--users-foo-myproject";
+        let worktree = "c--Users-Foo-myproject--worktrees-feature";
+        for other in [lower, drive, worktree] {
+            assert!(project_roots_match(main, other, true), "{other}");
+            assert!(project_roots_match(other, main, true), "{other}");
+            assert!(!project_roots_match(main, other, false), "{other}");
+        }
+        assert!(!project_roots_match(main, "C--Users-Foo-MyProject2", true));
+        assert!(project_roots_match(main, main, false));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn is_same_project_keeps_case_off_windows() {
+        assert!(!is_same_project(
+            "-home-user-myproject",
+            "-home-user-MyProject"
+        ));
+    }
+
+    #[test]
+    fn paths_ignore_case_only_when_asked() {
+        let recorded = Path::new("/Users/Foo/MyProject");
+        let reached = Path::new("/users/foo/myproject/");
+        assert!(paths_eq(recorded, reached, true));
+        assert!(!paths_eq(recorded, reached, false));
+        assert!(!paths_eq(
+            recorded,
+            Path::new("/Users/Foo/MyProject2"),
+            true
+        ));
+        assert!(!paths_eq(recorded, Path::new("/Users/Foo"), true));
+        assert!(path_str_eq(r"C:\Users\Ä", r"c:\users\ä", true));
+        assert!(!path_str_eq(r"C:\Users\Ä", r"c:\users\ä", false));
+    }
+
+    #[test]
+    fn cwd_prefixes_ignore_case_only_when_asked() {
+        let prefixes = vec![r"C:\Temp\".to_string()];
+        let cwd = Some(Path::new(r"c:\temp\eval-1"));
+        assert!(cwd_has_prefix(cwd, &prefixes, true));
+        assert!(!cwd_has_prefix(cwd, &prefixes, false));
+        assert!(!cwd_has_prefix(Some(Path::new(r"c:\tem")), &prefixes, true));
+        assert!(!cwd_has_prefix(
+            Some(Path::new(r"c:\other")),
+            &prefixes,
+            true
+        ));
     }
 }

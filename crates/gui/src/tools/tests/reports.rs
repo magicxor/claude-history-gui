@@ -476,6 +476,7 @@ fn a_report_is_refused_while_the_gate_is_held(cx: &mut TestAppContext) {
             crate::model::SemanticOp::Clear,
             cx
         ))
+        .is_some()
     );
     let dialog = open_report(
         cx,

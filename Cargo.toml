@@ -11,7 +11,8 @@ license = "Unlicense"
 repository = "https://github.com/magicxor/claude-history-gui"
 
 [workspace.dependencies]
-# Versions follow upstream claude-history v0.1.76 (Cargo.toml); the copied
+# Versions follow upstream claude-history v0.1.76 (Cargo.toml; the code is
+# synced through v0.1.80, see "Upstream sync" in crates/core/README.md); the copied
 # Cargo.lock keeps the resolved versions identical to the upstream tree,
 # except where gpui-kit 0.7.3's tree requires a newer minimum of a package
 # core shares (recorded when the GUI crate was added): memchr 2.8.3,
@@ -21,7 +22,7 @@ repository = "https://github.com/magicxor/claude-history-gui"
 # wasm-bindgen-futures 0.4.79. Every other shared package keeps upstream's
 # version (`cargo update -p <name> --precise <upstream version>`).
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["raw_value"] }
 bincode = "1.3" # cache format: do not bump to 2.x
 blake3 = "1.8"
 chrono = "0.4"
@@ -38,7 +39,10 @@ tempfile = "3"
 # stay OFF (fastembed disables them), which avoids the esaxx-rs static CRT
 # mismatch on Windows MSVC.
 fastembed = { version = "=6.0.2", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
-ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic"] }
+# The version fastembed uses, with no features of its own (upstream 9ee0a03):
+# core configures the ONNX Runtime environment in every build;
+# release-dynamic-ort adds load-dynamic.
+ort = { version = "=2.0.0-rc.13", default-features = false }
 # Used directly (same version and features fastembed's hf-hub-rustls-tls
 # resolves, so it adds no crates) to fetch the model into the HistoryEnv
 # model dir without fastembed's HF_HOME / HF_ENDPOINT / real-home token reads.
@@ -46,6 +50,28 @@ hf-hub = { version = "=0.5.0", default-features = false, features = ["ureq", "ru
 # Update check (HTTPS with rustls). Already in the tree through fastembed's
 # hf-hub, so it adds no crates.
 ureq = { version = "3.3", default-features = false, features = ["rustls"] }
+# Store generation manifests (Pod records read in place from a memory map),
+# as upstream. Both are already in gpui-kit's tree at upstream's versions
+# (bytemuck 1.25.2 with bytemuck_derive 1.12.1, memmap2 0.9.11), so they add
+# no crates.
+bytemuck = { version = "1.25.2", features = ["derive"] }
+memmap2 = "0.9"
+# Store word-start suffix index (store::lexindex), as upstream; adds one
+# crate (fst 0.4.7, no dependencies of its own).
+fst = "0.4"
+memchr = "2"
+# NFC for keyword search (text_match::nfc), as upstream; icu_normalizer 2.2.0
+# is already in the tree through idna, so it adds no crates.
+icu_normalizer = { version = "2", default-features = false, features = ["compiled_data"] }
+# Store text segments (store::text: one zstd frame per conversation), as
+# upstream; adds zstd 0.13.3, zstd-safe 7.3.0 and zstd-sys 2.1.1 (the zstd C
+# library, built with cc; cc, jobserver and pkg-config are already in the tree).
+zstd = "0.13"
+# Codex state database (read-only), as upstream: bundled SQLite (libsqlite3-sys
+# 0.38.2 builds it with cc). Adds rusqlite 0.40.2, libsqlite3-sys, hashlink 0.12.2
+# (with hashbrown 0.17.1), fallible-iterator 0.3.0, fallible-streaming-iterator
+# 0.1.9, vcpkg 0.2.15 and the wasm-only sqlite-wasm-rs 0.5.5 / rsqlite-vfs 0.1.1.
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # GUI crate (DESIGN §16.1). gpui-kit is pinned exactly: the GUI relies on
 # gpui-base text-selection internals verified against 0.7.3 (DESIGN §19).

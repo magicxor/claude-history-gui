@@ -5,7 +5,8 @@
 //! input, keys, selection, pointer, scope, exclusions), `semantic` (fake
 //! embedder flows), `ui` (footer, toolbar, row menu, workspace picker, time
 //! filter, picker banner), `misc` (ticker, prompt, status, probes), `cjk`
-//! (X-013), `perf` (ignored 20k-row probes, run in release), `smoke`.
+//! (X-013), `perf` (ignored 20k-row probes, run in release), `smoke`,
+//! `snapshot` (the startup snapshot's cards, L-099).
 //! Row ids in the comments are FEATURES.md rows.
 
 mod cjk;
@@ -16,5 +17,6 @@ mod rows;
 mod search;
 mod semantic;
 mod smoke;
+mod snapshot;
 mod states_ui;
 mod ui;

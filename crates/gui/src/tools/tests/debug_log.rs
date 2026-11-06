@@ -46,6 +46,8 @@ fn parse_errors_are_shown_and_written_to_debug_log(cx: &mut TestAppContext) {
     let world = TestWorld::new();
     let corpus = world.standard_corpus();
     let broken = corpus[7].clone();
+    // Store off: a reconcile pass appends its outcome to debug.log.
+    crate::test_support::use_memory_list(cx, &world, &[]);
     let f = ListFixture::open_loaded(cx, &world, &[]);
     show_in_viewer(cx, &f, &broken);
     let dialog = open(cx, f.handle, DebugLogTab::ParseErrors);
@@ -235,6 +237,8 @@ fn the_file_tab_shows_the_tail(cx: &mut TestAppContext) {
     std::fs::create_dir_all(log.parent().unwrap()).unwrap();
     let body: String = (0..2500).map(|n| format!("line {n}\n")).collect();
     std::fs::write(&log, body).unwrap();
+    // Store off: a reconcile pass appends its outcome to debug.log.
+    crate::test_support::use_memory_list(cx, &world, &[]);
     let (_f, handle) = main_window(cx, &world, &[]);
     let dialog = open(cx, handle, DebugLogTab::File);
     wait_for(cx, "the tail", |cx| {
@@ -260,6 +264,8 @@ fn the_file_tab_shows_the_tail(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn a_missing_debug_log_says_so(cx: &mut TestAppContext) {
     let world = TestWorld::new();
+    // Store off: a reconcile pass appends its outcome to debug.log.
+    crate::test_support::use_memory_list(cx, &world, &[]);
     let (_f, handle) = main_window(cx, &world, &[]);
     let dialog = open(cx, handle, DebugLogTab::File);
     wait_for(cx, "the tab", |cx| {

@@ -2,6 +2,16 @@ use super::*;
 use crate::view::document::DocBlock;
 use crate::view::{ToolDisplayMode, ViewPrefs};
 
+/// A service without instances: every path opens as a loose session file.
+fn history() -> HistoryService {
+    HistoryService::default()
+}
+
+/// The transcript of `path`, decoded again.
+fn decode(path: &Path) -> Transcript {
+    crate::history::sources::decode_path(path, None, false).unwrap()
+}
+
 fn write(dir: &Path, name: &str, lines: &[&str]) -> PathBuf {
     let path = dir.join(name);
     std::fs::write(&path, lines.join("\n") + "\n").unwrap();
@@ -24,7 +34,9 @@ fn conversation_lines() -> Vec<&'static str> {
         r#"{"type":"user","timestamp":"2024-01-01T00:00:00Z","message":{"role":"user","content":"Find the Bug please"}}"#,
         r#"{"type":"assistant","timestamp":"2024-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"text","text":"Looking for the bug."},{"type":"tool_use","id":"toolu_1","name":"Grep","input":{"pattern":"bug"}}]}}"#,
         r#"{"type":"user","timestamp":"2024-01-01T00:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"src/bug.rs: BUG here\nsrc/other.rs\nl3\nl4\nl5 bug"}]}}"#,
-        r#"{"type":"pi-metadata","label":"notice","text":"a bug note"}"#,
+        // Shows nothing (a Claude record holds no note since upstream
+        // 9597669, which turned `pi-metadata` records into Pi/OMP events).
+        r#"{"type":"system","subtype":"info","content":"a bug note"}"#,
         r#"{"type":"assistant","timestamp":"2024-01-01T00:00:03Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"the bug is subtle","signature":"s"},{"type":"text","text":"Fixed the bug."}]}}"#,
     ]
 }
@@ -70,7 +82,7 @@ fn doc_text(doc: &ConversationDocument) -> String {
 fn view_click_toggles_clickable_output() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_tool_conversation(dir.path());
-    let mut model = ViewerModel::open(&path, truncated()).unwrap();
+    let mut model = ViewerModel::open(&history(), &path, truncated()).unwrap();
 
     let ledger = model.ledger(80);
     assert!(!ledger_text(&ledger).contains("five"));
@@ -89,7 +101,7 @@ fn view_click_toggles_clickable_output() {
     assert!(!ledger_text(&model.ledger(80)).contains("five"));
 }
 
-/// V-101: `open_cancellable` abandons the parse mid-file once `cancelled`
+/// V-101: `open_cancellable` abandons the decode mid-file once `cancelled`
 /// says so, and equals `open` when it never does.
 #[test]
 fn open_cancellable_stops_midway_and_matches_open_otherwise() {
@@ -104,23 +116,25 @@ fn open_cancellable_stops_midway_and_matches_open_otherwise() {
         polls.set(polls.get() + 1);
         polls.get() >= 3
     };
-    let out = ViewerModel::open_cancellable(&path, ViewPrefs::default(), &stop_at_third).unwrap();
+    let out =
+        ViewerModel::open_cancellable(&history(), &path, ViewPrefs::default(), &stop_at_third)
+            .unwrap();
     assert!(out.is_none());
-    assert_eq!(polls.get(), 3, "polled before the file and every 64 lines");
+    assert_eq!(polls.get(), 3, "polled before the file and at each read");
 
-    let full = ViewerModel::open_cancellable(&path, ViewPrefs::default(), &|| false)
+    let full = ViewerModel::open_cancellable(&history(), &path, ViewPrefs::default(), &|| false)
         .unwrap()
         .expect("never cancelled");
-    let plain = ViewerModel::open(&path, ViewPrefs::default()).unwrap();
-    assert_eq!(full.entries.len(), plain.entries.len());
-    assert_eq!(full.entries.len(), 1000);
+    let plain = ViewerModel::open(&history(), &path, ViewPrefs::default()).unwrap();
+    assert_eq!(full.entries().len(), plain.entries().len());
+    assert_eq!(full.entries().len(), 1000);
 }
 
 #[test]
 fn view_click_uses_cached_entries_after_file_removed() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_tool_conversation(dir.path());
-    let mut model = ViewerModel::open(&path, truncated()).unwrap();
+    let mut model = ViewerModel::open(&history(), &path, truncated()).unwrap();
     std::fs::remove_file(&path).unwrap();
 
     let id = first_clickable_id(&model.ledger(80));
@@ -138,17 +152,25 @@ fn view_click_uses_cached_entries_after_file_removed() {
         "Bash: one\ntwo\nthree\nfour\nfive"
     );
     assert!(model.plain_display().contains("Claude: Bash: one"));
-    // Summary mode hides tools from copies.
-    model.cycle_tool_display();
+    // Off mode (after Full, upstream d0aca95) shows nothing of a tool-only
+    // conversation and hides tools from copies, like summary mode.
+    assert_eq!(model.cycle_tool_display(), ToolDisplayMode::Off);
+    assert!(model.document().messages.is_empty());
     assert_eq!(model.message_text(0).unwrap(), "");
     assert_eq!(model.plain_display(), "");
+    assert_eq!(model.cycle_tool_display(), ToolDisplayMode::Summary);
+    assert_eq!(model.message_text(0).unwrap(), "");
 }
 
 #[test]
 fn open_reports_io_errors() {
     let dir = tempfile::tempdir().unwrap();
-    let error =
-        ViewerModel::open(&dir.path().join("missing.jsonl"), ViewPrefs::default()).unwrap_err();
+    let error = ViewerModel::open(
+        &history(),
+        &dir.path().join("missing.jsonl"),
+        ViewPrefs::default(),
+    )
+    .unwrap_err();
     assert!(!error.to_string().is_empty());
 }
 
@@ -156,12 +178,12 @@ fn open_reports_io_errors() {
 fn preference_toggles_cycle_and_survive_expansion() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_tool_conversation(dir.path());
-    let mut model = ViewerModel::open(&path, ViewPrefs::default()).unwrap();
+    let mut model = ViewerModel::open(&history(), &path, ViewPrefs::default()).unwrap();
 
-    let labels: Vec<&str> = (0..4)
+    let labels: Vec<&str> = (0..7)
         .map(|_| model.cycle_tool_display().status_label())
         .collect();
-    assert_eq!(labels, ["trn", "all", "sum", "trn"]);
+    assert_eq!(labels, ["cal", "trn", "all", "off", "sum", "cal", "trn"]);
     assert!(model.toggle_thinking());
     assert!(!model.toggle_thinking());
     assert!(model.toggle_timing());
@@ -170,9 +192,9 @@ fn preference_toggles_cycle_and_survive_expansion() {
     let id = first_clickable_id(&model.ledger(80));
     model.toggle_expanded(&id);
     model.toggle_timing();
-    model.cycle_tool_display();
-    model.cycle_tool_display();
-    model.cycle_tool_display();
+    for _ in 0..5 {
+        model.cycle_tool_display();
+    }
     // Back in truncated mode, the expansion is still applied.
     assert_eq!(model.prefs.tool_display, ToolDisplayMode::Truncated);
     assert!(ledger_text(&model.ledger(80)).contains("five"));
@@ -182,17 +204,21 @@ fn preference_toggles_cycle_and_survive_expansion() {
 fn message_text_session_id_and_plain_display_use_the_cache() {
     let dir = tempfile::tempdir().unwrap();
     let path = write(dir.path(), "abc-123.jsonl", &conversation_lines());
-    let mut model = ViewerModel::open(&path, ViewPrefs::default()).unwrap();
+    let mut model = ViewerModel::open(&history(), &path, ViewPrefs::default()).unwrap();
     assert_eq!(model.session_id(), Some("abc-123"));
 
     assert_eq!(model.message_text(0).unwrap(), "Find the Bug please");
     assert_eq!(model.message_text(1).unwrap(), "Looking for the bug.");
-    assert_eq!(model.message_text(3).unwrap(), "[notice] a bug note");
+    assert_eq!(model.message_text(3).unwrap(), "");
     assert_eq!(
         model.message_text(99).unwrap_err(),
         crate::export::MESSAGE_NOT_FOUND
     );
 
+    // Calls mode lists the calls but, like summary mode, keeps them out of
+    // copies (upstream a60dfe9: tools are visible in truncated/full only).
+    assert_eq!(model.cycle_tool_display(), ToolDisplayMode::Calls);
+    assert_eq!(model.message_text(1).unwrap(), "Looking for the bug.");
     model.cycle_tool_display();
     model.toggle_thinking();
     assert_eq!(
@@ -207,12 +233,16 @@ fn message_text_session_id_and_plain_display_use_the_cache() {
     for entry_index in 0..5 {
         assert_eq!(
             model.message_text(entry_index),
-            crate::export::extract_message_text(&path, entry_index, model.export_options())
+            crate::export::extract_message_text(
+                &decode(&path),
+                entry_index,
+                model.export_options()
+            )
         );
     }
     assert_eq!(
         model.plain_display(),
-        crate::export::plain_display(&path, model.export_options()).unwrap()
+        crate::export::plain_display(&decode(&path), model.export_options())
     );
 }
 
@@ -234,13 +264,16 @@ fn ranges(spec: &[(usize, usize, usize)]) -> Vec<MessageRange> {
 fn ledger_search_matches_lines_case_insensitively_including_labels() {
     let dir = tempfile::tempdir().unwrap();
     let path = write(dir.path(), "c.jsonl", &conversation_lines());
-    let model = ViewerModel::open(&path, ViewPrefs::default()).unwrap();
+    let model = ViewerModel::open(&history(), &path, ViewPrefs::default()).unwrap();
     let rendered = model.ledger(80);
 
     let bug = search_lines(&rendered.lines, "BUG");
     assert!(!bug.is_empty());
     for &line in &bug {
-        assert!(line_matches_query(&rendered.lines[line], "bug"));
+        assert!(line_matches_query(
+            &rendered.lines[line],
+            &ViewSearchQuery::parse("bug")
+        ));
     }
     // Upstream quirk: the label column is searchable too.
     let claude = search_lines(&rendered.lines, "claude");
@@ -252,6 +285,28 @@ fn ledger_search_matches_lines_case_insensitively_including_labels() {
     }));
     assert!(!claude.is_empty());
     assert!(search_lines(&rendered.lines, "").is_empty());
+    // A lone separator has no words to find.
+    assert!(search_lines(&rendered.lines, " - / ").is_empty());
+}
+
+/// Upstream d2c0f07 (`tui/app/view_state.rs`).
+#[test]
+fn view_search_matches_lines_like_the_list() {
+    let matches = |line: &str, query: &str| {
+        let line = RenderedLine::new(vec![(line.to_string(), Default::default())]);
+        line_matches_query(&line, &ViewSearchQuery::parse(query))
+    };
+    assert!(matches("the hidden needle_token appears", "needle token"));
+    assert!(matches("late mention of İstanbul", "istanbul"));
+    assert!(matches("tag v1.1.1", "1.1"));
+    assert!(matches("tag v1.2.3", "1.2.3"));
+    assert!(matches("encode H264", "264"));
+    assert!(!matches("the AppConfig type", "onfig"));
+    assert!(!matches("encode H264", "64"));
+    assert!(matches("needle only", "needle token"));
+    assert!(!matches("the fired plan", "ired"));
+    assert!(matches("exact audio_generation", "\"audio_generation\""));
+    assert!(!matches("audio generation", "\"audio_generation\""));
 }
 
 #[test]
@@ -353,14 +408,16 @@ fn resolve_scroll_keeps_the_anchor_row_or_aligns_the_fallback() {
 fn rerender_after_toggle_keeps_the_focused_message() {
     let dir = tempfile::tempdir().unwrap();
     let path = write(dir.path(), "c.jsonl", &conversation_lines());
-    let mut model = ViewerModel::open(&path, ViewPrefs::default()).unwrap();
+    let mut model = ViewerModel::open(&history(), &path, ViewPrefs::default()).unwrap();
     let before = model.ledger(80);
     let mut nav = MessageNav::new(before.messages.len());
     nav.focus(2);
     let scroll = before.messages[2].start_line;
     let anchor = capture_anchor(&before.messages, scroll, nav.focused(), nav.is_active());
 
-    // Tool details add lines above the focused message.
+    // Tool details add lines above the focused message (summary → calls →
+    // truncated).
+    model.cycle_tool_display();
     model.cycle_tool_display();
     let after = model.ledger(80);
     let (focused, new_scroll) =
@@ -406,7 +463,7 @@ fn document_anchor_capture_and_resolution() {
 fn document_anchor_survives_tool_mode_changes() {
     let dir = tempfile::tempdir().unwrap();
     let path = write(dir.path(), "c.jsonl", &conversation_lines());
-    let mut model = ViewerModel::open(&path, ViewPrefs::default()).unwrap();
+    let mut model = ViewerModel::open(&history(), &path, ViewPrefs::default()).unwrap();
 
     let doc = model.document();
     let entries = doc.navigable_entry_indices();
@@ -414,6 +471,9 @@ fn document_anchor_survives_tool_mode_changes() {
     let anchor = capture_anchor_entry(&entries, Some(2), true, None).unwrap();
     assert_eq!(anchor, 4);
 
+    // Calls mode groups tool calls like summary mode.
+    assert_eq!(model.cycle_tool_display(), ToolDisplayMode::Calls);
+    assert_eq!(model.document().navigable_entry_indices(), [0, 1, 4]);
     model.cycle_tool_display();
     let doc = model.document();
     let entries = doc.navigable_entry_indices();
@@ -424,6 +484,59 @@ fn document_anchor_survives_tool_mode_changes() {
         doc.messages[doc.message_at_nav_position(position).unwrap()].entry_index,
         4
     );
+}
+
+/// Upstream d0aca95's `cycling_tools_to_off_keeps_focus_on_a_visible_message`
+/// (a TUI interaction test): focus the tool summary, cycle summary → calls
+/// → truncated → full → off; the tool-only messages are gone from the
+/// document and the ledger, and the anchor falls back to the previous
+/// visible message.
+#[test]
+fn cycling_tools_to_off_keeps_focus_on_a_visible_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write(
+        dir.path(),
+        "tools.jsonl",
+        &[
+            r#"{"type":"user","timestamp":"2024-01-01T00:00:00Z","message":{"role":"user","content":"please check"}}"#,
+            r#"{"type":"assistant","timestamp":"2024-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"cargo test"}}]}}"#,
+            r#"{"type":"user","timestamp":"2024-01-01T00:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}}"#,
+            r#"{"type":"assistant","timestamp":"2024-01-01T00:00:03Z","message":{"role":"assistant","content":[{"type":"text","text":"all good"}]}}"#,
+        ],
+    );
+    let mut model = ViewerModel::open(&history(), &path, ViewPrefs::default()).unwrap();
+
+    let doc = model.document();
+    let entries = doc.navigable_entry_indices();
+    assert_eq!(entries[1], 1);
+    assert!(doc_text(&doc).contains("Ran 1 shell command"));
+    // The tool summary row has the focus.
+    let anchor = capture_anchor_entry(&entries, Some(1), true, None).unwrap();
+    let ledger = model.ledger(80);
+    let ledger_anchor = capture_anchor(&ledger.messages, 0, Some(1), true);
+    for _ in 0..4 {
+        model.cycle_tool_display();
+    }
+
+    assert_eq!(model.prefs.tool_display, ToolDisplayMode::Off);
+    let doc = model.document();
+    let text = doc_text(&doc);
+    assert!(text.contains("please check"));
+    assert!(text.contains("all good"));
+    assert!(!text.contains("cargo test"));
+    assert!(!text.contains("shell command"));
+    let entries = doc.navigable_entry_indices();
+    assert_eq!(entries, [0, 3]);
+    let position = find_entry_or_prev(&entries, anchor).unwrap();
+    assert_eq!(entries[position], 0);
+    // The ledger agrees.
+    let ledger = model.ledger(80);
+    assert_eq!(ledger.messages.len(), 2);
+    let (focused, _) = resolve_scroll(&ledger.messages, ledger_anchor, 0, 20, ledger.lines.len());
+    assert_eq!(ledger.messages[focused.unwrap()].entry_index, 0);
+
+    assert_eq!(model.cycle_tool_display(), ToolDisplayMode::Summary);
+    assert!(doc_text(&model.document()).contains("Ran 1 shell command"));
 }
 
 // -----------------------------------------------------------------
@@ -523,7 +636,7 @@ fn typing_updates_matches_and_jumps_to_the_first() {
 
     // n/N only work in an active search.
     assert_eq!(search.next_match(), None);
-    search.commit();
+    assert_eq!(search.commit(), None);
     assert_eq!(search.mode(), ViewSearchMode::Active);
     assert_eq!(search.match_counter().as_deref(), Some("1/2"));
     assert_eq!(search.next_match(), Some(2));
@@ -539,9 +652,18 @@ fn commit_without_matches_turns_search_off() {
     let mut search: ViewSearch<usize> = ViewSearch::new();
     search.start();
     search.set_query("zzz", &find);
-    search.commit();
+    // Upstream d2c0f07's status message for a committed search without hits.
+    assert_eq!(search.commit().as_deref(), Some("No matches for /zzz"));
     assert_eq!(search.mode(), ViewSearchMode::Off);
     assert_eq!(search.match_counter(), None);
+
+    // Nothing to report for a query without text.
+    for query in ["", "  "] {
+        search.start();
+        search.set_query(query, &find);
+        assert_eq!(search.commit(), None, "{query:?}");
+        assert_eq!(search.mode(), ViewSearchMode::Off);
+    }
 }
 
 #[test]
@@ -622,7 +744,7 @@ fn escape_unwinds_typing_then_navigation_then_search_then_leaves() {
 fn document_search_reports_block_byte_ranges() {
     let dir = tempfile::tempdir().unwrap();
     let path = write(dir.path(), "c.jsonl", &conversation_lines());
-    let model = ViewerModel::open(&path, truncated()).unwrap();
+    let model = ViewerModel::open(&history(), &path, truncated()).unwrap();
     let doc = model.document();
     let index = DocSearchIndex::new(&doc);
 
@@ -646,7 +768,6 @@ fn document_search_reports_block_byte_ranges() {
             (2, 0, "bug"),
             (2, 0, "BUG"),
             (3, 0, "bug"),
-            (4, 0, "bug"),
         ]
     );
     assert!(index.find("").is_empty());
@@ -657,14 +778,24 @@ fn document_search_reports_block_byte_ranges() {
     let id = doc.messages[2].blocks[0].toggle_id().unwrap().clone();
     expanded.toggle_expanded(&id);
     let index = DocSearchIndex::new(&expanded.document());
-    assert_eq!(index.find("l5 BUG").len(), 1);
+    assert_eq!(index.find("\"l5 bug\"").len(), 1);
+    // Any query word matches, and words joined by separators on one line
+    // are one match: "bug", "BUG", then "l5 bug".
+    let text = index.text(2, 0, None).unwrap();
+    let found: Vec<&str> = index
+        .find("l5 BUG")
+        .into_iter()
+        .filter(|m| (m.message, m.block) == (2, 0))
+        .map(|m| &text[m.range])
+        .collect();
+    assert_eq!(found, ["bug", "BUG", "l5 bug"]);
 }
 
 #[test]
 fn document_search_covers_expanded_summary_items() {
     let dir = tempfile::tempdir().unwrap();
     let path = write(dir.path(), "c.jsonl", &conversation_lines()[..3]);
-    let mut model = ViewerModel::open(&path, ViewPrefs::default()).unwrap();
+    let mut model = ViewerModel::open(&history(), &path, ViewPrefs::default()).unwrap();
     // Summary mode: "Looking for the bug." + sentence, then nothing else.
     let index = DocSearchIndex::new(&model.document());
     assert!(index.find("src/other").is_empty());
@@ -677,7 +808,7 @@ fn document_search_covers_expanded_summary_items() {
             r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"fn main"}]}}"#,
         ],
     );
-    model = ViewerModel::open(&path, ViewPrefs::default()).unwrap();
+    model = ViewerModel::open(&history(), &path, ViewPrefs::default()).unwrap();
     let id = model.document().messages[0].blocks[0]
         .toggle_id()
         .unwrap()
@@ -695,16 +826,19 @@ fn document_search_covers_expanded_summary_items() {
     );
 }
 
+/// A one-block index over `text`.
+fn text_index(text: &str) -> DocSearchIndex {
+    DocSearchIndex {
+        targets: vec![SearchTarget::new(0, 0, None, text.to_string())],
+    }
+}
+
 #[test]
 fn document_search_folds_greek_final_sigma_in_both_directions() {
     // Per-character lowercasing turns 'Σ' into 'σ' but leaves the
-    // lowercase word-final 'ς' alone, so "οδος" missed "ΟΔΟΣ" and back.
-    let target = SearchTarget::new(0, 0, None, "ΟΔΟΣ οδος".to_string());
-    // ς and σ have the same UTF-8 length: no byte map is needed.
-    assert!(target.origin.is_none());
-    let index = DocSearchIndex {
-        targets: vec![target],
-    };
+    // lowercase word-final 'ς' alone; case folding maps both to 'σ'. (A
+    // comma keeps the two words apart: separator-joined matches merge.)
+    let index = text_index("ΟΔΟΣ, οδος");
     let text = index.text(0, 0, None).unwrap();
     for query in ["οδος", "ΟΔΟΣ", "οδοσ", "Οδος"] {
         let found: Vec<&str> = index
@@ -717,32 +851,55 @@ fn document_search_folds_greek_final_sigma_in_both_directions() {
 }
 
 #[test]
-fn document_search_maps_case_folding_back_to_original_bytes() {
-    // 'İ' lowercases to two characters and the Kelvin sign to a 1-byte 'k'.
-    let target = SearchTarget::new(0, 0, None, "xİy \u{212A}elvin Straße".to_string());
-    assert!(target.origin.is_some());
-    let index = DocSearchIndex {
-        targets: vec![target],
-    };
+fn document_search_follows_keyword_rules_and_maps_back_to_original_bytes() {
+    // 'İ' folds to 'i', the Kelvin sign to a 1-byte 'k' and 'ß' to "ss";
+    // words match at word starts only (upstream d2c0f07).
+    let index = text_index("xİy İstanbul \u{212A}elvin Straße the fired plan");
     let text = index.text(0, 0, None).unwrap();
-    let found: Vec<&str> = ["i", "kelvin", "STRASSE", "straße", "y"]
-        .iter()
-        .flat_map(|query| index.find(query))
-        .map(|m| &text[m.range])
-        .collect();
-    // "i" matches the first half of 'İ' (the whole character is reported)
-    // and the 'i' of "Kelvin"; "STRASSE" does not fold to "straße".
-    assert_eq!(found, ["İ", "i", "\u{212A}elvin", "Straße", "y"]);
-
-    // Plain text (identity folding) needs no byte map.
-    let plain = SearchTarget::new(0, 0, None, "Приветствие ABC".to_string());
-    assert!(plain.origin.is_none());
-    let index = DocSearchIndex {
-        targets: vec![plain],
+    let found = |query: &str| -> Vec<&str> {
+        index
+            .find(query)
+            .into_iter()
+            .map(|m| &text[m.range])
+            .collect()
     };
+    assert_eq!(found("istanbul"), ["İstanbul"]);
+    assert_eq!(found("kelvin"), ["\u{212A}elvin"]);
+    assert_eq!(found("STRASSE"), ["Straße"]);
+    assert_eq!(found("straße"), ["Straße"]);
+    // Not at a word start: inside "xİy", "Kelvin" and "fired".
+    assert_eq!(found("i"), ["İ"]);
+    assert!(found("y").is_empty());
+    assert!(found("ired").is_empty());
+    // Any word matches; words on one line joined by separators are one match.
+    assert_eq!(found("fired plan"), ["fired plan"]);
+    assert_eq!(found("straße zzz"), ["Straße"]);
+    // Quoted and `_` literals match exactly (smart case).
+    assert_eq!(found("\"Straße\""), ["Straße"]);
+    assert!(found("\"STRASSE\"").is_empty());
+
+    let index = text_index("Приветствие ABC");
     let text = index.text(0, 0, None).unwrap();
     let m = &index.find("ПРИВЕТ")[0];
     assert_eq!(&text[m.range.clone()], "Привет");
+}
+
+#[test]
+fn document_search_keeps_matches_on_different_lines_apart() {
+    let index = text_index("needle\nneedle token\n  needle_token");
+    let text = index.text(0, 0, None).unwrap();
+    let found: Vec<&str> = index
+        .find("needle token")
+        .into_iter()
+        .map(|m| &text[m.range])
+        .collect();
+    assert_eq!(found, ["needle", "needle token", "needle_token"]);
+    let found: Vec<&str> = index
+        .find("needle_token")
+        .into_iter()
+        .map(|m| &text[m.range])
+        .collect();
+    assert_eq!(found, ["needle_token"]);
 }
 
 // --- K5: agent message ordinals ---
@@ -771,13 +928,14 @@ fn ordinal_lines() -> Vec<&'static str> {
 fn agent_ordinals_match_the_agent_transcript() {
     let dir = tempfile::tempdir().unwrap();
     let path = write(dir.path(), "ordinals.jsonl", &ordinal_lines());
-    let viewer = ViewerModel::open(&path, truncated()).unwrap();
+    let viewer = ViewerModel::open(&history(), &path, truncated()).unwrap();
     let transcript = crate::agent::transcript::AgentTranscript::load(&path).unwrap();
     assert_eq!(transcript.messages.len(), 5);
 
     for message in &transcript.messages {
-        // Every line is a valid entry, so entry index = JSONL line - 1.
-        let entry = message.jsonl_line - 1;
+        // Every line after the file-history snapshot, which is no entry
+        // (upstream 9597669), is one: entry index = JSONL line - 2.
+        let entry = message.jsonl_line - 2;
         assert_eq!(
             viewer.agent_ordinal_for_entry(entry),
             Some(message.ordinal),
@@ -786,17 +944,17 @@ fn agent_ordinals_match_the_agent_transcript() {
         );
     }
     // The streamed message: the transcript keeps its last record (line 6),
-    // the viewer maps the ordinal to the first one (entry 4); both records
+    // the viewer maps the ordinal to the first one (entry 3); both records
     // carry the ordinal.
     assert_eq!(transcript.messages[1].jsonl_line, 6);
-    assert_eq!(viewer.entry_for_agent_ordinal(2), Some(4));
+    assert_eq!(viewer.entry_for_agent_ordinal(2), Some(3));
+    assert_eq!(viewer.agent_ordinal_for_entry(3), Some(2));
     assert_eq!(viewer.agent_ordinal_for_entry(4), Some(2));
-    assert_eq!(viewer.agent_ordinal_for_entry(5), Some(2));
-    for (ordinal, entry) in [(1, 3), (3, 6), (4, 7), (5, 10)] {
+    for (ordinal, entry) in [(1, 2), (3, 5), (4, 6), (5, 9)] {
         assert_eq!(viewer.entry_for_agent_ordinal(ordinal), Some(entry));
     }
-    // Snapshot, Warmup exchange, /clear and summary are not messages.
-    for entry in [0, 1, 2, 8, 9, 42] {
+    // Warmup exchange, /clear and summary are not messages.
+    for entry in [0, 1, 7, 8, 42] {
         assert_eq!(viewer.agent_ordinal_for_entry(entry), None, "entry {entry}");
     }
     assert_eq!(viewer.entry_for_agent_ordinal(0), None);
@@ -812,21 +970,25 @@ fn agent_ordinals_match_the_agent_transcript_for_pi_and_omp_fixtures() {
         "tests/fixtures/omp/v3.jsonl",
     ] {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture);
-        let viewer = ViewerModel::open(&path, truncated()).unwrap();
+        let viewer = ViewerModel::open(&history(), &path, truncated()).unwrap();
         let transcript = crate::agent::transcript::AgentTranscript::load(&path).unwrap();
         assert!(!transcript.messages.is_empty(), "{fixture}");
+        let shown = crate::history::view::entries_with_events(&viewer.transcript);
         for message in &transcript.messages {
-            // The transcript numbers the lines of the normalized projection.
-            let entry = message.jsonl_line - 1;
+            let entry = viewer
+                .entry_for_agent_ordinal(message.ordinal)
+                .unwrap_or_else(|| panic!("{fixture} m{}", message.ordinal));
             assert_eq!(
                 viewer.agent_ordinal_for_entry(entry),
                 Some(message.ordinal),
                 "{fixture} m{}",
                 message.ordinal
             );
+            // Both number a Pi or OMP message by its line in the session
+            // file (upstream 9597669).
+            let event = shown[entry].0.unwrap();
             assert_eq!(
-                viewer.entry_for_agent_ordinal(message.ordinal),
-                Some(entry),
+                viewer.transcript.events[event].origin.line as usize, message.jsonl_line,
                 "{fixture} m{}",
                 message.ordinal
             );

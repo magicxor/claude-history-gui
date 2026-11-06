@@ -9,7 +9,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use claude_history_core::browser::RenameError;
+use claude_history_core::browser::{PreparedSession, RenameError};
 use claude_history_core::history::rename_session;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -27,7 +27,8 @@ use gpui_kit::{
 use crate::actions::RenameClear;
 use crate::globals::{BusySpan, BusyTimer, OpenTargets, UiBusy, app_state};
 use crate::model::ConversationTarget;
-use crate::ops::copy::{can_act, clear_dialog, live_target, main_list};
+use crate::model::SessionAct;
+use crate::ops::copy::{can_act, clear_dialog, live_target, main_list, still_allowed};
 use crate::qa_ext::QaExt as _;
 use crate::workspace::startup::register_dialog;
 
@@ -45,12 +46,14 @@ pub const NOT_IN_LIST: &str = "This conversation is no longer in the list";
 /// target may predate an earlier rename or come from an agent hit that never
 /// knew the custom title.
 pub fn open_rename_dialog(target: ConversationTarget, window: &mut Window, cx: &mut App) {
-    if !can_act(&target) {
+    if !can_act(&target, SessionAct::Rename) {
         return;
     }
     window.defer(cx, move |window, cx| {
         let target = live_target(target, cx);
-        open_now(target, window, cx);
+        if still_allowed(&target, SessionAct::Rename, window, cx) {
+            open_now(target, window, cx);
+        }
     });
 }
 
@@ -250,8 +253,10 @@ impl RenameDialog {
         cx.notify();
         let task = {
             let path = path.clone();
-            cx.background_executor()
-                .spawn(async move { rename_session(&env, &path, source, &title, show_last) })
+            cx.background_executor().spawn(async move {
+                // The re-parsed text is normalized here, off the UI thread.
+                rename_session(&env, &path, source, &title, show_last).map(PreparedSession::new)
+            })
         };
         let dialog = cx.entity().downgrade();
         window
@@ -277,7 +282,7 @@ impl RenameDialog {
 /// then close the dialog or show the inline error. Returns whether the list
 /// applied the rename.
 fn finish(
-    result: Result<claude_history_core::history::Conversation, RenameError>,
+    result: Result<PreparedSession, RenameError>,
     path: std::path::PathBuf,
     list: Option<Entity<crate::list::ListPane>>,
     dialog: WeakEntity<RenameDialog>,

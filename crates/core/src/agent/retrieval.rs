@@ -1,9 +1,11 @@
 use crate::agent::refs::MessageRange;
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::transcript::{
-    AgentMessage, AgentMessagePart, AgentTranscript, agent_part_search_text, truncate_chars,
+    AgentMessage, AgentMessagePart, AgentMessageRole, AgentTranscript, agent_part_search_text,
+    truncate_chars,
 };
 use crate::agent::visibility::ContentVisibility;
+use crate::history::authored_text;
 use crate::search::literal::Literal;
 use crate::search::query::ParsedQuery;
 use crate::text_match::{contains_cjk, contains_prefix_match, normalize_for_search};
@@ -36,6 +38,12 @@ pub struct AgentSearchHit {
 pub struct AgentRetrievalOptions {
     pub read_context_radius: usize,
     pub limit: usize,
+    /// Search only what the person typed: the authored text of top-level
+    /// user messages, as `Conversation::own_text` holds it.
+    pub user_only: bool,
+    /// When no message matches every query term, return the messages that
+    /// match some of them, best first, instead of nothing.
+    pub partial_matches: bool,
 }
 
 impl Default for AgentRetrievalOptions {
@@ -43,6 +51,8 @@ impl Default for AgentRetrievalOptions {
         Self {
             read_context_radius: 1,
             limit: 10,
+            user_only: false,
+            partial_matches: false,
         }
     }
 }
@@ -151,7 +161,11 @@ fn retrieve_agent_hit_candidates(
         return Vec::new();
     }
 
-    let segments = build_segments(target.transcript);
+    let segments = if options.user_only {
+        build_own_segments(target.transcript)
+    } else {
+        build_segments(target.transcript)
+    };
     if segments.is_empty() {
         return Vec::new();
     }
@@ -185,6 +199,8 @@ fn lexical_candidates(
         .split_whitespace()
         .map(str::to_string)
         .collect::<Vec<_>>();
+    // As in keyword search, a query with CJK text matches its words anywhere.
+    let anywhere = contains_cjk(&normalized_query);
     let identifier_literals = unquoted_terms
         .iter()
         .copied()
@@ -204,33 +220,49 @@ fn lexical_candidates(
         return exact_candidates_for_literals(segments, target, &literal_filters, options);
     }
 
-    segments_by_message(segments)
-        .into_iter()
-        .filter_map(|message_segments| {
-            let body = join_segment_text(&message_segments);
-            let normalized = normalize_for_search(&body);
-            if !message_matches_words(&normalized, &query_words) {
-                return None;
-            }
-            if !literal_filters.iter().all(|literal| literal.matches(&body)) {
-                return None;
-            }
-            let ranges = collect_match_ranges(&message_segments, &query_words, &literal_filters);
-            if ranges.is_empty() {
-                return None;
-            }
-            Some(candidate_from_ranges(CandidateInput {
-                target,
-                message_ordinal: message_segments[0].message_ordinal,
-                message_count: target.transcript.messages.len(),
-                options,
-                body: &body,
-                query_words: &query_words,
-                literals: &literal_filters,
-                ranges,
-            }))
-        })
-        .collect()
+    let candidates = |require_all: bool| -> Vec<Candidate> {
+        segments_by_message(segments)
+            .into_iter()
+            .filter_map(|message_segments| {
+                let body = join_segment_text(&message_segments);
+                if require_all {
+                    let normalized = normalize_for_search(&body);
+                    if !query_words
+                        .iter()
+                        .all(|word| word_matches(&normalized, word, anywhere))
+                    {
+                        return None;
+                    }
+                    if !literal_filters.iter().all(|literal| literal.matches(&body)) {
+                        return None;
+                    }
+                }
+                let ranges = collect_match_ranges(
+                    &message_segments,
+                    &query_words,
+                    anywhere,
+                    &literal_filters,
+                );
+                if ranges.is_empty() {
+                    return None;
+                }
+                Some(candidate_from_ranges(CandidateInput {
+                    target,
+                    message_ordinal: message_segments[0].message_ordinal,
+                    message_count: target.transcript.messages.len(),
+                    options,
+                    body: &body,
+                    query_words: &query_words,
+                    literals: &literal_filters,
+                    ranges,
+                }))
+            })
+            .collect()
+    };
+    match candidates(true) {
+        strict if strict.is_empty() && options.partial_matches => candidates(false),
+        strict => strict,
+    }
 }
 
 fn exact_candidates(
@@ -252,29 +284,35 @@ fn exact_candidates_for_literals(
         return Vec::new();
     }
 
-    segments_by_message(segments)
-        .into_iter()
-        .filter_map(|message_segments| {
-            let body = join_segment_text(&message_segments);
-            if !literals.iter().all(|literal| literal.matches(&body)) {
-                return None;
-            }
-            let ranges = collect_match_ranges(&message_segments, &[], literals);
-            if ranges.is_empty() {
-                return None;
-            }
-            Some(candidate_from_ranges(CandidateInput {
-                target,
-                message_ordinal: message_segments[0].message_ordinal,
-                message_count: target.transcript.messages.len(),
-                options,
-                body: &body,
-                query_words: &[],
-                literals,
-                ranges,
-            }))
-        })
-        .collect()
+    let candidates = |require_all: bool| -> Vec<Candidate> {
+        segments_by_message(segments)
+            .into_iter()
+            .filter_map(|message_segments| {
+                let body = join_segment_text(&message_segments);
+                if require_all && !literals.iter().all(|literal| literal.matches(&body)) {
+                    return None;
+                }
+                let ranges = collect_match_ranges(&message_segments, &[], false, literals);
+                if ranges.is_empty() {
+                    return None;
+                }
+                Some(candidate_from_ranges(CandidateInput {
+                    target,
+                    message_ordinal: message_segments[0].message_ordinal,
+                    message_count: target.transcript.messages.len(),
+                    options,
+                    body: &body,
+                    query_words: &[],
+                    literals,
+                    ranges,
+                }))
+            })
+            .collect()
+    };
+    match candidates(true) {
+        strict if strict.is_empty() && options.partial_matches => candidates(false),
+        strict => strict,
+    }
 }
 
 struct CandidateInput<'a> {
@@ -351,6 +389,35 @@ fn build_segments(transcript: &AgentTranscript) -> Vec<Segment> {
         .messages
         .iter()
         .flat_map(message_segments)
+        .collect()
+}
+
+/// Segments of the authored text of each top-level user message that is not
+/// a note.
+fn build_own_segments(transcript: &AgentTranscript) -> Vec<Segment> {
+    transcript
+        .messages
+        .iter()
+        .filter(|message| {
+            message.role == AgentMessageRole::User
+                && message.parent_tool_use_id.is_none()
+                && transcript.notes.binary_search(&message.ordinal).is_err()
+        })
+        .flat_map(|message| {
+            message.parts.iter().filter_map(|part| match part {
+                AgentMessagePart::Text { text, .. } => {
+                    let text = authored_text(text)?;
+                    Some(Segment {
+                        message_ordinal: message.ordinal,
+                        source: AgentHitSource::Dialogue,
+                        render_options: AgentHitRenderOptions::default(),
+                        normalized: normalize_for_search(&text),
+                        text,
+                    })
+                }
+                _ => None,
+            })
+        })
         .collect()
 }
 
@@ -442,22 +509,17 @@ fn unquoted_terms(unquoted: &str) -> Vec<&str> {
     unquoted.split_whitespace().collect()
 }
 
-fn message_matches_words(normalized: &str, words: &[String]) -> bool {
-    words.iter().all(|word| {
-        contains_prefix_match(normalized, word) || (contains_cjk(word) && normalized.contains(word))
-    })
-}
-
 fn collect_match_ranges(
     segments: &[&Segment],
     query_words: &[String],
+    anywhere: bool,
     literals: &[Literal],
 ) -> Vec<MatchRange> {
     let mut ranges = Vec::new();
     let mut body_offset = 0usize;
     for segment in segments {
         for (term_index, word) in query_words.iter().enumerate() {
-            if normalized_word_matches(&segment.normalized, word) {
+            if word_matches(&segment.normalized, word, anywhere) {
                 ranges.push(MatchRange {
                     start: body_offset,
                     end: body_offset + segment.text.len(),
@@ -485,9 +547,14 @@ fn collect_match_ranges(
     ranges
 }
 
-fn normalized_word_matches(normalized_text: &str, word: &str) -> bool {
-    contains_prefix_match(normalized_text, word)
-        || (contains_cjk(word) && normalized_text.contains(word))
+/// Whether keyword search counts `word` in `normalized_text`: at a word
+/// start, or anywhere for queries with CJK text.
+fn word_matches(normalized_text: &str, word: &str, anywhere: bool) -> bool {
+    if anywhere {
+        normalized_text.contains(word)
+    } else {
+        contains_prefix_match(normalized_text, word)
+    }
 }
 
 fn adjacency_score(body: &str, query_words: &[String]) -> usize {
@@ -643,6 +710,39 @@ mod tests {
     }
 
     #[test]
+    fn user_only_hits_come_from_what_the_person_typed() {
+        let mut subagent = text_message(5, AgentMessageRole::User, "walrus from a parent");
+        subagent.parent_tool_use_id = Some("toolu_1".to_string());
+        let mut transcript = transcript(vec![
+            text_message(1, AgentMessageRole::User, "how does the walrus work"),
+            text_message(2, AgentMessageRole::Assistant, "the walrus assigns"),
+            tool_result_message(3, json!("walrus in tool output")),
+            text_message(4, AgentMessageRole::User, "[hook] walrus note"),
+            subagent,
+            text_message(
+                6,
+                AgentMessageRole::User,
+                "<system-reminder>walrus reminder</system-reminder>thanks",
+            ),
+        ]);
+        transcript.notes = vec![4];
+        let user_only = AgentRetrievalOptions {
+            user_only: true,
+            ..options()
+        };
+
+        let hits = retrieve_agent_hits(&transcript, "walrus", user_only);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].focus_range, MessageRange::single(1));
+        assert_eq!(hits[0].source, AgentHitSource::Dialogue);
+        assert!(retrieve_agent_hits(&transcript, "\"walrus in\"", user_only).is_empty());
+        assert_eq!(
+            retrieve_agent_hits(&transcript, "walrus", options()).len(),
+            6
+        );
+    }
+
+    #[test]
     fn lexical_terms_cluster_to_tight_message_focus() {
         let transcript = transcript(vec![
             text_message(1, AgentMessageRole::User, "alpha only"),
@@ -685,6 +785,56 @@ mod tests {
         let hits = retrieve_agent_hits(&transcript, "alpha beta \"exact_literal\"", options());
 
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn partial_matches_return_messages_with_some_terms() {
+        let transcript = transcript(vec![
+            text_message(1, AgentMessageRole::User, "authentication question"),
+            text_message(2, AgentMessageRole::Assistant, "noted"),
+            text_message(3, AgentMessageRole::User, "unrelated"),
+        ]);
+        assert!(retrieve_agent_hits(&transcript, "authentication noted", options()).is_empty());
+        let partial = AgentRetrievalOptions {
+            partial_matches: true,
+            ..options()
+        };
+        let hits = retrieve_agent_hits(&transcript, "authentication noted", partial);
+        let mut focused = hits
+            .iter()
+            .map(|hit| hit.focus_range.start)
+            .collect::<Vec<_>>();
+        focused.sort_unstable();
+        assert_eq!(focused, [1, 2]);
+    }
+
+    #[test]
+    fn letter_digit_transitions_start_words() {
+        let transcript = transcript(vec![
+            text_message(1, AgentMessageRole::User, "bump to v1.2.3 and h264"),
+            text_message(2, AgentMessageRole::Assistant, "the AppConfig type"),
+        ]);
+        assert_eq!(
+            retrieve_agent_hits(&transcript, "1.2.3", options()).len(),
+            1
+        );
+        assert_eq!(retrieve_agent_hits(&transcript, "264", options()).len(), 1);
+        assert!(retrieve_agent_hits(&transcript, "onfig", options()).is_empty());
+        assert!(retrieve_agent_hits(&transcript, "64", options()).is_empty());
+    }
+
+    #[test]
+    fn cjk_queries_match_their_words_anywhere() {
+        let transcript = transcript(vec![text_message(
+            1,
+            AgentMessageRole::User,
+            "testing the fired 测试",
+        )]);
+        assert_eq!(
+            retrieve_agent_hits(&transcript, "测试 ired", options()).len(),
+            1
+        );
+        assert!(retrieve_agent_hits(&transcript, "ired", options()).is_empty());
     }
 
     #[test]
@@ -784,7 +934,7 @@ mod tests {
     #[test]
     fn exact_tool_result_search_uses_bounded_head_and_tail() {
         let long = format!(
-            "HEAD{}TAIL",
+            "HEAD {} TAIL",
             "x".repeat(crate::agent::transcript::MAX_AGENT_SEGMENT_CHARS * 2)
         );
         let transcript = transcript(vec![tool_result_message(1, json!(long))]);

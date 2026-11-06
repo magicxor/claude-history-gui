@@ -19,6 +19,7 @@ use crate::model::{KeyAction, OpenPathsOptions, SettingsPage};
 use crate::services::ServiceCall;
 use crate::settings::draft::{Field, Value};
 use crate::settings::{self, SettingsDialog, current_dialog};
+use crate::test_support::fixtures_ops::fake_program;
 use crate::test_support::{TestWorld, global_lock, kbd, open_main, recording};
 
 fn render(cx: &mut TestAppContext, handle: AnyWindowHandle) {
@@ -597,7 +598,9 @@ fn typing_into_a_field_updates_the_draft(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn browse_fills_the_field_from_the_platform_prompt(cx: &mut TestAppContext) {
     let world = TestWorld::new();
-    let program = world.add_fixture("bin/claude-harmless.cmd", b"@echo off\r\n");
+    // A program the launcher check accepts: a `.cmd` on Windows, a script
+    // with the executable bit on Unix.
+    let program = fake_program(&world, "claude-harmless");
     let (handle, _ws) = open_main(cx, &world, &[]);
     let dialog = open_dialog(cx, handle);
     let services = recording(cx);
@@ -622,9 +625,7 @@ fn browse_fills_the_field_from_the_platform_prompt(cx: &mut TestAppContext) {
                 prompt: "Choose program".into(),
             }))
     );
-    let status = dialog.read_with(cx, |d, cx| {
-        d.program_status(Field::ClaudePath, "claude", cx)
-    });
+    let status = dialog.read_with(cx, |d, cx| d.program_status(Field::ClaudePath, cx));
     assert_eq!(status, format!("resolved: {}", program.display()));
     // A folder for the workspace; a cancelled prompt changes nothing.
     let folder = world.home().join("work");
@@ -666,6 +667,48 @@ fn browse_fills_the_field_from_the_platform_prompt(cx: &mut TestAppContext) {
             .starts_with("File not found")
     );
     assert!(!dialog.read_with(cx, |d, _| d.can_save()));
+}
+
+/// C-071 (upstream 8a99ccc): an agent's command is typed one word per line
+/// on the Resume page, probed in the background and saved as
+/// `[resume.pi] command`, which then starts Pi.
+#[gpui_kit::test]
+fn an_agent_command_is_edited_probed_and_saved(cx: &mut TestAppContext) {
+    use claude_history_core::history::model::SourceKind as Agent;
+    let world = TestWorld::new();
+    let (handle, _ws) = open_main(cx, &world, &[]);
+    let dialog = open_dialog(cx, handle);
+    set_text(
+        cx,
+        handle,
+        &dialog,
+        Field::PiCommand,
+        "mise\n exec \n\n--\npi\n",
+    );
+    assert_eq!(
+        dialog.read_with(cx, |d, _| d.draft().value(Field::PiCommand)),
+        Value::List(vec!["mise".into(), "exec".into(), "--".into(), "pi".into()])
+    );
+    let status = dialog.read_with(cx, |d, _| d.program_status_text(Field::PiCommand));
+    assert!(status.starts_with("runs mise exec -- pi · "), "{status}");
+    // The path row of the same agent says which key decides.
+    let status = dialog.read_with(cx, |d, _| d.program_status_text(Field::PiPath));
+    assert!(
+        status.starts_with("runs mise exec -- pi; from `command` under [resume.pi] in gui.toml · "),
+        "{status}"
+    );
+    save(cx, handle, &dialog);
+    let text = read_gui(&world);
+    assert!(text.contains("[resume.pi]"), "{text}");
+    assert!(
+        text.contains(r#"command = ["mise", "exec", "--", "pi"]"#),
+        "{text}"
+    );
+    let launcher = cx.read(|cx| {
+        let state = app_state(cx);
+        state.config.launcher(&state.env, Agent::Pi)
+    });
+    assert_eq!(launcher.words(), ["mise", "exec", "--", "pi"]);
 }
 
 /// The terminal preview shows the command a sample resume would run, and a
@@ -808,6 +851,81 @@ fn saving_excluded_projects_updates_the_open_list(cx: &mut TestAppContext) {
     // Clearing the field brings the rows back.
     let dialog = open_dialog(cx, handle);
     set_text(cx, handle, &dialog, Field::ExcludeProjects, "");
+    save(cx, handle, &dialog);
+    wait(cx);
+    assert_eq!(projects(cx).len(), before.len());
+}
+
+/// L-107: saving `exclude_paths` (upstream 982aea9) in Settings writes
+/// `[tui] exclude_paths` to gui.toml and reaches the open list pane
+/// (`apply_saved` -> `ListPane::set_exclude_paths`): the conversations under
+/// the prefix disappear without a restart, and clearing the field brings
+/// them back.
+#[gpui_kit::test]
+fn saving_excluded_working_directories_updates_the_open_list(cx: &mut TestAppContext) {
+    let world = TestWorld::new();
+    crate::test_support::fixtures_list::listed_corpus(&world);
+    let (handle, ws) = open_main(cx, &world, &[]);
+    let list = cx.read(|cx| ws.read(cx).list().clone());
+    let wait = |cx: &mut TestAppContext| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            cx.run_until_parked();
+            let idle = list.read_with(cx, |list, _| {
+                !list.is_loading()
+                    && !list.loader().is_running()
+                    && !list.browser().has_search_work_in_flight()
+            });
+            if idle {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the list never went idle"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    let projects = |cx: &TestAppContext| -> Vec<Option<String>> {
+        list.read_with(cx, |list, _| {
+            (0..list.browser().filtered().len())
+                .map(|pos| list.browser().row(pos).unwrap().project_name.clone())
+                .collect()
+        })
+    };
+    wait(cx);
+    let before = projects(cx);
+    assert_eq!(before.len(), 8, "{before:?}");
+    let api = crate::test_support::synth::cwd_base().join("api");
+    let dialog = open_dialog(cx, handle);
+    set_text(
+        cx,
+        handle,
+        &dialog,
+        Field::ExcludePaths,
+        &format!("/tmp/\n{}\n", api.display()),
+    );
+    save(cx, handle, &dialog);
+    wait(cx);
+    let text = std::fs::read_to_string(gui_toml(&world)).unwrap();
+    assert!(text.contains("exclude_paths"), "{text}");
+    assert_eq!(
+        cx.read(|cx| app_state(cx).settings.exclude_paths.clone()),
+        vec!["/tmp/".to_string(), api.display().to_string()]
+    );
+    let hidden = projects(cx);
+    assert_eq!(hidden.len(), 4, "api, Pi and OMP are hidden: {hidden:?}");
+    assert!(
+        !hidden.iter().flatten().any(|name| name == "api"),
+        "{hidden:?}"
+    );
+    assert_eq!(
+        list.read_with(cx, |list, _| list.excluded_paths().to_vec()),
+        vec!["/tmp/".to_string(), api.display().to_string()]
+    );
+    // Clearing the field brings the rows back.
+    let dialog = open_dialog(cx, handle);
+    set_text(cx, handle, &dialog, Field::ExcludePaths, "");
     save(cx, handle, &dialog);
     wait(cx);
     assert_eq!(projects(cx).len(), before.len());
