@@ -6,10 +6,14 @@
 //! `\n`s), every navigable message into the range of its items' lines, and
 //! core's [`preview::anchor`] picks the line: the one the row's semantic
 //! evidence points at, else the first line matching the query. The query's
-//! matches are the `/` search's (core `ViewSearchQuery`, AD7): those on the
-//! anchor line are drawn as the current match, the others as the other
-//! matches (upstream highlights the anchor line as the current match and
-//! marks it in the gutter; the viewer focuses its message instead).
+//! matches are the `/` search's (core `ViewSearchQuery`, AD7), widened to
+//! whole words and emphasized by core's [`preview::match_ranges`] (upstream
+//! 949ec4e): the matches of the whole query in the hit's message (or, when
+//! it has none, the matches on the anchor line) are the hit, drawn with the
+//! fill of the `/` search's other matches; every other match is secondary,
+//! bold accent text (upstream also marks the anchor line in the gutter; the
+//! viewer focuses its message instead). They are classified once per hit,
+//! here, for the whole conversation, not per paint.
 //!
 //! As built: the lines are segment text, without the ledger's name column,
 //! timestamp and wrapping, so a query matching only a label (`claude`) finds
@@ -21,11 +25,11 @@ use std::ops::Range;
 use claude_history_core::browser::ListHit;
 use claude_history_core::display_format::ViewSearchQuery;
 use claude_history_core::view::MessageRange;
-use claude_history_core::view::preview::{self, PreviewDoc};
+use claude_history_core::view::preview::{self, MatchEmphasis, PreviewDoc};
 
 use super::items::{BuildInfo, ViewerItem};
 use super::nav;
-use super::search::MatchesByItem;
+use super::search::{Emphasis, MatchesByItem};
 
 /// The line the hit is at.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,7 +48,8 @@ pub struct HitAnchor {
 #[derive(Clone, Debug, Default)]
 pub struct HitFound {
     pub anchor: Option<HitAnchor>,
-    /// The query's matches per item; those on the anchor line are current.
+    /// The query's matches per item, each [`Emphasis::Hit`] or
+    /// [`Emphasis::Secondary`].
     pub matches: MatchesByItem,
 }
 
@@ -91,31 +96,29 @@ pub fn find(items: &[ViewerItem], info: &BuildInfo, hit: &ListHit) -> HitFound {
         .filter(|message| message.start_line < message.end_line)
         .collect();
     let doc = PreviewDoc::new(texts, messages);
-    let anchor_line =
-        preview::anchor(&doc, &hit.query, hit.evidence.as_deref()).and_then(|line| lines.get(line));
+    let anchor_ix = preview::anchor(&doc, &hit.query, hit.evidence.as_deref())
+        .filter(|&line| line < lines.len());
+    let anchor_line = anchor_ix.map(|line| &lines[line]);
 
     let query = ViewSearchQuery::parse(&hit.query);
     let mut matches = MatchesByItem::new();
     let mut first_on_anchor = None;
-    if !query.is_empty() {
-        for (item_ix, item) in items.iter().enumerate() {
-            for (segment_ix, segment) in item.segments.iter().enumerate() {
-                for (start, end) in query.match_ranges(&segment.text) {
-                    let current = anchor_line.is_some_and(|line| {
-                        line.item == item_ix
-                            && line.segment == segment_ix
-                            && line.range.start <= start
-                            && start <= line.range.end
-                    });
-                    if current && first_on_anchor.is_none() {
-                        first_on_anchor = Some(start);
-                    }
-                    matches
-                        .entry(item_ix)
-                        .or_default()
-                        .push((segment_ix, start..end, current));
-                }
+    let ranges = preview::match_ranges(&doc, 0..lines.len(), anchor_ix, &query);
+    // Lines are in item, segment and byte order, so each item's matches are.
+    for (line_ix, (line, ranges)) in lines.iter().zip(ranges).enumerate() {
+        for (start, end, emphasis) in ranges {
+            let (start, end) = (line.range.start + start, line.range.start + end);
+            if anchor_ix == Some(line_ix) && first_on_anchor.is_none() {
+                first_on_anchor = Some(start);
             }
+            let emphasis = match emphasis {
+                MatchEmphasis::Hit => Emphasis::Hit,
+                MatchEmphasis::Secondary => Emphasis::Secondary,
+            };
+            matches
+                .entry(line.item)
+                .or_default()
+                .push((line.segment, start..end, emphasis));
         }
     }
     let anchor = anchor_line.map(|line| HitAnchor {

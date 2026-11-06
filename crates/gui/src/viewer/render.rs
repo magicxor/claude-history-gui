@@ -13,7 +13,8 @@
 //! ```
 //!
 //! Style runs are built in a fixed order: the segment's flags (or syntect
-//! tokens for code), then the search matches on top (`combine_highlights`).
+//! tokens for code), then the search matches on top (split by hand, not by
+//! `combine_highlights`, whose fold order is a hash order).
 //! Dimmed and thinking segments get no syntax colors (V-016, V-063).
 
 use std::cell::{Cell, RefCell};
@@ -30,13 +31,13 @@ use gpui_kit::{
     AnyElement, App, ElementId, FontStyle, FontWeight, HighlightStyle, InteractiveElement as _,
     IntoElement, MouseButton, ParentElement as _, Pixels, Point, SharedString,
     StatefulInteractiveElement as _, StrikethroughStyle, Styled as _, TestSupportExt as _,
-    UnderlineStyle, WeakEntity, Window, canvas, combine_highlights, div, px, rems,
+    UnderlineStyle, WeakEntity, Window, canvas, div, px, rems,
 };
 
 use super::ViewerPane;
 use super::items::{ItemKind, LaneRole, ViewerItem};
 use super::lru::{HandleCache, TokenCache};
-use super::search::MatchesByItem;
+use super::search::{Emphasis, MatchesByItem};
 use super::segments::{SegKind, Segment, Style, table_cell_ranges};
 use super::seltext::{LinkHandler, SelText};
 use crate::theme_tokens::Roles;
@@ -173,13 +174,18 @@ fn base_runs(
         .collect()
 }
 
-/// The styles of search matches (V-075): `(other matches, current match)`.
-/// Both set a background and a foreground, so they win over every base
-/// color (flags and syntax tokens) where they apply.
+/// The styles of search matches (V-075, L-109): the `/` search's other
+/// matches and its current match, and the list hit's secondary matches
+/// (its hit uses `other`, upstream 949ec4e's filled block). `other` and
+/// `current` set a background and a foreground, so they win over every base
+/// color (flags and syntax tokens) where they apply; `secondary` is bold
+/// accent text (upstream: bold colored text, like matches in the list) and
+/// keeps the base background.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MatchStyles {
     pub other: HighlightStyle,
     pub current: HighlightStyle,
+    pub secondary: HighlightStyle,
 }
 
 // The legible text color on a match background: the role's own foreground
@@ -208,37 +214,87 @@ impl MatchStyles {
                 )),
                 ..Default::default()
             },
+            // The accent is contrast-checked on the transcript background
+            // and the focused message's tint (X-039).
+            secondary: HighlightStyle {
+                color: Some(roles.accent),
+                font_weight: Some(FontWeight::BOLD),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// The style of a match drawn with `emphasis`.
+    pub fn style(&self, emphasis: Emphasis) -> HighlightStyle {
+        match emphasis {
+            Emphasis::Current => self.current,
+            Emphasis::Other | Emphasis::Hit => self.other,
+            Emphasis::Secondary => self.secondary,
         }
     }
 }
 
 /// Overlay the search matches of segment `segment_ix` on its base runs
-/// (§9.4): base runs first, matches on top (`combine_highlights` lets the
-/// later list override overlapping fields), the current match with its own
-/// style. `matches` are one item's `(segment, range, is_current)` in order.
+/// (§9.4): base runs first, each match on top in the style of its
+/// [`Emphasis`] (its fields win over the base's). `matches` are one item's
+/// `(segment, range, emphasis)`, disjoint.
 pub fn overlay_matches(
     base: Vec<(Range<usize>, HighlightStyle)>,
-    matches: &[(usize, Range<usize>, bool)],
+    matches: &[(usize, Range<usize>, Emphasis)],
     segment_ix: usize,
     styles: MatchStyles,
 ) -> Vec<(Range<usize>, HighlightStyle)> {
-    let runs: Vec<(Range<usize>, HighlightStyle)> = matches
+    let mut runs: Vec<(Range<usize>, HighlightStyle)> = matches
         .iter()
         .filter(|(segment, range, _)| *segment == segment_ix && !range.is_empty())
-        .map(|(_, range, current)| {
-            let style = if *current {
-                styles.current
-            } else {
-                styles.other
-            };
-            (range.clone(), style)
-        })
+        .map(|(_, range, emphasis)| (range.clone(), styles.style(*emphasis)))
         .collect();
     if runs.is_empty() {
-        base
-    } else {
-        combine_highlights(base, runs).collect()
+        return base;
     }
+    runs.sort_by_key(|(range, _)| range.start);
+    layer_runs(&base, &runs)
+}
+
+/// `top` laid over `base` (both sorted, each disjoint): cut at every
+/// boundary of either, a piece under both styled `base.highlight(top)` (the
+/// top's fields win), a piece under one styled by it. Done by hand:
+/// `combine_highlights` folds overlapping styles in hash order, so a base
+/// color could win over a match's (gpui-kit pitfall, as `list::rows::overlay`).
+fn layer_runs(
+    base: &[(Range<usize>, HighlightStyle)],
+    top: &[(Range<usize>, HighlightStyle)],
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    let mut cuts: Vec<usize> = base
+        .iter()
+        .chain(top)
+        .flat_map(|(range, _)| [range.start, range.end])
+        .collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    let covering = |runs: &[(Range<usize>, HighlightStyle)], ix: &mut usize, at: usize| {
+        while runs.get(*ix).is_some_and(|(range, _)| range.end <= at) {
+            *ix += 1;
+        }
+        runs.get(*ix)
+            .filter(|(range, _)| range.start <= at)
+            .map(|(_, style)| *style)
+    };
+    let (mut base_ix, mut top_ix) = (0, 0);
+    let mut out = Vec::with_capacity(base.len() + top.len() * 2);
+    for cut in cuts.windows(2) {
+        let (start, end) = (cut[0], cut[1]);
+        let style = match (
+            covering(base, &mut base_ix, start),
+            covering(top, &mut top_ix, start),
+        ) {
+            (Some(under), Some(over)) => under.highlight(over),
+            (Some(style), None) | (None, Some(style)) => style,
+            (None, None) => continue,
+        };
+        out.push((start..end, style));
+    }
+    out
 }
 
 /// The final runs of a segment (deterministic overlay: base, then matches).

@@ -8,6 +8,9 @@ Release notes are taken from the `## v<version>` section of this file by the rel
   first line that matches the query (for a semantic result, the passage its row shows), with that message marked
   and the query's matches highlighted. Typing more moves it to the new match; clearing the query or a search with
   `/` in the viewer removes the highlights.
+- In that preview only the match the result was found by stands out: matches of the whole query in that message get
+  the highlight fill, other matches are bold colored text. Highlights cover whole words, so a search for `test`
+  marks all of `tests`.
 - Tool results show screenshots and documents as `[image: image/png]` or `[document: application/pdf]` instead of
   pages of base64 data, also next to text (where the image used to be dropped), tool errors as `Error: ...` and
   one-line JSON results pretty-printed. Subagent results show their text instead of a quoted JSON string. Exports

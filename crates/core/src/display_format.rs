@@ -922,6 +922,12 @@ impl ViewSearchQuery {
         self.0.has_match(text)
     }
 
+    /// Whether `matched` holds every word and literal of the query
+    /// ([`HighlightQuery::covers_all_terms`]).
+    pub fn covers_all_terms(&self, matched: &str) -> bool {
+        self.0.covers_all_terms(matched)
+    }
+
     /// Merged byte ranges of the matches in `text`, per line (see the type).
     pub fn match_ranges(&self, text: &str) -> Vec<(usize, usize)> {
         self.match_ranges_in(text, &NormalizedForm::new(text))
@@ -1035,6 +1041,17 @@ impl HighlightQuery {
             .cloned()
             .map(ContextMatchSpec::Literal)
             .collect()
+    }
+
+    /// Whether `matched` holds every word and literal of the query, as a
+    /// match of the whole query, not one of its words, does (upstream
+    /// 949ec4e).
+    pub fn covers_all_terms(&self, matched: &str) -> bool {
+        let normalized = normalize_for_search(matched);
+        self.unquoted
+            .split_whitespace()
+            .all(|term| normalized.contains(term))
+            && self.literals.iter().all(|literal| literal.matches(matched))
     }
 
     /// Whether any term or literal matches `text`.

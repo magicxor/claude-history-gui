@@ -1138,13 +1138,15 @@ mod pure {
     }
 
     /// L-109 (upstream 411e227 `list_preview_anchors_on_the_first_match`):
-    /// the list hit is the first line matching the query, its matches are
-    /// the current ones; the semantic evidence wins over the first match.
+    /// the list hit is the first line matching the query, its match is the
+    /// hit (949ec4e), the other message's secondary; the semantic evidence
+    /// wins over the first match.
     #[test]
     fn l109_list_hit_anchors_on_the_first_match_or_the_evidence() {
         use claude_history_core::browser::ListHit;
 
         use crate::viewer::hit;
+        use crate::viewer::search::Emphasis;
 
         let lines = vec![
             user("set up the tunnel"),
@@ -1173,27 +1175,33 @@ mod pure {
             segment.find("token").unwrap(),
             "revealed at the match"
         );
-        let all: Vec<(usize, usize, String, bool)> = found
+        let all: Vec<(usize, usize, String, Emphasis)> = found
             .matches
             .iter()
             .flat_map(|(item, matches)| {
-                matches.iter().map(|(segment, range, current)| {
+                matches.iter().map(|(segment, range, emphasis)| {
                     let text = items[*item].segments[*segment].text[range.clone()].to_string();
-                    (*item, *segment, text, *current)
+                    (*item, *segment, text, *emphasis)
                 })
             })
             .collect();
         assert_eq!(all.len(), 2, "{all:?}");
         assert!(all.iter().all(|(_, _, text, _)| text == "token"), "{all:?}");
-        let current: Vec<usize> = all
+        let hits: Vec<usize> = all
             .iter()
-            .filter(|(.., current)| *current)
+            .filter(|(.., emphasis)| *emphasis == Emphasis::Hit)
             .map(|(item, ..)| *item)
             .collect();
         assert_eq!(
-            current,
+            hits,
             [anchor.item],
-            "only the anchor line's match is current"
+            "only the hit message's match is the hit"
+        );
+        assert!(
+            all.iter().all(
+                |(item, .., emphasis)| *item == anchor.item || *emphasis == Emphasis::Secondary
+            ),
+            "{all:?}"
         );
 
         // The semantic evidence names the passage the row shows.
@@ -1212,10 +1220,70 @@ mod pure {
         assert!(found.matches.is_empty());
     }
 
+    /// L-109 (upstream 949ec4e
+    /// `preview_fills_only_whole_query_matches_in_the_hit_message`): in the
+    /// hit's message the matches of the whole query are the hit and a match
+    /// of one word is secondary, as is every match in other messages;
+    /// matches widen to whole words (`tests`, `flakyness`).
     #[test]
-    fn v075_overlay_gives_the_current_match_its_own_style() {
+    fn l109_list_hit_emphasizes_whole_query_matches_in_the_hit_message() {
+        use claude_history_core::browser::ListHit;
+
+        use crate::viewer::hit;
+        use crate::viewer::search::Emphasis;
+
+        let lines = vec![
+            user("set up the runner"),
+            assistant("failed on one flaky test: navigation\n3,125 tests passed"),
+            user("Fix the flakyness and a flaky test"),
+        ];
+        let (_dir, model) = model_for(&lines, prefs(ToolDisplayMode::Summary, false, false));
+        let doc = model.document();
+        let (items, info) = items::build_with_info(&doc, &model, 80, &|| false).unwrap();
+        let hit = ListHit {
+            query: "flaky test".to_string(),
+            evidence: None,
+        };
+
+        let found = hit::find(&items, &info, &hit);
+
+        let anchor = found.anchor.expect("a line matches");
+        let segment = &items[anchor.item].segments[anchor.segment].text;
+        assert_eq!(
+            &segment[anchor.line.clone()],
+            "failed on one flaky test: navigation"
+        );
+        assert_eq!(anchor.byte, segment.find("flaky test").unwrap());
+        let items = &items;
+        let mut all: Vec<(usize, usize, usize, String, Emphasis)> = found
+            .matches
+            .iter()
+            .flat_map(|(item, matches)| {
+                matches.iter().map(move |(segment, range, emphasis)| {
+                    let text = items[*item].segments[*segment].text[range.clone()].to_string();
+                    (*item, *segment, range.start, text, *emphasis)
+                })
+            })
+            .collect();
+        all.sort_by_key(|(item, segment, start, ..)| (*item, *segment, *start));
+        let shown: Vec<(&str, Emphasis)> = all
+            .iter()
+            .map(|(.., text, emphasis)| (text.as_str(), *emphasis))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("flaky test", Emphasis::Hit),
+                ("tests", Emphasis::Secondary),
+                ("flakyness", Emphasis::Secondary),
+                ("flaky test", Emphasis::Secondary),
+            ]
+        );
+    }
+
+    fn test_match_styles() -> render::MatchStyles {
         use gpui_kit::{FontWeight, HighlightStyle, hsla};
-        let styles = render::MatchStyles {
+        render::MatchStyles {
             other: HighlightStyle {
                 background_color: Some(hsla(0.5, 0.5, 0.5, 0.25)),
                 color: Some(hsla(0.0, 0.0, 0.1, 1.0)),
@@ -1226,7 +1294,20 @@ mod pure {
                 color: Some(hsla(0.0, 0.0, 0.0, 1.0)),
                 ..Default::default()
             },
-        };
+            secondary: HighlightStyle {
+                color: Some(hsla(0.45, 0.7, 0.3, 1.0)),
+                font_weight: Some(FontWeight::BOLD),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn v075_overlay_gives_the_current_match_its_own_style() {
+        use gpui_kit::{FontWeight, HighlightStyle, hsla};
+
+        use crate::viewer::search::Emphasis;
+        let styles = test_match_styles();
         // A bold, colored base run over the whole text "abc needle needle".
         let base_style = HighlightStyle {
             color: Some(hsla(0.6, 0.6, 0.6, 1.0)),
@@ -1235,7 +1316,11 @@ mod pure {
         };
         let base = vec![(0..17, base_style)];
         // Matches of segment 0 (the second one current) and one of segment 1.
-        let matches = vec![(0, 4..10, false), (0, 11..17, true), (1, 0..3, false)];
+        let matches = vec![
+            (0, 4..10, Emphasis::Other),
+            (0, 11..17, Emphasis::Current),
+            (1, 0..3, Emphasis::Other),
+        ];
         let runs = render::overlay_matches(base.clone(), &matches, 0, styles);
         let style_at = |byte: usize| {
             runs.iter()
@@ -1267,6 +1352,66 @@ mod pure {
             render::overlay_matches(base.clone(), &matches, 2, styles),
             base
         );
+    }
+
+    /// L-109 (upstream 949ec4e): the list hit's hit is drawn with the fill
+    /// of the `/` search's other matches, its secondary matches as bold
+    /// accent text over the base (no fill); the match's fields win over every
+    /// base run's, whatever the number of runs (the overlay does not depend
+    /// on `combine_highlights`' hash order), and text outside base runs is
+    /// styled too.
+    #[test]
+    fn l109_overlay_draws_the_hit_filled_and_secondary_matches_as_bold_text() {
+        use gpui_kit::{FontStyle, HighlightStyle, hsla};
+
+        use crate::viewer::search::Emphasis;
+        let styles = test_match_styles();
+        assert_eq!(styles.style(Emphasis::Hit), styles.other);
+        assert_eq!(styles.style(Emphasis::Secondary), styles.secondary);
+        // Forty one-byte italic runs in alternating colors over bytes 0..40;
+        // bytes 40..50 have no base run.
+        let colors = [hsla(0.6, 0.6, 0.6, 1.0), hsla(0.9, 0.6, 0.4, 1.0)];
+        let base: Vec<_> = (0..40)
+            .map(|byte| {
+                let style = HighlightStyle {
+                    color: Some(colors[byte % 2]),
+                    font_style: Some(FontStyle::Italic),
+                    ..Default::default()
+                };
+                (byte..byte + 1, style)
+            })
+            .collect();
+        let matches: Vec<_> = (0..10)
+            .map(|ix| {
+                let emphasis = if ix % 2 == 0 {
+                    Emphasis::Secondary
+                } else {
+                    Emphasis::Hit
+                };
+                (0, ix * 5..ix * 5 + 3, emphasis)
+            })
+            .collect();
+        let runs = render::overlay_matches(base, &matches, 0, styles);
+        for (_, range, emphasis) in &matches {
+            let want = styles.style(*emphasis);
+            for byte in range.clone() {
+                let (_, style) = runs
+                    .iter()
+                    .find(|(run, _)| run.contains(&byte))
+                    .expect("styled byte");
+                assert_eq!(style.color, want.color, "byte {byte}");
+                assert_eq!(style.background_color, want.background_color, "byte {byte}");
+                assert_eq!(style.font_weight, want.font_weight, "byte {byte}");
+                let italic = (byte < 40).then_some(FontStyle::Italic);
+                assert_eq!(style.font_style, italic, "byte {byte}: base flags stay");
+            }
+        }
+        // Between matches the base runs are untouched; the runs are disjoint
+        // and in order.
+        let (_, style) = runs.iter().find(|(run, _)| run.contains(&3)).unwrap();
+        assert_eq!(style.color, Some(colors[1]));
+        assert!(runs.windows(2).all(|w| w[0].0.end <= w[1].0.start));
+        assert!(!runs.iter().any(|(run, _)| run.contains(&43)));
     }
 
     fn id(n: u16) -> (ItemId, u64) {

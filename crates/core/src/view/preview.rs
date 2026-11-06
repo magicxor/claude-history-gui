@@ -11,6 +11,11 @@
 //! rendered lines ([`PreviewDoc::from_rendered`], what upstream's pane
 //! shows), or any other split into lines, such as a GUI's own text.
 //!
+//! The query's matches are emphasized where the result was found
+//! ([`match_ranges`], upstream 949ec4e): the matches of the whole query in
+//! the hit message are the hit, every other match is secondary, and every
+//! match widens to the whole words it touches ([`widen_to_words`]).
+//!
 //! # Differences from upstream
 //!
 //! * Only the UI-neutral rules live here. Upstream's `ListPreview`
@@ -24,8 +29,14 @@
 //!   evidence matcher is 917758a's (a bit per evidence word, at most
 //!   [`EVIDENCE_WORDS`] words, one mask per line), which finds the same
 //!   lines for evidence of up to 64 distinct words.
+//! * [`match_ranges`] is upstream's `preview_match_ranges` (949ec4e,
+//!   `tui/ui.rs`) with a [`MatchEmphasis`] where upstream returns a ratatui
+//!   `Style` (filled block for the hit, colored text for the rest), so each
+//!   UI draws the two its own way; it finds the hit message by
+//!   [`PreviewDoc::message_at`] and classifies the hit message's lines once.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use super::ledger::{MessageRange, RenderedLine};
 use crate::display_format::ViewSearchQuery;
@@ -170,6 +181,107 @@ fn distinctive_words(text: &str) -> impl Iterator<Item = &str> {
         .filter(|word| word.chars().nth(3).is_some())
 }
 
+/// How a match of the query is drawn where the result was found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MatchEmphasis {
+    /// The hit: a match of the whole query in the message holding the
+    /// anchor, or a match on the anchor line when that message has none
+    /// (upstream: a filled block).
+    Hit,
+    /// Every other match (upstream: colored text, like matches in the list).
+    Secondary,
+}
+
+/// The query's matches on each line of `lines`: byte ranges into the line,
+/// sorted and disjoint, each with its [`MatchEmphasis`] (upstream 949ec4e
+/// `preview_match_ranges`).
+///
+/// The hit, the message the result was found by (the one holding `anchor`),
+/// has its matches of the whole query as the hit: or, when it has none, the
+/// matches on the `anchor` line. Every other match is secondary. Matches
+/// widen to whole words, so a prefix match on `tests` does not stop
+/// mid-word.
+pub fn match_ranges<T: AsRef<str>>(
+    doc: &PreviewDoc<T>,
+    lines: Range<usize>,
+    anchor: Option<usize>,
+    query: &ViewSearchQuery,
+) -> Vec<Vec<(usize, usize, MatchEmphasis)>> {
+    if query.is_empty() {
+        return lines.map(|_| Vec::new()).collect();
+    }
+    let ranges_at = |idx: usize| {
+        let text = doc.texts[idx].as_ref();
+        widen_to_words(text, query.match_ranges(text))
+    };
+    let covers_query = |idx: usize, (start, end): (usize, usize)| {
+        query.covers_all_terms(&doc.texts[idx].as_ref()[start..end])
+    };
+    let hit = anchor
+        .and_then(|line| doc.message_at(line))
+        .map_or(0..0, |m| m.start_line..m.end_line);
+    let hit_ranges: Vec<Vec<(usize, usize)>> = hit.clone().map(ranges_at).collect();
+    // Sorted: the hit's lines in order.
+    let full_match_lines: Vec<usize> = hit
+        .clone()
+        .zip(&hit_ranges)
+        .filter(|(idx, ranges)| ranges.iter().any(|&range| covers_query(*idx, range)))
+        .map(|(idx, _)| idx)
+        .collect();
+    let is_hit = |idx: usize, range: (usize, usize)| {
+        if full_match_lines.is_empty() {
+            anchor == Some(idx)
+        } else {
+            full_match_lines.binary_search(&idx).is_ok() && covers_query(idx, range)
+        }
+    };
+
+    lines
+        .map(|idx| {
+            let ranges = if hit.contains(&idx) {
+                hit_ranges[idx - hit.start].clone()
+            } else {
+                ranges_at(idx)
+            };
+            ranges
+                .into_iter()
+                .map(|(start, end)| {
+                    let emphasis = if is_hit(idx, (start, end)) {
+                        MatchEmphasis::Hit
+                    } else {
+                        MatchEmphasis::Secondary
+                    };
+                    (start, end, emphasis)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Sorted `ranges` of `text` widened to the whole words they touch, merged
+/// where they then meet.
+pub fn widen_to_words(text: &str, ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    let is_word_char = |c: char| c.is_alphanumeric();
+    let mut widened: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        let start = text[..start]
+            .char_indices()
+            .rev()
+            .take_while(|&(_, c)| is_word_char(c))
+            .last()
+            .map_or(start, |(i, _)| i);
+        let end = text[end..]
+            .char_indices()
+            .find(|&(_, c)| !is_word_char(c))
+            .map_or(text.len(), |(i, _)| end + i);
+        match widened.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => widened.push((start, end)),
+        }
+    }
+    widened
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,6 +372,106 @@ mod tests {
         // Too deep into its message: the match goes a third of the way down.
         assert_eq!(doc.scroll_offset(Some(30), 12), 26);
         assert_eq!(doc.scroll_offset(None, 12), 0);
+    }
+
+    /// The matched text of each line and whether it is the hit (upstream
+    /// 949ec4e `preview_styles`, comparing to `filled_match_style()`).
+    fn emphases(
+        lines: &[&'static str],
+        anchor: Option<usize>,
+        messages: &[(usize, usize)],
+        query: &str,
+    ) -> Vec<Vec<(String, bool)>> {
+        let doc = doc(lines, messages);
+        let query = ViewSearchQuery::parse(query);
+        match_ranges(&doc, 0..doc.texts.len(), anchor, &query)
+            .into_iter()
+            .zip(&doc.texts)
+            .map(|(ranges, text)| {
+                ranges
+                    .into_iter()
+                    .map(|(start, end, emphasis)| {
+                        (text[start..end].to_string(), emphasis == MatchEmphasis::Hit)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn preview_fills_only_whole_query_matches_in_the_hit_message() {
+        let styles = emphases(
+            &[
+                "failed on one flaky test: navigation",
+                "3,125 tests passed",
+                "Fix the flakyness and a flaky test",
+            ],
+            Some(1),
+            &[(0, 2), (2, 3)],
+            "flaky test",
+        );
+        assert_eq!(styles[0], vec![("flaky test".to_string(), true)]);
+        assert_eq!(styles[1], vec![("tests".to_string(), false)]);
+        assert_eq!(
+            styles[2],
+            vec![
+                ("flakyness".to_string(), false),
+                ("flaky test".to_string(), false)
+            ]
+        );
+    }
+
+    #[test]
+    fn preview_fills_anchor_line_when_hit_lacks_whole_query_match() {
+        let styles = emphases(
+            &["a flaky run", "the test failed"],
+            Some(1),
+            &[(0, 2)],
+            "flaky test",
+        );
+        assert_eq!(styles[0], vec![("flaky".to_string(), false)]);
+        assert_eq!(styles[1], vec![("test".to_string(), true)]);
+    }
+
+    /// The fork classifies any window of lines, as the GUI does for a whole
+    /// conversation and upstream for the visible rows: the same emphasis
+    /// either way, and an empty query or no anchor has no hit.
+    #[test]
+    fn match_ranges_of_a_window_agree_with_the_whole_and_need_an_anchor() {
+        let lines = [
+            "failed on one flaky test: navigation",
+            "3,125 tests passed",
+            "Fix the flakyness and a flaky test",
+        ];
+        let doc = doc(&lines, &[(0, 2), (2, 3)]);
+        let query = ViewSearchQuery::parse("flaky test");
+        let whole = match_ranges(&doc, 0..3, Some(1), &query);
+        assert_eq!(match_ranges(&doc, 1..3, Some(1), &query), whole[1..]);
+        assert!(
+            match_ranges(&doc, 0..3, None, &query)
+                .iter()
+                .flatten()
+                .all(|&(.., emphasis)| emphasis == MatchEmphasis::Secondary)
+        );
+        let blank = ViewSearchQuery::parse("  ");
+        assert_eq!(
+            match_ranges(&doc, 0..3, Some(1), &blank),
+            vec![Vec::new(); 3]
+        );
+    }
+
+    #[test]
+    fn widen_to_words_covers_whole_words() {
+        let text = "src/tui/app_tests/nav and untested";
+        let ranges = widen_to_words(
+            text,
+            [text.find("test").unwrap(), text.rfind("test").unwrap()]
+                .into_iter()
+                .map(|start| (start, start + 4))
+                .collect(),
+        );
+        let words: Vec<_> = ranges.iter().map(|&(s, e)| &text[s..e]).collect();
+        assert_eq!(words, vec!["tests", "untested"]);
     }
 
     /// Upstream `list_preview_anchors_on_the_first_match`, over the ledger's

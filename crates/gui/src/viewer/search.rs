@@ -130,8 +130,24 @@ impl SearchIndex {
     }
 }
 
-/// Visible matches per item: `(segment, range, is_current)`.
-pub type MatchesByItem = HashMap<usize, Vec<(usize, Range<usize>, bool)>>;
+/// How a highlighted match is drawn (`render::MatchStyles`, V-075, L-109).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Emphasis {
+    /// The `/` search's current match.
+    Current,
+    /// Every other match of the `/` search.
+    Other,
+    /// The list hit's hit (core `preview::MatchEmphasis::Hit`), drawn with
+    /// the fill of [`Emphasis::Other`] (upstream 949ec4e: the filled block).
+    Hit,
+    /// Every other match of the list's query (core
+    /// `preview::MatchEmphasis::Secondary`).
+    Secondary,
+}
+
+/// Visible matches per item: `(segment, range, emphasis)`, in segment and
+/// byte order.
+pub type MatchesByItem = HashMap<usize, Vec<(usize, Range<usize>, Emphasis)>>;
 
 /// Group the visible matches by item for rendering.
 pub fn by_item(matches: &[SegMatch], current: Option<usize>) -> MatchesByItem {
@@ -140,11 +156,14 @@ pub fn by_item(matches: &[SegMatch], current: Option<usize>) -> MatchesByItem {
         if m.hidden.is_some() || m.range.is_empty() {
             continue;
         }
-        out.entry(m.item_ix).or_default().push((
-            m.segment_ix,
-            m.range.clone(),
-            current == Some(ix),
-        ));
+        let emphasis = if current == Some(ix) {
+            Emphasis::Current
+        } else {
+            Emphasis::Other
+        };
+        out.entry(m.item_ix)
+            .or_default()
+            .push((m.segment_ix, m.range.clone(), emphasis));
     }
     out
 }

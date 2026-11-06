@@ -446,6 +446,26 @@ fn highlight_query_uses_unquoted_terms_and_literals_for_context() {
     );
 }
 
+/// Upstream 949ec4e: a match covers the query when it holds every word
+/// (folded, anywhere in it) and every literal (as literals match).
+#[test]
+fn highlight_query_covers_all_terms_only_with_every_word_and_literal() {
+    let query = HighlightQuery::parse("flaky test");
+    assert!(query.covers_all_terms("Flaky Test"));
+    assert!(query.covers_all_terms("flaky tests"));
+    assert!(!query.covers_all_terms("tests"));
+    assert!(!query.covers_all_terms("flakyness"));
+
+    let query = HighlightQuery::parse("deploy \"API_KEY\"");
+    assert!(query.covers_all_terms("deploy the API_KEY"));
+    assert!(!query.covers_all_terms("deploy the api_key"));
+    assert!(!query.covers_all_terms("API_KEY"));
+
+    // No terms at all: anything covers it.
+    assert!(HighlightQuery::parse("").covers_all_terms("text"));
+    assert!(ViewSearchQuery::parse("flaky test").covers_all_terms("a flaky test"));
+}
+
 #[test]
 fn highlight_query_preserves_unquoted_identifier_punctuation() {
     let query = HighlightQuery::parse("deployment_token");

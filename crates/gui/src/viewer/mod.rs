@@ -1884,7 +1884,7 @@ impl ViewerPane {
         self.hit_view.as_ref().and_then(|view| view.anchor.as_ref())
     }
 
-    /// The list hit's highlights per item: `(segment, range, is_current)`
+    /// The list hit's highlights per item: `(segment, range, emphasis)`
     /// (tests).
     pub fn hit_matches(&self) -> Option<Rc<MatchesByItem>> {
         self.hit_view.as_ref().map(|view| view.matches.clone())

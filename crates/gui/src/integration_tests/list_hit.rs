@@ -14,6 +14,7 @@ use crate::test_support::fixtures_list::{ListFixture, SessionSpec};
 use crate::test_support::fixtures_viewer::wait_viewer_ready;
 use crate::viewer::ViewerPane;
 use crate::viewer::nav;
+use crate::viewer::search::Emphasis;
 
 /// `n` alternating filler messages of three paragraphs each.
 fn filler(n: usize) -> Vec<(&'static str, String)> {
@@ -145,9 +146,13 @@ fn l109_the_previewed_result_opens_at_its_hit(cx: &mut TestAppContext) {
         );
         assert!(list.logical_scroll_top().item_ix > 0, "not at the top");
         let matches = viewer.hit_matches().expect("highlighted");
-        let current: Vec<bool> = matches.values().flatten().map(|m| m.2).collect();
-        assert_eq!(current.len(), 2, "both matches are highlighted");
-        assert_eq!(current.iter().filter(|c| **c).count(), 1, "one is current");
+        let emphases: Vec<Emphasis> = matches.values().flatten().map(|m| m.2).collect();
+        assert_eq!(emphases.len(), 2, "both matches are highlighted");
+        assert_eq!(
+            emphases.iter().filter(|e| **e == Emphasis::Hit).count(),
+            1,
+            "the hit message's match is the hit, the other one secondary"
+        );
     });
     assert_eq!(
         probe(cx, f.handle, &f.ws, "focus"),

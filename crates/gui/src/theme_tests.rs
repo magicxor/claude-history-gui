@@ -76,6 +76,25 @@ fn search_match_text_is_legible_in_both_themes(cx: &mut TestAppContext) {
                 "{mode:?} {name}: {ratio:.2}:1 (text {text:?} on {fill:?})"
             );
         }
+        // The list hit's secondary matches (L-109) have no fill: their text
+        // is drawn on the transcript, the focused message's tint, a hovered
+        // message and code blocks.
+        let text = styles
+            .secondary
+            .color
+            .expect("a match sets its text colour");
+        for fill in [
+            roles.background,
+            roles.list_active,
+            roles.list_hover,
+            roles.code_background,
+        ] {
+            let ratio = contrast_ratio(text, fill, roles.background);
+            assert!(
+                ratio >= MIN_CONTRAST,
+                "{mode:?} secondary match: {ratio:.2}:1 (text {text:?} on {fill:?})"
+            );
+        }
     }
     // The guard itself: a foreground that passes stays, one that fails is
     // replaced by the better of near-black and white.
