@@ -62,8 +62,11 @@
 //!   The worker wakes the poller with each report (upstream's TUI polled
 //!   every 250 ms while indexing). [`Browser::suspend_semantic`] closes the
 //!   worker's channel before it cancels, and forgets the indexing progress
-//!   with the worker (as does a replaced worker); a dropped browser cancels
-//!   its worker's running slice (upstream detached it).
+//!   with the worker (as does a replaced worker); it does not wait for the
+//!   worker, which is usually in the middle of a batch, but hands its
+//!   thread out to be joined off the UI thread ([`SemanticWorkerExit`]). A
+//!   dropped browser cancels its worker's running slice (upstream detached
+//!   it).
 
 use super::corpus::{CorpusSnapshot, SearchSnapshot};
 use super::{
@@ -104,10 +107,41 @@ pub(super) struct SemanticSearchState {
     pub(super) worker_tx: Option<mpsc::Sender<SemanticWorkerCommand>>,
     pub(super) worker_rx: Option<mpsc::Receiver<SemanticSearchMessage>>,
     pub(super) cancellation: Option<SemanticCancellationToken>,
-    /// The worker thread, joined by [`Browser::suspend_semantic`]
+    /// The worker thread, handed out by [`Browser::suspend_semantic`] to be
+    /// joined
     pub(super) worker_thread: Option<std::thread::JoinHandle<()>>,
     /// Suspended by [`Browser::suspend_semantic`]: no worker is started
     pub(super) suspended: bool,
+}
+
+/// The semantic worker stopped by [`Browser::suspend_semantic`] (K6). Its
+/// channel is closed and its running step cancelled, but its thread may
+/// still be finishing that step. [`SemanticWorkerExit::join`] waits until
+/// the thread has ended, which drops the worker's embedder and its copy of
+/// the embedding cache: an exclusive semantic-cache operation joins it
+/// first, on its own thread (never a UI thread). Dropping an exit
+/// detaches the thread, which ends on its own.
+#[derive(Debug, Default)]
+#[must_use = "join the stopped worker before an exclusive semantic-cache operation"]
+pub struct SemanticWorkerExit {
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SemanticWorkerExit {
+    /// Wait until the worker thread has ended (returns at once when there
+    /// was no worker, or it has ended already).
+    pub fn join(self) {
+        if let Some(thread) = self.thread {
+            let _ = thread.join();
+        }
+    }
+
+    /// Whether the worker thread has ended (or there was none).
+    pub fn is_finished(&self) -> bool {
+        self.thread
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished)
+    }
 }
 
 /// What [`Browser::semantic_activity_status_text`] shows.
@@ -984,20 +1018,27 @@ impl Browser {
     }
 
     /// Stop the semantic worker for an exclusive semantic-cache operation
-    /// (generate or clear the cache, K6): cancel its search, close its
-    /// channel and **join** its thread, which drops its embedder and its
-    /// copy of the embedding cache. Blocks until the worker's current step
-    /// returns (embedding checks the cancellation between batches). Its
-    /// background indexing stops with it; what it embedded since its last
-    /// cache write (at most 30 s of work) is embedded again later.
+    /// (generate or clear the cache, K6): cancel its search and close its
+    /// channel, without waiting for it. The worker may still be finishing
+    /// its current step (an embedder call, which checks the cancellation
+    /// only between batches of [`DEFAULT_EMBEDDING_BATCH_SIZE`] passages, or
+    /// a cache write, which may wait up to 2 s for `embeddings.lock`): the
+    /// returned [`SemanticWorkerExit`] joins its thread, which drops its
+    /// embedder and its copy of the embedding cache. Join it before the
+    /// exclusive operation starts, off the UI thread. Its background
+    /// indexing stops with it; what it embedded since its last cache write
+    /// (at most 30 s of work) is embedded again later.
     ///
     /// While suspended no worker is started: a semantic query still gets
     /// the lexical fallback rows, [`Browser::semantic_progress`] is
     /// [`SemanticProgress::Suspended`] and [`Browser::semantic_status_text`]
-    /// is `"sem paused"`. No-op when already suspended.
-    pub fn suspend_semantic(&mut self) {
+    /// is `"sem paused"`. No-op when already suspended (an exit with no
+    /// thread to join).
+    ///
+    /// [`DEFAULT_EMBEDDING_BATCH_SIZE`]: crate::semantic::types::DEFAULT_EMBEDDING_BATCH_SIZE
+    pub fn suspend_semantic(&mut self) -> SemanticWorkerExit {
         if self.semantic_search.suspended {
-            return;
+            return SemanticWorkerExit::default();
         }
         self.semantic_search.suspended = true;
         // The channel is closed before the cancel: an indexing slice the
@@ -1008,9 +1049,9 @@ impl Browser {
         if let Some(cancellation) = self.semantic_search.cancellation.take() {
             cancellation.cancel();
         }
-        if let Some(thread) = self.semantic_search.worker_thread.take() {
-            let _ = thread.join();
-        }
+        let exit = SemanticWorkerExit {
+            thread: self.semantic_search.worker_thread.take(),
+        };
         self.semantic_sent_corpus_version = 0;
         self.semantic_sent_scope_signature = None;
         self.semantic_search.indexing = None;
@@ -1024,6 +1065,7 @@ impl Browser {
         self.semantic_search.prewarm_generation = None;
         self.semantic_search.prewarm_status = None;
         self.semantic_search.last_status = SemanticProgress::Suspended;
+        exit
     }
 
     /// End [`Browser::suspend_semantic`]. In semantic mode the current query

@@ -543,7 +543,7 @@ their signatures and behavior.
 | K3 | `browser`, `history` | `history::rename_session(env: &HistoryEnv, path: &Path, source: Source, title: &str, show_last: bool) -> Result<Conversation, RenameError>` (blocking: write per source, re-parse, preview per `show_last`; Pi ensures a trailing newline); `Browser::apply_renamed_session(&mut self, path: &Path, renamed: PreparedSession) -> Result<(), RenameError>` (the GUI's call, the background task ends in `.map(PreparedSession::new)`; `apply_renamed(path, Conversation)` is the synchronous wrapper that normalizes on the caller's thread; keeps index/project_name/project_path, updates one element and its search data, re-selects by path) | `rename_conversation` stays (sync convenience). Tests: equivalence with `rename_conversation`; `NoTarget` when the path left the corpus meanwhile |
 | K4 | `maintenance`, `browser` | `pub struct DeletePlan { pub source: Source, pub path: PathBuf, pub session_id: String, pub files: Vec<PathBuf>, pub dirs: Vec<PathBuf>, pub metadata: Vec<PathBuf>, pub kept: Vec<PathBuf> }` (`metadata` = a sidecar's `.meta.json`, `kept` = the session's `/btw` forks that stay, 3c2ffeb) (`path` = the listed conversation, added by WP-C); `pub struct DeleteReport { pub removed_files: Vec<PathBuf>, pub removed_dirs: Vec<PathBuf>, pub missing: Vec<PathBuf> }`; `maintenance::plan_session_delete(env: &HistoryEnv, path: &Path, source: Source) -> Result<DeletePlan>` (Claude: every copy via `find_session_copies` + session dirs; Pi: the validated file; OMP: the validated file + artifact dir); **breaking**: `maintenance::execute_session_delete(env: &HistoryEnv, plan: &DeletePlan) -> Result<DeleteReport, Box<SessionDeleteFailure>>` (was `Result<DeleteReport>`; `SessionDeleteFailure { error, partial }` converts `Into<AppError>`; WP-C3) (removes only plan items; on failure writes upstream's debug-log line `Failed to delete session <path>: <e>`); `Browser::remove_paths(&mut self, paths: &[PathBuf]) -> usize` (removes rows, keeps selection position, clears semantic metadata/evidence like `remove_selected_from_list`) | A1/A2. Tests per source; missing files reported not failed; invalid uuid → `SessionNotFound` |
 | K5 | `view` | `impl ViewerModel { pub fn entry_for_agent_ordinal(&self, ordinal: usize) -> Option<usize>; pub fn agent_ordinal_for_entry(&self, entry_index: usize) -> Option<usize> }` | Same placement as `history::messages::MessageOrdinals` over the transcript's dialogue events (as `agent::transcript` places them), each mapped to the entry that shows it (`history::view::entries_with_events`, 9597669), placed once when the model is built (on the viewer worker), not on each reveal; replaced streaming duplicates map to the first entry with that ordinal. Tests against `agent::transcript` ordinals on fixtures |
-| K6 | `browser`, `semantic` | `Browser::suspend_semantic(&mut self)` (cancel, close the channel, **join** the worker thread, drop its embedder; while suspended semantic dispatch reports `SemanticProgress::Suspended` and `semantic_status_text()` = `"sem paused"`); `Browser::resume_semantic(&mut self)` (next dispatch respawns the worker, reloading the cache file; re-dispatches the current semantic query); cache writes take an exclusive `std::fs::File::lock` on `<semantic dir>/embeddings.lock` (wait ≤ 2 s, else skip the write with a Warn debug line); `semantic_ops::{generate_semantic_cache, clear_semantic_cache}` hold the same lock while writing/deleting. Since upstream 8919a76 the cache is the memory-mapped matrix `embeddings-v2.bin` (`semantic::matrix`): a save, under the lock, merges in the rows another writer saved since this one read the file, prunes to 50 000 entries by last use and renames a temporary file into place (never modifying a written file, so readers keep valid maps); the first read without a matrix converts a matching `embeddings-v1.bin` under the lock and removes it (lock timeout: the v1 file is used unconverted this time) | Single writer per process and across processes; no writer drops another's embeddings. Tests: suspend joins (thread gone), resume reloads a cache written meanwhile, lock contention skips without corrupting, writes keep what another writer saved, a save replaces a matrix that readers still map (Windows) |
+| K6 | `browser`, `semantic` | `Browser::suspend_semantic(&mut self) -> SemanticWorkerExit` (close the channel, cancel, and return at once: the worker may still be finishing its current step, an embedder call of up to 64 passages (at the worker's first call also the shared model's lazy load, a download on first use) or a cache write that waits ≤ 2 s for the lock; `SemanticWorkerExit::join()` waits until its thread has ended and dropped its embedder, and the GUI's semantic gate joins it on the exclusive operation's own thread before that operation starts, never on the UI thread; `is_finished()`; while suspended semantic dispatch reports `SemanticProgress::Suspended` and `semantic_status_text()` = `"sem paused"`); `Browser::resume_semantic(&mut self)` (next dispatch respawns the worker, reloading the cache file; re-dispatches the current semantic query); cache writes take an exclusive `std::fs::File::lock` on `<semantic dir>/embeddings.lock` (wait ≤ 2 s, else skip the write with a Warn debug line); `semantic_ops::{generate_semantic_cache, clear_semantic_cache}` hold the same lock while writing/deleting. Since upstream 8919a76 the cache is the memory-mapped matrix `embeddings-v2.bin` (`semantic::matrix`): a save, under the lock, merges in the rows another writer saved since this one read the file, prunes to 50 000 entries by last use and renames a temporary file into place (never modifying a written file, so readers keep valid maps); the first read without a matrix converts a matching `embeddings-v1.bin` under the lock and removes it (lock timeout: the v1 file is used unconverted this time) | Single writer per process and across processes; no writer drops another's embeddings. Tests: suspend does not wait for a worker inside an embedder call and its exit joins it (thread gone, embedder dropped), resume reloads a cache written meanwhile, lock contention skips without corrupting, writes keep what another writer saved, a save replaces a matrix that readers still map (Windows) |
 | K7 | `agent` | `AgentService::with_cancellation(self, token: SemanticCancellationToken) -> Self`; checked between conversations, retrieval batches and embedding batches, and while agent search loads from the store (its reconcile pass, its wait for the store's `LOCK`, its card reads; §11.24); cancelled → `AgentResponse` with `exit_code 1`, `error: None`, `stderr` = `Error: Semantic search cancelled\n` | Tests: a cancelled long fake-embedder search ends early; a search waiting for the store's lock ends when cancelled |
 | K8 | `agent` | `agent::refs::conversation_key_for_path(env: &HistoryEnv, config: &ConfigFile, path: &Path) -> Result<Option<AgentConversationKey>>` — the discovered key whose canonical path equals `path`'s, else `None` | Out-of-root files (exports, attachments) and same-named copies never resolve to another file. Tests: in-root file → key; copy outside → None; same name in another root → None |
 | K9 | `view` | `DocToolResult::ledger_visible_rows(&self, content_width: usize) -> Vec<String>` (the rows the ledger shows at that width in the current fold: hard-wrapped like the ledger, at most `limit` rows when collapsed) | Visual-row truncation for soft-wrapping GUIs (a 50 KB single-line result shows ≤ 4 rows). Tests at widths 40/120 |
@@ -1355,7 +1355,8 @@ pub struct EnvHistory { /* env, Arc<OnceLock<HistoryService>> */ }  // core Hist
 impl EnvHistory { pub fn new(env: Arc<HistoryEnv>) -> Self; pub fn service(&self) -> &HistoryService }  // first use,
 pub fn env_history(cx: &App) -> EnvHistory;                   // off the UI thread; viewer, exports, print, tools
 pub enum SemanticGateState { Open, Exclusive(SemanticOp) }
-pub struct SemanticGate { pub state: SemanticGateState }      // current/is_open/enter_exclusive(op, cx) -> bool/leave(cx)
+pub struct SemanticGate { pub state: SemanticGateState }      // current/is_open/enter_exclusive(op, cx) -> Option<SemanticGateEntry>/leave(cx)
+pub struct SemanticGateEntry;                                 // wait(self): joins the stopped list worker (on the operation's thread)
 pub struct LastToast(pub SharedString);                       // read by QA probes (last_toast(cx))
 pub enum CorpusNotice { Deleted(Vec<PathBuf>) }
 pub struct CorpusBus;  // emits CorpusNotice through cx.emit on a small global Entity<CorpusBus> (CorpusBusHandle)
@@ -1534,11 +1535,19 @@ channel closes; every named thread uses an 8 MiB stack.
   default (`semantic model is not available in tests`). `--qa-model-dir` points the real factory at a pre-downloaded model dir (feature `qa`).
   If `FastembedEmbedder` turns out not to be `Send`, WP7 falls back to per-consumer instances and records it (risk
   §19).
-* `SemanticGate` (globals.rs): `Open` normally. Generate/Clear semantic cache (WP5) call
-  `gate.enter_exclusive(op, cx)`: ListPane `browser.suspend_semantic()` (K6; joins the worker; footer `sem paused`),
+* `SemanticGate` (globals.rs): `Open` normally. Generate/Clear semantic cache (WP5) and the semantic report run call
+  `gate.enter_exclusive(op, cx)`: ListPane `browser.suspend_semantic()` (K6; footer `sem paused` at once),
   AgentWorker drops queued semantic/hybrid jobs (not user-only searches, which core runs lexically) with
-  `Semantic search is paused while the cache is generated/cleared` and stops using the embedder, the shared model is
-  dropped (Clear) or kept (Generate uses it).
+  `Semantic search is paused while the cache is generated/cleared` and stops using the embedder. The list's worker is
+  stopped but not waited for on the UI thread: since background indexing (c6d0421) it is usually in the middle of an
+  embedder call (64 passages; cancellation is checked between calls; at the first call also the shared model's lazy load, a download on first use) or a cache write (up to 2 s waiting for
+  `embeddings.lock`, then the write), so a join there could freeze the window for up to seconds (goal 6). The gate
+  returns a `SemanticGateEntry` holding the worker's `SemanticWorkerExit`; the operation's own thread calls
+  `entry.wait()` first (joins the worker), so the operation starts only once the worker has ended and no list worker
+  uses the model or writes the cache while it runs (the Generate dialog shows `Semantic cache: starting…`
+  meanwhile; checking the cancellation inside an embedder call would need upstream's `SemanticEmbedder` trait to take
+  a token, so the wait, which only delays the operation's start, stays at most one call). Then the shared model is
+  dropped (Clear, on its thread) or kept (Generate uses it).
   `gate.leave(cx)` → `browser.resume_semantic()` (reloads the cache from disk), AgentWorker accepts jobs again. While
   `Exclusive`, a second Generate/Clear is disabled. Cache files are additionally protected by core's write lock (K6),
   so a second GUI instance or a racing writer never corrupts them, and each save merges in what the others saved
@@ -2804,16 +2813,17 @@ the K4 plan) — the same route as §11.9 — so the list drops them, the viewer
 and agent result sets holding them close. Then a background refresh runs (Pi/OMP untouched; Claude counts updated).
 
 ### 11.16 Semantic cache generation / clear (semantic gate, §7.6)
-* Generate: dialog → `gate.enter_exclusive(Generate)` (list worker suspended + joined, agent semantic jobs paused) →
-  std thread: `maintenance::load_sorted_conversations_cancellable(env, show_last, None, &TimeFilter::default())` (fresh, no time
+* Generate: dialog → `gate.enter_exclusive(Generate)` (list worker suspended, agent semantic jobs paused) →
+  std thread: `entry.wait()` (joins the list worker, §7.6) →
+  `maintenance::load_sorted_conversations_cancellable(env, show_last, None, &TimeFilter::default())` (fresh, no time
   filter, AD9) → `semantic_ops::generate_semantic_cache(env, &convs, scope_workspace, &TimeFilter::default(),
   &mut shared.ops_factory(), &mut progress, &cancel)`; progress lines into the dialog; Cancel → `cancel.cancel()` →
   `Semantic search cancelled` (also while the load waits for the list's reconcile pass); capacity error text from core; done → `GenerateReport::text`; finally `gate.leave()`
   (list worker resumes and reloads the cache).
-* Clear: AlertDialog §5.11 → `gate.enter_exclusive(Clear)` → shared model dropped (files closed) →
-  `semantic_ops::clear_semantic_cache(env)` (under core's lock; empties `<cache root>/semantic` and keeps the directory
-  and `embeddings.lock`, never follows links — K6 as built) → `ClearReport::message` / error (+Retry) →
-  `gate.leave()`.
+* Clear: AlertDialog §5.11 → `gate.enter_exclusive(Clear)` → std thread: `entry.wait()` (joins the list worker) →
+  shared model dropped (files closed) → `semantic_ops::clear_semantic_cache(env)` (under core's lock; empties
+  `<cache root>/semantic` and keeps the directory and `embeddings.lock`, never follows links — K6 as built) →
+  `ClearReport::message` / error (+Retry) → `gate.leave()`.
 
 ### 11.17 Update check
 Help/Tools → Check for updates… (or `update` subcommand) → dialog `Checking for updates…` → background
@@ -3768,7 +3778,7 @@ impl ListPane {
     pub fn set_time_filter(&mut self, filter: TimeFilter, label: Option<String>, cx: &mut Context<Self>);
     pub fn set_exclude_projects(&mut self, excluded: Vec<String>, cx: &mut Context<Self>);
     pub fn set_exclude_paths(&mut self, excluded: Vec<String>, cx: &mut Context<Self>);
-    pub fn suspend_semantic(&mut self, cx: &mut Context<Self>);
+    pub fn suspend_semantic(&mut self, cx: &mut Context<Self>) -> SemanticWorkerExit;   // join off the UI thread
     pub fn resume_semantic(&mut self, cx: &mut Context<Self>);
     pub fn project_paths(&self) -> &[PathBuf];                    // cached, computed off-thread
     pub fn choose_workspace_folder(&mut self, window: &mut Window, cx: &mut Context<Self>);
@@ -3866,7 +3876,7 @@ Provides: `main` (incl. headless paths §11.23, time-filter error exit 1); `star
 resolve_workspace, resolve_initial_view, run_startup_tool, show_config_errors}`; `ops::console::{stdout_kind,
 ensure_console, write_stdout, write_stderr}`; complete `RealServices` (spawn via `spawn_terminal_checked`, debug-build
 guard, `exec_in_current_terminal` Unix exec, `login_shell_path`); `embedder::{install, install_fake, browser_factory,
-agent_factory, ops_factory, drop_model}`; `debug_sink::install`; the QA runner (§15.3) + gate (§15.4); CI/release
+agent_factory, ops_factory, installed}` (`SharedEmbedder::drop_model`); `debug_sink::install`; the QA runner (§15.3) + gate (§15.4); CI/release
 (§16); icons + `assets/windows/app.rc` + build.rs resource compile; macOS bundle script; Linux `.desktop`.
 Tests: P launch mapping (`GuiLaunchArgs` → `LaunchContext`/`StartupTool`), PD3 workspace resolution table (incl. root
 /home/exe-dir exclusions, Pi/OMP cwd, `-L`), PD17 initial view resolution table (C-066), console kind logic with
@@ -3978,7 +3988,7 @@ DoD: common + Q `deep-search.qa`, `agent-panel.qa`.
 Owns: `crates/gui/src/tools/*`, `test_support/fixtures_tools.rs`, `tests/fixtures/tools/`,
 `qa/scenarios/tools.qa`.
 Consumes: core `maintenance` (+K4), `semantic_ops`, `update` (via services), `history`, `debug_log`; GUI `MainPanes`
-(list refresh/suspend), `SemanticGate`, `embedder::{ops_factory, drop_model}`, `single_file::open_window`,
+(list refresh/suspend), `SemanticGate`, `embedder::{ops_factory, installed}`, `single_file::open_window`,
 `Services`, `notify`, `DebugBufferHandle`, `widgets::{confirm, path_list, text_view}`, `CorpusBus`,
 `startup::run_startup_tool` (tests of C-013…C-015 call it).
 Provides:
@@ -4890,7 +4900,7 @@ Every review finding of revision 1, in the order received (lens / title), with t
 | P16 | CLI parser deviations (exit code, validator message, missing conflict) | Accepted | Inverted range = runtime `Error: Invalid time range: …` exit 1; `invalid positive integer: <v>`; `--delete`×`--global` (K14, §11.1, §13.1; C-005, C-016, C-020). |
 | P17 | Window-close semantics contradict PD5/PD6 | Accepted | Closing the main window always quits (picker: no output) via its should-close handler (PD6, §11.22; C-065, X-033). |
 | P18 | Uncached-passages banner tells users to run the CLI | Accepted | Banner `<n> passage(s) are not cached. Generate the semantic cache to include them.` + button; the upstream line stays only in the agent text (§12; D-006). |
-| P19 | Clear/Generate don't reset the agent embedder; concurrent cache writers | Accepted | Semantic gate suspends and joins the list worker (K6), pauses agent semantic jobs, drops the shared model before Clear; core write lock (K6) (§7.6, §11.16; T-010, T-024, X-041). |
+| P19 | Clear/Generate don't reset the agent embedder; concurrent cache writers | Accepted | Semantic gate suspends the list worker and joins it on the operation's thread before the operation starts (K6), pauses agent semantic jobs, drops the shared model before Clear; core write lock (K6) (§7.6, §11.16; T-010, T-024, X-041). |
 | P20 | Viewer scroll keys active while typing in the find bar | Accepted | All viewer navigation keys use `Viewer && !Input`, matching V-079 parity (§8.1, §8.3; V-079). |
 | P21 | Time-filter/workspace reloads keep the old list on errors | Accepted | Reloads use K18 `RefreshPolicy::ApplyPartial` with a warning; a fatal failure reverts the chip/workspace with an error toast (§11.20–11.21). |
 | P22 | Deletes from Tools don't clear the viewer or dialogs | Accepted | Every deleting route broadcasts `CorpusNotice::Deleted`; Workspace removes rows, clears the viewer, closes registered dialogs and marks agent result sets (§7.2, §11.15; T-023). |

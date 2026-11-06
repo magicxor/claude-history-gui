@@ -787,8 +787,11 @@ mod infrastructure {
         let _handle = open_single_file(cx, &world, &path);
         cx.update(|cx| {
             assert!(crate::globals::main_panes(cx).deep().is_none());
-            assert!(SemanticGate::enter_exclusive(SemanticOp::Clear, cx));
+            let entry = SemanticGate::enter_exclusive(SemanticOp::Clear, cx).expect("taken");
             assert!(AgentWorkerHandle::global(cx).is_semantic_paused());
+            // No list worker to wait for.
+            assert!(entry.is_ready());
+            entry.wait();
             SemanticGate::leave(cx);
             assert!(!AgentWorkerHandle::global(cx).is_semantic_paused());
         });
@@ -800,8 +803,8 @@ mod infrastructure {
         let (_handle, _ws) = open_main(cx, &world, &[]);
         cx.update(|cx| {
             assert!(SemanticGate::is_open(cx));
-            assert!(SemanticGate::enter_exclusive(SemanticOp::Generate, cx));
-            assert!(!SemanticGate::enter_exclusive(SemanticOp::Clear, cx));
+            assert!(SemanticGate::enter_exclusive(SemanticOp::Generate, cx).is_some());
+            assert!(SemanticGate::enter_exclusive(SemanticOp::Clear, cx).is_none());
             assert!(AgentWorkerHandle::global(cx).is_semantic_paused());
             SemanticGate::leave(cx);
             assert!(SemanticGate::is_open(cx));

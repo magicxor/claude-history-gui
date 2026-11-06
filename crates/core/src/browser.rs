@@ -167,6 +167,7 @@ pub use loader::{
     DEFAULT_DRAIN_BUDGET, HistoryLoader, LoadEvent, LoaderOptions, LoaderPoll, REFRESHING_STATUS,
     RefreshPolicy,
 };
+pub use search_state::SemanticWorkerExit;
 pub use types::{
     DeleteError, DeletedSession, EscapeOutcome, IndexNotice, ListSearchMode, RENAMED_STATUS,
     Readiness, ReconcileState, RenameError, SemanticProgress, SemanticResultMetadata, UuidLookup,

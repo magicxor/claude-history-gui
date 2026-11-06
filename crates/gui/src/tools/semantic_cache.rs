@@ -3,7 +3,9 @@
 //!
 //! Both take the semantic gate: the list worker is suspended (`sem paused`),
 //! agent semantic jobs are paused, and a second Generate/Clear is refused.
-//! Generate runs over the whole corpus (AD9: never a time filter). Clear
+//! The operation's thread first waits for the list's worker to finish its
+//! current step (`SemanticGateEntry::wait`); the UI thread never waits for
+//! it. Generate runs over the whole corpus (AD9: never a time filter). Clear
 //! empties the semantic directory and keeps the directory and
 //! `embeddings.lock` (core K6), after the shared model was dropped.
 
@@ -116,11 +118,12 @@ impl GenerateDialog {
 
     /// The Generate button.
     pub fn start(&mut self, cx: &mut Context<Self>) {
-        if self.state == GenerateState::Running
-            || !SemanticGate::enter_exclusive(SemanticOp::Generate, cx)
-        {
+        if self.state == GenerateState::Running {
             return;
         }
+        let Some(gate) = SemanticGate::enter_exclusive(SemanticOp::Generate, cx) else {
+            return;
+        };
         self.state = GenerateState::Running;
         self.progress = None;
         let cancel = SemanticCancellationToken::new();
@@ -139,6 +142,9 @@ impl GenerateDialog {
         let mut factory = embedder::ops_factory(cx);
         let level = Some(crate::debug_sink::capture_level(cx));
         let rx = spawn_progress_thread("semantic-generate", move |tx| {
+            // The list's semantic worker finishes its current step first
+            // (K6; the dialog says "starting…" meanwhile).
+            gate.wait();
             let progress_tx = tx.clone();
             // The load may wait for the list's reconcile pass: Cancel ends
             // that wait too (the gate is left on `Msg::Done`).
@@ -417,14 +423,20 @@ pub fn open_clear_semantic_cache(window: &mut Window, cx: &mut App) {
         .width_rem(36.0)
         .on_closed(|cx| forget_dialog(CLEAR_ID, cx));
     open_destructive_confirm(options, window, cx, move |control, _, cx| {
-        if !SemanticGate::enter_exclusive(SemanticOp::Clear, cx) {
+        let Some(gate) = SemanticGate::enter_exclusive(SemanticOp::Clear, cx) else {
             control.set_error(Some(GATE_BUSY.into()), cx);
             return ConfirmOutcome::KeepOpen;
-        }
-        // Files the model holds open must be closed first.
-        embedder::drop_model(cx);
+        };
+        let shared = embedder::installed(cx);
         let env = (*app_state(cx).env).clone();
         let rx = spawn_thread("semantic-clear", move || {
+            // The list's semantic worker finishes its current step first
+            // (K6): it may still use the model or write the cache.
+            gate.wait();
+            // Files the model holds open must be closed first.
+            if let Some(shared) = shared {
+                shared.drop_model();
+            }
             clear_semantic_cache(&env)
                 .map(|report| (report.removed, report.message))
                 .map_err(|error| error_text(&error))

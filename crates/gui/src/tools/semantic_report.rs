@@ -255,11 +255,11 @@ impl SemanticReportDialog {
                 }
             }
         };
-        if !SemanticGate::enter_exclusive(SemanticOp::Generate, cx) {
+        let Some(gate) = SemanticGate::enter_exclusive(SemanticOp::Generate, cx) else {
             self.state = RunState::Failed(GATE_BUSY.to_string());
             cx.notify();
             return;
-        }
+        };
         self.state = RunState::Running;
         self.output.set_text("", window, cx);
         let (env, workspace) = {
@@ -275,6 +275,8 @@ impl SemanticReportDialog {
         let dump = self.mode_dump;
         let mut factory = embedder::ops_factory(cx);
         let rx = spawn_thread("semantic-report-run", move || {
+            // The list's semantic worker finishes its current step first (K6).
+            gate.wait();
             if dump {
                 semantic_debug_report(&env, &query, &corpus, workspace.as_ref(), &mut *factory)
                     .map(|report| report.text)

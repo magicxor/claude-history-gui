@@ -29,7 +29,7 @@ use std::time::Duration;
 use chrono::{DateTime, Local};
 use claude_history_core::HistoryEnv;
 use claude_history_core::WorkspaceScope;
-use claude_history_core::browser::ListSearchMode;
+use claude_history_core::browser::{ListSearchMode, SemanticWorkerExit};
 use claude_history_core::config::LayeredConfig;
 use claude_history_core::debug::DebugLevel;
 use claude_history_core::history::service::HistoryService;
@@ -519,6 +519,34 @@ pub struct SemanticGate {
 
 impl Global for SemanticGate {}
 
+/// The semantic gate just taken ([`SemanticGate::enter_exclusive`]). The
+/// list's semantic worker has been told to stop but may still be finishing
+/// its current step: an embedder call (up to 64 passages, or at the first call the model's lazy load) or a cache write
+/// (up to 2 s waiting for `embeddings.lock`, then the write; core K6). The
+/// exclusive operation calls [`SemanticGateEntry::wait`] first, on its own
+/// background thread, and only then touches the semantic cache or the
+/// model, so the UI thread never waits for the worker and the worker never
+/// writes the cache while the operation runs.
+#[must_use = "the exclusive operation must wait for the list's semantic worker before it starts"]
+#[derive(Debug)]
+pub struct SemanticGateEntry {
+    list_worker: SemanticWorkerExit,
+}
+
+impl SemanticGateEntry {
+    /// Block until the list's semantic worker has ended (at once when there
+    /// was none). Never on the UI thread.
+    pub fn wait(self) {
+        self.list_worker.join();
+    }
+
+    /// Whether the list's semantic worker has ended (tests).
+    #[cfg(test)]
+    pub fn is_ready(&self) -> bool {
+        self.list_worker.is_finished()
+    }
+}
+
 impl SemanticGate {
     pub fn current(cx: &App) -> SemanticGateState {
         cx.try_global::<SemanticGate>()
@@ -530,22 +558,26 @@ impl SemanticGate {
         Self::current(cx) == SemanticGateState::Open
     }
 
-    /// Take the gate for `op`. Returns `false` (and changes nothing) when it
-    /// is already held: a second Generate/Clear is not allowed.
-    pub fn enter_exclusive(op: SemanticOp, cx: &mut App) -> bool {
+    /// Take the gate for `op`. Returns `None` (and changes nothing) when it
+    /// is already held: a second Generate/Clear is not allowed. The list's
+    /// semantic worker is stopped without waiting for it (footer `sem
+    /// paused` at once): the operation waits for it on its own thread
+    /// through the returned entry.
+    pub fn enter_exclusive(op: SemanticOp, cx: &mut App) -> Option<SemanticGateEntry> {
         if !Self::is_open(cx) {
-            return false;
+            return None;
         }
         cx.default_global::<SemanticGate>().state = SemanticGateState::Exclusive(op);
         AgentWorkerHandle::global(cx).pause_semantic(true);
         let panes = main_panes(cx);
-        if let Some(list) = panes.list() {
-            list.update(cx, |list, cx| list.suspend_semantic(cx));
-        }
+        let list_worker = panes
+            .list()
+            .map(|list| list.update(cx, |list, cx| list.suspend_semantic(cx)))
+            .unwrap_or_default();
         if let Some(deep) = panes.deep() {
             deep.update(cx, |deep, cx| deep.pause_semantic(true, cx));
         }
-        true
+        Some(SemanticGateEntry { list_worker })
     }
 
     /// Release the gate: the list worker resumes (reloading the cache) and

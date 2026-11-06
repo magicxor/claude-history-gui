@@ -53,7 +53,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Local};
 use claude_history_core::browser::{
     Browser, BrowserOptions, HistoryLoader, ListHit, ListSearchMode, LoaderOptions,
-    PreparedSession, RenameError,
+    PreparedSession, RenameError, SemanticWorkerExit,
 };
 #[cfg(test)]
 use claude_history_core::browser::{LoadEvent, UuidLookup};
@@ -889,11 +889,14 @@ impl ListPane {
         self.refresh(cx);
     }
 
-    /// Semantic gate entered (§7.6): join the semantic worker, footer `sem paused`.
-    pub fn suspend_semantic(&mut self, cx: &mut Context<Self>) {
+    /// Semantic gate entered (§7.6): stop the semantic worker, footer `sem
+    /// paused`. The worker may still be finishing its current step: the
+    /// returned exit joins it, off the UI thread (core K6).
+    pub fn suspend_semantic(&mut self, cx: &mut Context<Self>) -> SemanticWorkerExit {
         self.semantic_suspended = true;
-        self.browser.suspend_semantic();
+        let exit = self.browser.suspend_semantic();
         cx.notify();
+        exit
     }
 
     /// Semantic gate left: the worker restarts and reloads the cache.

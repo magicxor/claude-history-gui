@@ -319,7 +319,7 @@ fn browser_timings_on_20k_rows() {
         refresh_semantic.push(refresh(&sandbox, &mut browser));
         // Stop (and join) the worker that is still embedding 20k
         // conversations, so it does not compete with the next measurements.
-        browser.suspend_semantic();
+        browser.suspend_semantic().join();
         drop(browser);
 
         let (mut browser, install) = initial_load(&sandbox, scoped(), &mut appends, |_| {});

@@ -1770,7 +1770,7 @@ fn refreshed_semantic_results_keep_the_row_the_user_moved_to() {
     );
 }
 
-/// Fork (K6): a suspended worker is joined, so its indexing progress goes
+/// Fork (K6): a suspended worker is stopped, so its indexing progress goes
 /// with it.
 #[test]
 fn suspending_the_worker_forgets_its_indexing() {
@@ -1780,7 +1780,7 @@ fn suspending_the_worker_forgets_its_indexing() {
         completed: 1,
         total: 2,
     });
-    app.suspend_semantic();
+    app.suspend_semantic().join();
     assert_eq!(app.semantic_indexing(), None);
     assert_eq!(app.semantic_activity_status_text(), None);
 }

@@ -456,9 +456,11 @@ fn a_suspended_semantic_worker_says_paused(cx: &mut TestAppContext) {
     let f = ListFixture::open_loaded(cx, &world, &[]);
     to_semantic(&f, cx);
     f.wait_idle(cx);
-    f.with_window(cx, |list, _, cx| list.suspend_semantic(cx));
+    let exit = f.with_window(cx, |list, _, cx| list.suspend_semantic(cx));
     let status = f.read(cx, |list, _| list.search_status().text);
     assert!(status.contains("sem paused"), "{status}");
+    // The idle worker ends at once.
+    exit.join();
     f.with_window(cx, |list, _, cx| list.resume_semantic(cx));
     f.wait_idle(cx);
     let status = f.read(cx, |list, _| list.search_status().text);

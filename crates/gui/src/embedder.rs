@@ -8,7 +8,7 @@
 //! [`agent_factory`] (`agent::service::EmbedderFactory`) and
 //! [`ops_factory`] (an owned `FnMut` for `semantic_ops::EmbedderFactory<'_>`).
 //! Each adapter locks the shared model per call, so one model is in memory
-//! and Clear semantic cache can drop it ([`drop_model`]).
+//! and Clear semantic cache can drop it ([`SharedEmbedder::drop_model`]).
 //!
 //! [`install`] sets up fastembed
 //! (`FastembedEmbedder::new_in(env.semantic_model_dir(), false, Background)`,
@@ -247,11 +247,12 @@ pub fn ops_factory(cx: &App) -> OpsEmbedderFactory {
     })
 }
 
-/// Drop the shared model (Clear semantic cache, under the semantic gate).
-pub fn drop_model(cx: &mut App) {
-    if let Some(handle) = cx.try_global::<SharedEmbedderHandle>() {
-        handle.0.drop_model();
-    }
+/// The shared embedder when one is installed. Clear semantic cache drops its
+/// model ([`SharedEmbedder::drop_model`]) on its own thread, under the
+/// semantic gate, once the list's semantic worker has ended.
+pub fn installed(cx: &App) -> Option<Arc<SharedEmbedder>> {
+    cx.try_global::<SharedEmbedderHandle>()
+        .map(|handle| handle.0.clone())
 }
 
 #[cfg(test)]
@@ -363,8 +364,10 @@ mod tests {
         assert!(!handle.is_loaded());
         browser().unwrap().embed_query("q").unwrap();
         assert_eq!(created.load(Ordering::SeqCst), 2);
-        // Clear semantic cache through the App entry point.
-        cx.update(drop_model);
+        // Clear semantic cache drops the installed embedder's model.
+        let installed = cx.read(installed).expect("installed");
+        assert!(Arc::ptr_eq(&installed, &handle));
+        installed.drop_model();
         assert!(!handle.is_loaded());
         ops().unwrap().embed_query("q").unwrap();
         assert_eq!(created.load(Ordering::SeqCst), 3);

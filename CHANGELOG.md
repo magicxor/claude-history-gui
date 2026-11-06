@@ -51,7 +51,9 @@ Release notes are taken from the `## v<version>` section of this file by the rel
   background ("sem indexing 40%  1200/3000 chunks" with a progress bar in the list footer) instead of making every
   search wait until all of them are embedded. When indexing finishes, the results are refreshed, keeping the row you
   selected; a search that nothing embedded so far matches shows the keyword matches until something indexed matches,
-  which is after the first slice, about two seconds in.
+  which is after the first slice, about two seconds in. Tools > Generate semantic cache and Clear semantic cache
+  pause the background indexing without freezing the window while it finishes the batch it is embedding; they
+  start once it has stopped.
 - Claude Code `/btw` side questions are listed and searched as conversations of their own, tagged `fork`, and the
   question is also searchable in the session it was asked in.
 - Claude Code subagent transcripts are indexed with their session and can be read in full. The viewer header of a

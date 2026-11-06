@@ -11,7 +11,7 @@ use crate::history::model::SourceKind;
 use crate::semantic::embed::SemanticEmbedder;
 use crate::semantic_worker::{SemanticSearchMessage, SemanticWorkerCommand};
 use chrono::{Duration as ChronoDuration, Local, TimeZone};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 const UUID_A: &str = "aaaaaaaa-1111-4111-8111-111111111111";
@@ -1314,11 +1314,17 @@ fn remove_paths_removes_rows_keeps_the_selection_and_clears_metadata() {
 struct CountingEmbedder {
     passages: Arc<AtomicUsize>,
     drops: Arc<AtomicUsize>,
+    hold: Arc<AtomicBool>,
 }
 
 impl SemanticEmbedder for CountingEmbedder {
+    /// Counts the passages, then waits (≤ 30 s) while `hold` is set.
     fn embed_passages(&mut self, passages: &[String]) -> crate::error::Result<Vec<Vec<f32>>> {
         self.passages.fetch_add(passages.len(), Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while self.hold.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         Ok(passages.iter().map(|text| embedding(text)).collect())
     }
 
@@ -1345,22 +1351,27 @@ struct Counters {
     factory: SemanticEmbedderFactory,
     passages: Arc<AtomicUsize>,
     drops: Arc<AtomicUsize>,
+    /// While set, `embed_passages` calls wait.
+    hold: Arc<AtomicBool>,
 }
 
 fn counting_factory() -> Counters {
     let passages = Arc::new(AtomicUsize::new(0));
     let drops = Arc::new(AtomicUsize::new(0));
-    let (p, d) = (passages.clone(), drops.clone());
+    let hold = Arc::new(AtomicBool::new(false));
+    let (p, d, h) = (passages.clone(), drops.clone(), hold.clone());
     let factory: SemanticEmbedderFactory = Arc::new(move || {
         Ok(Box::new(CountingEmbedder {
             passages: p.clone(),
             drops: d.clone(),
+            hold: h.clone(),
         }) as Box<dyn SemanticEmbedder>)
     });
     Counters {
         factory,
         passages,
         drops,
+        hold,
     }
 }
 
@@ -1387,7 +1398,7 @@ fn wait_for_semantic(app: &mut Browser) {
 }
 
 #[test]
-fn suspend_joins_the_worker_and_drops_its_embedder() {
+fn suspend_and_join_end_the_worker_and_drop_its_embedder() {
     let sandbox = Sandbox::new();
     let counters = counting_factory();
     let mut app = semantic_app(&sandbox, counters.factory.clone());
@@ -1397,7 +1408,7 @@ fn suspend_joins_the_worker_and_drops_its_embedder() {
     assert_eq!(counters.drops.load(Ordering::SeqCst), 0);
     assert!(app.semantic_search.worker_thread.is_some());
 
-    app.suspend_semantic();
+    app.suspend_semantic().join();
     // Joined: the worker thread has ended and dropped its embedder.
     assert!(app.semantic_search.worker_thread.is_none());
     assert!(app.semantic_search.worker_tx.is_none());
@@ -1415,7 +1426,45 @@ fn suspend_joins_the_worker_and_drops_its_embedder() {
     assert_eq!(app.row(0).unwrap().session_id, "a");
     app.set_query("");
     assert!(app.semantic_search.worker_tx.is_none(), "no prewarm either");
-    app.suspend_semantic(); // no-op
+    // A no-op: nothing to join.
+    assert!(app.suspend_semantic().is_finished());
+}
+
+/// K6: suspending does not wait for a worker that is inside an embedder
+/// call (the GUI suspends on its UI thread); the exit it returns joins the
+/// worker once the call returns, and the worker stops there.
+#[test]
+fn suspend_does_not_wait_for_a_busy_worker_and_its_exit_joins_it() {
+    let sandbox = Sandbox::new();
+    let counters = counting_factory();
+    counters.hold.store(true, Ordering::SeqCst);
+    let mut app = semantic_app(&sandbox, counters.factory.clone());
+    app.set_query("beta");
+    // The worker's indexing is inside its first embedder call.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while counters.passages.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "the worker never embedded");
+        app.poll();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let embedding = counters.passages.load(Ordering::SeqCst);
+
+    let exit = app.suspend_semantic();
+    assert!(app.is_semantic_suspended());
+    assert_eq!(app.semantic_status_text().as_deref(), Some("sem paused"));
+    assert!(app.semantic_search.worker_thread.is_none());
+    assert!(!exit.is_finished(), "the worker is still in its call");
+    assert_eq!(counters.drops.load(Ordering::SeqCst), 0);
+
+    counters.hold.store(false, Ordering::SeqCst);
+    exit.join();
+    // The worker ended after the call it was in and dropped its embedder.
+    assert_eq!(counters.drops.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.passages.load(Ordering::SeqCst), embedding);
+    // Nothing from the stopped worker is applied.
+    wait_for_semantic(&mut app);
+    assert_eq!(app.semantic_progress(), &SemanticProgress::Suspended);
+    assert!(app.semantic_search.worker_tx.is_none());
 }
 
 #[test]
@@ -1423,7 +1472,7 @@ fn resume_reloads_a_cache_written_meanwhile() {
     let sandbox = Sandbox::new();
     let counters = counting_factory();
     let mut app = semantic_app(&sandbox, counters.factory.clone());
-    app.suspend_semantic();
+    app.suspend_semantic().join();
 
     // The exclusive operation: generate the cache for the same corpus.
     let corpus = app.into_conversations();
@@ -1444,7 +1493,7 @@ fn resume_reloads_a_cache_written_meanwhile() {
     assert!(sandbox.env.embedding_cache_file().unwrap().exists());
 
     let mut app = semantic_app(&sandbox, counters.factory.clone());
-    app.suspend_semantic();
+    app.suspend_semantic().join();
     app.set_query("beta");
     wait_for_semantic(&mut app);
     app.resume_semantic();
@@ -1465,7 +1514,7 @@ fn semantic_messages_from_a_suspended_worker_are_ignored() {
     let sandbox = Sandbox::new();
     let mut app = semantic_app(&sandbox, counting_factory().factory);
     let (_request_tx, _request_rx, response_tx) = connect_semantic_search_channels(&mut app);
-    app.suspend_semantic();
+    app.suspend_semantic().join();
     // The suspended browser dropped the worker's channel.
     let sent = response_tx.send(SemanticSearchMessage::Progress {
         generation: app.search_generation,
