@@ -766,7 +766,8 @@ mod pure {
 
     #[test]
     fn v064_subagent_result_has_a_result_header_and_clipped_rows() {
-        // A block array pretty-prints to several JSON lines (quirk 4 kept).
+        // Four text blocks join with blank lines into seven lines (upstream
+        // 6afae1c), clipped to four with three hidden.
         let blocks: Vec<String> = (1..=4)
             .map(|i| format!(r#"{{"type":"text","text":"row {i} {}"}}"#, "z".repeat(100)))
             .collect();
@@ -788,7 +789,48 @@ mod pure {
         let body = &result.segments[1];
         assert!(body.line_count() <= 4);
         assert!(body.text.lines().all(|l| l.chars().count() <= 40));
-        assert!(result.more.is_some());
+        assert!(body.text.starts_with("row 1 z"), "{:?}", body.text);
+        assert_eq!(result.more, Some(3));
+    }
+
+    #[test]
+    fn v064_empty_subagent_result_shows_only_its_header() {
+        // A string result is its text (upstream 6afae1c), so an empty one
+        // has no body row, as in the ledger.
+        let lines = vec![
+            user("q"),
+            subagent_text("toolu_parent_abc", "sub", 1),
+            r#"{"type":"user","parent_tool_use_id":"toolu_parent_abc","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"r","content":""}]}}"#.to_string(),
+        ];
+        for mode in [ToolDisplayMode::Truncated, ToolDisplayMode::Full] {
+            let items = items_for(&lines, prefs(mode, true, false), 40);
+            let result = items
+                .iter()
+                .find(|i| i.kind == ItemKind::SubagentResult)
+                .expect("subagent result");
+            assert_eq!(result.segments.len(), 1, "{mode:?}");
+            assert_eq!(result.segments[0].text, "<Result>");
+            assert_eq!(result.more, None);
+        }
+    }
+
+    #[test]
+    fn v064_subagent_result_trailing_newline_adds_no_blank_row() {
+        let lines = vec![
+            user("q"),
+            subagent_text("toolu_parent_abc", "sub", 1),
+            r#"{"type":"user","parent_tool_use_id":"toolu_parent_abc","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"r","content":"a\nb\n"}]}}"#.to_string(),
+        ];
+        for mode in [ToolDisplayMode::Truncated, ToolDisplayMode::Full] {
+            let items = items_for(&lines, prefs(mode, true, false), 40);
+            let result = items
+                .iter()
+                .find(|i| i.kind == ItemKind::SubagentResult)
+                .expect("subagent result");
+            let rows: usize = result.segments[1..].iter().map(|s| s.line_count()).sum();
+            assert_eq!(rows, 2, "{mode:?}");
+            assert!(result.segments[1..].iter().all(|s| !s.text.ends_with('\n')));
+        }
     }
 
     #[test]

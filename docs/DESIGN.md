@@ -2094,7 +2094,7 @@ bitflags-like: Style { bold, italic, code, heading, link, quote, dimmed, strike,
 pub fn markdown(text: &str) -> Vec<Segment>;
 pub fn code_block(text: &str, lang: &str) -> Segment;          // fenced ```text for tool results
 pub fn tool_body(lines: &[ToolBodyLine], clip_cols: Option<usize>) -> Segment;  // diff_add / diff_remove / dimmed per line
-pub fn plain(text: &str, dimmed: bool, clip_cols: Option<usize>) -> Segment;    // subagent results (pretty JSON)
+pub fn plain(text: &str, dimmed: bool, clip_cols: Option<usize>) -> Segment;    // subagent results
 // search.rs keeps core `text_match::NormalizedForm::new(&seg.text)` per segment, built lazily on the first search
 // (the search-normalized text plus a sparse offset map back to the segment text, as core DocSearchIndex)
 ```

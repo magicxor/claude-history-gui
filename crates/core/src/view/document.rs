@@ -60,11 +60,10 @@ use super::ViewPrefs;
 use super::ledger::{
     RenderOptions, RenderableEntry, RowTiming, TRUNCATED_BODY_LINES, TRUNCATED_RESULT_LINES,
     TimingSlot, ToolActivitySummary, ToolDisplayMode, ToolOutputId, ToolOutputKind,
-    assistant_label, call_line, entry_shows_nothing, format_timestamp, format_tool_result_content,
-    group_call_result, group_messages, group_summary_line, make_tool_output_id,
-    make_tool_summary_output_id, render_markdown_to_lines, subagent_label, summarize_tool_calls,
-    summary_rows, tool_only_assistant_summary, tool_result_display_text,
-    user_entry_is_only_tool_results,
+    assistant_label, call_line, entry_shows_nothing, format_timestamp, group_call_result,
+    group_messages, group_summary_line, make_tool_output_id, make_tool_summary_output_id,
+    render_markdown_to_lines, subagent_label, summarize_tool_calls, summary_rows,
+    tool_only_assistant_summary, tool_result_display_text, user_entry_is_only_tool_results,
 };
 use crate::commands::process_command_message;
 use crate::history::model::{Message, Part, Role};
@@ -440,9 +439,12 @@ impl DocToolCall {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DocToolResult {
     pub id: ToolOutputId,
-    /// Display text: a string result verbatim, the `text` fields of a block
-    /// array joined by a blank line, otherwise pretty-printed JSON,
-    /// `<no content>` or `<invalid content>`.
+    /// Display text ([`crate::tool_format::format_tool_result`], upstream
+    /// 6afae1c): content blocks joined by a blank line, with images,
+    /// documents and loaded tools as one-line placeholders
+    /// (`[image: image/png]`, `Loaded tool: X`); a tool error as
+    /// `Error: ...`; a one-line JSON string and any other value
+    /// pretty-printed; `<no content>` without content.
     pub text: String,
     /// What the ledger renders as markdown: `text` fenced as
     /// `` ```text `` unless it already contains a fence.
@@ -645,8 +647,9 @@ fn markdown_prefix_for_rows(markdown: &str, visible: usize) -> String {
 }
 
 /// A tool result inside a subagent or agent-progress message: the ledger
-/// shows `"  ↳ Tool │ <Result>"` and then the raw content pretty-printed as
-/// JSON (a string result appears quoted with `\n` escapes), muted, unwrapped.
+/// shows `"  ↳ Tool │ <Result>"` and then the same display text as a
+/// top-level result ([`DocToolResult::text`], upstream 6afae1c), muted,
+/// unwrapped and not rendered as markdown.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DocSubagentToolResult {
     pub id: ToolOutputId,
@@ -1115,7 +1118,7 @@ impl Builder<'_> {
                     let slot = timing.pad();
                     blocks.push(self.subagent_tool_result(
                         id,
-                        format_tool_result_content(content.as_ref()),
+                        tool_result_display_text(content.as_ref()),
                         slot,
                     ));
                 } else {
@@ -1412,7 +1415,7 @@ impl Builder<'_> {
                     );
                     blocks.push(self.subagent_tool_result(
                         id,
-                        format_tool_result_content(content.as_ref()),
+                        tool_result_display_text(content.as_ref()),
                         TimingSlot::from_show_timing(self.prefs.show_timing),
                     ));
                 }

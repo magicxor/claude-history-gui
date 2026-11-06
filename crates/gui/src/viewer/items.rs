@@ -711,11 +711,15 @@ fn subagent_pending(
     let header = segments::styled_line(SUBAGENT_RESULT_HEADER, Style::DIMMED);
     let collapsed = is_collapsed(result.fold);
     let mut chunks = Vec::new();
-    if collapsed {
+    if result.text.is_empty() {
+        // An empty result (since upstream 6afae1c a string result is its
+        // text, not a quoted JSON string) has no body row, like the ledger.
+        chunks.push(vec![header]);
+    } else if collapsed {
         let body = segments::plain(&result.visible_text(), true, Some(cols));
         chunks.push(vec![header, body]);
     } else {
-        let body = segments::plain(&result.text, true, None);
+        let body = segments::plain(&result.visible_text(), true, None);
         let mut first = Some(header);
         for piece in line_chunks(body) {
             let mut chunk = Vec::new();

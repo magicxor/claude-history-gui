@@ -8,8 +8,10 @@
 //!   [`crate::commands::process_command_message`], no markdown rendering;
 //! - tool calls as `Claude: {header}` with the body indented by 2 spaces,
 //!   formatted for an 80-column width (Bash commands wrap at 74);
-//! - tool results as `Tool: <Result>` followed by the content (strings
-//!   verbatim, anything else pretty-printed JSON);
+//! - tool results as `Tool: <Result>` followed by the content formatted by
+//!   [`tool_format::format_tool_result`] (block text, `[image: image/png]`
+//!   style placeholders, `Error: ...` for tool errors, other JSON
+//!   pretty-printed, upstream 6afae1c);
 //! - thinking as `Thinking: {text}` (top-level assistants only);
 //! - subagent and `agent_progress` entries as `  [{id}] User: …` /
 //!   `  [{id}] Agent: …`, their tool bodies and results indented by 4;
@@ -112,7 +114,7 @@ impl PlainFormatter {
 
     fn format_tool_result(&mut self, content: Option<&serde_json::Value>) {
         let _ = writeln!(self.output, "Tool: <Result>");
-        let content_str = format_tool_content(content);
+        let content_str = tool_format::format_tool_result(content);
         let _ = writeln!(self.output, "{}", content_str);
     }
 
@@ -159,26 +161,10 @@ impl PlainFormatter {
 
     fn format_agent_tool_result(&mut self, _agent_id: &str, content: Option<&serde_json::Value>) {
         let _ = writeln!(self.output, "    Tool: <Result>");
-        let content_str = format_tool_content(content);
+        let content_str = tool_format::format_tool_result(content);
         for line in content_str.lines() {
             let _ = writeln!(self.output, "    {}", line);
         }
-    }
-}
-
-/// Format tool result content to a string
-fn format_tool_content(content: Option<&serde_json::Value>) -> String {
-    match content {
-        Some(value) => {
-            if let Some(s) = value.as_str() {
-                s.to_string()
-            } else if let Ok(formatted) = serde_json::to_string_pretty(value) {
-                formatted
-            } else {
-                "<invalid content>".to_string()
-            }
-        }
-        None => "<no content>".to_string(),
     }
 }
 

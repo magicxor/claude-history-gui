@@ -54,8 +54,7 @@ pub(crate) use summary::{
 };
 pub(crate) use timing::{RowTiming, TimingSlot};
 pub(crate) use tools::{
-    ToolOutputKind, format_tool_result_content, make_tool_output_id, make_tool_summary_output_id,
-    tool_result_display_text,
+    ToolOutputKind, make_tool_output_id, make_tool_summary_output_id, tool_result_display_text,
 };
 
 /// Width of the focus gutter indicator (▌ + space)

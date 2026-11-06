@@ -1728,8 +1728,9 @@ fn agent_progress_user_with_text_and_result_keeps_template_order() {
     let DocBlockKind::SubagentToolResult(result) = &message.blocks[1].kind else {
         panic!("expected a subagent result: {doc:#?}");
     };
-    // Subagent results are the raw content as pretty JSON.
-    assert_eq!(result.text, "\"result body\"");
+    // Subagent results show the same display text as top-level results
+    // (upstream 6afae1c), not a JSON-quoted string.
+    assert_eq!(result.text, "result body");
     assert_eq!(
         result.id.0,
         "entry:0:parent:agent-abc1234:block:1:kind:result:id:toolu_1"
@@ -2040,8 +2041,10 @@ fn result_visible_text_and_markdown_follow_the_fold() {
         subagent[0].visible_text(),
         "{\n  \"a\": 1,\n  \"b\": [\n    1,"
     );
-    assert_eq!(subagent[1].text, "\"r1\\nr2\\nr3\\nr4\\nr5\"");
-    assert_eq!(subagent[1].hidden_lines(), None);
+    // A string result is its text, so its lines count (upstream 6afae1c).
+    assert_eq!(subagent[1].text, "r1\nr2\nr3\nr4\nr5");
+    assert_eq!(subagent[1].hidden_lines(), Some(1));
+    assert_eq!(subagent[1].visible_text(), "r1\nr2\nr3\nr4");
 }
 
 #[test]
@@ -2373,29 +2376,47 @@ fn v030_warmup_exchange_is_rendered_in_the_viewer() {
 }
 
 #[test]
-fn v058_image_only_read_result_shows_pretty_json_with_the_base64_data() {
+fn v058_image_results_show_a_placeholder_without_the_base64_data() {
+    // Upstream 6afae1c: an image result shows `[image: <media type>]`, also
+    // next to text (which used to drop the image), and a tool error reads
+    // `Error: ...` without its tags.
     let entries = [
         entry(
             0,
-            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"shot.png"}}]}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[
+                {"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"shot.png"}},
+                {"type":"tool_use","id":"toolu_2","name":"Read","input":{"file_path":"page.png"}},
+                {"type":"tool_use","id":"toolu_3","name":"Edit","input":{"file_path":"a.md","old_string":"x","new_string":"y"}}
+            ]}}"#,
         ),
         entry(
             1,
-            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"QkFTRTY0REFUQQ=="}}]}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"QkFTRTY0REFUQQ=="}}]},
+                {"type":"tool_result","tool_use_id":"toolu_2","content":[{"type":"text","text":"caption"},{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"T1RIRVJEQVRB"}}]},
+                {"type":"tool_result","tool_use_id":"toolu_3","content":"<tool_use_error>String to replace not found in file.</tool_use_error>"}
+            ]}}"#,
         ),
     ];
     let doc = build(&entries, &prefs(ToolDisplayMode::Full));
-    let DocBlockKind::ToolResult(result) = &doc.messages[1].blocks[0].kind else {
-        panic!("expected a result: {doc:#?}");
-    };
-    let parsed: serde_json::Value = serde_json::from_str(&result.text).expect("pretty JSON");
+    let texts: Vec<&str> = doc.messages[1]
+        .blocks
+        .iter()
+        .filter_map(|block| match &block.kind {
+            DocBlockKind::ToolResult(result) => Some(result.text.as_str()),
+            _ => None,
+        })
+        .collect();
     assert_eq!(
-        parsed[0]["source"]["data"],
-        serde_json::json!("QkFTRTY0REFUQQ==")
+        texts,
+        [
+            "[image: image/png]",
+            "caption\n\n[image: image/jpeg]",
+            "Error: String to replace not found in file.",
+        ]
     );
-    assert!(
-        result.text.contains('\n'),
-        "pretty-printed: {}",
-        result.text
-    );
+    let text = doc_text(&doc);
+    for secret in ["QkFTRTY0REFUQQ==", "T1RIRVJEQVRB", "tool_use_error"] {
+        assert!(!text.contains(secret), "{secret} in {text}");
+    }
 }

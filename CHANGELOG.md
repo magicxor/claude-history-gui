@@ -4,6 +4,10 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 ## Unreleased
 
+- Tool results show screenshots and documents as `[image: image/png]` or `[document: application/pdf]` instead of
+  pages of base64 data, also next to text (where the image used to be dropped), tool errors as `Error: ...` and
+  one-line JSON results pretty-printed. Subagent results show their text instead of a quoted JSON string. Exports
+  and copied conversations format results the same way.
 - The viewer has a new **Calls** tool display between Summary and Truncated (toolbar, View > Tool display, and the
   `t` cycle: Off, Summary, Calls, Truncated, Full). It lists every tool call of a run on its own line, such as
   `Bash: cargo test`, without the results; a click on one of these lines expands just that call and its result,
