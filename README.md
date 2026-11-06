@@ -119,8 +119,8 @@ log, show the projects directory, delete a conversation by session ID, check for
 **Settings and themes**
 * Themes: follow the system, Light or Dark (View > Theme, Settings, palette).
 * A Settings dialog (General, Display, Search, Keys, Resume, Agent) that edits `gui.toml` only; every field shows
-  where its value comes from. Resume, Fork, Rename, Delete, Refresh and Show automated and subagent
-  conversations keys are rebindable.
+  where its value comes from. Resume, Fork, Rename, Delete, Refresh, Show automated and subagent
+  conversations and Search only your own messages keys are rebindable.
 * Window layout, workspace and view defaults are remembered between runs.
 
 The full parity checklist with one row per upstream behavior is in [`docs/FEATURES.md`](docs/FEATURES.md).

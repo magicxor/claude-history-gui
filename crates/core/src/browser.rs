@@ -201,8 +201,8 @@ pub struct BrowserOptions {
     /// Project names hidden from the list (`[tui].exclude_projects`).
     pub exclude_projects: Vec<String>,
     /// Working-directory prefixes hidden from the list (`[tui].exclude_paths`,
-    /// upstream 982aea9): literal, case-sensitive prefixes of a
-    /// conversation's recorded cwd; empty entries are ignored.
+    /// upstream 982aea9): literal prefixes (case-insensitive on
+    /// Windows, upstream 59417d1) of a conversation's recorded cwd; empty entries are ignored.
     pub exclude_paths: Vec<String>,
     /// The workspace for the "project" scope. [`BrowserOptions::new`] takes
     /// it from [`HistoryEnv::workspace`] (a workspace that is not an

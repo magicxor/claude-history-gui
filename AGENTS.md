@@ -112,7 +112,9 @@ after an edit takes about 15 s.
 
 CI tests every change on Ubuntu, so a local Linux build is needed only when the change touches
 platform-specific code: `cfg(unix)` / `cfg(windows)` / `cfg(target_os = ...)` blocks (core: `env`,
-`program`, `settings`, `history/path`, `resume/terminal`, `semantic/cache`; gui: `ops/console`,
+`program`, `settings`, `maintenance`, `resume`, `resume/terminal`, `bench`,
+`history/{path,actions,workspace,pi_loader}`, `history/sources` (and `sources/codex/head`),
+`store/{reconcile,generation,progress}`, `browser/index`, `semantic/{cache,fastembed}`; gui: `ops/console`,
 `services`, `single_file`, `globals`, `workspace`, `test_support`, `qa/gate`), `libc` calls, file
 permissions, or the dependencies (`Cargo.toml`, `Cargo.lock`).
 

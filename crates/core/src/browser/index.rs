@@ -255,7 +255,8 @@ pub(super) struct ScopeSettings {
 ///   names, or is a worktree `parent/branch` whose parent is. Conversations
 ///   without a project name are never excluded.
 /// * A conversation whose recorded cwd starts with one of the excluded
-///   paths is excluded (upstream 982aea9: literal, case-sensitive prefixes;
+///   paths is excluded (upstream 982aea9: literal prefixes, case-insensitive on
+///   Windows, 59417d1;
 ///   without a cwd it stays).
 /// * Automated and child conversations are listed only with `all_kinds`
 ///   (upstream 8f60c5f, cb990e6).

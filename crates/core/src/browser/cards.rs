@@ -17,8 +17,8 @@
 //! Two steps show a generation:
 //!
 //! 1. [`Browser::show_snapshot`] lists the newest [`SNAPSHOT_ROWS`] cards in
-//!    scope for the first frame (bounded work, on the caller's thread);
-//!    queries wait.
+//!    scope for the first frame, on the caller's thread (it evaluates the
+//!    scope of every card, O(cards), as upstream's swap does); queries wait.
 //! 2. [`Browser::install_generation`] takes a [`GenerationOpen`]: every card
 //!    materialized, its lookup data and the generation's index, built off
 //!    the UI thread. From then on row `r` below [`Browser::generation_len`]
@@ -520,7 +520,9 @@ impl Browser {
     /// row, its index answers lexical queries, overlays the generation
     /// reflects are dropped and the others applied, and the query, the
     /// scope, the time filter shown and the selected session are kept (a
-    /// query's rows stay until it answers). Pointer-sized work per card.
+    /// query's rows stay until it answers). O(cards) on the caller's thread:
+    /// it evaluates the scope of every card (listed flag, project, time
+    /// filter, excluded and workspace paths) and sets it on the generation.
     pub(super) fn install_generation(&mut self, open: GenerationOpen) {
         if self.single_file_mode {
             return;
