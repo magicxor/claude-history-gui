@@ -10,7 +10,7 @@ built on [gpui-kit](https://crates.io/crates/gpui-kit) (GPUI) and a UI-agnostic 
 ## Credits and license
 
 * The original **claude-history** is by [Raine](https://github.com/raine/claude-history), MIT licensed.
-  `crates/core` is derived from it (v0.1.76); its license text is in
+  `crates/core` is derived from it (v0.1.76, synced through v0.1.80; see `crates/core/README.md`); its license text is in
   [`crates/core/LICENSE-MIT`](crates/core/LICENSE-MIT) and that crate is distributed under the same MIT terms.
 * The rest of the repository (the GUI crate, tools, docs) is under the repository [`LICENSE`](LICENSE)
   (the Unlicense).

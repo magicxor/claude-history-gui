@@ -11,7 +11,8 @@ license = "Unlicense"
 repository = "https://github.com/magicxor/claude-history-gui"
 
 [workspace.dependencies]
-# Versions follow upstream claude-history v0.1.76 (Cargo.toml); the copied
+# Versions follow upstream claude-history v0.1.76 (Cargo.toml; the code is
+# synced through v0.1.80, see "Upstream sync" in crates/core/README.md); the copied
 # Cargo.lock keeps the resolved versions identical to the upstream tree,
 # except where gpui-kit 0.7.3's tree requires a newer minimum of a package
 # core shares (recorded when the GUI crate was added): memchr 2.8.3,

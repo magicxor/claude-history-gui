@@ -8,7 +8,8 @@ depends on a terminal or GUI toolkit.
 ## Origin and license
 
 This crate is derived from [claude-history](https://github.com/raine/claude-history)
-v0.1.76 (commit `8d4cf67`), Copyright (c) 2024 Raine, released under the MIT
+v0.1.76 (commit `8d4cf67`) and kept in step with it up to v0.1.80 (commit `38b1267`,
+see [Upstream sync](#upstream-sync)), Copyright (c) 2024 Raine, released under the MIT
 license. The upstream license text is in [`LICENSE-MIT`](LICENSE-MIT), and this
 crate is distributed under the same MIT terms. The rest of the repository uses
 the Unlicense (see the repository root `LICENSE`).
@@ -18,6 +19,35 @@ edits. The terminal UI, the clap command line, the stdout/pager display and
 the self-updater are not part of this crate; the upstream TUI's logic is
 here as UI-neutral controllers and models (`browser`, `view`), and a GitHub
 release check (`update`) replaces the self-updater.
+
+## Upstream sync
+
+The core follows upstream claude-history by backporting commit by commit; it is not a one-time copy.
+
+* Original baseline: v0.1.76, commit `8d4cf67`.
+* Last synced upstream commit: `38b1267` (v0.1.80). The core includes upstream through that commit, except the
+  commits listed below. `crates/core/Cargo.toml` still says `0.1.76` (the version of the original baseline,
+  shown in About and `--version`); the fork versions and releases independently.
+* Every ported commit is a fork commit with an `Upstream-Commit: <sha>` trailer: list them with
+  `git log --grep Upstream-Commit`. A next sync starts at the commit after `38b1267`
+  (`git log --reverse 38b1267..<upstream tip>` in the upstream clone) and skips what the trailers cover.
+
+Upstream commits in `8d4cf67..38b1267` deliberately not ported:
+
+| Commits | Reason |
+|---|---|
+| `f5ba49a` `866fbf2` `d2f9dae` `38b1267` (release v0.1.77, v0.1.78, v0.1.79, v0.1.80) | release version bumps; the fork versions independently |
+| `671d915` `bbcc328` `314e90c` `197472f` `cdcee8c` `cd2dec9` `ed1a479` `255c7f4` `2cb4623` | upstream CHANGELOG-only; the fork's own CHANGELOG entries were written in the commits that ported the features |
+| `7e290a9` | crates.io publishing from GitHub Actions; the fork publishes nothing |
+| `e5f6785` | fixes merge-conflict markers that only upstream's README had |
+| `9d8dbe5` | upstream terminal screenshot; the fork's screenshots are its own |
+| `0ebecdd` | the Claude Code skill file (`skills/claude-history/SKILL.md`); the fork ships no skill |
+| `d96e233` | upstream's TUI startup bench harness |
+| `6c3260b` | keeps native-library stderr off the TUI screen; no terminal UI |
+| `5f57985` | search-qa script that drives the TUI through the keyboard |
+| `d1ace36` `d184154` `d2ad13e` | already present in the fork (shared corpus snapshot, loader waker instead of polling, native list hover) |
+| `e308095` | already present (CI denies clippy warnings) |
+| `d3f3b70` `5890d3c` `874672f` `458725c` `b4ce5e2` | background daemon (targeted reconcile passes, leave background embedding to the daemon, daemon docs, bulk directory times, quick pass every 5 minutes): not ported by decision; only the `[semantic]` config schema (`daemon`, `pause_on_battery`) was kept, accepted and ignored by the GUI |
 
 ## Module map
 

@@ -1,8 +1,9 @@
 //! claude-history-core: the UI-agnostic core of claude-history-gui.
 //!
 //! Derived from claude-history (<https://github.com/raine/claude-history>,
-//! v0.1.76, commit 8d4cf67), Copyright (c) 2024 Raine, MIT licensed; see
-//! `LICENSE-MIT` in this crate. The upstream terminal UI, CLI parsing and
+//! v0.1.76, commit 8d4cf67; backported commit by commit up to v0.1.80, commit
+//! 38b1267, see the README's "Upstream sync"), Copyright (c) 2024 Raine, MIT
+//! licensed; see `LICENSE-MIT` in this crate. The upstream terminal UI, CLI parsing and
 //! self-updater are not part of this crate.
 //!
 //! Every input that upstream read from the process (home directory,

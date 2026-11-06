@@ -12,7 +12,8 @@ Inputs this design is built on (all in `scratchpad/docs/`): `inventory-list-mode
 `inventory-addendum.md` (ADD, incl. SAFETY A1/A2), `core-extraction-plan.md` (CORE), `gpui-kit-app-infra.md`
 (GK-INFRA), `gpui-kit-components.md` (GK-COMP), `gpui-kit-design-rules.md` (DG), and the spike reports
 `spike-viewer.md`, `spike-list.md`, `spike-platform.md` (spike code in `scratchpad/spikes/{viewer,list,platform}/src`).
-Upstream source = `C:/git/opensource/claude-history` v0.1.76 (read-only). gpui-kit source of truth = the published
+Upstream source = `C:/git/opensource/claude-history` (read-only): the design baseline is v0.1.76; the core was later
+backported through v0.1.80 (commit `38b1267`), see `crates/core/README.md` "Upstream sync". gpui-kit source of truth = the published
 `gpui-kit 0.7.3` crates in the cargo registry (GK-INFRA §0). **Core baseline = `crates/core` at commit `3ba9f90`**
 of `C:/git/opensource/claude-history-gui` (the core Modules stage is merged; §4 lists the real signatures), **plus
 WP-C (K1–K18, merge commit `78ec36c`)**; §4.3 records where WP-C's code differs from the K-item text.
