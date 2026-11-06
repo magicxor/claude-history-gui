@@ -56,7 +56,7 @@ pub fn load_sorted_conversations(
     let mut conversations =
         crate::store::load_conversations(env, show_last, debug, crate::store::Contents::Full)?;
     conversations.retain(|conversation| time_filter.matches(conversation.timestamp));
-    conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    conversations.sort_by_key(|a| std::cmp::Reverse(a.timestamp));
     Ok(conversations)
 }
 
@@ -79,7 +79,7 @@ pub fn load_sorted_conversations_cancellable(
         cancelled,
     )?;
     conversations.retain(|conversation| time_filter.matches(conversation.timestamp));
-    conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    conversations.sort_by_key(|a| std::cmp::Reverse(a.timestamp));
     Ok(conversations)
 }
 

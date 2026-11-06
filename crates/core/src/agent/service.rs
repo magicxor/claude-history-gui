@@ -469,7 +469,7 @@ impl AgentService {
         self.check_cancelled()?;
         let mut conversations = loaded?;
         let excluded_paths = excluded_paths.into_inner().unwrap();
-        conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        conversations.sort_by_key(|a| std::cmp::Reverse(a.timestamp));
         let scope = configured_scope(args, &agent_config);
         // Upstream derived the local scope from the process cwd; core uses
         // the environment's workspace (W1: encoded from the non-canonical
@@ -590,11 +590,11 @@ impl AgentService {
                 // cancel, not those failures.
                 self.check_cancelled()?;
                 apply_configured_render_policy(&mut output, &agent_config);
-                return Ok(Served::search(
+                Ok(Served::search(
                     output,
                     warnings.into_inner(),
                     &agent::refs::resolved_conversations_for_keys(&keys),
-                ));
+                ))
             }
             SearchMode::Semantic => {
                 let (mut output, mut warnings) =
@@ -602,11 +602,11 @@ impl AgentService {
                 self.check_cancelled()?;
                 apply_configured_render_policy(&mut output, &agent_config);
                 warnings.splice(0..0, base_warnings);
-                return Ok(Served::search(
+                Ok(Served::search(
                     output,
                     warnings,
                     &agent::refs::resolved_conversations_for_keys(&keys),
-                ));
+                ))
             }
             SearchMode::Hybrid => {
                 let lexical_request = agent::search::AgentSearchRequest {
@@ -648,15 +648,15 @@ impl AgentService {
                         attach_input_transcript_metadata(self, &mut output, &inputs);
                         self.check_cancelled()?;
                         apply_configured_render_policy(&mut output, &agent_config);
-                        return Ok(Served::search(
+                        Ok(Served::search(
                             output,
                             warnings.into_inner(),
                             &agent::refs::resolved_conversations_for_keys(&keys),
-                        ));
+                        ))
                     }
                     // A cancel is not a semantic failure to fall back from.
                     Err(AppError::SemanticSearchCancelled) => {
-                        return Err(AppError::SemanticSearchCancelled);
+                        Err(AppError::SemanticSearchCancelled)
                     }
                     Err(error) => {
                         warnings
@@ -682,11 +682,11 @@ impl AgentService {
                         let mut output = lexical;
                         output.mode = SearchMode::Hybrid;
                         apply_configured_render_policy(&mut output, &agent_config);
-                        return Ok(Served::search(
+                        Ok(Served::search(
                             output,
                             warnings.into_inner(),
                             &agent::refs::resolved_conversations_for_keys(&keys),
-                        ));
+                        ))
                     }
                 }
             }

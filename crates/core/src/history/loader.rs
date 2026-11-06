@@ -106,7 +106,7 @@ fn load_all_streaming_inner(
             .iter()
             .any(|adapter| adapter.instance().root.exists());
         let mut conversations = crate::store::reconcile::parse_everything(&auxiliary);
-        conversations.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
+        conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
         for conversation in &mut conversations {
             conversation.preview = if show_last {
                 conversation.preview_last.clone()
@@ -525,7 +525,7 @@ pub fn list_projects(root: &Path) -> Result<Vec<Project>> {
         .collect();
 
     // Sort by recently modified
-    projects.sort_by(|a, b| b.modified.cmp(&a.modified));
+    projects.sort_by_key(|a| std::cmp::Reverse(a.modified));
 
     Ok(projects)
 }
@@ -614,7 +614,7 @@ pub(crate) fn load_conversations(
         .collect();
 
     // Ensure deterministic ordering after parallel processing
-    conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    conversations.sort_by_key(|a| std::cmp::Reverse(a.timestamp));
 
     // Inject project info into each conversation
     let fallback_path = projects_dir

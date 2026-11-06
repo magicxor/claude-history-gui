@@ -10,16 +10,6 @@
 //! an explicit [`env::HistoryEnv`]; see that module for the default data
 //! locations, which are isolated from the installed CLI.
 
-// Style lints that newer clippy versions raise on code kept verbatim from
-// upstream. Allowed crate-wide to keep the diff against upstream minimal.
-#![allow(
-    clippy::derivable_impls,
-    clippy::needless_return,
-    clippy::obfuscated_if_else,
-    clippy::unnecessary_sort_by,
-    clippy::useless_vec
-)]
-
 pub mod agent;
 pub mod bench;
 pub mod case_fold;

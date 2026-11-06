@@ -1697,7 +1697,7 @@ mod tests {
     #[test]
     fn quoted_uuid_exact_fallback_is_literal_search() {
         let uuid = "e7d318b1-4274-4ee2-a341-e94893b5df49";
-        let conversations = vec![
+        let conversations = [
             test_conversation("/projects/-p/session-1.jsonl", uuid, vec![]),
             test_conversation("/projects/-p/session-2.jsonl", "other", vec![]),
         ];

@@ -137,7 +137,7 @@ where
         .map(|entry| (entry.index, conversations[entry.index].borrow().timestamp))
         .collect::<Vec<_>>();
 
-    matches.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    matches.sort_unstable_by_key(|a| std::cmp::Reverse(a.1));
     matches.into_iter().map(|(index, _)| index).collect()
 }
 

@@ -272,7 +272,7 @@ pub fn load_in_memory(
         ));
     }
     let mut conversations = reconcile::parse_everything(&sources);
-    conversations.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
+    conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
     for (index, conversation) in conversations.iter_mut().enumerate() {
         conversation.index = index;
         conversation.preview = if show_last {

@@ -274,7 +274,7 @@ impl Browser {
                 paths.insert(path)
             });
         }
-        conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        conversations.sort_by_key(|a| std::cmp::Reverse(a.timestamp));
         let indexed = reindex(&mut conversations, false);
         let searchable = search::precompute_search_text(&conversations)
             .into_iter()
