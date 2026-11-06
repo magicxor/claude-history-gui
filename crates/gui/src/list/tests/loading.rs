@@ -532,3 +532,43 @@ fn an_incomplete_retry_returns_to_the_error_view(cx: &mut TestAppContext) {
         "Couldn't load history"
     );
 }
+
+/// Review fix (store): a "Preview shows" change made while the initial
+/// pass runs reaches the loader at once (it used to wait for a restart).
+#[gpui_kit::test]
+fn a_preview_change_during_the_store_pass_reaches_the_loader(cx: &mut TestAppContext) {
+    let world = TestWorld::new();
+    listed_corpus(&world);
+    let f = ListFixture::open_paused(cx, &world, &[]);
+    assert!(f.read(cx, |list, _| list.is_loading()));
+    let wanted = !f.read(cx, |list, _| list.loader_show_last());
+    f.with_window(cx, |list, _, cx| list.set_show_last(wanted, cx));
+    assert_eq!(f.read(cx, |list, _| list.loader_show_last()), wanted);
+    f.resume(cx);
+    f.wait_loaded(cx);
+    assert_eq!(f.read(cx, |list, _| list.loader_show_last()), wanted);
+}
+
+/// Review fix (in memory): a preview change made while the load streams is
+/// applied by a reload when the load ends.
+#[gpui_kit::test]
+fn a_preview_change_during_the_memory_load_reloads_afterwards(cx: &mut TestAppContext) {
+    let world = TestWorld::new();
+    listed_corpus(&world);
+    // Store off: the in-memory loader streams batches.
+    crate::test_support::use_memory_list(cx, &world, &[]);
+    let f = ListFixture::open_paused(cx, &world, &[]);
+    assert!(f.read(cx, |list, _| list.is_loading()));
+    let before = f.read(cx, |list, _| list.loader_show_last());
+    f.with_window(cx, |list, _, cx| list.set_show_last(!before, cx));
+    assert_eq!(
+        f.read(cx, |list, _| list.loader_show_last()),
+        before,
+        "the running load keeps its stream"
+    );
+    f.resume(cx);
+    f.wait_loaded(cx);
+    f.wait_idle(cx);
+    assert_eq!(f.read(cx, |list, _| list.loader_show_last()), !before);
+    assert_eq!(f.paths(cx).len(), 8);
+}

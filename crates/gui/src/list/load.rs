@@ -496,6 +496,7 @@ impl ListPane {
             self.loader.reconfigure(env.clone(), options);
             self.loader_env = env;
         }
+        self.sync_loader_show_last();
         self.loader.set_time_filter(self.time_filter);
         // A retry after a failed initial load tolerates project errors like
         // the initial load does (it applies the partial result).
@@ -523,6 +524,19 @@ impl ListPane {
         }
         if let Some(changes) = self.reload.queued.take() {
             self.start_reload(changes, cx);
+        } else if self.loader.options().show_last != self.browser.show_last() {
+            // A preview-mode change made while the load ran.
+            self.start_plain_refresh(cx);
+        }
+    }
+
+    /// Give the loader the preview mode the browser shows.
+    pub(super) fn sync_loader_show_last(&mut self) {
+        let show_last = self.browser.show_last();
+        if self.loader.options().show_last != show_last {
+            let mut options = self.loader.options().clone();
+            options.show_last = show_last;
+            self.loader.reconfigure(self.loader_env.clone(), options);
         }
     }
 

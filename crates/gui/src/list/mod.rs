@@ -879,10 +879,12 @@ impl ListPane {
             return;
         }
         self.browser.set_show_last(show_last);
-        if !self.loader.is_running() {
-            let mut options = self.loader.options().clone();
-            options.show_last = show_last;
-            self.loader.reconfigure(self.loader_env.clone(), options);
+        // Store mode: reconfiguring is safe while a pass runs, the next poll
+        // reopens the generation with the new preview. In memory a running
+        // load keeps its stream: the loader follows when it ends (the
+        // queued reload in `start_queued_reload`).
+        if self.loader.uses_store() || !self.loader.is_running() {
+            self.sync_loader_show_last();
         }
         self.refresh(cx);
     }
@@ -1931,6 +1933,12 @@ impl ListPane {
     #[cfg(test)]
     pub(crate) fn set_poll_paused(&mut self, paused: bool) {
         self.poll_paused = paused;
+    }
+
+    /// The preview mode the loader parses with (tests).
+    #[cfg(test)]
+    pub(crate) fn loader_show_last(&self) -> bool {
+        self.loader.options().show_last
     }
 
     /// The snapshots of mid-load polls (tests).
