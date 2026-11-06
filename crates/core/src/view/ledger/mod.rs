@@ -43,8 +43,8 @@ use summary::{PendingToolSummary, flush_tool_summary};
 pub(crate) use markdown::render_markdown_to_lines;
 pub(crate) use style::{assistant_label, subagent_label};
 pub(crate) use summary::{
-    ToolActivitySummary, group_summary_line, summarize_tool_calls, summary_line,
-    tool_only_assistant_summary, user_entry_is_only_tool_results,
+    ToolActivitySummary, entry_shows_nothing, group_summary_line, summarize_tool_calls,
+    summary_line, tool_only_assistant_summary, user_entry_is_only_tool_results,
 };
 pub(crate) use timing::{RowTiming, TimingSlot};
 pub(crate) use tools::{
@@ -295,6 +295,12 @@ fn try_extend_or_start_pending_summary(
                 });
             }
         }
+        return true;
+    }
+
+    // Records that render nothing sit between a tool result and the next
+    // call; they must not split one run of tool calls into several rows.
+    if pending.is_some() && entry_shows_nothing(entry, options) {
         return true;
     }
 

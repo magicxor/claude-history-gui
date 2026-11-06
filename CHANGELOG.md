@@ -4,6 +4,8 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 ## Unreleased
 
+- Summary mode keeps a run of tool calls in one row even when records that show nothing (bookkeeping entries,
+  thinking-only messages while thinking is hidden) sit between the calls, instead of one "Ran 1 shell command" row per call.
 - Tool calls without a dedicated format (MCP tools and the like) now show as one line of JSON, for example
   `clock__sleep: { "duration_ms": 20000 }`, instead of a bare name with a pretty-printed body. In Summary mode a group
   of exactly one such call shows that line instead of "Called 1 tool".

@@ -581,6 +581,25 @@ fn parity_with_ledger_for_all_fixtures_and_preferences() {
             assistant_text_entry(1, "Hi there", None),
         ],
         conversation_with_tool_only_turns(),
+        vec![
+            entry(
+                0,
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]}}"#,
+            ),
+            entry(
+                1,
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}}"#,
+            ),
+            entry(2, r#"{"type":"last-prompt","lastPrompt":"x"}"#),
+            entry(
+                3,
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"next","signature":""}]}}"#,
+            ),
+            entry(
+                4,
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Bash","input":{"command":"pwd"}}]}}"#,
+            ),
+        ],
     ];
     for entries in fixtures {
         assert_parity_everywhere(&entries);
@@ -624,6 +643,35 @@ fn summary_tool_mode_renders_activity_summary() {
     let text = doc_text(&doc);
     assert!(!text.contains("Grep:"));
     assert!(!text.contains("Read:"));
+}
+
+#[test]
+fn summary_tool_mode_coalesces_tool_calls_across_records_that_show_nothing() {
+    let entries = [
+        entry(
+            0,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]}}"#,
+        ),
+        entry(
+            1,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}}"#,
+        ),
+        entry(2, r#"{"type":"last-prompt","lastPrompt":"x"}"#),
+        entry(
+            3,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"next","signature":""}]}}"#,
+        ),
+        entry(
+            4,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Bash","input":{"command":"pwd"}}]}}"#,
+        ),
+    ];
+    let doc = build(&entries, &prefs(ToolDisplayMode::Summary));
+
+    let text = doc_text(&doc);
+    assert!(text.contains("Ran 2 shell commands"), "{text}");
+    assert!(!text.contains("Ran 1 shell command"), "{text}");
+    assert_eq!(doc.messages.len(), 1);
 }
 
 #[test]

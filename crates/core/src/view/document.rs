@@ -57,10 +57,10 @@ use super::ViewPrefs;
 use super::ledger::{
     RenderOptions, RenderableEntry, RowTiming, TRUNCATED_BODY_LINES, TRUNCATED_RESULT_LINES,
     TimingSlot, ToolActivitySummary, ToolDisplayMode, ToolOutputId, ToolOutputKind,
-    assistant_label, format_timestamp, format_tool_result_content, group_summary_line,
-    make_tool_output_id, make_tool_summary_output_id, render_markdown_to_lines, subagent_label,
-    summarize_tool_calls, summary_line, tool_only_assistant_summary, tool_result_display_text,
-    user_entry_is_only_tool_results,
+    assistant_label, entry_shows_nothing, format_timestamp, format_tool_result_content,
+    group_summary_line, make_tool_output_id, make_tool_summary_output_id, render_markdown_to_lines,
+    subagent_label, summarize_tool_calls, summary_line, tool_only_assistant_summary,
+    tool_result_display_text, user_entry_is_only_tool_results,
 };
 use crate::commands::process_command_message;
 use crate::history::model::{Message, Part, Role};
@@ -1405,6 +1405,12 @@ impl Builder<'_> {
                     });
                 }
             }
+            return true;
+        }
+
+        // Records that render nothing sit between a tool result and the next
+        // call; they must not split one run of tool calls into several rows.
+        if pending.is_some() && entry_shows_nothing(entry, &self.options) {
             return true;
         }
 
