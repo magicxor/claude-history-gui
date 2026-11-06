@@ -876,6 +876,8 @@ pub(crate) mod test_support {
             cwd: None,
             cwds: Vec::new(),
             message_count: 3,
+            prompt_count: 1,
+            tool_call_count: 0,
             parse_errors: Vec::new(),
             summary: None,
             custom_title: None,
@@ -1071,6 +1073,8 @@ mod tests {
             assert_eq!(card.cwds, conversation.cwds);
             assert_eq!(card.preview, conversation.preview);
             assert_eq!(card.message_count, conversation.message_count);
+            assert_eq!(card.prompt_count, conversation.prompt_count);
+            assert_eq!(card.tool_call_count, conversation.tool_call_count);
             assert_eq!(
                 snapshot.find_session(&conversation.session_id.to_uppercase()),
                 Some(doc)
@@ -1144,6 +1148,8 @@ mod tests {
             assert_eq!(stored.preview, conversation.preview);
             assert_eq!(stored.project_name, conversation.project_name);
             assert_eq!(stored.message_count, conversation.message_count);
+            assert_eq!(stored.prompt_count, conversation.prompt_count);
+            assert_eq!(stored.tool_call_count, conversation.tool_call_count);
             assert_eq!(stored.full_text, conversation.full_text);
             assert_eq!(stored.agent_search_text, conversation.agent_search_text);
             assert_eq!(stored.semantic_route_text, conversation.semantic_route_text);

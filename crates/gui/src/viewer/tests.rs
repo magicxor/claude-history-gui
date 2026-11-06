@@ -945,7 +945,9 @@ mod pure {
             project_name: Some("proj".into()),
             custom_title: None,
             model: None,
-            message_count: 2,
+            message_count: 4,
+            prompt_count: 2,
+            tool_call_count: 0,
             duration_minutes: None,
             total_tokens: 0,
             timestamp: chrono::Local
@@ -1009,13 +1011,37 @@ mod pure {
     fn v004_header_omission_rules_and_token_forms() {
         let mut info = header_info();
         let text = header::layout(Some(&info), "3f2a", 200).text();
-        assert_eq!(text, "proj · 2 messages · 2026-10-12 14:03");
-        info.message_count = 1;
+        assert_eq!(text, "proj · 2 prompts · 2026-10-12 14:03");
+        // Upstream e930cac: prompts, then tool calls when there are any, each
+        // its own part.
+        info.tool_call_count = 5;
+        let layout = header::layout(Some(&info), "3f2a", 200);
+        assert_eq!(
+            layout.text(),
+            "proj · 2 prompts · 5 tool calls · 2026-10-12 14:03"
+        );
+        assert_eq!(layout.parts[1].text, "2 prompts");
+        assert_eq!(layout.parts[2].text, "5 tool calls");
+        info.tool_call_count = 1;
         assert!(
             header::layout(Some(&info), "x", 200)
                 .text()
-                .contains("1 message ·")
+                .contains("· 1 tool call ·")
         );
+        info.tool_call_count = 0;
+        info.prompt_count = 1;
+        assert!(
+            header::layout(Some(&info), "x", 200)
+                .text()
+                .contains("1 prompt ·")
+        );
+        // A conversation without a typed prompt still shows its header.
+        info.prompt_count = 0;
+        assert_eq!(
+            header::layout(Some(&info), "x", 200).text(),
+            "proj · 0 prompts · 2026-10-12 14:03"
+        );
+        info.prompt_count = 1;
         info.total_tokens = 926_000;
         info.model = Some("claude-opus-4-5-20251101".into());
         info.duration_minutes = Some(65);
@@ -1023,7 +1049,7 @@ mod pure {
         let wide = header::layout(Some(&info), "x", 200).text();
         assert_eq!(
             wide,
-            "proj · My title · opus-4.5 · 1 message · 1h 5m · 926k tokens · 2026-10-12 14:03"
+            "proj · My title · opus-4.5 · 1 prompt · 1h 5m · 926k tokens · 2026-10-12 14:03"
         );
         let narrow = header::layout(Some(&info), "x", 60).text();
         assert!(narrow.contains("· 926k ·"), "{narrow}");
@@ -1033,6 +1059,19 @@ mod pure {
         let layout = header::layout(Some(&info), "x", 80);
         assert!(!layout.summary_inline, "the summary moves to line 2");
         assert!(layout.text().contains("\nA long summary"));
+        // The counts are measured in cells (their "·" is two bytes), and the
+        // tool calls add their width and a separator.
+        let inline_at = |info: &crate::model::HeaderInfo| {
+            (0..400)
+                .find(|&width| header::layout(Some(info), "x", width).summary_inline)
+                .unwrap()
+        };
+        let without_tools = inline_at(&info);
+        info.tool_call_count = 3;
+        assert_eq!(
+            inline_at(&info),
+            without_tools + " · 3 tool calls".chars().count()
+        );
     }
 
     #[test]
@@ -4016,10 +4055,7 @@ mod gui {
                 "source known after parsing"
             );
             let header = v.header_layout().unwrap().text();
-            assert!(
-                header.contains("2 messages") || header.contains("4 messages"),
-                "{header}"
-            );
+            assert!(header.contains(" · 2 prompts · "), "{header}");
         });
     }
 

@@ -30,6 +30,8 @@ fn test_conversation() -> Conversation {
         cwd: Some(PathBuf::from("/cwd/sentinel")),
         cwds: vec![PathBuf::from("/cwd/sentinel")],
         message_count: 1,
+        prompt_count: 1,
+        tool_call_count: 0,
         parse_errors: Vec::new(),
         summary: Some("summary sentinel".to_string()),
         custom_title: Some("title sentinel".to_string()),
@@ -144,7 +146,7 @@ fn header_line(header: &RowHeader) -> String {
         line.push_str(&format!(" · {}", summary.text));
     }
     line.push_str(&" ".repeat(header.padding));
-    line.push_str(&header.message_count);
+    line.push_str(&header.prompt_count);
     for part in [&header.semantic_score, &header.duration]
         .into_iter()
         .flatten()
@@ -249,11 +251,26 @@ fn test_format_tokens_long() {
 
 #[test]
 fn counts_durations_and_header_timestamp() {
-    assert_eq!(format_msg_count_short(1), "1 msg");
-    assert_eq!(format_msg_count_short(0), "0 msgs");
-    assert_eq!(format_msg_count_short(12), "12 msgs");
-    assert_eq!(format_msg_count_long(1), "1 message");
-    assert_eq!(format_msg_count_long(3), "3 messages");
+    assert_eq!(count_label(1, "prompt", "prompts"), "1 prompt");
+    assert_eq!(count_label(0, "prompt", "prompts"), "0 prompts");
+    assert_eq!(count_label(12, "prompt", "prompts"), "12 prompts");
+    // The header omits tool calls when there are none.
+    assert_eq!(format_header_counts(1, 0), "1 prompt");
+    assert_eq!(format_header_counts(2, 0), "2 prompts");
+    assert_eq!(format_header_counts(1, 1), "1 prompt · 1 tool call");
+    assert_eq!(
+        format_header_counts(113, 948),
+        "113 prompts · 948 tool calls"
+    );
+    assert_eq!(header_count_parts(2, 0), ("2 prompts".to_string(), None));
+    assert_eq!(
+        header_count_parts(1, 5),
+        ("1 prompt".to_string(), Some("5 tool calls".to_string()))
+    );
+    let mut conversation = test_conversation();
+    conversation.prompt_count = 0;
+    conversation.tool_call_count = 3;
+    assert_eq!(header_counts(&conversation), "0 prompts · 3 tool calls");
     assert_eq!(format_duration_minutes(0), "0m");
     assert_eq!(format_duration_minutes(59), "59m");
     assert_eq!(format_duration_minutes(60), "1h 0m");
@@ -272,9 +289,15 @@ fn header_fits_single_line_measures_every_part() {
     conversation.model = Some("claude-opus-4-5-20251101".to_string());
     conversation.total_tokens = 926_000;
     conversation.duration_minutes = Some(75);
-    // "  project sentinel · " + "title sentinel · " + "opus-4.5 · " + "1 message"
+    // "  project sentinel · " + "title sentinel · " + "opus-4.5 · " + "1 prompt"
     // + " · 1h 15m" + " · " + "926k tokens · " + "YYYY-MM-DD HH:MM" + " · " + summary
-    let expected = 2 + 16 + 3 + 17 + 11 + 9 + 9 + 3 + 14 + 16 + 3 + 16;
+    let expected = 2 + 16 + 3 + 17 + 11 + 8 + 9 + 3 + 14 + 16 + 3 + 16;
+    assert!(header_fits_single_line(&conversation, expected as u16));
+    assert!(!header_fits_single_line(&conversation, expected as u16 - 1));
+
+    // The counts are measured in cells: their "·" is one cell, two bytes.
+    conversation.tool_call_count = 5;
+    let expected = expected + " · 5 tool calls".chars().count();
     assert!(header_fits_single_line(&conversation, expected as u16));
     assert!(!header_fits_single_line(&conversation, expected as u16 - 1));
 }
@@ -1108,7 +1131,7 @@ fn list_truncates_long_project_names_on_narrow_rows() {
     conversation.custom_title = Some("semantic status title".to_string());
     conversation.summary = Some("semantic status summary".to_string());
     let header = row_header(&conversation, 70, false, None);
-    assert_eq!(header.project.text, "claude-history/drop-semantic…");
+    assert_eq!(header.project.text, "claude-history/drop-semant…");
     let line = header_line(&header);
     assert!(
         !line.contains("claude-history/drop-semantic-feature-gate"),
@@ -1136,7 +1159,7 @@ fn list_uses_available_width_for_custom_titles() {
         line.contains("generated summary remains visible"),
         "{line:?}"
     );
-    assert!(line.contains("1 msg · Jan 01, 00:00"), "{line:?}");
+    assert!(line.contains("1 prompt · Jan 01, 00:00"), "{line:?}");
     assert_eq!(header.recency, Recency::Old);
 }
 
@@ -1151,10 +1174,10 @@ fn list_truncates_custom_titles_to_preserve_metadata() {
     let header = row_header(&conversation, 72, false, None);
     let line = header_line(&header);
     assert!(
-        line.contains("fork lineage alpha beta gamma delta e…"),
+        line.contains("fork lineage alpha beta gamma delt…"),
         "{line:?}"
     );
-    assert!(line.contains("1 msg · Jan 01, 00:00"), "{line:?}");
+    assert!(line.contains("1 prompt · Jan 01, 00:00"), "{line:?}");
     // Upstream leaves one trailing cell free.
     assert_eq!(UnicodeWidthStr::width(line.as_str()), 71, "{line:?}");
 }

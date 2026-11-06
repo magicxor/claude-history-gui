@@ -75,6 +75,8 @@ fn synthetic(root: &Path, index: usize) -> Conversation {
         cwd: None,
         cwds: Vec::new(),
         message_count: 2,
+        prompt_count: 1,
+        tool_call_count: 0,
         parse_errors: Vec::new(),
         summary: Some(format!("Summary {index}")),
         custom_title: None,

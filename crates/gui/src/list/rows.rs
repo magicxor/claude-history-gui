@@ -9,7 +9,8 @@
 //! 1. `[lane] TITLE ······ time` — the title is the custom title, else the
 //!    summary, else the project (AD20); the time is mono and carries the
 //!    recency color;
-//! 2. `[kind ·] project · N msgs · duration · score · summary-tail`, where
+//! 2. `[kind ·] project · N prompts · duration · score · summary-tail`
+//!    (the prompts the person typed, upstream e930cac), where
 //!    `kind` is `auto` or `sub` for an automated or subagent conversation
 //!    (listed only on request, upstream cb990e6);
 //! 3. the preview with the query highlighted;
@@ -180,7 +181,8 @@ pub struct RowModel {
     pub title_kind: TitleKind,
     /// Line 2: the project when it is not the title.
     pub project: Option<HighlightedText>,
-    pub message_count: String,
+    /// `1 prompt` / `N prompts` (core `RowHeader::prompt_count`).
+    pub prompt_count: String,
     pub duration: Option<String>,
     /// Hybrid score (Semantic mode with metadata, rows wide enough).
     pub score: Option<String>,
@@ -198,7 +200,7 @@ pub struct RowModel {
 }
 
 impl RowModel {
-    /// The text of line 2: `[kind -] project - 42 msgs - 1h 5m - 0.87 -
+    /// The text of line 2: `[kind -] project - 42 prompts - 1h 5m - 0.87 -
     /// summary`.
     pub fn meta_text(&self) -> String {
         let mut parts: Vec<&str> = Vec::new();
@@ -208,7 +210,7 @@ impl RowModel {
         if let Some(project) = &self.project {
             parts.push(&project.text);
         }
-        parts.push(&self.message_count);
+        parts.push(&self.prompt_count);
         if let Some(duration) = &self.duration {
             parts.push(duration);
         }
@@ -332,7 +334,7 @@ pub fn build_row_model(browser: &Browser, pos: usize, ctx: &RowContext<'_>) -> O
         title,
         title_kind,
         project,
-        message_count: header.message_count,
+        prompt_count: header.prompt_count,
         duration: header.duration,
         score: header.semantic_score.filter(|_| ctx.show_score()),
         summary_tail,
@@ -474,7 +476,7 @@ pub fn render_row(model: RowModel, style: &RowStyle) -> AnyElement {
         },
     );
 
-    // Line 2: [kind ·] project · N msgs · duration · score · summary.
+    // Line 2: [kind ·] project · N prompts · duration · score · summary.
     let separator = color_style(roles.dot_separator);
     let mut meta = Runs::new();
     if let Some(kind) = model.kind_label {
@@ -485,7 +487,7 @@ pub fn render_row(model: RowModel, style: &RowStyle) -> AnyElement {
         meta.push_field(project, color_style(roles.text_secondary));
         meta.push(" · ", separator);
     }
-    meta.push(&model.message_count, color_style(roles.msg_count));
+    meta.push(&model.prompt_count, color_style(roles.msg_count));
     if let Some(duration) = &model.duration {
         meta.push(" · ", separator);
         meta.push(duration, color_style(roles.duration));

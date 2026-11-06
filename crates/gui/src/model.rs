@@ -224,7 +224,14 @@ pub struct HeaderInfo {
     pub project_name: Option<SharedString>,
     pub custom_title: Option<SharedString>,
     pub model: Option<String>,
+    /// Every message, tool calls and results included. Not shown since
+    /// upstream e930cac; [`HeaderInfo::is_stem_only`] still tests it, as a
+    /// real conversation can have no prompts.
     pub message_count: usize,
+    /// `Conversation::prompt_count` and `tool_call_count` (upstream
+    /// e930cac): the header shows `N prompts · M tool calls`.
+    pub prompt_count: usize,
+    pub tool_call_count: usize,
     pub duration_minutes: Option<u64>,
     pub total_tokens: u64,
     pub timestamp: DateTime<Local>,
@@ -298,6 +305,8 @@ impl HeaderInfo {
                 .map(|t| SharedString::from(t.to_string())),
             model: c.model.clone(),
             message_count: c.message_count,
+            prompt_count: c.prompt_count,
+            tool_call_count: c.tool_call_count,
             duration_minutes: c.duration_minutes,
             total_tokens: c.total_tokens,
             timestamp: c.timestamp,
@@ -324,6 +333,8 @@ impl HeaderInfo {
             custom_title: None,
             model: None,
             message_count: 0,
+            prompt_count: 0,
+            tool_call_count: 0,
             duration_minutes: None,
             total_tokens: 0,
             timestamp: DateTime::<Local>::from(std::time::SystemTime::UNIX_EPOCH),

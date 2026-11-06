@@ -131,7 +131,9 @@ fn line_one_follows_custom_title_summary_project() {
     );
 }
 
-/// L-019, L-021: `1 msg` / `2 msgs`, durations `1h 5m` / `5m` / none.
+/// L-019, L-021: `1 prompt` / `2 prompts` (upstream e930cac: only the
+/// prompts the person typed, not the replies), durations `1h 5m` / `5m` /
+/// none.
 #[test]
 fn meta_has_counts_and_durations() {
     let world = TestWorld::new();
@@ -140,7 +142,7 @@ fn meta_has_counts_and_durations() {
         .start(Utc::now() - Duration::hours(1))
         .write(&world);
     SessionSpec::new("proj", 2)
-        .messages(&[("user", "q"), ("assistant", "a")])
+        .messages(&[("user", "q"), ("user", "q2")])
         .spacing_minutes(65)
         .start(Utc::now() - Duration::hours(3))
         .write(&world);
@@ -151,14 +153,15 @@ fn meta_has_counts_and_durations() {
         .write(&world);
     let browser = browser_of(&world);
     let one = model_of(&browser, 1, "", 480.0);
-    assert_eq!(one.message_count, "1 msg");
+    assert_eq!(one.prompt_count, "1 prompt");
     assert_eq!(one.duration, None);
-    assert!(one.meta_text().contains("1 msg") && !one.meta_text().contains("1 msgs"));
+    assert!(one.meta_text().contains("1 prompt") && !one.meta_text().contains("1 prompts"));
     let long = model_of(&browser, 2, "", 480.0);
-    assert_eq!(long.message_count, "2 msgs");
+    assert_eq!(long.prompt_count, "2 prompts");
     assert_eq!(long.duration.as_deref(), Some("1h 5m"));
-    assert!(long.meta_text().contains("2 msgs · 1h 5m"));
+    assert!(long.meta_text().contains("2 prompts · 1h 5m"));
     let short = model_of(&browser, 3, "", 480.0);
+    assert_eq!(short.prompt_count, "1 prompt", "a reply is not a prompt");
     assert_eq!(short.duration.as_deref(), Some("5m"));
 }
 

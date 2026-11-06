@@ -4,6 +4,9 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 ## Unreleased
 
+- The conversation list shows how many prompts you typed, such as `12 prompts`, instead of a message count that
+  included every tool call and tool result; the viewer header shows prompts and tool calls, such as
+  `113 prompts · 948 tool calls`. The list's index is rebuilt once after the update.
 - A shared `config.toml` written for the CLI with `[semantic] daemon = true` (or `pause_on_battery`) loads again
   instead of being rejected. The GUI has no background daemon and ignores these keys.
 - Loading and refreshing the history spends less CPU checking session files: project folders are no longer looked up

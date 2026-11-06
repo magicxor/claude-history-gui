@@ -87,22 +87,39 @@ pub fn format_tokens_long(tokens: u64) -> String {
     format!("{} tokens", format_tokens(tokens))
 }
 
-/// List-row message count: `"1 msg"` / `"<n> msgs"`.
-pub fn format_msg_count_short(count: usize) -> String {
-    if count == 1 {
-        "1 msg".to_string()
-    } else {
-        format!("{} msgs", count)
+/// `"<count> <singular>"` for a count of 1, else `"<count> <plural>"`
+/// (upstream `tui/ui.rs`, e930cac). The list row shows
+/// `count_label(prompt_count, "prompt", "prompts")`.
+pub fn count_label(count: usize, singular: &str, plural: &str) -> String {
+    format!("{count} {}", if count == 1 { singular } else { plural })
+}
+
+/// Prompts and, when there are any, tool calls, for the conversation header
+/// (upstream `header_counts`, e930cac): `"2 prompts"`,
+/// `"113 prompts · 948 tool calls"`.
+///
+/// Fork: takes the two counts instead of a [`Conversation`], so the GUI's
+/// header model can pass the numbers it keeps; [`header_counts`] is
+/// upstream's form.
+pub fn format_header_counts(prompts: usize, tool_calls: usize) -> String {
+    match header_count_parts(prompts, tool_calls) {
+        (prompts, None) => prompts,
+        (prompts, Some(tools)) => format!("{prompts} · {tools}"),
     }
 }
 
-/// Viewer-header message count: `"1 message"` / `"<n> messages"`.
-pub fn format_msg_count_long(count: usize) -> String {
-    if count == 1 {
-        "1 message".to_string()
-    } else {
-        format!("{} messages", count)
-    }
+/// The two parts of [`format_header_counts`]: the prompts, and the tool
+/// calls when there are any. Fork-only: the GUI draws each as its own
+/// `·`-separated header part.
+pub fn header_count_parts(prompts: usize, tool_calls: usize) -> (String, Option<String>) {
+    let prompts = count_label(prompts, "prompt", "prompts");
+    let tools = (tool_calls > 0).then(|| count_label(tool_calls, "tool call", "tool calls"));
+    (prompts, tools)
+}
+
+/// [`format_header_counts`] of a conversation (upstream `header_counts`).
+pub fn header_counts(conv: &Conversation) -> String {
+    format_header_counts(conv.prompt_count, conv.tool_call_count)
 }
 
 /// Conversation duration: `"<m>m"` below an hour, else `"<h>h <m>m"`.
@@ -134,7 +151,8 @@ pub fn format_header_timestamp(timestamp: DateTime<Local>) -> String {
 }
 
 /// Whether the viewer header (with summary) fits on one line of
-/// `terminal_width` cells (upstream byte-length heuristic, kept verbatim).
+/// `terminal_width` cells (upstream heuristic, kept verbatim: byte lengths,
+/// except the counts, which are measured in cells since e930cac).
 pub fn header_fits_single_line(conv: &Conversation, terminal_width: u16) -> bool {
     let summary = match &conv.summary {
         Some(s) => s,
@@ -157,7 +175,7 @@ pub fn header_fits_single_line(conv: &Conversation, terminal_width: u16) -> bool
         .map(|m| format_model_name(m).len() + 3) // + " · "
         .unwrap_or(0);
 
-    let msg_count_len = format_msg_count_long(conv.message_count).len();
+    let msg_count_len = UnicodeWidthStr::width(header_counts(conv).as_str());
 
     // Calculate tokens length if present (use long form for single-line check)
     let tokens_len = if conv.total_tokens > 0 {
@@ -1402,8 +1420,10 @@ pub struct RowHeader {
     pub custom_title: Option<HighlightedText>,
     /// Generated summary (shown after `" · "`), when there is room for it.
     pub summary: Option<HighlightedText>,
-    /// `"1 msg"` / `"<n> msgs"`.
-    pub message_count: String,
+    /// `"1 prompt"` / `"<n> prompts"`: the conversation's
+    /// [`Conversation::prompt_count`] (upstream e930cac; it showed every
+    /// message, tool calls and results included, as `"<n> msgs"` before).
+    pub prompt_count: String,
     /// Hybrid semantic score (semantic mode, rows at least 70 cells wide).
     pub semantic_score: Option<String>,
     /// Conversation duration, if known.
@@ -1417,7 +1437,7 @@ pub struct RowHeader {
 }
 
 /// Compose a row header for `width` cells (upstream `render_list`,
-/// inventory 4.3): the right block (message count, semantic score,
+/// inventory 4.3): the right block (prompt count, semantic score,
 /// duration, timestamp, separated by `" · "`) is kept whole; the project
 /// name is truncated first, rows narrower than 90 cells reserve
 /// `clamp(left/3, 10, 24)` cells for the title/summary, the title is shown
@@ -1429,7 +1449,7 @@ pub fn build_row_header(input: &RowHeaderInput<'_>) -> RowHeader {
     let conv = input.conversation;
     let width = input.width;
     let (timestamp, recency) = format_timestamp(conv.timestamp, input.now);
-    let message_count = format_msg_count_short(conv.message_count);
+    let prompt_count = count_label(conv.prompt_count, "prompt", "prompts");
     let duration = conv.duration_minutes.map(format_duration_minutes);
 
     let semantic_score = (input.semantic_mode && width >= 70)
@@ -1443,7 +1463,7 @@ pub fn build_row_header(input: &RowHeaderInput<'_>) -> RowHeader {
         .as_ref()
         .map(|d| UnicodeWidthStr::width(d.as_str()) + 3)
         .unwrap_or(0);
-    let right_len = UnicodeWidthStr::width(message_count.as_str())
+    let right_len = UnicodeWidthStr::width(prompt_count.as_str())
         + duration_len
         + semantic_meta_len
         + 3
@@ -1512,7 +1532,7 @@ pub fn build_row_header(input: &RowHeaderInput<'_>) -> RowHeader {
         project: HighlightedText::new(project_part, input.query),
         custom_title: custom_title_part.map(|text| HighlightedText::new(text, input.query)),
         summary: summary_part.map(|text| HighlightedText::new(text, input.query)),
-        message_count,
+        prompt_count,
         semantic_score,
         duration,
         timestamp,
