@@ -139,7 +139,7 @@
 
 use crate::display_format::{HighlightQuery, RowHeaderInput, RowPreviewInput};
 use crate::env::{HistoryEnv, WorkspaceScope};
-use crate::history::{Conversation, format_short_name_from_path, process_conversation_file};
+use crate::history::{Conversation, format_short_name_from_path, process_conversation_file_in};
 use crate::search::{self, LexicalEvidence, SearchableConversation};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -601,8 +601,12 @@ impl Browser {
     /// A browser for one opened JSONL file (upstream `App::new_single_file`).
     ///
     /// The file is parsed like a listed session and its project name is
-    /// derived from its `cwd` (or the file path). Semantic search,
-    /// exclusions, the workspace scope and delete are unavailable.
+    /// derived from its `cwd` (or the file path). It is parsed in
+    /// [`BrowserOptions::env`] (`history::process_conversation_file_in`): a
+    /// rollout of that env's Codex home finds its state database through the
+    /// env's `CODEX_SQLITE_HOME`, as the viewer's history service does.
+    /// Semantic search, exclusions, the workspace scope and delete are
+    /// unavailable.
     ///
     /// A file the list would leave out (a clear-only session, or one with
     /// no listable preview such as a Warmup prompt and its reply) yields an
@@ -621,7 +625,7 @@ impl Browser {
         let mut selected = None;
         let mut single_file_error = None;
 
-        match process_conversation_file(path.clone(), modified, None) {
+        match process_conversation_file_in(&opts.env, path.clone(), modified, None) {
             Ok(Some(mut conv)) => {
                 // Set project_name the same way as the loader does
                 let project_path = conv.cwd.clone().unwrap_or_else(|| path.clone());
@@ -631,7 +635,7 @@ impl Browser {
                 filtered.push(0);
                 selected = Some(0);
             }
-            Ok(None) => match single_file_renders_nothing(&path) {
+            Ok(None) => match single_file_renders_nothing(&opts.env, &path) {
                 Ok(false) => {}
                 Ok(true) => {
                     single_file_error = Some(format!(
@@ -900,9 +904,10 @@ use crate::history::apply_preview_mode;
 
 /// Whether the viewer would show no message for `path` even with every
 /// display toggle on (thinking, full tool output). Used for a single file
-/// the list leaves out: only then is it reported as empty.
-fn single_file_renders_nothing(path: &Path) -> std::io::Result<bool> {
-    let transcript = crate::history::sources::decode_path(path, None, false)
+/// the list leaves out: only then is it reported as empty. Decoded in `env`,
+/// as the viewer decodes it.
+fn single_file_renders_nothing(env: &HistoryEnv, path: &Path) -> std::io::Result<bool> {
+    let transcript = crate::history::sources::decode_path_in(env, path, None, false)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     let entries = crate::view::renderable_entries(&transcript);
     let prefs = crate::view::ViewPrefs {

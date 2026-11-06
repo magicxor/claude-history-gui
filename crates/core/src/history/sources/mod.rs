@@ -20,6 +20,12 @@
 //!   the session file through a reader that fails once the caller's flag is
 //!   set ([`super::adapter::is_cancelled`]); `decode_file` is that decode
 //!   with a flag that never is.
+//! * **Files opened in an env.** [`decode_path_in`] (and the streaming
+//!   `decode_path_into` given an env) decodes a rollout of the env's own
+//!   Codex home through the env's adapter, with its `CODEX_SQLITE_HOME`
+//!   (upstream's adapters read it from the process environment, see
+//!   `codex::view`); [`decode_path`] and [`decode_path_cancellable`] have no
+//!   env.
 
 pub mod claude;
 pub mod codex;
@@ -264,24 +270,47 @@ fn native_id(root: &Path, path: &Path) -> String {
 /// from its contents (as OMP when it starts with a session header and
 /// `omp` is set). `modified` dates a session that records no activity time.
 pub fn decode_path(path: &Path, modified: Option<SystemTime>, omp: bool) -> Result<Transcript> {
+    decode_path_collected(None, path, modified, omp)
+}
+
+/// [`decode_path`] of a file opened in `env` (fork, see the module docs): a
+/// rollout of `env`'s own Codex home decodes through the env's adapter, with
+/// its `CODEX_SQLITE_HOME`, as the history service opens it.
+pub fn decode_path_in(
+    env: &HistoryEnv,
+    path: &Path,
+    modified: Option<SystemTime>,
+    omp: bool,
+) -> Result<Transcript> {
+    decode_path_collected(Some(env), path, modified, omp)
+}
+
+fn decode_path_collected(
+    env: Option<&HistoryEnv>,
+    path: &Path,
+    modified: Option<SystemTime>,
+    omp: bool,
+) -> Result<Transcript> {
     let mut decoded = Vec::new();
-    let transcript = decode_path_into(path, modified, omp, &mut |event| decoded.push(event))?;
+    let transcript = decode_path_into(env, path, modified, omp, &mut |event| decoded.push(event))?;
     Ok(Transcript {
         events: decoded,
         ..transcript
     })
 }
 
-/// [`decode_path`], passing the events to `events` as they are decoded; the
-/// returned transcript has none. (Fork: the list loaders stream a file into
-/// the indexer through this, so a file's events are never all held at once.)
+/// [`decode_path`], or [`decode_path_in`] with an `env`, passing the events
+/// to `events` as they are decoded; the returned transcript has none. (Fork:
+/// the list loaders stream a file into the indexer through this, so a file's
+/// events are never all held at once.)
 pub(crate) fn decode_path_into(
+    env: Option<&HistoryEnv>,
     path: &Path,
     modified: Option<SystemTime>,
     omp: bool,
     events: &mut dyn FnMut(Event),
 ) -> Result<Transcript> {
-    decode_path_into_cancellable(path, modified, omp, events, &|| false)
+    decode_path_into_cancellable(env, path, modified, omp, events, &|| false)
 }
 
 /// [`decode_path`] that gives up once `cancelled()` returns true, with the
@@ -299,6 +328,7 @@ pub fn decode_path_cancellable(
     }
     let mut decoded = Vec::new();
     let transcript = decode_path_into_cancellable(
+        None,
         path,
         modified,
         omp,
@@ -312,13 +342,14 @@ pub fn decode_path_cancellable(
 }
 
 fn decode_path_into_cancellable(
+    env: Option<&HistoryEnv>,
     path: &Path,
     modified: Option<SystemTime>,
     omp: bool,
     events: &mut dyn FnMut(Event),
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Transcript> {
-    if let Some(transcript) = codex::view::decode_path_into(path, events) {
+    if let Some(transcript) = codex::view::decode_path_into(env, path, events) {
         return match transcript {
             Ok(_) if cancelled() => Err(super::adapter::cancelled_error()),
             transcript => transcript,

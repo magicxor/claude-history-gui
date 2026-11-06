@@ -7,6 +7,7 @@ use super::index::Skipped;
 use super::messages::is_clear_metadata_message;
 use crate::debug;
 use crate::debug::DebugLevel;
+use crate::env::HistoryEnv;
 use crate::error::Result;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -17,20 +18,35 @@ pub fn process_conversation_file(
     modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
 ) -> Result<Option<Conversation>> {
-    stream_conversation(&path, modified, debug_level)
+    stream_conversation(None, &path, modified, debug_level)
+}
+
+/// Fork: [`process_conversation_file`] of a file opened in `env` (the
+/// single-file browser): a rollout of `env`'s own Codex home is decoded
+/// through the env's adapter, with its `CODEX_SQLITE_HOME`, as the viewer's
+/// history service opens it (`sources::decode_path_in`).
+pub fn process_conversation_file_in(
+    env: &HistoryEnv,
+    path: PathBuf,
+    modified: Option<SystemTime>,
+    debug_level: Option<DebugLevel>,
+) -> Result<Option<Conversation>> {
+    stream_conversation(Some(env), &path, modified, debug_level)
 }
 
 /// Decodes `path` straight into an incremental indexer. Upstream collects the
 /// events here (its list no longer loads files this way); the fork's loaders
 /// still do, so the events are not all held at once.
 fn stream_conversation(
+    env: Option<&HistoryEnv>,
     path: &std::path::Path,
     modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
 ) -> Result<Option<Conversation>> {
     let mut indexer = super::index::Indexer::default();
-    let transcript =
-        super::sources::decode_path_into(path, modified, false, &mut |event| indexer.push(&event))?;
+    let transcript = super::sources::decode_path_into(env, path, modified, false, &mut |event| {
+        indexer.push(&event)
+    })?;
     Ok(index_with(&transcript, debug_level, |t| indexer.finish(t)))
 }
 

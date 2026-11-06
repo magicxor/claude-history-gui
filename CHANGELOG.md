@@ -132,8 +132,8 @@ Release notes are taken from the `## v<version>` section of this file by the rel
   refs and anchors still resolve; an anchor whose message was edited or dropped is reported as `stale-anchor`.
 - Pi and OMP messages in Deep Search and the agent panel are numbered by their line in the session file. Reopening
   a conversation viewed recently no longer reads its file again while it is unchanged, and Codex threads open in the
-  viewer and exports with the state database `CODEX_SQLITE_HOME` names. Print with `--debug` reports only the records
-  of a Pi or OMP session that could not be read.
+  viewer, exports and single-file windows with the state database `CODEX_SQLITE_HOME` names. Print with `--debug`
+  reports only the records of a Pi or OMP session that could not be read.
 - Deep Search and the agent panel find, read and outline Codex threads; Codex exec runs and subagent threads stay out
   of agent search, for every source.
 - First rows appear sooner with large Pi or OMP histories: Claude, Pi and OMP conversations load at the same time

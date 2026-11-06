@@ -671,6 +671,77 @@ fn rollouts_opened_by_path_decode_as_their_thread() {
     assert!(crate::history::adapter::is_cancelled(&cancelled));
 }
 
+/// Fork: a rollout of the env's own Codex home opened as a single file is
+/// decoded through the env's adapter, so the single-file row finds the state
+/// database in `CODEX_SQLITE_HOME` when the home's `config.toml` names none,
+/// as the viewer does: the database's title and heads (an orphaned thread
+/// stays orphaned). Decoded without the env, or as a rollout of another
+/// home, the state database is not found there.
+#[test]
+fn single_files_of_the_envs_home_find_its_state_database() {
+    use crate::browser::{Browser, BrowserOptions};
+    use crate::history::service::HistoryService;
+    use crate::history::sources::{decode_path, decode_path_in};
+
+    let sandbox = tempfile::tempdir().unwrap();
+    let home = home_copy(sandbox.path());
+    let state = sandbox.path().join("codex-state");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::rename(home.join("state_5.sqlite"), state.join("state_5.sqlite")).unwrap();
+    assert_eq!(configured_sqlite_home(&home), None);
+    let mut env = HistoryEnv::sandbox(sandbox.path());
+    env.codex_home = Some(home.clone());
+    env.codex_sqlite_home = Some(state.clone());
+    let env = Arc::new(env);
+    let path_of = |thread: &str| {
+        discover::list(&home)
+            .unwrap()
+            .into_iter()
+            .find(|rollout| rollout.thread_id == thread)
+            .unwrap()
+            .path
+    };
+    let (paged, orphan) = (path_of(PAGED), path_of(ORPHAN));
+    let history = HistoryService::from_env(&env);
+
+    let row = |path: &Path| {
+        let browser =
+            Browser::new_single_file(path.to_path_buf(), BrowserOptions::new(env.clone()));
+        assert_eq!(browser.single_file_error(), None);
+        (**browser.conversations().first().unwrap()).clone()
+    };
+    let named = row(&paged);
+    assert_eq!(named.source, SourceKind::Codex);
+    assert_eq!(named.custom_title.as_deref(), Some("Named in Codex"));
+    assert!(!named.provenance.orphaned);
+    assert!(row(&orphan).provenance.orphaned);
+    for (path, head) in [
+        (&paged, HeadStatus::Current),
+        (&orphan, HeadStatus::Orphaned),
+    ] {
+        let (_, viewed) = history.open_path(path).unwrap();
+        assert_eq!(viewed.head, head);
+        assert_eq!(decode_path_in(&env, path, None, false).unwrap().head, head);
+    }
+    assert_eq!(
+        history.open_path(&paged).unwrap().1.meta.custom_title,
+        named.custom_title
+    );
+
+    // Without the env, the home's own database (there is none) decides.
+    let loose = decode_path(&paged, None, false).unwrap();
+    assert_eq!(loose.head, HeadStatus::Inferred);
+    assert_eq!(loose.meta.custom_title.as_deref(), Some("Index name"));
+    // `CODEX_SQLITE_HOME` belongs to the env's own home (`<sandbox>/.codex`
+    // here), not to a rollout of another home.
+    let mut other = HistoryEnv::sandbox(sandbox.path());
+    other.codex_sqlite_home = Some(state);
+    let other = BrowserOptions::new(Arc::new(other));
+    let browser = Browser::new_single_file(paged.clone(), other);
+    let conversation = browser.conversations().first().unwrap();
+    assert_eq!(conversation.custom_title.as_deref(), Some("Index name"));
+}
+
 /// The thread of a rollout holding `records` after its `session_meta`, in
 /// a Codex home under `dir`.
 fn rollout_thread(dir: &Path, meta: &str, records: &[&str]) -> Transcript {

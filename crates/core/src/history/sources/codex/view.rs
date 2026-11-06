@@ -6,15 +6,23 @@
 //!   decoded (the fork's list loaders index a file through
 //!   `sources::decode_path_into`); [`decode_path`] collects them, as
 //!   upstream's does.
-//! * **No `CODEX_SQLITE_HOME` here.** A rollout is decoded through
-//!   [`CodexAdapter::new`] of the home holding it, as upstream, but the
-//!   fork's adapter reads no process environment: its state database is the
-//!   `sqlite_home` of the home's `config.toml`, else the home. A rollout of
-//!   the env's own Codex home never comes here: the history service opens
-//!   it through the env's adapter (`CodexAdapter::from_env`), as the
-//!   reconcile pass and the agent commands decode it.
+//! * **`CODEX_SQLITE_HOME` from the env, for its own home.** Upstream decodes
+//!   a rollout through [`CodexAdapter::new`] of the home holding it, whose
+//!   state database falls back to the process's `CODEX_SQLITE_HOME`. The
+//!   fork's adapter reads no process environment, so `decode_path_into`
+//!   takes the [`HistoryEnv`] the file is opened in when its caller has one
+//!   (`sources::decode_path_in`, `history::process_conversation_file_in`:
+//!   the single-file browser, `Browser::new_single_file`). A rollout of that
+//!   env's own Codex home ([`HistoryEnv::codex_home`]) then decodes through
+//!   [`CodexAdapter::from_env`], with the env's `CODEX_SQLITE_HOME`, as the
+//!   history service (the viewer, exports), the reconcile pass and the agent
+//!   commands decode it. A rollout of another home, and any rollout decoded
+//!   without an env ([`decode_path`], `sources::decode_path`), decodes
+//!   through [`CodexAdapter::new`]: its state database is the `sqlite_home`
+//!   of its home's `config.toml`, else that home.
 
 use super::{CodexAdapter, discover};
+use crate::env::HistoryEnv;
 use crate::error::{AppError, Result};
 use crate::history::adapter::Adapter;
 use crate::history::model::{Event, Transcript};
@@ -25,7 +33,7 @@ use std::time::SystemTime;
 /// holding it. `None` when `path` is not a rollout of a Codex home.
 pub fn decode_path(path: &Path) -> Option<Result<Transcript>> {
     let mut decoded = Vec::new();
-    let transcript = decode_path_into(path, &mut |event| decoded.push(event))?;
+    let transcript = decode_path_into(None, path, &mut |event| decoded.push(event))?;
     Some(transcript.map(|transcript| Transcript {
         events: decoded,
         ..transcript
@@ -33,14 +41,16 @@ pub fn decode_path(path: &Path) -> Option<Result<Transcript>> {
 }
 
 /// [`decode_path`], passing the events to `events` as they are decoded; the
-/// returned transcript has none (fork, see the module docs).
+/// returned transcript has none. A rollout of `env`'s own Codex home
+/// decodes through the env's adapter (fork, see the module docs).
 pub(crate) fn decode_path_into(
+    env: Option<&HistoryEnv>,
     path: &Path,
     events: &mut dyn FnMut(Event),
 ) -> Option<Result<Transcript>> {
     let home = discover::home_of(path)?;
     let thread_id = discover::rollout_of(path, false)?.thread_id;
-    let adapter = CodexAdapter::new(home.to_path_buf());
+    let adapter = adapter_of(env, home);
     Some(
         adapter
             .resolve(&thread_id, SystemTime::now())
@@ -54,4 +64,13 @@ pub(crate) fn decode_path_into(
                 })
             }),
     )
+}
+
+/// The adapter of the Codex home `home`: `env`'s own, with its
+/// `CODEX_SQLITE_HOME`, when `home` is `env`'s Codex home, else one without
+/// (fork, see the module docs).
+fn adapter_of(env: Option<&HistoryEnv>, home: &Path) -> CodexAdapter {
+    env.and_then(CodexAdapter::from_env)
+        .filter(|adapter| adapter.instance().root.as_path() == home)
+        .unwrap_or_else(|| CodexAdapter::new(home.to_path_buf()))
 }
