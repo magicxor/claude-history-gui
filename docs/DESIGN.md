@@ -1483,7 +1483,7 @@ Debug builds of `RealServices` refuse `spawn_terminal`/`exec_in_current_terminal
 |---|---|---|---|
 | Initial load / refresh / reload | core `HistoryLoader` (`LoaderOptions::with_waker`), K1 off-thread preparation, K18 policy | waker → `async_channel::bounded::<()>(1)` → ListPane `_poll_task` → `loader.poll(&mut browser)` then `browser.poll()`, then one yield to the executor | core |
 | Lexical + semantic search | core `Browser` workers, same waker; the lexical worker ranks the loaded corpus on a one-thread pool or the store index on `index-search-*` (≤ 8 threads, top page first, ac7f591) | same task → `browser.poll()` → `on_results` | core generations; index answers by `Arc` identity |
-| Store generations (ac7f591, e905169, 358becb) | core `HistoryLoader` in store mode: `generation-open` thread materializes every card of a generation and opens its index (and maps the semantic corpus to it); `store-reconcile` thread (own `store-reconcile-*` pool, ≤ 4 threads) runs a reconcile pass (`store::reconcile::reconcile_cancellable` over the env's sources: one stat per session file on the scan's own `store-scan-*` pool, only new or changed files parsed, delta generations, merges), retried every `BUSY_RETRY` (1 s) while another instance holds `LOCK`, with a `store-watch` thread that reads `CURRENT` every `GENERATION_POLL` (200 ms) and wakes the poll when it names a newer generation; each sends its result before calling the waker; dropping the loader gives up a running pass (or its wait for the lock), then joins both | waker → `loader.poll` → `Browser::install_generation` | generation name |
+| Store generations (ac7f591, e905169, 358becb) | core `HistoryLoader` in store mode: `generation-open` thread materializes every card of a generation and opens its index (and maps the semantic corpus to it); `store-reconcile` thread (own `store-reconcile-*` pool, ≤ 4 threads) runs a reconcile pass (`store::reconcile::reconcile_cancellable` over the env's sources: one stat per session file on the scan's own `store-scan-*` pool, only new or changed files parsed, delta generations, merges), retried every `BUSY_RETRY` (1 s) while another instance holds `LOCK`, with a `store-watch` thread that reads `CURRENT` every `GENERATION_POLL` (200 ms) and wakes the poll when it names another generation (by inequality, as upstream; the records of `CURRENT` and `PROGRESS` are per store root); each sends its result before calling the waker; dropping the loader gives up a running pass (or its wait for the lock), then joins both | waker → `loader.poll` → `Browser::install_generation` | generation name |
 | UUID lookup (K2) | `cx.background_spawn(history::load_session_by_uuid)` when `uuid_lookup() == Pending` | `browser.resolve_uuid_lookup_session(uuid, conv)`; the task is `load_session_by_uuid(..).map(PreparedSession::new)` | core ignores a stale UUID |
 | Rename (K3) | `cx.background_spawn(history::rename_session(..).map(PreparedSession::new))` | `list.apply_renamed(path, prepared)` → `browser.apply_renamed_session` | dialog id + path |
 | Delete (K4) | `background_spawn(plan_session_delete)` → dialog → `background_spawn(execute_session_delete)` | `CorpusNotice::Deleted(plan files)` | dialog disabled while running |
@@ -2482,7 +2482,10 @@ recorded each frame (for the keyboard context menu position).
      and earlier from the cache dir, still holding `LOCK` (`store::legacy`, upstream 75df2d4; §13.4 "GUI caches").
      When another instance holds the lock the pass tries again every second
      (`BUSY_RETRY`) until it gets it. While it runs, its `store-watch` thread reads `CURRENT` every 200 ms and wakes
-     the poll when it names a newer generation, which is opened on `generation-open` and swapped in: the query, the
+     the poll when it names another generation than the one recorded (by inequality, as upstream's `show_current`
+     compared: a store whose directory is deleted while the app runs is numbered from `g000001` again and still
+     shown); the poll opens it on `generation-open` unless it is the one shown (an open may find a newer generation
+     than `CURRENT` named) and swaps it in: the query, the
      scope, the time filter and the selected session are kept, a query's rows stay (moved by path) until it answers
      on the new index (quirk 16; upstream 7ec719a), and `LoaderPoll::swapped` makes the pane emit `CorpusChanged`
      (header, project paths). A refresh (§11.3), a rename or a delete asks for another pass, run after the one
@@ -2503,7 +2506,10 @@ recorded each frame (for the keyboard context menu position).
      conversations` (replacing the refresh toasts). A failed pass records `failed <message>` in `PROGRESS` (upstream's
      record for the instance that started it); the loader reports the first line of the error itself: during a
      refresh as `RefreshFailed` (§11.3), for the initial load with no conversation listed as `LoadFailed`, otherwise
-     as `IndexNotice::Failed`: error toast `Indexing failed: <message>` + [Show debug log].
+     as `IndexNotice::Failed`: error toast `Indexing failed: <message>` + [Show debug log]. The loader keeps its
+     record of `PROGRESS` (like that of `CURRENT`) per store root: when a workspace switch moves it to another root
+     (§11.20) the indicator ends without a notice, and a pass still running over the previous store no longer
+     reaches the footer, the success toast or a failure report.
    * **Edits (upstream 358becb).** Rename and delete work on cards once the generation is shown in full. A delete
      hides the rows of the deleted session (by its key hash) from the list and the index's scope until a generation
      without it is shown; a hidden row is no longer in the list (`ListPane::conversation`). A rename shows the new
@@ -2850,6 +2856,8 @@ Picker selection / Choose folder… / Clear → validate dir → `AppState.works
 `Couldn't switch the workspace: <e>`. If a load is already running, the change waits for it and then reloads. In store
 mode the reload is a reconcile pass; a workspace whose Pi/OMP session roots differ (`.pi/settings.json`) moves the
 loader to that store root (`roots-<hash>`), whose generation is swapped in once open (the rows shown stay until then).
+A pass still running over the previous store goes on (the new store's pass runs after it), but its progress,
+completion toast and failure are no longer shown; the indexing indicator ends at the switch.
 
 ### 11.21 Time filter change
 Dropdown preset or custom dialog → `TimePoint::from_str` + `TimeFilter::resolve` (errors inline) →

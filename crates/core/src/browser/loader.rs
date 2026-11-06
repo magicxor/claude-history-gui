@@ -16,13 +16,16 @@
 //! ([`crate::store::reconcile`]): it stats every session file of the env's
 //! sources, parses only new or changed ones and publishes them as delta
 //! generations. While a pass runs, its `store-watch` thread checks `CURRENT`
-//! every [`GENERATION_POLL`] and wakes the poll when it names a newer
-//! generation, which is opened off the UI thread and swapped in keeping the
-//! query, the scope and the selected session. A rename or a delete asks for
-//! another pass ([`Browser::take_reconcile_request`]), run after the one
-//! running; a refresh runs a pass and reports
-//! [`LoadEvent::Refreshed`] from the generation sizes. Every thread sends its
-//! result before it calls the waker, so the poll it schedules finds it.
+//! every [`GENERATION_POLL`] and wakes the poll when it names another
+//! generation; unless that is the one shown (upstream `Store::show_current`
+//! compares by inequality, so a store recreated while the app runs,
+//! numbered from `g000001` again, is shown too), it is opened off the UI
+//! thread and swapped in keeping the query, the scope and the selected
+//! session. A rename or a delete asks for another pass
+//! ([`Browser::take_reconcile_request`]), run after the one running; a
+//! refresh runs a pass and reports [`LoadEvent::Refreshed`] from the
+//! generation sizes. Every thread sends its result before it calls the
+//! waker, so the poll it schedules finds it.
 //!
 //! A pass that parses at least [`crate::store::progress::MIN_FILES`] files
 //! reports its progress in the store's `PROGRESS` file (upstream 04c714b);
@@ -86,7 +89,10 @@
 //!   re-scopes the cards shown and a new preview mode reopens the
 //!   generation; a new workspace whose Pi/OMP session roots differ moves to
 //!   that store root ([`HistoryLoader::reconfigure`]). Upstream fixed them at
-//!   launch.
+//!   launch. The records of `CURRENT` and `PROGRESS` belong to one store
+//!   root: a pass still running over the previous one keeps updating its
+//!   own, so neither its generations nor its progress, completion notice or
+//!   failure reach the browser, and the indicator it fed ends.
 
 use super::cards::GenerationOpen;
 use super::corpus::corpus_edit_mark;
@@ -467,31 +473,40 @@ fn take_finished<T>(task: &mut Option<Background<T>>) -> Option<Option<T>> {
     Some(received)
 }
 
-/// A generation name (`gNNN`) as a number, to tell which is newer.
-fn generation_number(name: &str) -> u64 {
-    name.strip_prefix('g')
-        .and_then(|digits| digits.parse().ok())
-        .unwrap_or(0)
-}
-
 /// The store the list is read from in store mode (upstream runtime
 /// `Store`): generations under `root`, kept up to date by reconcile passes.
 struct StoreRun {
     root: PathBuf,
-    /// The newest generation `CURRENT` named, as seen by a pass's watcher,
-    /// at a pass's end or when the store was opened.
+    /// The generation `CURRENT` named when it was last read: when the store
+    /// was opened, by a pass's watcher or at a pass's end. Any other name
+    /// replaces it, an older one too (upstream `show_current` compares by
+    /// inequality): a store whose directory was deleted while the app runs
+    /// numbers its generations from `g000001` again. Each store root has
+    /// its own record, written in the order `CURRENT` was read (one pass
+    /// runs at a time: its watcher, then its end), so an older name is
+    /// never a stale read; a generation-open does not write it.
     latest: Arc<Mutex<Option<String>>>,
     /// What `PROGRESS` said at the running pass's watcher's last check: the
     /// progress of the pass indexing the store, by this process or another
-    /// (upstream 04c714b). `None` between passes.
+    /// (upstream 04c714b). `None` between passes. Each store root has its
+    /// own record.
     progress: Arc<Mutex<Option<Indexing>>>,
-    /// The generation an open was last started for (not started again
-    /// until `CURRENT` or the preview mode changes).
+    /// The generation an open was last started for, with its preview mode
+    /// (not started again until `CURRENT` or the preview mode changes).
     attempted: Option<(String, bool)>,
+    /// The generation of this store root installed last, with its preview
+    /// mode (upstream `Store::shown`): an open may find a generation newer
+    /// than `latest`, which is then not opened again once recorded.
+    shown: Option<(String, bool)>,
+    /// The store root changed: the next poll ends the indicator, which may
+    /// show the progress of a pass over the previous store.
+    left_root: bool,
     /// Cards in the generation shown (a refresh reports the change).
     shown_len: usize,
     /// The `store-reconcile` thread of the running pass.
     pass: Option<Background<PassResult>>,
+    /// The store root the running pass was started over.
+    pass_root: PathBuf,
     /// Another pass was asked for while one was running.
     again: bool,
     /// The `generation-open` thread, and the store it opens a generation of.
@@ -516,6 +531,9 @@ impl StoreRun {
             latest: Arc::new(Mutex::new(latest)),
             progress: Arc::default(),
             attempted: None,
+            shown: None,
+            left_root: false,
+            pass_root: PathBuf::new(),
             shown_len: 0,
             pass: None,
             again: false,
@@ -535,15 +553,9 @@ impl StoreRun {
             .clone()
     }
 
-    /// Records a newer `CURRENT` (never an older one).
+    /// Records the name `CURRENT` was just read with.
     fn saw(&self, name: &str) {
-        let mut latest = self.latest.lock().unwrap_or_else(PoisonError::into_inner);
-        if latest
-            .as_deref()
-            .is_none_or(|seen| generation_number(seen) < generation_number(name))
-        {
-            *latest = Some(name.to_owned());
-        }
+        record_current(&self.latest, name);
     }
 
     /// Takes in what a finished pass left. Returns whether it failed.
@@ -555,22 +567,30 @@ impl StoreRun {
                 current,
             }) => {
                 // A pass over the store of a previous workspace says
-                // nothing about this one's generations.
-                if let Some(current) = current.filter(|_| root == self.root) {
+                // nothing about this one: neither its generations nor its
+                // failure (logged by its thread).
+                let ours = root == self.root;
+                if ours && let Some(current) = current {
                     self.saw(&current);
                 }
                 match result {
                     Ok(publish) => {
                         self.written = Some(publish);
-                        self.failed = None;
+                        if ours {
+                            self.failed = None;
+                        }
                         false
                     }
-                    Err(error) => {
+                    Err(error) if ours => {
                         self.failed = Some(error);
                         true
                     }
+                    Err(_) => false,
                 }
             }
+            // A pass that stopped without a result (a panic) over a previous
+            // store root is not reported either.
+            None if self.pass_root != self.root => false,
             None => {
                 self.failed = Some(std::io::Error::other("the reconcile pass stopped"));
                 true
@@ -669,11 +689,16 @@ impl HistoryLoader {
         if let (Some(store), Some(root)) = (&mut self.store, root)
             && store.root != root
         {
-            // A new record of `CURRENT`: a pass still running over the
-            // previous store keeps updating its own.
+            // New records of `CURRENT` and `PROGRESS`: a pass still running
+            // over the previous store keeps updating its own, which no
+            // longer reach the browser, and the indicator it may have fed
+            // ends without a completion notice.
             store.latest = Arc::new(Mutex::new(Generation::current_name(&root)));
+            store.progress = Arc::default();
             store.root = root;
             store.attempted = None;
+            store.shown = None;
+            store.left_root = true;
         }
         if self.store.is_some() {
             // The next poll shows the cards of these settings (a reverted
@@ -778,6 +803,7 @@ impl HistoryLoader {
             store.again = true;
             return;
         }
+        store.pass_root = store.root.clone();
         let job = ReconcileJob {
             root: store.root.clone(),
             env: self.env.clone(),
@@ -1091,23 +1117,25 @@ impl HistoryLoader {
                 // current one's generation is opened instead.
                 store.attempted = None;
             } else {
-                let name = open.generation_name().to_owned();
-                let show_last = open.show_last();
-                store.saw(&name);
+                // Not recorded as `CURRENT`: the watcher or the pass's end
+                // may have recorded a newer name since the open read it,
+                // which must not give way to an older one. The name
+                // recorded is compared with the one shown instead.
+                let shown = (open.generation_name().to_owned(), open.show_last());
                 browser.install_generation(open);
-                store.attempted = Some((name, show_last));
+                store.shown = Some(shown);
                 store.shown_len = browser.generation_len().unwrap_or(0);
                 result.swapped = true;
             }
         }
-        // A newer generation, or another preview mode: open it off this
-        // thread.
+        // Another generation than the one shown (upstream `show_current`),
+        // or another preview mode: open it off this thread.
         if store.opening.is_none()
             && let Some(name) = store.latest()
         {
-            let wanted = (name, self.options.show_last);
-            if store.attempted.as_ref() != Some(&wanted) {
-                store.attempted = Some(wanted);
+            let wanted = Some((name, self.options.show_last));
+            if store.attempted != wanted && store.shown != wanted {
+                store.attempted = wanted;
                 let root = store.root.clone();
                 store.opening_root = root.clone();
                 let (show_last, time) = (self.options.show_last, self.options.time_filter);
@@ -1126,6 +1154,11 @@ impl HistoryLoader {
         if !pending && store.failed.is_some() {
             // A failed pass (however it was collected) ends the indicator
             // without a completion notice.
+            browser.end_index_progress();
+        }
+        if std::mem::take(&mut store.left_root) {
+            // So does a pass over the store of a previous workspace: what
+            // the indicator shows from now on is this store's.
             browser.end_index_progress();
         }
         browser.set_index_progress(store.indexing(pending), pending);
@@ -1442,12 +1475,13 @@ struct ReconcileJob {
     /// Set when the loader is dropped: the pass is given up.
     cancel: Arc<Cancel>,
     log_path: Option<PathBuf>,
-    /// The newest `CURRENT` the watcher saw, shared with the loader.
+    /// `CURRENT` as the watcher last read it: the loader's record for
+    /// `root` (it gets a new one when it moves to another root).
     latest: Arc<Mutex<Option<String>>>,
-    /// What `PROGRESS` said at the watcher's last check, shared with the
-    /// loader.
+    /// What `PROGRESS` said at the watcher's last check: the loader's
+    /// record for `root`, like `latest`.
     progress: Arc<Mutex<Option<Indexing>>>,
-    /// Called when the watcher sees a newer `CURRENT` or new progress.
+    /// Called when the watcher sees another `CURRENT` or new progress.
     waker: Option<Waker>,
 }
 
@@ -1458,7 +1492,7 @@ struct ReconcileJob {
 /// own `store-scan-*` pool of no more threads; the threads of both lower
 /// their priority, so the pass leaves cores to the UI and the search
 /// workers. Meanwhile a `store-watch` thread reads `CURRENT` every
-/// [`GENERATION_POLL`] and wakes the loader's poll when it names a newer
+/// [`GENERATION_POLL`] and wakes the loader's poll when it names another
 /// generation. Each pass's outcome goes to the
 /// debug log with upstream's line (`Reconcile: {outcome:?}`; of a store
 /// found locked again and again, only the first); a pass given up (the
@@ -1551,10 +1585,12 @@ fn reconcile_store(job: ReconcileJob) -> PassResult {
 }
 
 /// The `store-watch` thread: until `done` (or `cancel`), checks `CURRENT`
-/// and `PROGRESS` every [`GENERATION_POLL`], records a newer generation in
-/// `latest` and the progress of the pass indexing the store (by this process
-/// or another; upstream read it whenever it polled `CURRENT`) in `progress`,
-/// and calls the waker when either changed. Clears `progress` when it ends.
+/// and `PROGRESS` every [`GENERATION_POLL`], records the generation
+/// `CURRENT` names in `latest` (any other name than the one recorded, as
+/// upstream's `show_current` compared) and the progress of the pass
+/// indexing the store (by this process or another; upstream read it
+/// whenever it polled `CURRENT`) in `progress`, and calls the waker when
+/// either changed. Clears `progress` when it ends.
 fn watch_current(
     root: &Path,
     latest: &Mutex<Option<String>>,
@@ -1573,14 +1609,7 @@ fn watch_current(
             std::mem::replace(&mut *shown, indexing) != indexing
         };
         if let Some(current) = Generation::current_name(root) {
-            let mut seen = latest.lock().unwrap_or_else(PoisonError::into_inner);
-            if seen
-                .as_deref()
-                .is_none_or(|seen| generation_number(seen) < generation_number(&current))
-            {
-                *seen = Some(current);
-                changed = true;
-            }
+            changed |= record_current(latest, &current);
         }
         if changed && let Some(waker) = waker {
             waker();
@@ -1588,6 +1617,20 @@ fn watch_current(
     }
     // The pass is over: what it reported no longer applies.
     *progress.lock().unwrap_or_else(PoisonError::into_inner) = None;
+}
+
+/// Records `name`, just read from `CURRENT`, in `latest` unless it is the
+/// name recorded; returns whether it was another. An older generation
+/// counts too (upstream `Store::show_current` compares by inequality): a
+/// store recreated while the app runs numbers its generations from
+/// `g000001` again.
+fn record_current(latest: &Mutex<Option<String>>, name: &str) -> bool {
+    let mut latest = latest.lock().unwrap_or_else(PoisonError::into_inner);
+    if latest.as_deref() == Some(name) {
+        return false;
+    }
+    *latest = Some(name.to_owned());
+    true
 }
 
 /// Forward loader messages through a new channel, calling `waker` after

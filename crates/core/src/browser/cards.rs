@@ -496,7 +496,8 @@ impl Browser {
         opened
     }
 
-    /// Shows `snapshot` if it is a newer generation than the one shown,
+    /// Shows `snapshot` unless it is the generation shown (by name and
+    /// preview mode; an older name counts, as upstream compared),
     /// keeping the query, scope and selected session (upstream
     /// `swap_generation`; synchronous, see [`Browser::open_search_index`]).
     /// Returns whether it did.

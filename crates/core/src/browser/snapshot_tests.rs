@@ -1637,6 +1637,90 @@ fn a_new_store_root_is_reconciled_and_shown_after_reconfigure() {
     }
 }
 
+/// Upstream `Store::show_current` swaps whenever `CURRENT` names another
+/// generation than the one shown, not only a newer one: a store whose
+/// directory is deleted while the app runs is numbered from `g000001`
+/// again, and that generation is shown, both when a pass's watcher reads it
+/// (here the pass waits for another instance that rebuilds the store) and
+/// when a pass that rebuilt the store itself ends.
+#[test]
+fn a_store_recreated_while_shown_is_shown_from_its_first_generation() {
+    let sandbox = Sandbox::new();
+    let mut paths = write_sessions(&sandbox);
+    let root = crate::store::default_root(&sandbox.env).unwrap();
+    let sources = crate::history::sources::Registry::from_env(&sandbox.env);
+    // One generation per pass: g000001, then four deltas.
+    let unmerged = crate::store::generation::MergePolicy {
+        max_deltas: usize::MAX,
+        base_share: f64::INFINITY,
+        text_garbage: f64::INFINITY,
+    };
+    crate::store::reconcile::reconcile_with(&root, &sources, unmerged).unwrap();
+    for hour in 4..8 {
+        let name = format!("{hour}.jsonl");
+        paths.insert(
+            0,
+            write_session(&sandbox, "-tmp-gamma", &name, hour, "a later prompt"),
+        );
+        crate::store::reconcile::reconcile_with(&root, &sources, unmerged).unwrap();
+    }
+    let current = || crate::store::Generation::current_name(&root);
+    assert_eq!(current().as_deref(), Some("g000005"));
+    // Shown without an initial pass (which would merge the deltas).
+    let mut loader = snapshot_loader(&sandbox);
+    let mut app = loading_app(&sandbox, None, vec![]);
+    app.show_snapshot(loader.open_snapshot().unwrap());
+    poll_until(&mut loader, &mut app, "the generation in full", |app| {
+        app.generation_open()
+    });
+    assert_eq!(app.generation_name(), Some("g000005"));
+    assert_eq!(listed_paths(&app), display(&paths));
+
+    // The store's directory goes, with the generation shown; another
+    // instance builds it again while the loader's pass waits for its lock.
+    std::fs::remove_dir_all(&root).unwrap();
+    let held = PublishLock::try_acquire(&root).unwrap().unwrap();
+    assert!(loader.start_refresh());
+    let parsed = crate::store::reconcile::parse_everything(&sources);
+    crate::store::generation::publish_all(&held, &parsed).unwrap();
+    assert_eq!(current().as_deref(), Some("g000001"));
+    poll_until(&mut loader, &mut app, "the rebuilt store's watch", |app| {
+        app.generation_name() == Some("g000001")
+    });
+    assert_eq!(
+        app.readiness().reconcile,
+        ReconcileState::Running,
+        "seen by the watcher of the waiting pass"
+    );
+    assert_eq!(listed_paths(&app), display(&paths));
+    drop(held);
+    let event = poll_until_event(&mut loader, &mut app);
+    assert!(
+        matches!(event, LoadEvent::Refreshed { old: 7, new: 7, .. }),
+        "{event:?}"
+    );
+    // The pass parsed every file again (the other instance's fingerprints
+    // are unknown to it) and published that.
+    assert_ne!(current().as_deref(), Some("g000001"));
+    assert_eq!(app.generation_name(), current().as_deref());
+
+    // Deleted again, the store is rebuilt by the loader's own pass.
+    std::fs::remove_dir_all(&root).unwrap();
+    assert!(loader.start_refresh());
+    let event = poll_until_event(&mut loader, &mut app);
+    assert!(
+        matches!(event, LoadEvent::Refreshed { old: 7, new: 7, .. }),
+        "{event:?}"
+    );
+    assert_eq!(current().as_deref(), Some("g000001"));
+    assert_eq!(app.generation_name(), Some("g000001"));
+    assert_eq!(listed_paths(&app), display(&paths));
+    for _ in 0..5 {
+        loader.poll(&mut app);
+        assert!(!loader.is_preparing(), "settled");
+    }
+}
+
 #[test]
 fn a_first_pass_over_no_session_reports_no_history() {
     let sandbox = Sandbox::new();
@@ -1864,6 +1948,85 @@ fn the_progress_of_a_pass_indexing_the_store_shows_until_no_pass_runs() {
     let notice = app.take_index_notice();
     assert_eq!(notice, Some(IndexNotice::Indexed { total }));
     assert!(!root.join("PROGRESS").exists());
+}
+
+/// Fork: a workspace switch moves the loader to another store root while a
+/// pass over the previous one runs (here it waits for another instance's
+/// lock and shows that instance's progress). The indicator ends at once,
+/// and neither the previous store's later progress nor a completion notice
+/// for it reaches the browser; the new store's pass runs after that one.
+#[test]
+fn a_new_store_root_ends_the_indicator_of_a_pass_over_the_previous_one() {
+    use crate::store::progress::{Indexing, MIN_FILES, Reporter};
+    use std::sync::atomic::Ordering::Relaxed;
+    let sandbox = Sandbox::new();
+    let paths = write_sessions(&sandbox);
+    let first_root = crate::store::default_root(&sandbox.env).unwrap();
+    let sources = crate::history::sources::Registry::from_env(&sandbox.env);
+    crate::store::reconcile::reconcile(&first_root, &sources).unwrap();
+    let held = PublishLock::try_acquire(&first_root).unwrap().unwrap();
+    let total = MIN_FILES + 10;
+    let reporter = Reporter::start(&first_root, total).unwrap();
+    reporter.counter().fetch_add(3, Relaxed);
+    let mut loader = snapshot_loader(&sandbox);
+    let mut app = loading_app(&sandbox, None, vec![]);
+    app.show_snapshot(loader.open_snapshot().unwrap());
+    assert!(loader.start_initial_load());
+    let event = poll_until_event(&mut loader, &mut app);
+    assert!(
+        matches!(
+            event,
+            LoadEvent::Loaded {
+                conversations: 3,
+                ..
+            }
+        ),
+        "{event:?}"
+    );
+    poll_until(&mut loader, &mut app, "the progress", |app| {
+        app.index_progress() == Some(Indexing { done: 3, total })
+    });
+
+    let elsewhere = sandbox.path().join("pi-elsewhere");
+    let env = Arc::new(HistoryEnv::sandbox(sandbox.path()).with_pi_session_dir(elsewhere));
+    let second_root = crate::store::default_root(&env).unwrap();
+    assert_ne!(first_root, second_root);
+    loader.reconfigure(env, LoaderOptions::default().with_snapshot(true));
+    assert!(loader.start_refresh());
+    loader.poll(&mut app);
+    assert_eq!(app.index_progress(), None, "the indicator ends");
+    assert_eq!(app.take_index_notice(), None, "without a notice");
+    assert_eq!(app.readiness().reconcile, ReconcileState::Running);
+
+    // The previous store's pass is still reported, to no one.
+    reporter.counter().fetch_add(4, Relaxed);
+    let until = Instant::now() + loader::GENERATION_POLL * 4;
+    while Instant::now() < until {
+        loader.poll(&mut app);
+        assert_eq!(app.index_progress(), None);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // That pass ends; the new store's pass (three files, no progress) runs
+    // after it and its generation is shown.
+    drop(reporter);
+    drop(held);
+    let event = poll_until_event(&mut loader, &mut app);
+    assert!(
+        matches!(event, LoadEvent::Refreshed { new: 3, .. }),
+        "{event:?}"
+    );
+    assert_eq!(listed_paths(&app), display(&paths));
+    assert_eq!(
+        crate::store::Generation::current_name(&second_root).as_deref(),
+        app.generation_name()
+    );
+    assert_eq!(app.index_progress(), None);
+    assert_eq!(
+        app.take_index_notice(),
+        None,
+        "no completion notice for the previous store's pass"
+    );
 }
 
 /// Upstream 04c714b: a failed pass that no load event reports (here the
