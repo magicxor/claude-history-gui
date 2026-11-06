@@ -1140,7 +1140,8 @@ mod pure {
     /// L-109 (upstream 411e227 `list_preview_anchors_on_the_first_match`):
     /// the list hit is the first line matching the query, its match is the
     /// hit (949ec4e), the other message's secondary; the semantic evidence
-    /// wins over the first match.
+    /// wins only among the matching lines (59195df), and decides alone only
+    /// when nothing matches.
     #[test]
     fn l109_list_hit_anchors_on_the_first_match_or_the_evidence() {
         use claude_history_core::browser::ListHit;
@@ -1213,6 +1214,11 @@ mod pure {
         let anchor = found.anchor.expect("the evidence's message");
         assert_eq!(line_of(&anchor), "rotated the token and restarted");
         assert_eq!(anchor.position, Some(3));
+
+        // Evidence on a message without the query does not move the anchor.
+        let found = hit::find(&items, &info, &hit_of("token", Some("…the tunnel is up…")));
+        let anchor = found.anchor.expect("a matching line");
+        assert_eq!(line_of(&anchor), "now rotate the token");
 
         // Nothing matches: no anchor, nothing highlighted.
         let found = hit::find(&items, &info, &hit_of("absent", None));

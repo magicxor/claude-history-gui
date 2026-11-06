@@ -5,7 +5,7 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 ## Unreleased
 
 - While you search, the viewer shows the selected result at the match instead of at its start: scrolled to the
-  first line that matches the query (for a semantic result, the passage its row shows), with that message marked
+  first line that matches the query (for a semantic result, the matching passage closest to the one its row shows), with that message marked
   and the query's matches highlighted. Typing more moves it to the new match; clearing the query or a search with
   `/` in the viewer removes the highlights.
 - In that preview only the match the result was found by stands out: matches of the whole query in that message get

@@ -4,8 +4,9 @@
 //!
 //! The installed items are split into lines (each segment's text at its
 //! `\n`s), every navigable message into the range of its items' lines, and
-//! core's [`preview::anchor`] picks the line: the one the row's semantic
-//! evidence points at, else the first line matching the query. The query's
+//! core's [`preview::anchor`] picks a line matching the query (the one in the
+//! message the row's semantic evidence points at, else the first); only when
+//! no line matches does the evidence alone decide (59195df). The query's
 //! matches are the `/` search's (core `ViewSearchQuery`, AD7), widened to
 //! whole words and emphasized by core's [`preview::match_ranges`] (upstream
 //! 949ec4e): the matches of the whole query in the hit's message (or, when
