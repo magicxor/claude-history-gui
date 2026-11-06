@@ -11,7 +11,7 @@
 //! 949ec4e): the matches of the whole query in the hit's message (or, when
 //! it has none, the matches on the anchor line) are the hit, drawn with the
 //! fill of the `/` search's other matches; every other match is secondary,
-//! bold accent text (upstream also marks the anchor line in the gutter; the
+//! a soft background wash (upstream also marks the anchor line in the gutter; the
 //! viewer focuses its message instead). They are classified once per hit,
 //! here, for the whole conversation, not per paint.
 //!

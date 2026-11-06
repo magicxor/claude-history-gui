@@ -2161,7 +2161,7 @@ h_flex().w_full().items_start()                       // one ledger row per item
   items of the same block and consecutive call lines have no gap.
 * Search highlights: `HighlightStyle { background_color: match role, color: on-match role }`; current match
   `background_color: current-match role (warning token), color: on-current role` (V-075); the list hit's secondary
-  matches bold accent text without a fill (§9.8a). Style runs are built by a deterministic overlay (base spans, then
+  matches a soft accent wash (`soft_match_background`) without a color change (§9.8a). Style runs are built by a deterministic overlay (base spans, then
   code tokens, then match ranges on top; spike-list §6): `render::overlay_matches` cuts the base runs at the match
   boundaries by hand and lays each match's style over the base style (its fields win), since `combine_highlights`
   folds overlapping styles in hash order.
@@ -2256,8 +2256,8 @@ row), taken from the handle LRU (§9.7).
   conversation (on the build worker or the re-find task, never per paint): the hit's message (the one holding the
   anchor line) has its matches of the whole query (`ViewSearchQuery::covers_all_terms`, every word and literal in
   the match) as the hit, or, when it has none, the matches on the anchor line; they are drawn with the fill of the
-  `/` search's other matches (`Emphasis::Hit`). Every other match is secondary, bold accent text without a fill
-  (`Emphasis::Secondary`; upstream: bold colored text, like matches in the list). Matches widen to the whole words
+  `/` search's other matches (`Emphasis::Hit`). Every other match is secondary, a soft accent wash
+  (`Emphasis::Secondary`; upstream 6755b3b: `search_match_soft_bg`; the text keeps its color). Matches widen to the whole words
   they touch (`widen_to_words`, alphanumeric characters), so a prefix match on `tests` covers the word. Lines are
   segment text: the ledger's name column, timestamp and wrapping are not searched (upstream's pane searches them).
 * Placement (upstream `scroll_offset`, in pixels): the anchor message's first item goes to the top and the message is

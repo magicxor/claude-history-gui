@@ -58,6 +58,10 @@ pub struct Roles {
     pub match_background: Hsla,
     pub match_foreground: Hsla,
     pub current_match_background: Hsla,
+    /// Fill of the list hit's secondary matches (L-109, upstream 6755b3b): the
+    /// accent washed over the transcript (opaque, so the contrast table is exact);
+    /// the text keeps its own color.
+    pub soft_match_background: Hsla,
     pub current_match_foreground: Hsla,
     // List roles (core palette).
     pub custom_title: Hsla,
@@ -229,6 +233,7 @@ fn raw_roles(cx: &App) -> Roles {
         focus_tint: theme.list_active,
         separator: theme.border,
         match_background: accent.opacity(0.25),
+        soft_match_background: flatten(theme.background, accent.opacity(0.12)),
         match_foreground: theme.foreground,
         current_match_background: theme.warning,
         current_match_foreground: theme.warning_foreground,
@@ -495,25 +500,26 @@ macro_rules! text_roles {
 
 // Backgrounds: `background` (viewer transcript, dialogs), `sidebar` (left pane),
 // `list_active` (selected row, focused message), `list_hover`, `code_background`,
-// `match_background` / `current_match_background` (search highlights).
+// `match_background` / `current_match_background` / `soft_match_background`
+// (search highlights).
 // Not text, so not listed: `border`, `separator`, `selection`, `focus_mark`,
 // `focus_tint`, `dot_separator` (a decorative glyph between meta fields).
 text_roles! {
-    text_primary => [background, sidebar, list_active, list_hover],
-    text_secondary => [background, sidebar, list_active, list_hover],
+    text_primary => [background, sidebar, list_active, list_hover, soft_match_background],
+    text_secondary => [background, sidebar, list_active, list_hover, soft_match_background],
     text_muted => [background, sidebar, list_active],
     muted_foreground => [background, sidebar, list_active, list_hover],
-    accent => [background, sidebar, list_active, match_background],
+    accent => [background, sidebar, list_active, match_background, soft_match_background],
     accent_dim => [background, sidebar, list_active],
-    thinking => [background, list_active],
-    tool_text => [background, list_active],
-    heading => [background, list_active],
-    code => [background, code_background],
-    diff_add => [background, list_active],
-    diff_remove => [background, list_active],
-    quote => [background, list_active],
-    dimmed => [background, list_active],
-    link => [background, sidebar, code_background],
+    thinking => [background, list_active, soft_match_background],
+    tool_text => [background, list_active, soft_match_background],
+    heading => [background, list_active, soft_match_background],
+    code => [background, code_background, soft_match_background],
+    diff_add => [background, list_active, soft_match_background],
+    diff_remove => [background, list_active, soft_match_background],
+    quote => [background, list_active, soft_match_background],
+    dimmed => [background, list_active, soft_match_background],
+    link => [background, sidebar, code_background, soft_match_background],
     warning => [background, sidebar],
     danger => [background, sidebar],
     success => [background, sidebar],

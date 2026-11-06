@@ -178,9 +178,8 @@ fn base_runs(
 /// matches and its current match, and the list hit's secondary matches
 /// (its hit uses `other`, upstream 949ec4e's filled block). `other` and
 /// `current` set a background and a foreground, so they win over every base
-/// color (flags and syntax tokens) where they apply; `secondary` is bold
-/// accent text (upstream: bold colored text, like matches in the list) and
-/// keeps the base background.
+/// color (flags and syntax tokens) where they apply; `secondary` is a soft
+/// background wash only (upstream 6755b3b), so the text keeps its base color.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MatchStyles {
     pub other: HighlightStyle,
@@ -214,11 +213,10 @@ impl MatchStyles {
                 )),
                 ..Default::default()
             },
-            // The accent is contrast-checked on the transcript background
-            // and the focused message's tint (X-039).
+            // The wash is opaque (the accent flattened onto the transcript);
+            // the text roles are contrast-checked on it (X-039).
             secondary: HighlightStyle {
-                color: Some(roles.accent),
-                font_weight: Some(FontWeight::BOLD),
+                background_color: Some(roles.soft_match_background),
                 ..Default::default()
             },
         }

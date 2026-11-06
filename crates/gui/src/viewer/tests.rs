@@ -1282,7 +1282,7 @@ mod pure {
     }
 
     fn test_match_styles() -> render::MatchStyles {
-        use gpui_kit::{FontWeight, HighlightStyle, hsla};
+        use gpui_kit::{HighlightStyle, hsla};
         render::MatchStyles {
             other: HighlightStyle {
                 background_color: Some(hsla(0.5, 0.5, 0.5, 0.25)),
@@ -1295,8 +1295,7 @@ mod pure {
                 ..Default::default()
             },
             secondary: HighlightStyle {
-                color: Some(hsla(0.45, 0.7, 0.3, 1.0)),
-                font_weight: Some(FontWeight::BOLD),
+                background_color: Some(hsla(0.5, 0.5, 0.5, 0.12)),
                 ..Default::default()
             },
         }
@@ -1355,13 +1354,13 @@ mod pure {
     }
 
     /// L-109 (upstream 949ec4e): the list hit's hit is drawn with the fill
-    /// of the `/` search's other matches, its secondary matches as bold
-    /// accent text over the base (no fill); the match's fields win over every
+    /// of the `/` search's other matches, its secondary matches as a soft
+    /// wash (6755b3b) over the base (background only); the match's fields win over every
     /// base run's, whatever the number of runs (the overlay does not depend
     /// on `combine_highlights`' hash order), and text outside base runs is
     /// styled too.
     #[test]
-    fn l109_overlay_draws_the_hit_filled_and_secondary_matches_as_bold_text() {
+    fn l109_overlay_draws_the_hit_filled_and_secondary_matches_as_a_soft_wash() {
         use gpui_kit::{FontStyle, HighlightStyle, hsla};
 
         use crate::viewer::search::Emphasis;
@@ -1399,7 +1398,10 @@ mod pure {
                     .iter()
                     .find(|(run, _)| run.contains(&byte))
                     .expect("styled byte");
-                assert_eq!(style.color, want.color, "byte {byte}");
+                // A match without a color (the secondary wash) keeps the
+                // base run's.
+                let color = want.color.or((byte < 40).then_some(colors[byte % 2]));
+                assert_eq!(style.color, color, "byte {byte}");
                 assert_eq!(style.background_color, want.background_color, "byte {byte}");
                 assert_eq!(style.font_weight, want.font_weight, "byte {byte}");
                 let italic = (byte < 40).then_some(FontStyle::Italic);

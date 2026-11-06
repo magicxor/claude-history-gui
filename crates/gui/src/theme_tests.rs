@@ -76,23 +76,34 @@ fn search_match_text_is_legible_in_both_themes(cx: &mut TestAppContext) {
                 "{mode:?} {name}: {ratio:.2}:1 (text {text:?} on {fill:?})"
             );
         }
-        // The list hit's secondary matches (L-109) have no fill: their text
-        // is drawn on the transcript, the focused message's tint, a hovered
-        // message and code blocks.
-        let text = styles
+        // The list hit's secondary matches (L-109, 6755b3b) are a soft wash
+        // that keeps the text's own color: every text role drawn in the
+        // viewer is legible on the opaque wash over the transcript (it
+        // replaces the tint of the focused message, a hovered message or a
+        // code block it covers).
+        let wash = styles
             .secondary
-            .color
-            .expect("a match sets its text colour");
-        for fill in [
-            roles.background,
-            roles.list_active,
-            roles.list_hover,
-            roles.code_background,
+            .background_color
+            .expect("a secondary match sets a wash");
+        assert!(styles.secondary.color.is_none());
+        for (name, text) in [
+            ("text_primary", roles.text_primary),
+            ("text_secondary", roles.text_secondary),
+            ("heading", roles.heading),
+            ("code", roles.code),
+            ("tool_text", roles.tool_text),
+            ("thinking", roles.thinking),
+            ("quote", roles.quote),
+            ("dimmed", roles.dimmed),
+            ("link", roles.link),
+            ("diff_add", roles.diff_add),
+            ("diff_remove", roles.diff_remove),
+            ("accent", roles.accent),
         ] {
-            let ratio = contrast_ratio(text, fill, roles.background);
+            let ratio = contrast_ratio(text, wash, roles.background);
             assert!(
                 ratio >= MIN_CONTRAST,
-                "{mode:?} secondary match: {ratio:.2}:1 (text {text:?} on {fill:?})"
+                "{mode:?} secondary match, {name}: {ratio:.2}:1"
             );
         }
     }
