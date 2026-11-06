@@ -79,7 +79,19 @@ pub fn warm_up() {
             .name("syntect-warmup".into())
             .stack_size(8 * 1024 * 1024)
             .spawn(|| {
-                let _ = highlight("fn main() {}\n", "rust", ThemeKind::Dark);
+                // Common grammars of conversations (917758a): compile them up
+                // front so the first highlighted block does not pay for them.
+                for (code, lang) in [
+                    ("fn main() {}\n", "rust"),
+                    ("const a = 1;\n", "typescript"),
+                    ("def f(): pass\n", "python"),
+                    ("echo hi\n", "bash"),
+                    ("{\"a\": 1}\n", "json"),
+                    ("a: 1\n", "yaml"),
+                    ("# a\n", "markdown"),
+                ] {
+                    let _ = highlight(code, lang, ThemeKind::Dark);
+                }
                 let _ = highlight("fn main() {}\n", "rust", ThemeKind::Light);
             });
     });
