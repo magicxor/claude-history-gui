@@ -92,7 +92,6 @@ use crate::history::actions::{self, Launch, Launcher, Target};
 use crate::history::model::SourceKind;
 use crate::history::sources::Registry;
 use crate::history::{Conversation, Provenance};
-use crate::program::ResolvedProgram;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -193,19 +192,6 @@ pub enum ResumeStrategy {
     CopyToWorkspace,
     /// Pi / OMP / Codex: the agent's native resume or fork command.
     Native,
-}
-
-/// Resolve `name` (`claude`, `pi`, `omp`, ...) to a full path: the override
-/// when given (it must exist), else a `PATH` search with `PATHEXT` on
-/// Windows (W9). [`ResolvedProgram::kind`] tells whether it is a batch
-/// script that must run through `cmd.exe`; [`ResolvedProgram::command`]
-/// spawns either kind with its arguments intact.
-pub fn resolve_program(
-    env: &HistoryEnv,
-    name: &str,
-    override_path: Option<&Path>,
-) -> Result<ResolvedProgram> {
-    env.resolve_program(name, override_path)
 }
 
 /// What a session to resume is: its source, transcript path, recorded

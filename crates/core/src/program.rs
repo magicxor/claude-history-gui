@@ -13,7 +13,6 @@
 //! `history::actions::Launcher` (upstream 8a99ccc: a configured `command`
 //! or `[gui]` path, else the agent's name), found by [`find_program_path`].
 
-use crate::env::HistoryEnv;
 use crate::error::{AppError, Result};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -214,34 +213,6 @@ fn is_batch_script(path: &Path) -> bool {
         })
 }
 
-impl HistoryEnv {
-    /// Resolve `name` (e.g. `"claude"`): an explicit `override_path` wins
-    /// (it must exist), otherwise `PATH` is searched (with `PATHEXT` on
-    /// Windows).
-    pub fn resolve_program(
-        &self,
-        name: &str,
-        override_path: Option<&Path>,
-    ) -> Result<ResolvedProgram> {
-        if let Some(path) = override_path {
-            if path.is_file() {
-                return Ok(ResolvedProgram::new(path.to_path_buf()));
-            }
-            return Err(AppError::ClaudeExecutionError(format!(
-                "Configured program '{}' does not exist",
-                path.display()
-            )));
-        }
-        find_program(
-            name,
-            self.path_var.as_deref(),
-            self.pathext.as_deref(),
-            cfg!(windows),
-        )
-        .ok_or_else(|| AppError::ClaudeExecutionError(format!("Could not find '{name}' on PATH")))
-    }
-}
-
 /// Search for `name` like a shell would.
 ///
 /// * A name containing a path separator is checked as given (only when it
@@ -363,6 +334,7 @@ fn is_runnable(path: &Path, windows: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::env::HistoryEnv;
 
     fn touch(path: &Path) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -578,21 +550,31 @@ mod tests {
     }
 
     #[test]
-    fn env_override_wins_and_must_exist() {
+    fn env_path_is_searched_and_absolute_paths_must_exist() {
         let root = tempfile::tempdir().unwrap();
         let custom = root.path().join("custom").join("claude.cmd");
         touch(&custom);
         let env = HistoryEnv::sandbox(root.path());
+        let find = |env: &HistoryEnv, name: &Path| {
+            find_program_path(
+                name,
+                env.path_var.as_deref(),
+                env.pathext.as_deref(),
+                cfg!(windows),
+            )
+        };
 
-        let resolved = env.resolve_program("claude", Some(&custom)).unwrap();
-        assert_eq!(resolved.path, custom);
-        assert_eq!(resolved.kind, ProgramKind::BatchScript);
-        assert!(
-            env.resolve_program("claude", Some(&root.path().join("nope.exe")))
-                .is_err()
-        );
+        // An absolute path is used as given when it exists (the launcher's
+        // configured command). Windows-only: `custom` is a .cmd file, which
+        // is classified by extension; on Unix it would need the exec bit.
+        if cfg!(windows) {
+            let resolved = find(&env, &custom).unwrap();
+            assert_eq!(resolved.path, custom);
+            assert_eq!(resolved.kind, ProgramKind::BatchScript);
+        }
+        assert!(find(&env, &root.path().join("nope.exe")).is_none());
         // The sandbox has no PATH, so nothing is found by name.
-        assert!(env.resolve_program("claude", None).is_err());
+        assert!(find(&env, Path::new("claude")).is_none());
 
         let bin = root.path().join("bin");
         let program = if cfg!(windows) { "pi.exe" } else { "pi" };
@@ -601,9 +583,6 @@ mod tests {
             path_var: Some(path_var(&[&bin])),
             ..env
         };
-        assert_eq!(
-            env.resolve_program("pi", None).unwrap().path,
-            bin.join(program)
-        );
+        assert_eq!(find(&env, Path::new("pi")).unwrap().path, bin.join(program));
     }
 }
