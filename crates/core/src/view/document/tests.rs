@@ -778,7 +778,20 @@ fn single_unknown_tool_call_summary_is_the_call_itself() {
         r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"a__b","input":{}},{"type":"tool_use","id":"toolu_2","name":"a__c","input":{}}]}}"#,
     );
     let doc = build(&[two], &prefs(ToolDisplayMode::Summary));
-    assert_eq!(doc.messages[0].blocks[0].plain_text(), "Called 2 tools");
+    assert_eq!(doc.messages[0].blocks[0].plain_text(), "Called a__b, a__c");
+}
+
+#[test]
+fn summary_tool_mode_names_unknown_tools_in_group() {
+    let e = entry(
+        0,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"mcp__docs__search","input":{"query":"x"}},{"type":"tool_use","id":"toolu_2","name":"clock__sleep","input":{"duration_ms":1}},{"type":"tool_use","id":"toolu_3","name":"clock__sleep","input":{"duration_ms":2}},{"type":"tool_use","id":"toolu_4","name":"Read","input":{"file_path":"src/main.rs"}}]}}"#,
+    );
+    let doc = build(&[e], &prefs(ToolDisplayMode::Summary));
+    assert_eq!(
+        doc.messages[0].blocks[0].plain_text(),
+        "Read 1 file, called mcp__docs__search, clock__sleep ×2"
+    );
 }
 
 #[test]
@@ -795,7 +808,7 @@ fn hidden_pi_thinking_allows_clickable_grouped_tool_summary() {
     );
     assert_eq!(
         collapsed.messages[0].blocks[0].plain_text(),
-        "Called 2 tools"
+        "Called bash ×2"
     );
 
     let expanded = build_document(
