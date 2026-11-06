@@ -4,6 +4,8 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 ## Unreleased
 
+- Loading and refreshing the history spends less CPU checking session files: project folders are no longer looked up
+  one by one, and the check runs on at most four threads at a lower priority.
 - While you search, the viewer shows the selected result at the match instead of at its start: scrolled to the
   first line that matches the query, preferring lines that hold every query word (for a semantic result, the matching passage closest to the one its row shows), with that message marked
   and the query's matches highlighted. Typing more moves it to the new match; clearing the query or a search with

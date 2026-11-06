@@ -458,9 +458,11 @@ Background work (all threads named, 8 MiB stack via `std::thread::Builder::stack
   dropped), `row-evidence` (reads the literal context of visible rows from their
   text frames); the browser joins its `semantic-corpus` and `row-evidence` threads when it is dropped; rayon pools (`lexical-rank-worker`, `index-search-*` up to 8 threads,
   `store-reconcile-*` up to 4, which lower their scheduling priority when they start, as upstream's reconcile
-  child ran at nice 10; not in tests) use rayon's default stack size, not 8 MiB; ONNX Runtime's inference pool
-  (`semantic-embed`, half the cores, started by ONNX Runtime through core's thread manager when the GUI's model
-  loads; each lowers its scheduling priority when it starts, §7.6);
+  child ran at nice 10; not in tests) use rayon's default stack size, not 8 MiB; every scan of the session files
+  (a reconcile pass of the list, Tools or Deep search, or a load without the store) runs on a pool of its own
+  (`store-scan-*`, up to 4, 605ef46) whose threads have 8 MiB stacks and lower their scheduling priority the same
+  way; ONNX Runtime's inference pool (`semantic-embed`, half the cores, started by ONNX Runtime through core's
+  thread manager when the GUI's model loads; each lowers its scheduling priority when it starts, §7.6);
 * GUI-owned: `viewer-worker` (one per ViewerPane: single-flight parse + document + items + segments, §7.5),
   `agent-worker` (Deep Search + agent panel, single-flight per request kind with cancellation), short-lived tool
   threads (`semantic-cache-gen`, `update-check`, `delete-empty-scan`, `uuid-load`, `rename-write`, `delete-exec`,
@@ -1481,7 +1483,7 @@ Debug builds of `RealServices` refuse `spawn_terminal`/`exec_in_current_terminal
 |---|---|---|---|
 | Initial load / refresh / reload | core `HistoryLoader` (`LoaderOptions::with_waker`), K1 off-thread preparation, K18 policy | waker → `async_channel::bounded::<()>(1)` → ListPane `_poll_task` → `loader.poll(&mut browser)` then `browser.poll()`, then one yield to the executor | core |
 | Lexical + semantic search | core `Browser` workers, same waker; the lexical worker ranks the loaded corpus on a one-thread pool or the store index on `index-search-*` (≤ 8 threads, top page first, ac7f591) | same task → `browser.poll()` → `on_results` | core generations; index answers by `Arc` identity |
-| Store generations (ac7f591, e905169, 358becb) | core `HistoryLoader` in store mode: `generation-open` thread materializes every card of a generation and opens its index (and maps the semantic corpus to it); `store-reconcile` thread (own `store-reconcile-*` pool, ≤ 4 threads) runs a reconcile pass (`store::reconcile::reconcile_cancellable` over the env's sources: one stat per session file, only new or changed files parsed, delta generations, merges), retried every `BUSY_RETRY` (1 s) while another instance holds `LOCK`, with a `store-watch` thread that reads `CURRENT` every `GENERATION_POLL` (200 ms) and wakes the poll when it names a newer generation; each sends its result before calling the waker; dropping the loader gives up a running pass (or its wait for the lock), then joins both | waker → `loader.poll` → `Browser::install_generation` | generation name |
+| Store generations (ac7f591, e905169, 358becb) | core `HistoryLoader` in store mode: `generation-open` thread materializes every card of a generation and opens its index (and maps the semantic corpus to it); `store-reconcile` thread (own `store-reconcile-*` pool, ≤ 4 threads) runs a reconcile pass (`store::reconcile::reconcile_cancellable` over the env's sources: one stat per session file on the scan's own `store-scan-*` pool, only new or changed files parsed, delta generations, merges), retried every `BUSY_RETRY` (1 s) while another instance holds `LOCK`, with a `store-watch` thread that reads `CURRENT` every `GENERATION_POLL` (200 ms) and wakes the poll when it names a newer generation; each sends its result before calling the waker; dropping the loader gives up a running pass (or its wait for the lock), then joins both | waker → `loader.poll` → `Browser::install_generation` | generation name |
 | UUID lookup (K2) | `cx.background_spawn(history::load_session_by_uuid)` when `uuid_lookup() == Pending` | `browser.resolve_uuid_lookup_session(uuid, conv)`; the task is `load_session_by_uuid(..).map(PreparedSession::new)` | core ignores a stale UUID |
 | Rename (K3) | `cx.background_spawn(history::rename_session(..).map(PreparedSession::new))` | `list.apply_renamed(path, prepared)` → `browser.apply_renamed_session` | dialog id + path |
 | Delete (K4) | `background_spawn(plan_session_delete)` → dialog → `background_spawn(execute_session_delete)` | `CorpusNotice::Deleted(plan files)` | dialog disabled while running |

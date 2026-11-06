@@ -63,7 +63,9 @@
 //!   later). The pool's threads lower their own scheduling priority when
 //!   they start (nice 10 on Linux, utility QoS on macOS, below normal on
 //!   Windows; not in tests), with the semantic worker's helper (8322afe),
-//!   where upstream lowered the whole child process on Unix.
+//!   where upstream lowered the whole child process on Unix. So do the
+//!   threads of the scan's own pool (`store-scan-*`, at most four, 605ef46),
+//!   since new threads do not inherit a lowered priority on Windows or macOS.
 //! * **Waker-driven `CURRENT` checks.** Upstream's event loop read `CURRENT`
 //!   (and `PROGRESS`, 04c714b) every 200 ms while a pass could publish; here
 //!   the pass's `store-watch` thread does, so an idle GUI never polls. A
@@ -1451,11 +1453,13 @@ struct ReconcileJob {
 
 /// The `store-reconcile` thread's work: a reconcile pass over the env's
 /// sources into `root`, retried every [`BUSY_RETRY`] while another process
-/// holds the store's lock. Its parallel parts (the scan, parsing, zstd
-/// frames, the suffix index and merges) run on a pool of their own, so it
-/// leaves cores to the UI and the search workers. Meanwhile a `store-watch`
-/// thread reads `CURRENT` every [`GENERATION_POLL`] and wakes the loader's
-/// poll when it names a newer generation. Each pass's outcome goes to the
+/// holds the store's lock. Its parallel parts (parsing, zstd frames, the
+/// suffix index and merges) run on a pool of their own, and the scan on its
+/// own `store-scan-*` pool of no more threads; the threads of both lower
+/// their priority, so the pass leaves cores to the UI and the search
+/// workers. Meanwhile a `store-watch` thread reads `CURRENT` every
+/// [`GENERATION_POLL`] and wakes the loader's poll when it names a newer
+/// generation. Each pass's outcome goes to the
 /// debug log with upstream's line (`Reconcile: {outcome:?}`; of a store
 /// found locked again and again, only the first); a pass given up (the
 /// loader was dropped) is not logged.

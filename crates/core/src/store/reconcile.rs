@@ -20,7 +20,13 @@
 //! [`reconcile_cancellable`] gives a pass up soon after a flag is set,
 //! because the GUI runs it in-process (see `store`'s differences from
 //! upstream). Old caches are never removed from the installed CLI's cache
-//! dir ([`Registry::cli_cache`]), nor once the pass is given up.
+//! dir ([`Registry::cli_cache`]), nor once the pass is given up. The scan's
+//! own pool (upstream 605ef46) has named `store-scan-*` threads with 8 MiB
+//! stacks that lower their own scheduling priority when they start, where
+//! upstream ran the whole reconcile child at nice 10. Every scan runs at
+//! this lower priority, also the foreground ones (the Tools and Deep search
+//! passes, loads without the store), where upstream's in-process loads
+//! scanned at normal priority.
 
 use super::card::Fingerprint;
 use super::generation::{
@@ -227,9 +233,39 @@ impl Scan {
     }
 }
 
+/// Threads listing and stating session files. The scan is bound by the
+/// kernel's directory and inode work, which contends across threads: past
+/// a few, more threads add CPU time without making it finish sooner.
+const SCAN_THREADS: usize = 4;
+
 /// Every conversation of every instance. A file reachable through more than
-/// one instance is kept once, under the first in registry order.
+/// one instance is kept once, under the first in registry order. Runs on its
+/// own small pool ([`scan_pool`]); parsing changed files runs on the
+/// caller's pool (in the GUI, the loader's `store-reconcile-*`).
+/// Fork: also a scan the user waits on runs at the lower priority.
 fn scan(sources: &Registry) -> Scan {
+    match scan_pool(SCAN_THREADS.min(rayon::current_num_threads())) {
+        Ok(pool) => pool.install(|| scan_on_current_pool(sources)),
+        Err(_) => scan_on_current_pool(sources),
+    }
+}
+
+/// The scan's pool of `threads` threads. Fork: they are named
+/// `store-scan-*`, get an 8 MiB stack like the crate's other named threads
+/// and lower their own scheduling priority when they start, as the loader's
+/// `store-reconcile-*` threads do (not in tests). Upstream's scan ran inside
+/// its reconcile child at nice 10; here the pass runs in the GUI's process,
+/// and new threads do not inherit a lowered priority on Windows or macOS.
+fn scan_pool(threads: usize) -> Result<rayon::ThreadPool, rayon::ThreadPoolBuildError> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("store-scan-{i}"))
+        .stack_size(8 * 1024 * 1024)
+        .start_handler(|_| crate::semantic::fastembed::lower_background_thread_priority())
+        .build()
+}
+
+fn scan_on_current_pool(sources: &Registry) -> Scan {
     let started = SystemTime::now();
     let mut scan = Scan::default();
     let discoveries: Vec<_> = sources
@@ -1019,6 +1055,20 @@ mod tests {
         assert!(Generation::open(&fixture.root).is_none());
         drop(held);
         assert!(matches!(fixture.run().publish, Publish::Published(_)));
+    }
+
+    /// Fork: the scan's threads are named (and, outside tests, lower their
+    /// priority like the loader's `store-reconcile-*` pool).
+    #[test]
+    fn the_scan_runs_on_its_own_named_threads() {
+        let pool = scan_pool(2).unwrap();
+        assert_eq!(pool.current_num_threads(), 2);
+        let name = pool.install(|| std::thread::current().name().map(str::to_owned));
+        assert!(
+            name.as_deref()
+                .is_some_and(|name| name.starts_with("store-scan-")),
+            "{name:?}"
+        );
     }
 
     #[test]

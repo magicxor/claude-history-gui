@@ -15,8 +15,9 @@
 //!   of the thread making the embedder, which takes part in inference; the
 //!   GUI's one shared model may be made on the agent worker or a Tools
 //!   thread, so the semantic worker lowers its own thread instead
-//!   ([`lower_background_thread_priority`]), and so does the store's
-//!   reconcile pool (upstream ran reconcile in a child process at nice 10).
+//!   ([`lower_background_thread_priority`]), and so do the store's
+//!   reconcile and scan pools (upstream ran reconcile in a child process at
+//!   nice 10).
 //!   Lowering also covers Windows (`THREAD_PRIORITY_BELOW_NORMAL`), which
 //!   upstream left out; the worker and reconcile threads skip it in tests
 //!   and `hermetic` builds (which never load the model).
@@ -261,7 +262,7 @@ fn unsort<T: Default>(order: &[usize], values: Vec<T>) -> Vec<T> {
 }
 
 /// Lowers the calling thread's scheduling priority for background work
-/// (the semantic worker, the store's reconcile pool), with
+/// (the semantic worker, the store's reconcile and scan pools), with
 /// [`lower_current_thread_priority`].
 ///
 /// Guard rail: in this crate's tests and in `hermetic` builds (the GUI's
