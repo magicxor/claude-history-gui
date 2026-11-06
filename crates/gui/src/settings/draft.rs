@@ -763,11 +763,11 @@ fn remembered(field: Field, ui: &UiState) -> Value {
             Value::Tools(match tools {
                 RememberedToolDisplay::Off => InitialToolDisplay::Off,
                 RememberedToolDisplay::Full => InitialToolDisplay::Full,
-                // The Settings control is Off/Summary/Full; Truncated reads
-                // as Summary.
-                RememberedToolDisplay::Summary | RememberedToolDisplay::Truncated => {
-                    InitialToolDisplay::Summary
-                }
+                // The Settings control is Off/Summary/Full; Calls and
+                // Truncated read as Summary.
+                RememberedToolDisplay::Summary
+                | RememberedToolDisplay::Calls
+                | RememberedToolDisplay::Truncated => InitialToolDisplay::Summary,
             })
         }),
         Field::ShowThinking => opt(ui.view.show_thinking, Value::Bool),

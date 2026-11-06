@@ -275,6 +275,9 @@ pub enum RememberedToolDisplay {
     /// know as never remembered ([`RememberedView::tool_display`]).
     Off,
     Summary,
+    /// Upstream a60dfe9's calls mode; builds before it read `"calls"` as
+    /// never remembered, like `"off"` above.
+    Calls,
     Truncated,
     Full,
 }
@@ -284,6 +287,7 @@ impl From<ToolDisplayMode> for RememberedToolDisplay {
         match mode {
             ToolDisplayMode::Off => Self::Off,
             ToolDisplayMode::Summary => Self::Summary,
+            ToolDisplayMode::Calls => Self::Calls,
             ToolDisplayMode::Truncated => Self::Truncated,
             ToolDisplayMode::Full => Self::Full,
         }
@@ -295,6 +299,7 @@ impl From<RememberedToolDisplay> for ToolDisplayMode {
         match remembered {
             RememberedToolDisplay::Off => Self::Off,
             RememberedToolDisplay::Summary => Self::Summary,
+            RememberedToolDisplay::Calls => Self::Calls,
             RememberedToolDisplay::Truncated => Self::Truncated,
             RememberedToolDisplay::Full => Self::Full,
         }
@@ -868,20 +873,24 @@ pub fn remember_deep_options(open: bool, cx: &mut App) {
 mod tests {
     use super::*;
 
-    /// Upstream d0aca95: the off mode is remembered as `"off"` and every
-    /// remembered value maps back to the mode it came from.
+    /// Upstream d0aca95: the off mode is remembered as `"off"`, upstream
+    /// a60dfe9's calls mode as `"calls"`, and every remembered value maps
+    /// back to the mode it came from.
     #[test]
     fn tool_display_off_is_remembered() {
         let state = parse(r#"{ "view": { "tool_display": "off" } }"#).unwrap();
         assert_eq!(state.view.tool_display, Some(RememberedToolDisplay::Off));
+        let state = parse(r#"{ "view": { "tool_display": "calls" } }"#).unwrap();
+        assert_eq!(state.view.tool_display, Some(RememberedToolDisplay::Calls));
         // A mode of a newer build is forgotten; the rest of the file stays.
         let state =
-            parse(r#"{ "view": { "tool_display": "calls", "show_thinking": true } }"#).unwrap();
+            parse(r#"{ "view": { "tool_display": "lines", "show_thinking": true } }"#).unwrap();
         assert_eq!(state.view.tool_display, None);
         assert_eq!(state.view.show_thinking, Some(true));
         for mode in [
             ToolDisplayMode::Off,
             ToolDisplayMode::Summary,
+            ToolDisplayMode::Calls,
             ToolDisplayMode::Truncated,
             ToolDisplayMode::Full,
         ] {

@@ -3,9 +3,9 @@
 //! [`build_document`] turns a transcript's entries
 //! ([`crate::history::view::entries`]) into a [`ConversationDocument`]:
 //! messages in render order, each with a label, presentation flags and a list
-//! of semantic blocks (markdown text, thinking, tool summary, tool calls and
-//! results). It follows exactly the rules of the [ledger](super::ledger)
-//! renderer and reuses its helpers, so both agree on:
+//! of semantic blocks (markdown text, thinking, tool summary, call lines,
+//! tool calls and results). It follows exactly the rules of the
+//! [ledger](super::ledger) renderer and reuses its helpers, so both agree on:
 //!
 //! - which entries render (hidden records and notes that are not
 //!   searchable never do; subagent entries and `agent_progress` entries only
@@ -13,13 +13,14 @@
 //! - the user template (text after [`process_command_message`], text
 //!   blocks joined with a blank line, then tool results) and the assistant
 //!   template in fixed order regardless of the JSON block order (text blocks,
-//!   tool summary in summary mode, tool calls in truncated/full mode,
-//!   thinking for top-level assistants); off mode (upstream d0aca95) has no
-//!   tool summary, call or result, so a tool-only message has no block and
-//!   is left out (see below);
-//! - summary-mode grouping of consecutive tool-only assistant entries with
-//!   the same parent and speaker, absorbing tool-result-only user entries, and
-//!   the summary sentence (`"Searched for 2 patterns, read 1 file"`);
+//!   tool summary in summary mode or one call line per call in calls mode,
+//!   tool calls in truncated/full mode, thinking for top-level assistants);
+//!   off mode (upstream d0aca95) has no tool summary, call or result, so a
+//!   tool-only message has no block and is left out (see below);
+//! - summary- and calls-mode grouping of consecutive tool-only assistant
+//!   entries with the same parent and speaker, absorbing tool-result-only
+//!   user entries, the summary sentence (`"Searched for 2 patterns, read 1
+//!   file"`) and the call lines (`"Bash: cargo test"`, upstream a60dfe9);
 //! - tool output ids ([`ToolOutputId`]), which are stable across re-renders
 //!   and shared with the ledger, so one expanded set drives both;
 //! - truncation and expansion ([`Fold`]), label text, roles and dimming;
@@ -58,8 +59,8 @@ use super::ledger::{
     RenderOptions, RenderableEntry, RowTiming, TRUNCATED_BODY_LINES, TRUNCATED_RESULT_LINES,
     TimingSlot, ToolActivitySummary, ToolDisplayMode, ToolOutputId, ToolOutputKind,
     assistant_label, entry_shows_nothing, format_timestamp, format_tool_result_content,
-    group_summary_line, make_tool_output_id, make_tool_summary_output_id, render_markdown_to_lines,
-    subagent_label, summarize_tool_calls, summary_line, tool_only_assistant_summary,
+    group_summary_rows, make_tool_output_id, make_tool_summary_output_id, render_markdown_to_lines,
+    subagent_label, summarize_tool_calls, summary_rows, tool_only_assistant_summary,
     tool_result_display_text, user_entry_is_only_tool_results,
 };
 use crate::commands::process_command_message;
@@ -91,7 +92,7 @@ pub enum DocMessageKind {
     /// The assistant side of a Claude `agent_progress` record.
     AgentProgressAssistant,
     /// Consecutive tool-only assistant entries collapsed into one summary
-    /// (summary tool-display mode only).
+    /// (summary tool-display mode) or one call line per call (calls mode).
     ToolSummaryGroup,
 }
 
@@ -176,8 +177,9 @@ pub struct DocMessage {
     /// expansions, notes, subagent summary groups).
     ///
     /// It is not a style for every block. A [`DocToolCall`] carries its own
-    /// [`DocToolCall::dimmed`]; a [`DocBlockKind::ToolSummary`] sentence and
-    /// a [`DocBlockKind::SubagentToolResult`] are always muted; a
+    /// [`DocToolCall::dimmed`]; a [`DocBlockKind::ToolSummary`] sentence, a
+    /// [`DocBlockKind::ToolCallLine`] and a
+    /// [`DocBlockKind::SubagentToolResult`] are always muted; a
     /// [`DocBlockKind::Thinking`] block keeps its thinking style; and a
     /// [`DocBlockKind::ToolResult`] always keeps the normal, un-muted style,
     /// including the results of a skill-expansion user message and those
@@ -232,6 +234,19 @@ pub enum DocBlockKind {
         id: Option<ToolOutputId>,
         sentence: String,
     },
+    /// One tool call on one line, without its result (calls mode, upstream
+    /// a60dfe9): the call's header as formatted at width 0, whole (the
+    /// ledger cuts it to the content width with `…`). Each call of a
+    /// collapsed group is one block, and every block of the group carries
+    /// the group's `id`, so a click on any of them expands the whole group
+    /// (into [`DocBlockKind::ToolSummaryDetails`]); a mixed text + tools
+    /// assistant message gets non-clickable lines (`id: None`). Like the
+    /// summary sentence, later lines of a group take the continuation timing
+    /// slot.
+    ToolCallLine {
+        id: Option<ToolOutputId>,
+        header: String,
+    },
     /// An expanded summary group: every call and result of the group in
     /// truncated mode, each individually expandable; a click on the group
     /// (the ledger: its first row) collapses it again via `id`.
@@ -263,7 +278,10 @@ impl Fold {
         match mode {
             ToolDisplayMode::Truncated if expanded => Fold::Expanded,
             ToolDisplayMode::Truncated => Fold::Collapsed { limit },
-            ToolDisplayMode::Full | ToolDisplayMode::Summary | ToolDisplayMode::Off => Fold::Full,
+            ToolDisplayMode::Full
+            | ToolDisplayMode::Summary
+            | ToolDisplayMode::Calls
+            | ToolDisplayMode::Off => Fold::Full,
         }
     }
 
@@ -667,7 +685,9 @@ impl DocBlock {
     /// (expandable calls/results, collapsed or expanded summary groups).
     pub fn toggle_id(&self) -> Option<&ToolOutputId> {
         match &self.kind {
-            DocBlockKind::ToolSummary { id, .. } => id.as_ref(),
+            DocBlockKind::ToolSummary { id, .. } | DocBlockKind::ToolCallLine { id, .. } => {
+                id.as_ref()
+            }
             DocBlockKind::ToolSummaryDetails { id, .. } => Some(id),
             DocBlockKind::ToolCall(call) => call.expandable().then_some(&call.id),
             DocBlockKind::ToolResult(result) => result.expandable().then_some(&result.id),
@@ -680,7 +700,9 @@ impl DocBlock {
     /// expandable right now).
     pub fn tool_output_id(&self) -> Option<&ToolOutputId> {
         match &self.kind {
-            DocBlockKind::ToolSummary { id, .. } => id.as_ref(),
+            DocBlockKind::ToolSummary { id, .. } | DocBlockKind::ToolCallLine { id, .. } => {
+                id.as_ref()
+            }
             DocBlockKind::ToolSummaryDetails { id, .. } => Some(id),
             DocBlockKind::ToolCall(call) => Some(&call.id),
             DocBlockKind::ToolResult(result) => Some(&result.id),
@@ -691,15 +713,17 @@ impl DocBlock {
 
     /// The text shown for this block in its current state, as plain text:
     /// markdown and thinking through [`markdown_plain_text`], the summary
-    /// sentence, the call header followed by the visible body lines, the
-    /// visible result lines. Expanded summary groups join their items with
-    /// newlines. In-view search ([`super::DocSearchIndex`]) matches this text.
+    /// sentence, a call line's header, the call header followed by the
+    /// visible body lines, the visible result lines. Expanded summary groups
+    /// join their items with newlines. In-view search
+    /// ([`super::DocSearchIndex`]) matches this text.
     pub fn plain_text(&self) -> String {
         match &self.kind {
             DocBlockKind::Markdown { text } | DocBlockKind::Thinking { text } => {
                 markdown_plain_text(text)
             }
             DocBlockKind::ToolSummary { sentence, .. } => sentence.clone(),
+            DocBlockKind::ToolCallLine { header, .. } => header.clone(),
             DocBlockKind::ToolSummaryDetails { items, .. } => items
                 .iter()
                 .map(DocBlock::plain_text)
@@ -792,12 +816,14 @@ pub fn build_document(
 ) -> ConversationDocument {
     let builder = Builder {
         prefs: *prefs,
-        // The shared ledger predicates only read `show_thinking`.
+        // The shared ledger predicates only read `show_thinking`; the summary
+        // rows read `tool_display` and `content_width`, which leaves them
+        // whole here (the GUI clips them to its columns).
         options: RenderOptions {
             tool_display: prefs.tool_display,
             show_thinking: prefs.show_thinking,
             show_timing: prefs.show_timing,
-            content_width: 0,
+            content_width: usize::MAX,
             expanded_tool_outputs: BTreeSet::new(),
         },
         expanded,
@@ -807,7 +833,7 @@ pub fn build_document(
 
     // Mirrors `ledger::render_parsed_conversation`.
     for (parsed_idx, parsed) in entries.iter().enumerate() {
-        if prefs.tool_display.is_summary()
+        if prefs.tool_display.groups_tools()
             && builder.try_extend_or_start_pending_summary(
                 &mut messages,
                 &mut pending,
@@ -1160,29 +1186,53 @@ impl Builder<'_> {
         blocks
     }
 
-    /// step_tool_summary: the non-clickable sentence of an assistant entry
-    /// that is not grouped (summary mode only).
+    /// step_tool_summary: the non-clickable sentence (summary mode) or call
+    /// lines (calls mode) of an assistant entry that is not grouped.
     fn push_tool_summary(
         &self,
         blocks: &mut Vec<DocBlock>,
         timing: &mut RowTiming<'_>,
         content: &[Part],
     ) {
-        if !self.prefs.tool_display.is_summary() {
+        if !self.prefs.tool_display.groups_tools() {
             return;
         }
         let summary = summarize_tool_calls(content);
         if summary.is_empty() {
             return;
         }
-        let slot = timing.consume();
-        blocks.push(DocBlock {
-            timing: DocTiming::from_slot(slot),
-            kind: DocBlockKind::ToolSummary {
-                id: None,
-                sentence: summary_line(&summary, content.iter(), usize::MAX),
-            },
-        });
+        let rows = summary_rows(&summary, content.iter(), &self.options);
+        blocks.extend(self.summary_blocks(None, timing.consume(), rows));
+    }
+
+    /// The ledger's `render_tool_activity_summary`: the collapsed rows of a
+    /// group or a mixed message as blocks. Summary mode has one row, the
+    /// sentence; calls mode one [`DocBlockKind::ToolCallLine`] per call,
+    /// where rows after the first take the continuation slot of `slot`.
+    fn summary_blocks(
+        &self,
+        id: Option<&ToolOutputId>,
+        slot: TimingSlot<'_>,
+        rows: Vec<String>,
+    ) -> Vec<DocBlock> {
+        let calls = self.prefs.tool_display == ToolDisplayMode::Calls;
+        rows.into_iter()
+            .enumerate()
+            .map(|(i, row)| DocBlock {
+                timing: DocTiming::from_slot(if i == 0 { slot } else { slot.continuation() }),
+                kind: if calls {
+                    DocBlockKind::ToolCallLine {
+                        id: id.cloned(),
+                        header: row,
+                    }
+                } else {
+                    DocBlockKind::ToolSummary {
+                        id: id.cloned(),
+                        sentence: row,
+                    }
+                },
+            })
+            .collect()
     }
 
     /// step_tool_calls
@@ -1441,38 +1491,38 @@ impl Builder<'_> {
         } else {
             None
         };
-        let block = if self.expanded.contains(&group.id) {
+        let blocks = if self.expanded.contains(&group.id) {
             let items = self.summary_group_details(entries, &group);
             if items.is_empty() {
                 return;
             }
-            DocBlock {
+            vec![DocBlock {
                 timing: DocTiming::from_slot(TimingSlot::from_show_timing(self.prefs.show_timing)),
                 kind: DocBlockKind::ToolSummaryDetails {
                     id: group.id.clone(),
                     items,
                 },
-            }
+            }]
         } else {
             if group.summary.is_empty() {
                 return;
             }
-            DocBlock {
-                timing: match ts.as_deref() {
-                    Some(ts) => DocTiming::Stamp(ts.to_string()),
-                    None => DocTiming::Disabled,
-                },
-                kind: DocBlockKind::ToolSummary {
-                    id: Some(group.id.clone()),
-                    sentence: group_summary_line(
-                        entries,
-                        group.first_parsed_idx..=group.last_parsed_idx,
-                        group.parent_id.as_deref(),
-                        &group.summary,
-                        usize::MAX,
-                    ),
-                },
+            let slot = match ts.as_deref() {
+                Some(ts) => TimingSlot::Stamp(ts),
+                None => TimingSlot::Disabled,
+            };
+            let rows = group_summary_rows(
+                entries,
+                group.first_parsed_idx..=group.last_parsed_idx,
+                group.parent_id.as_deref(),
+                &group.summary,
+                &self.options,
+            );
+            let blocks = self.summary_blocks(Some(&group.id), slot, rows);
+            if blocks.is_empty() {
+                return;
             }
+            blocks
         };
 
         let is_subagent = group.parent_id.is_some();
@@ -1487,7 +1537,7 @@ impl Builder<'_> {
             timestamp: ts,
             raw_timestamp: group.timestamp,
             navigable: true,
-            blocks: vec![block],
+            blocks,
         });
     }
 

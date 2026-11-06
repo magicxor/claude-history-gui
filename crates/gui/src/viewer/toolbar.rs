@@ -1,5 +1,5 @@
-//! The viewer toolbar (DESIGN §9.10): Off|Summary|Truncated|Full, Thinking,
-//! Timing, find bar, Outline, Resume, Fork, ⋯ menu. WP2.
+//! The viewer toolbar (DESIGN §9.10): Off|Summary|Calls|Truncated|Full,
+//! Thinking, Timing, find bar, Outline, Resume, Fork, ⋯ menu. WP2.
 //!
 //! Every control dispatches the same action as its key (V-096) from the
 //! transcript's focus, so the viewer's own handlers (and the menus' enabled
@@ -29,12 +29,14 @@ use crate::qa_ext::QaExt as _;
 /// The disabled tooltip of actions that need a known source.
 pub const UNKNOWN_SOURCE_TOOLTIP: &str = crate::model::UNKNOWN_SOURCE;
 
-/// The tool display modes in cycle order (upstream d0aca95 put Off first),
-/// with the toolbar button id and the label of the toolbar button and of
-/// View → Tool display. The toolbar and the menu are built from this table.
-pub const TOOL_DISPLAY_MODES: [(ToolDisplayMode, &str, &str); 4] = [
+/// The tool display modes in cycle order (upstream d0aca95 put Off first,
+/// a60dfe9 added Calls after Summary), with the toolbar button id and the
+/// label of the toolbar button and of View → Tool display. The toolbar and
+/// the menu are built from this table.
+pub const TOOL_DISPLAY_MODES: [(ToolDisplayMode, &str, &str); 5] = [
     (ToolDisplayMode::Off, "tools-off", "Off"),
     (ToolDisplayMode::Summary, "tools-summary", "Summary"),
+    (ToolDisplayMode::Calls, "tools-calls", "Calls"),
     (ToolDisplayMode::Truncated, "tools-truncated", "Truncated"),
     (ToolDisplayMode::Full, "tools-full", "Full"),
 ];
@@ -44,6 +46,7 @@ pub fn set_tools_action(mode: ToolDisplayMode) -> Box<dyn Action> {
     match mode {
         ToolDisplayMode::Off => Box::new(SetToolsOff),
         ToolDisplayMode::Summary => Box::new(SetToolsSummary),
+        ToolDisplayMode::Calls => Box::new(SetToolsCalls),
         ToolDisplayMode::Truncated => Box::new(SetToolsTruncated),
         ToolDisplayMode::Full => Box::new(SetToolsFull),
     }

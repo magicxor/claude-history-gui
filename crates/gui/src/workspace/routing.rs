@@ -204,6 +204,7 @@ macro_rules! on_fallback_actions {
                 $crate::actions::CycleToolDisplay,
                 $crate::actions::SetToolsOff,
                 $crate::actions::SetToolsSummary,
+                $crate::actions::SetToolsCalls,
                 $crate::actions::SetToolsTruncated,
                 $crate::actions::SetToolsFull,
                 $crate::actions::ToggleThinking,
@@ -261,6 +262,7 @@ pub fn is_viewer_action(action: &dyn Action) -> bool {
     a.is::<CycleToolDisplay>()
         || a.is::<SetToolsOff>()
         || a.is::<SetToolsSummary>()
+        || a.is::<SetToolsCalls>()
         || a.is::<SetToolsTruncated>()
         || a.is::<SetToolsFull>()
         || a.is::<ToggleThinking>()

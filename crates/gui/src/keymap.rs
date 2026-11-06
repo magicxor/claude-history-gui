@@ -952,7 +952,7 @@ static HELP_ROWS: &[HelpRow] = &[
         Viewer,
         [key!(CycleToolDisplay, "t")],
         V,
-        "Cycle tools: off/sum/trunc/full",
+        "Cycle tools: off/sum/calls/trunc/full",
         "t"
     ),
     help!(

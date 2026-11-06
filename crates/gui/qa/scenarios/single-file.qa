@@ -33,7 +33,7 @@ expect focus == viewer
 # The viewer works as usual.
 key t
 wait-for viewer.loading == false 5s
-expect viewer.tool_display == trn
+expect viewer.tool_display == cal
 key shift-j
 expect viewer.nav_focus == 2
 key escape

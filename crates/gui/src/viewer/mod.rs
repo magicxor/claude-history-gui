@@ -2178,6 +2178,9 @@ impl ViewerPane {
         } else if a.is::<SetToolsSummary>() {
             prefs.tool_display = ToolDisplayMode::Summary;
             self.set_prefs(prefs, true, cx);
+        } else if a.is::<SetToolsCalls>() {
+            prefs.tool_display = ToolDisplayMode::Calls;
+            self.set_prefs(prefs, true, cx);
         } else if a.is::<SetToolsTruncated>() {
             prefs.tool_display = ToolDisplayMode::Truncated;
             self.set_prefs(prefs, true, cx);
@@ -3094,6 +3097,7 @@ impl Render for ViewerPane {
                 CycleToolDisplay,
                 SetToolsOff,
                 SetToolsSummary,
+                SetToolsCalls,
                 SetToolsTruncated,
                 SetToolsFull,
                 ToggleThinking,

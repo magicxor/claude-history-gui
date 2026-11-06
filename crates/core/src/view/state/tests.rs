@@ -180,10 +180,10 @@ fn preference_toggles_cycle_and_survive_expansion() {
     let path = write_tool_conversation(dir.path());
     let mut model = ViewerModel::open(&history(), &path, ViewPrefs::default()).unwrap();
 
-    let labels: Vec<&str> = (0..5)
+    let labels: Vec<&str> = (0..7)
         .map(|_| model.cycle_tool_display().status_label())
         .collect();
-    assert_eq!(labels, ["trn", "all", "off", "sum", "trn"]);
+    assert_eq!(labels, ["cal", "trn", "all", "off", "sum", "cal", "trn"]);
     assert!(model.toggle_thinking());
     assert!(!model.toggle_thinking());
     assert!(model.toggle_timing());
@@ -192,7 +192,7 @@ fn preference_toggles_cycle_and_survive_expansion() {
     let id = first_clickable_id(&model.ledger(80));
     model.toggle_expanded(&id);
     model.toggle_timing();
-    for _ in 0..4 {
+    for _ in 0..5 {
         model.cycle_tool_display();
     }
     // Back in truncated mode, the expansion is still applied.
@@ -215,6 +215,10 @@ fn message_text_session_id_and_plain_display_use_the_cache() {
         crate::export::MESSAGE_NOT_FOUND
     );
 
+    // Calls mode lists the calls but, like summary mode, keeps them out of
+    // copies (upstream a60dfe9: tools are visible in truncated/full only).
+    assert_eq!(model.cycle_tool_display(), ToolDisplayMode::Calls);
+    assert_eq!(model.message_text(1).unwrap(), "Looking for the bug.");
     model.cycle_tool_display();
     model.toggle_thinking();
     assert_eq!(
@@ -411,7 +415,9 @@ fn rerender_after_toggle_keeps_the_focused_message() {
     let scroll = before.messages[2].start_line;
     let anchor = capture_anchor(&before.messages, scroll, nav.focused(), nav.is_active());
 
-    // Tool details add lines above the focused message.
+    // Tool details add lines above the focused message (summary → calls →
+    // truncated).
+    model.cycle_tool_display();
     model.cycle_tool_display();
     let after = model.ledger(80);
     let (focused, new_scroll) =
@@ -465,6 +471,9 @@ fn document_anchor_survives_tool_mode_changes() {
     let anchor = capture_anchor_entry(&entries, Some(2), true, None).unwrap();
     assert_eq!(anchor, 4);
 
+    // Calls mode groups tool calls like summary mode.
+    assert_eq!(model.cycle_tool_display(), ToolDisplayMode::Calls);
+    assert_eq!(model.document().navigable_entry_indices(), [0, 1, 4]);
     model.cycle_tool_display();
     let doc = model.document();
     let entries = doc.navigable_entry_indices();
@@ -478,8 +487,8 @@ fn document_anchor_survives_tool_mode_changes() {
 }
 
 /// Upstream d0aca95's `cycling_tools_to_off_keeps_focus_on_a_visible_message`
-/// (a TUI interaction test): focus the tool summary, cycle summary →
-/// truncated → full → off; the tool-only messages are gone from the
+/// (a TUI interaction test): focus the tool summary, cycle summary → calls
+/// → truncated → full → off; the tool-only messages are gone from the
 /// document and the ledger, and the anchor falls back to the previous
 /// visible message.
 #[test]
@@ -505,7 +514,7 @@ fn cycling_tools_to_off_keeps_focus_on_a_visible_message() {
     let anchor = capture_anchor_entry(&entries, Some(1), true, None).unwrap();
     let ledger = model.ledger(80);
     let ledger_anchor = capture_anchor(&ledger.messages, 0, Some(1), true);
-    for _ in 0..3 {
+    for _ in 0..4 {
         model.cycle_tool_display();
     }
 

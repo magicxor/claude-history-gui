@@ -22,8 +22,14 @@ expect viewer.indicator == "[1/9]"
 set-theme light
 shot viewer-basics-light-summary
 
-# t cycles sum → trn → all → off → sum; T and i toggle (V-010, V-048, V-062). Off (upstream
-# d0aca95) shows the conversation text only.
+# t cycles sum → cal → trn → all → off → sum; T and i toggle (V-010, V-048, V-062). Calls
+# (upstream a60dfe9) lists each tool call on one row; Off (upstream d0aca95) shows the
+# conversation text only.
+key t
+wait-for viewer.loading == false 5s
+expect viewer.tool_display == cal
+expect viewer.items > 0
+shot viewer-basics-light-calls
 key t
 wait-for viewer.loading == false 5s
 expect viewer.tool_display == trn
@@ -49,6 +55,9 @@ wait-for viewer.loading == false 5s
 expect viewer.timing == false
 
 # Truncated tool output with thinking (light).
+key t
+wait-for viewer.loading == false 5s
+expect viewer.tool_display == cal
 key t
 wait-for viewer.loading == false 5s
 expect viewer.tool_display == trn

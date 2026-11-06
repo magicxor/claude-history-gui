@@ -1,10 +1,10 @@
 //! `ViewerItem`s built from the core `ConversationDocument` (DESIGN §9.2):
 //! stable ids, lanes, ≈100-line chunks, visual-row truncation (K9). WP2.
 //!
-//! One item per ledger block (markdown text, thinking, tool summary, tool
-//! call, tool result, subagent result, expanded summary detail); blocks
-//! longer than the chunk limits are split into chunk items with stable
-//! `(block, chunk)` ids. Gpui-free: the worker thread builds them.
+//! One item per ledger block (markdown text, thinking, tool summary, call
+//! line, tool call, tool result, subagent result, expanded summary detail);
+//! blocks longer than the chunk limits are split into chunk items with
+//! stable `(block, chunk)` ids. Gpui-free: the worker thread builds them.
 //!
 //! Truncation (Truncated mode, collapsed) counts ledger rows at `cols`
 //! display cells, never logical lines (P4/K9): a 50 KB single-line result
@@ -46,6 +46,10 @@ pub enum TextKind {
     Thinking,
     /// The non-clickable tool summary sentence of a mixed message.
     Summary,
+    /// A tool call line (calls mode, upstream a60dfe9), by its position
+    /// among the message's call lines: the lines of a group all carry the
+    /// group's id, so the id cannot tell them apart.
+    CallLine,
 }
 
 /// Stable identity of a block across rebuilds (preference toggles,
@@ -56,7 +60,7 @@ pub enum ItemKey {
     Text {
         entry: usize,
         kind: TextKind,
-        ordinal: u16,
+        ordinal: u32,
     },
     /// A tool output (call, result, summary group) by its core id.
     Tool(ToolOutputId),
@@ -120,6 +124,8 @@ pub enum ItemKind {
     Markdown,
     Thinking,
     ToolSummary,
+    /// One tool call on one row (calls mode), drawn like a summary row.
+    CallLine,
     ToolCall,
     ToolResult,
     SubagentResult,
@@ -230,6 +236,7 @@ pub fn build_with_info(
             show_timing,
             markdown_ordinal: 0,
             thinking_ordinal: 0,
+            call_line_ordinal: 0,
             out: &mut out,
         };
         for (block_index, block) in message.blocks.iter().enumerate() {
@@ -257,8 +264,9 @@ struct MessageCtx<'a> {
     nav_position: Option<usize>,
     cols: usize,
     show_timing: bool,
-    markdown_ordinal: u16,
-    thinking_ordinal: u16,
+    markdown_ordinal: u32,
+    thinking_ordinal: u32,
+    call_line_ordinal: u32,
     out: &'a mut Vec<ViewerItem>,
 }
 
@@ -370,7 +378,7 @@ impl MessageCtx<'_> {
                 // A single unrecognized call reads as the call itself, which
                 // has no length limit in the document: keep one row.
                 let clipped = segments::clip_to_cols(sentence, self.cols);
-                let cols_dependent = clipped != *sentence;
+                let cols_dependent = unicode_width::UnicodeWidthStr::width(sentence.as_str()) > 8;
                 let segment = segments::styled_line(&clipped, Style::TOOL | Style::DIMMED);
                 let key = match id {
                     Some(id) => ItemKey::Tool(id.clone()),
@@ -390,6 +398,52 @@ impl MessageCtx<'_> {
                 self.emit(Pending {
                     key,
                     kind: ItemKind::ToolSummary,
+                    lanes,
+                    chunks: vec![vec![segment]],
+                    has_header: false,
+                    toggle: id.clone(),
+                    expanded: false,
+                    more: None,
+                    group_toggle: None,
+                    block: self.block_ref(block_index, None),
+                    cols_dependent,
+                });
+            }
+            DocBlockKind::ToolCallLine { id, header } => {
+                // One row like the summary sentence: the document keeps the
+                // header whole, the row clips it to the content columns.
+                let clipped = segments::clip_to_cols(header, self.cols);
+                // A narrower window could clip any line wider than the 8-column floor.
+                let cols_dependent = unicode_width::UnicodeWidthStr::width(header.as_str()) > 8;
+                let segment = segments::styled_line(&clipped, Style::TOOL | Style::DIMMED);
+                let ordinal = self.call_line_ordinal;
+                self.call_line_ordinal += 1;
+                // A run of call lines reads as one block: the label (and the
+                // stamp, which only the first line carries) on its first line.
+                let continues_run = block_index
+                    .checked_sub(1)
+                    .and_then(|previous| message.blocks.get(previous))
+                    .is_some_and(|previous| {
+                        matches!(previous.kind, DocBlockKind::ToolCallLine { .. })
+                    });
+                let lanes = if continues_run {
+                    Lanes::empty(LaneRole::AccentDim, message.dimmed)
+                } else {
+                    Lanes {
+                        timestamp: self.stamp(block),
+                        label: self.label(),
+                        role: LaneRole::AccentDim,
+                        bold: false,
+                        dimmed: message.dimmed,
+                    }
+                };
+                self.emit(Pending {
+                    key: ItemKey::Text {
+                        entry: message.entry_index,
+                        kind: TextKind::CallLine,
+                        ordinal,
+                    },
+                    kind: ItemKind::CallLine,
                     lanes,
                     chunks: vec![vec![segment]],
                     has_header: false,
@@ -758,6 +812,7 @@ pub fn is_tool_item(item: &ViewerItem) -> bool {
             | ItemKind::ToolResult
             | ItemKind::SubagentResult
             | ItemKind::ToolSummary
+            | ItemKind::CallLine
     )
 }
 

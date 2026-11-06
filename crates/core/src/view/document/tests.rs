@@ -384,6 +384,29 @@ fn name_span(line: &RenderedLine) -> &(String, LineStyle) {
     &line.spans[separator - 1]
 }
 
+/// The content of a ledger row (the spans after `" │ "`; a row without a
+/// separator, such as a blank one, is all content).
+fn row_content(line: &RenderedLine) -> String {
+    let start = line
+        .spans
+        .iter()
+        .position(|(text, _)| text == " │ ")
+        .map_or(0, |separator| separator + 1);
+    line.spans[start..]
+        .iter()
+        .map(|(text, _)| text.as_str())
+        .collect()
+}
+
+/// Check the timing column of a ledger row against a block's slot.
+fn assert_timing_span(line: &RenderedLine, timing: &DocTiming, context: &str) {
+    match timing {
+        DocTiming::Stamp(stamp) => assert_eq!(line.spans[0].0, format!(" {stamp} "), "{context}"),
+        DocTiming::Pad => assert_eq!(line.spans[0].0, " ".repeat(TIMESTAMP_WIDTH), "{context}"),
+        DocTiming::Disabled => assert_eq!(line.spans[0].0.chars().count(), NAME_WIDTH, "{context}"),
+    }
+}
+
 /// The ledger label of a message's first row, derived from its first block.
 fn expected_first_label(message: &DocMessage) -> String {
     let mut block = &message.blocks[0];
@@ -496,10 +519,40 @@ fn assert_ledger_parity(
             assert_eq!(style.bold, message.bold, "{context}");
             assert_eq!(style.dimmed, message.dimmed, "{context}");
         }
-        match &message.blocks[0].timing {
-            DocTiming::Stamp(stamp) => assert_eq!(first.spans[0].0, format!(" {stamp} ")),
-            DocTiming::Pad => assert_eq!(first.spans[0].0, " ".repeat(TIMESTAMP_WIDTH)),
-            DocTiming::Disabled => assert_eq!(first.spans[0].0.chars().count(), NAME_WIDTH),
+        assert_timing_span(first, &message.blocks[0].timing, &context);
+
+        // Call lines (calls mode, upstream a60dfe9) are ledger rows of the
+        // message, in order; a collapsed group is nothing but its call lines,
+        // one row each with the line's timing slot. The fixtures keep every
+        // header narrower than 80 columns, so the ledger does not cut them.
+        let call_lines: Vec<(&DocTiming, &str)> = message
+            .blocks
+            .iter()
+            .filter_map(|block| match &block.kind {
+                DocBlockKind::ToolCallLine { header, .. } => Some((&block.timing, header.as_str())),
+                _ => None,
+            })
+            .collect();
+        let rows: Vec<String> = rendered.lines[range.start_line..range.end_line]
+            .iter()
+            .map(row_content)
+            .collect();
+        let mut next_row = 0;
+        for (_, header) in &call_lines {
+            let found = rows[next_row..]
+                .iter()
+                .position(|row| row == header)
+                .unwrap_or_else(|| panic!("call line {header:?} not in the ledger\n{context}"));
+            next_row += found + 1;
+        }
+        if !call_lines.is_empty() && call_lines.len() == message.blocks.len() {
+            assert_eq!(rows.len(), call_lines.len(), "call line rows\n{context}");
+            for (line, (timing, _)) in rendered.lines[range.start_line..range.end_line]
+                .iter()
+                .zip(&call_lines)
+            {
+                assert_timing_span(line, timing, &context);
+            }
         }
     }
 
@@ -532,9 +585,10 @@ fn assert_ledger_parity(
     doc
 }
 
-const MODES: [ToolDisplayMode; 4] = [
+const MODES: [ToolDisplayMode; 5] = [
     ToolDisplayMode::Off,
     ToolDisplayMode::Summary,
+    ToolDisplayMode::Calls,
     ToolDisplayMode::Truncated,
     ToolDisplayMode::Full,
 ];
@@ -672,6 +726,93 @@ fn summary_tool_mode_coalesces_tool_calls_across_records_that_show_nothing() {
     assert!(text.contains("Ran 2 shell commands"), "{text}");
     assert!(!text.contains("Ran 1 shell command"), "{text}");
     assert_eq!(doc.messages.len(), 1);
+}
+
+/// Upstream a60dfe9: calls mode groups like summary mode but lists each
+/// call on its own line, without results; every line carries the group's
+/// id, so a click on any of them expands the whole group.
+#[test]
+fn calls_tool_mode_lists_each_call_on_one_line_without_results() {
+    let entries = tool_summary_entries();
+    let summary_id = make_tool_summary_output_id(0, None);
+    let doc = assert_ledger_parity(&entries, &prefs(ToolDisplayMode::Calls), &BTreeSet::new());
+
+    assert_eq!(doc.messages.len(), 1);
+    let message = &doc.messages[0];
+    assert_eq!(message.kind, DocMessageKind::ToolSummaryGroup);
+    assert_eq!(message.label, "Claude");
+    assert_eq!(message.label_role, LabelRole::AccentDim);
+    let lines: Vec<&DocBlockKind> = message.blocks.iter().map(|block| &block.kind).collect();
+    let line = |header: &str| DocBlockKind::ToolCallLine {
+        id: Some(summary_id.clone()),
+        header: header.to_string(),
+    };
+    assert_eq!(
+        lines,
+        [
+            &line(r#"Grep: "one" in ."#),
+            &line("Read: src/main.rs"),
+            &line("Bash: cargo test"),
+        ]
+    );
+    assert!(
+        message
+            .blocks
+            .iter()
+            .all(|block| block.toggle_id() == Some(&summary_id))
+    );
+    let text = doc_text(&doc);
+    assert!(!text.contains("Result"), "{text}");
+    assert!(!text.contains("grep result"), "{text}");
+
+    let expanded = assert_ledger_parity(
+        &entries,
+        &prefs(ToolDisplayMode::Calls),
+        &BTreeSet::from([summary_id.clone()]),
+    );
+    assert!(doc_text(&expanded).contains("grep result"));
+    assert!(matches!(
+        &expanded.messages[0].blocks[..],
+        [DocBlock {
+            kind: DocBlockKind::ToolSummaryDetails { id, .. },
+            ..
+        }] if *id == summary_id
+    ));
+}
+
+/// Calls mode: the first line of a group carries the stamp, later lines
+/// pad under it (the ledger's continuation rows); without timing every
+/// line has no column.
+#[test]
+fn calls_tool_mode_lines_after_the_first_pad_the_timing_column() {
+    let timestamp = Local.with_ymd_and_hms(2026, 9, 4, 13, 59, 0).unwrap();
+    let entries = [entry(
+        0,
+        &format!(
+            r#"{{"type":"assistant","timestamp":"{}","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_1","name":"Bash","input":{{"command":"pwd"}}}},{{"type":"tool_use","id":"toolu_2","name":"Read","input":{{"file_path":"a.rs"}}}}]}}}}"#,
+            timestamp.to_rfc3339()
+        ),
+    )];
+    let mut prefs = prefs(ToolDisplayMode::Calls);
+    prefs.show_timing = true;
+    let doc = assert_ledger_parity(&entries, &prefs, &BTreeSet::new());
+    let slots: Vec<&DocTiming> = doc.messages[0].blocks.iter().map(|b| &b.timing).collect();
+    assert_eq!(
+        slots,
+        [
+            &DocTiming::Stamp("Sep 04 13:59".to_string()),
+            &DocTiming::Pad
+        ]
+    );
+
+    prefs.show_timing = false;
+    let doc = assert_ledger_parity(&entries, &prefs, &BTreeSet::new());
+    assert!(
+        doc.messages[0]
+            .blocks
+            .iter()
+            .all(|block| block.timing == DocTiming::Disabled)
+    );
 }
 
 #[test]
@@ -1352,6 +1493,29 @@ fn assistant_block_order_hidden_mode_text_then_summary_then_thinking() {
         .collect();
     assert_eq!(kinds, ["TEXT_BLOCK", "Ran 1 shell command", "THINK_BLOCK"]);
     // A mixed text + tools message has a non-clickable sentence.
+    assert_eq!(doc.messages[0].blocks[1].toggle_id(), None);
+}
+
+/// Calls mode: a mixed text + tools message lists its calls where summary
+/// mode has the sentence, as non-clickable lines.
+#[test]
+fn assistant_block_order_calls_mode_text_then_call_lines_then_thinking() {
+    let mut prefs = prefs(ToolDisplayMode::Calls);
+    prefs.show_thinking = true;
+    let doc = assert_ledger_parity(&[reordered_blocks_entry()], &prefs, &BTreeSet::new());
+    let kinds: Vec<String> = doc.messages[0]
+        .blocks
+        .iter()
+        .map(|block| block.plain_text())
+        .collect();
+    assert_eq!(kinds, ["TEXT_BLOCK", "Bash: echo hi", "THINK_BLOCK"]);
+    assert_eq!(
+        doc.messages[0].blocks[1].kind,
+        DocBlockKind::ToolCallLine {
+            id: None,
+            header: "Bash: echo hi".to_string(),
+        }
+    );
     assert_eq!(doc.messages[0].blocks[1].toggle_id(), None);
 }
 

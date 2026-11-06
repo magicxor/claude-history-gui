@@ -72,9 +72,11 @@ All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-h
 
 **Viewer**
 * Native rendering of messages, markdown, tables and syntax-highlighted code; text selection and copy.
-* Tool display modes **Off / Summary / Truncated / Full** (Off shows only the conversation text: messages that
-  hold only tool calls or results disappear and message navigation skips them), thinking and subagent blocks,
-  timestamps, tool outputs.
+* Tool display modes **Off / Summary / Calls / Truncated / Full** (Off shows only the conversation text: messages
+  that hold only tool calls or results disappear and message navigation skips them; Summary condenses a run of
+  tool calls into a sentence such as "Ran 5 shell commands"; Calls lists each call on one line, such as
+  `Bash: cargo test`, without its result; a click on a summary or calls row expands that group into its calls and
+  results), thinking and subagent blocks, timestamps, tool outputs.
 * In-conversation search (`/`, `n`/`N`), message navigation, outline, per-message copy, focus-viewer mode.
 * Subagents and forks: the header of a session names its subagents and `/btw` forks (`s` or a click picks one to
   open), and the header of a subagent or fork names the session it came from (Shift+P or a click opens it), for
@@ -348,7 +350,7 @@ command palette.
 | Shift+J or `]`, Shift+K or `[` | Next / previous message |
 | `/` | Find in conversation (words match like the list search); Enter commits, Esc cancels, Ctrl+U clears |
 | n / Shift+N, F3 / Shift+F3 (Cmd+G / Cmd+Shift+G on macOS) | Next / previous match |
-| t | Cycle tool display (Off, Summary, Truncated, Full) |
+| t | Cycle tool display (Off, Summary, Calls, Truncated, Full) |
 | Shift+T | Toggle thinking and subagents |
 | i | Toggle timestamps |
 | x | Toggle tool outputs |

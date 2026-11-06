@@ -314,6 +314,7 @@ impl Render for SingleFileWindow {
                 CycleToolDisplay,
                 SetToolsOff,
                 SetToolsSummary,
+                SetToolsCalls,
                 SetToolsTruncated,
                 SetToolsFull,
                 ToggleThinking,

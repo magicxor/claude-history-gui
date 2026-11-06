@@ -538,6 +538,85 @@ mod pure {
         assert!(items::item_text(summary).contains("Read 1 file"));
     }
 
+    /// Calls mode (upstream a60dfe9): a group lists one clipped row per
+    /// call, every row toggling the group; the label sits on the first row
+    /// only and the keys stay unique although the rows share the group id.
+    #[test]
+    fn calls_mode_lists_one_row_per_call_toggling_the_group() {
+        let long = "x".repeat(200);
+        let lines = vec![
+            user("q"),
+            tool_call("g1", "Grep", r#"{"pattern":"one"}"#, 1),
+            tool_result("g1", "grep result", 1),
+            bash_call("b1", &format!("echo {long}"), 1),
+            tool_result("b1", "bash result", 1),
+        ];
+        let items = items_for(&lines, prefs(ToolDisplayMode::Calls, false, true), 60);
+        let rows: Vec<&items::ViewerItem> = items
+            .iter()
+            .filter(|i| i.kind == ItemKind::CallLine)
+            .collect();
+        assert_eq!(rows.len(), 2, "{items:#?}");
+        assert_eq!(items::item_text(rows[0]), r#"Grep: "one" in ."#);
+        let bash = items::item_text(rows[1]);
+        assert!(bash.starts_with("Bash: echo xxx"), "{bash}");
+        assert!(bash.ends_with('…'), "{bash}");
+        assert!(unicode_width::UnicodeWidthStr::width(bash.as_str()) <= 60);
+        assert!(rows[0].cols_dependent && rows[1].cols_dependent);
+        // One group: the same toggle on every row, distinct item ids.
+        let group = rows[0].toggle.clone().expect("a clickable row");
+        assert_eq!(rows[1].toggle.as_ref(), Some(&group));
+        assert_ne!(rows[0].id, rows[1].id);
+        assert!(rows[0].first_of_message && !rows[1].first_of_message);
+        assert!(rows[0].lanes.label.is_some() && rows[1].lanes.label.is_none());
+        assert!(rows[0].lanes.timestamp.is_some() && rows[1].lanes.timestamp.is_none());
+        assert_eq!(rows[0].message_index, rows[1].message_index);
+        assert!(items::is_tool_item(rows[0]));
+        // No results in calls mode.
+        let text: String = items.iter().map(items::item_text).collect();
+        assert!(!text.contains("grep result") && !text.contains("bash result"));
+    }
+
+    /// Calls mode: a mixed text + tools message lists its calls as rows that
+    /// do not toggle anything.
+    #[test]
+    fn calls_mode_mixed_message_rows_are_not_clickable() {
+        let lines = vec![
+            user("q"),
+            assistant_blocks(
+                r#"[{"type":"text","text":"Let me look."},{"type":"tool_use","id":"a","name":"Read","input":{"file_path":"x.rs"}},{"type":"tool_use","id":"b","name":"Read","input":{"file_path":"y.rs"}}]"#,
+                1,
+            ),
+            tool_result("a", "content", 1),
+        ];
+        let items = items_for(&lines, prefs(ToolDisplayMode::Calls, false, false), 80);
+        let rows: Vec<&items::ViewerItem> = items
+            .iter()
+            .filter(|i| i.kind == ItemKind::CallLine)
+            .collect();
+        let texts: Vec<String> = rows.iter().map(|row| items::item_text(row)).collect();
+        assert_eq!(texts, ["Read: x.rs", "Read: y.rs"]);
+        assert!(rows.iter().all(|row| row.toggle.is_none()));
+        let keys: Vec<&ItemKey> = rows.iter().map(|row| &row.id.key).collect();
+        assert!(matches!(
+            keys[..],
+            [
+                ItemKey::Text {
+                    kind: TextKind::CallLine,
+                    ordinal: 0,
+                    ..
+                },
+                ItemKey::Text {
+                    kind: TextKind::CallLine,
+                    ordinal: 1,
+                    ..
+                }
+            ]
+        ));
+        // The first row starts the tool run under the message's label.
+        assert!(rows[0].lanes.label.is_some() && rows[1].lanes.label.is_none());
+    }
+
     #[test]
     fn v051_single_unknown_call_summary_is_one_clipped_row() {
         let long = "x".repeat(200);
@@ -1423,7 +1502,8 @@ mod gui {
         let (handle, viewer, path) = open_viewer(cx, &world, &lines, &[]);
         let before = read(cx, &viewer, |v| v.items().unwrap().len());
         std::fs::remove_file(&path).unwrap();
-        keys(cx, handle, &viewer, "t");
+        // Summary → Calls → Truncated (upstream a60dfe9).
+        keys(cx, handle, &viewer, "t t");
         read(cx, &viewer, |v| {
             assert!(v.failure().is_none());
             assert!(
@@ -1703,6 +1783,9 @@ mod gui {
             read(cx, &viewer, |v| status::toggle_texts(&v.prefs().unwrap()))
         };
         assert_eq!(texts(cx)[0], "tools·sum");
+        // Upstream a60dfe9: summary → calls → truncated.
+        keys(cx, handle, &viewer, "t");
+        assert_eq!(texts(cx)[0], "tools·cal");
         keys(cx, handle, &viewer, "t");
         assert_eq!(texts(cx)[0], "tools·trn");
         keys(cx, handle, &viewer, "t");
@@ -1781,15 +1864,16 @@ mod gui {
     fn v048_tool_display_persists_across_conversations(cx: &mut TestAppContext) {
         let world = TestWorld::new();
         let (handle, ws, viewer, _) = open_main_viewer(cx, &world, &long_conversation(2), &[]);
+        // Summary → Calls (upstream a60dfe9).
         keys(cx, handle, &viewer, "t");
-        assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Truncated);
+        assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Calls);
         let other = write_transcript(
             &world.home().join("other"),
             "other.jsonl",
             &long_conversation(3),
         );
         let viewer = open_in_main(cx, handle, &ws, &other, true);
-        assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Truncated);
+        assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Calls);
     }
 
     /// V-048 / upstream d0aca95: cycling to Off removes the tool-only
@@ -1821,6 +1905,13 @@ mod gui {
         assert_eq!(nav_entries(cx), [0, 1, 3]);
         assert!(text(cx).contains("Ran 1 shell command"), "{}", text(cx));
         keys(cx, handle, &viewer, "shift-j");
+        assert_eq!(read(cx, &viewer, |v| v.nav().focused()), Some(1));
+
+        // Calls (upstream a60dfe9) keeps the group and lists its call.
+        keys(cx, handle, &viewer, "t");
+        assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Calls);
+        assert_eq!(nav_entries(cx), [0, 1, 3]);
+        assert!(text(cx).contains("Bash: cargo test"), "{}", text(cx));
         assert_eq!(read(cx, &viewer, |v| v.nav().focused()), Some(1));
 
         keys(cx, handle, &viewer, "t t t");
@@ -1894,7 +1985,8 @@ mod gui {
     fn v056_v059_indicator_click_expands_and_focuses(cx: &mut TestAppContext) {
         let world = TestWorld::new();
         let (handle, viewer, _) = open_viewer(cx, &world, &truncated_fixture(), &[]);
-        keys(cx, handle, &viewer, "t");
+        // Summary → Calls → Truncated (upstream a60dfe9).
+        keys(cx, handle, &viewer, "t t");
         settle(cx, handle, &viewer);
         let call = item_index(cx, &viewer, |i| i.kind == ItemKind::ToolCall);
         let (more, hash) = read(cx, &viewer, |v| {
@@ -1921,7 +2013,8 @@ mod gui {
     fn v060_expanded_set_survives_toggles_not_reopen(cx: &mut TestAppContext) {
         let world = TestWorld::new();
         let (handle, ws, viewer, path) = open_main_viewer(cx, &world, &truncated_fixture(), &[]);
-        keys(cx, handle, &viewer, "t");
+        // Summary → Calls → Truncated (upstream a60dfe9).
+        keys(cx, handle, &viewer, "t t");
         let call = item_index(cx, &viewer, |i| i.kind == ItemKind::ToolCall);
         let id = read(cx, &viewer, |v| {
             v.items().unwrap()[call].toggle.clone().unwrap()
@@ -1950,6 +2043,103 @@ mod gui {
             .unwrap()
             .expanded
             .is_empty()));
+    }
+
+    /// Calls mode (upstream a60dfe9): the chevron of any call row expands
+    /// the whole group into its truncated calls and results, and the group
+    /// chevron collapses it again.
+    #[gpui_kit::test]
+    fn calls_row_chevron_expands_the_group(cx: &mut TestAppContext) {
+        let world = TestWorld::new();
+        let lines = vec![
+            user("q"),
+            tool_call("g1", "Grep", r#"{"pattern":"one"}"#, 1),
+            tool_result("g1", "grep result", 1),
+            tool_call("r1", "Read", r#"{"file_path":"x.rs"}"#, 1),
+            tool_result("r1", "read result", 1),
+            assistant_at("done", 2),
+        ];
+        let (handle, viewer, _) = open_viewer(cx, &world, &lines, &[]);
+        let all_text = |cx: &mut TestAppContext| {
+            read(cx, &viewer, |v| {
+                v.items()
+                    .unwrap()
+                    .iter()
+                    .map(crate::viewer::items::item_text)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+        };
+        cx.update_window(handle, |_, window, cx| {
+            viewer.update(cx, |viewer, cx| {
+                viewer.handle_forwarded(&SetToolsCalls, window, cx)
+            })
+        })
+        .unwrap();
+        wait_viewer_ready(cx, handle, &viewer);
+        assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Calls);
+        let rows = read(cx, &viewer, |v| {
+            v.items()
+                .unwrap()
+                .iter()
+                .filter(|i| i.kind == ItemKind::CallLine)
+                .count()
+        });
+        assert_eq!(rows, 2);
+        assert!(!all_text(cx).contains("read result"));
+        // The second row's chevron.
+        let second = read(cx, &viewer, |v| {
+            v.items()
+                .unwrap()
+                .iter()
+                .filter(|i| i.kind == ItemKind::CallLine)
+                .nth(1)
+                .unwrap()
+                .key_hash
+        });
+        draw(cx, handle);
+        cx.update_window(handle, |_, window, cx| {
+            window.click(
+                gpui_kit::ElementId::NamedInteger("summary-chevron".into(), second),
+                cx,
+            )
+        })
+        .unwrap();
+        wait_viewer_ready(cx, handle, &viewer);
+        let expanded = all_text(cx);
+        assert!(
+            expanded.contains("grep result") && expanded.contains("read result"),
+            "{expanded}"
+        );
+        assert!(read(cx, &viewer, |v| {
+            v.items()
+                .unwrap()
+                .iter()
+                .all(|i| i.kind != ItemKind::CallLine)
+        }));
+        // The group chevron collapses it again.
+        let group = item_index(cx, &viewer, |i| i.group_toggle.is_some());
+        let hash = read(cx, &viewer, |v| v.items().unwrap()[group].key_hash);
+        draw(cx, handle);
+        cx.update_window(handle, |_, window, cx| {
+            window.click(
+                gpui_kit::ElementId::NamedInteger("group-chevron".into(), hash),
+                cx,
+            )
+        })
+        .unwrap();
+        wait_viewer_ready(cx, handle, &viewer);
+        assert!(!all_text(cx).contains("read result"));
+        assert_eq!(
+            read(cx, &viewer, |v| {
+                v.items()
+                    .unwrap()
+                    .iter()
+                    .filter(|i| i.kind == ItemKind::CallLine)
+                    .count()
+            }),
+            2
+        );
     }
 
     /// V-052: summary group chevrons.
@@ -2032,7 +2222,8 @@ mod gui {
             ),
         ];
         let (handle, viewer, _) = open_viewer(cx, &world, &lines, &[]);
-        keys(cx, handle, &viewer, "t");
+        // Summary → Calls → Truncated (upstream a60dfe9).
+        keys(cx, handle, &viewer, "t t");
         keys(cx, handle, &viewer, "shift-j");
         keys(cx, handle, &viewer, "x");
         let expanded =
@@ -2050,7 +2241,8 @@ mod gui {
         lines.push(bash_call("b", "cat big", 30));
         lines.push(tool_result("b", &"x".repeat(50_000), 30));
         let (handle, viewer, _) = open_viewer(cx, &world, &lines, &[]);
-        keys(cx, handle, &viewer, "t");
+        // Summary → Calls → Truncated (upstream a60dfe9).
+        keys(cx, handle, &viewer, "t t");
         settle(cx, handle, &viewer);
         let result = item_index(cx, &viewer, |i| i.kind == ItemKind::ToolResult);
         let (wide_more, wide_cols) = read(cx, &viewer, |v| {
@@ -2186,7 +2378,8 @@ mod gui {
             tool_result("b1", &numbered_lines(12), 1),
         ];
         let (handle, viewer, _) = open_viewer(cx, &world, &lines, &[]);
-        keys(cx, handle, &viewer, "t");
+        // Summary → Calls → Truncated (upstream a60dfe9).
+        keys(cx, handle, &viewer, "t t");
         settle(cx, handle, &viewer);
         let result = item_index(cx, &viewer, |i| i.kind == ItemKind::ToolResult);
         let (more, hash) = read(cx, &viewer, |v| {
@@ -2588,7 +2781,8 @@ mod gui {
         lines.push(bash_call("b", "cat", 40));
         lines.push(tool_result("b", &body, 40));
         let (handle, viewer, _) = open_viewer(cx, &world, &lines, &[]);
-        keys(cx, handle, &viewer, "t");
+        // Summary → Calls → Truncated (upstream a60dfe9).
+        keys(cx, handle, &viewer, "t t");
         keys(cx, handle, &viewer, "/");
         cx.simulate_input(handle, "treasure");
         wait_viewer_ready(cx, handle, &viewer);
@@ -2957,7 +3151,8 @@ mod gui {
     fn v017_hover_marks_the_tool_output(cx: &mut TestAppContext) {
         let world = TestWorld::new();
         let (handle, viewer, _) = open_viewer(cx, &world, &truncated_fixture(), &[]);
-        keys(cx, handle, &viewer, "t");
+        // Summary → Calls → Truncated (upstream a60dfe9).
+        keys(cx, handle, &viewer, "t t");
         let call = item_index(cx, &viewer, |i| i.kind == ItemKind::ToolCall);
         let id = read(cx, &viewer, |v| v.items().unwrap()[call].toggle.clone());
         let over_call = text_position(cx, handle, &viewer, call, 0, 2);
@@ -3043,7 +3238,8 @@ mod gui {
         let world = TestWorld::new();
         let (handle, _ws, viewer, _) = open_main_viewer(cx, &world, &truncated_fixture(), &[]);
         cx.update(|cx| cx.set_reduce_motion(true));
-        keys(cx, handle, &viewer, "t");
+        // Summary → Calls → Truncated (upstream a60dfe9).
+        keys(cx, handle, &viewer, "t t");
         settle(cx, handle, &viewer);
         let call = item_index(cx, &viewer, |i| i.kind == ItemKind::ToolCall);
         let (more, hash) = read(cx, &viewer, |v| {
@@ -3113,6 +3309,7 @@ mod gui {
             ("tools-truncated", Box::new(SetToolsTruncated)),
             ("tools-full", Box::new(SetToolsFull)),
             ("tools-off", Box::new(SetToolsOff)),
+            ("tools-calls", Box::new(SetToolsCalls)),
             ("tools-summary", Box::new(SetToolsSummary)),
             ("toggle-thinking", Box::new(ToggleThinking)),
             ("toggle-timing", Box::new(ToggleTiming)),
@@ -3513,6 +3710,8 @@ mod gui {
         assert_eq!(probe(cx, "window.kind").as_deref(), Some("single-file"));
         assert_eq!(probe(cx, "list.count"), None);
         keys(cx, handle, &viewer, "t");
+        assert_eq!(probe(cx, "viewer.tool_display").as_deref(), Some("cal"));
+        keys(cx, handle, &viewer, "t");
         assert_eq!(probe(cx, "viewer.tool_display").as_deref(), Some("trn"));
     }
 
@@ -3698,6 +3897,8 @@ mod gui {
         let items = read(cx, &viewer, |v| v.items().unwrap().len());
         assert!(items >= 3000, "{items}");
         keys(cx, handle, &viewer, "shift-g");
+        keys(cx, handle, &viewer, "t");
+        assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Calls);
         keys(cx, handle, &viewer, "t");
         assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Truncated);
         let probe = |key: &str, cx: &mut TestAppContext| -> f64 {

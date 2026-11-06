@@ -9,9 +9,9 @@
 //!   monospace font for exact parity with the terminal app.
 //! - [`document`]: a semantic, layout-free [`ConversationDocument`] built by
 //!   the same rules (skipped entry kinds, templates and fixed block order,
-//!   summary-mode grouping, tool output ids, truncation and expansion,
-//!   subagent / agent-progress / note handling, timing slots). A GUI
-//!   renders it natively (markdown, collapsible tool cards).
+//!   summary- and calls-mode grouping, tool output ids, truncation and
+//!   expansion, subagent / agent-progress / note handling, timing slots). A
+//!   GUI renders it natively (markdown, collapsible tool cards).
 //! - [`state`]: [`ViewerModel`] (the decoded transcript, preferences,
 //!   expanded outputs) and the view-state rules of upstream
 //!   `tui/app/view_state.rs`: in-view search, message navigation, re-render
@@ -81,7 +81,7 @@ pub use state::{
 /// always starts off there.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ViewPrefs {
-    /// Off / summary / truncated / full tool display.
+    /// Off / summary / calls / truncated / full tool display.
     pub tool_display: ToolDisplayMode,
     /// Thinking blocks, subagent entries and `agent_progress` entries.
     pub show_thinking: bool,

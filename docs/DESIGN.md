@@ -479,7 +479,7 @@ truth.
 | `settings` | `parse_launch_args(args) -> Result<LaunchCommand, LaunchArgsError>` (`LaunchCommand::{Run(GuiLaunchArgs), Help, Version, DeleteEmpty { local, all, yes }, Update, Agent(AgentCli), SubcommandHelp(String)}`; K14/K15, `SubcommandHelp` added by WP-C: `update --help`, `delete-empty -h`, `help <subcommand>` → print the text, exit 0), `GuiLaunchArgs` (+`display_flags`, `search_mode_override`, `picker`, `time_filter`, `settings`, `validate`; `all_kinds` = `--all-kinds`, cb990e6), `help_text(program)`, `effective_settings(config, flags, mode_override) -> EffectiveSettings { show_last, show_tools, tool_display, show_thinking, search_mode, list_search_mode, exclude_projects, exclude_paths, keys, semantic_toggle_enabled, resume_default_args, resume_codex_default_args }`, `EffectiveSettings::initial_view_prefs()`, `EffectiveSettings::resume_default_args_for(source)` (eea6d37), `initial_tool_display`, `PickerAction::{ShowPath, ShowId, Resume{fork}}`, `picker_output(action, conv)`, `session_id_from_path(path)` |
 | `browser` | `Browser` (`family_of(path) -> ViewFamily { parent, children }` (a conversation's parent and its subagents and forks, oldest first, over every card; upstream 3c2ffeb), `new_loading`, `append_conversations`, `set_query`, `escape -> EscapeOutcome`, `toggle_workspace_filter`, `set_workspace_filter`, `set_workspace`, `workspace_display` (the workspace with `~` for the home, the prompt's folder, 82b355a), `set_excluded_projects`, `set_excluded_paths` + `excluded_paths` (`[tui] exclude_paths`: literal prefixes of the recorded cwd (case-sensitive; case-insensitive on Windows, 59417d1), applied by `ScopeFilter` in memory and by `Snapshot::head` / `scope(all_kinds, excluded_paths, workspace, ..)` for cards, 982aea9; the workspace test of both is `history::Workspace::contains`, the cards' by project key and the cwds a card stores, 82b355a), `all_kinds`, `toggle_all_kinds`, `set_all_kinds` (automated and child conversations in the list and its lexical search, keeping the query and the selected session, cb990e6), `user_only`, `toggle_user_only`, `set_user_only`, `searches_user_only` (lexical search over `Conversation::own_text` only, keeping the query and the selected session; `searches_user_only` is false in semantic mode, which ignores the toggle; ae7ae39), `toggle_list_search_mode`, `set_list_search_mode`, `poll`, `has_search_work_in_flight`, `filtered`, `row`, `selected`, `select*`, `select_half_page_down(viewport_rows)`, `selected_path`, `selected_conversation`, `has_multiple_sources`, `conversation_by_path`, `count_text`, `search_status_text`, `semantic_status_text`, `semantic_activity_status_text`, `semantic_activity_counts` (the `(done, total)` chunks the activity shows, for its progress bar; fork), `semantic_indexing -> Option<SemanticIndexing { completed, total }>` (the semantic worker's background indexing, upstream c6d0421), `semantic_error`, `semantic_progress`, `semantic_result_metadata[_for_selection]`, `lexical_evidence`, `row_preview_input`, `row_header_input`, `uuid_lookup`, `rename_prefill`, `workspace`, `has_project_context`, `list_search_mode`, `is_loading` (`!readiness.list`, 358becb), `readiness() -> Readiness { list, lexical, reconcile: ReconcileState::{Running, Done}, semantic }`; generation mode (358becb): `show_snapshot(store::Snapshot)` (the first `SNAPSHOT_ROWS` cards), `shows_snapshot`, `generation_open`, `generation_len`, `generation_name`, `generation_is_empty`, `history_is_empty`, `is_hidden(index)`, `time_filter`, `set_time_filter(TimeFilter)`, `open_search_index` and `swap_generation(store::Snapshot)` (synchronous; the loader installs a generation opened off the UI thread), `search_index_generation`, `take_reconcile_request`, `set_reconciling`, `set_index_progress(Option<store::progress::Indexing>, running)`, `index_failed(message)`, `indexing_status_text`, `index_progress`, `take_index_notice -> Option<IndexNotice::{Indexed { total }, Failed(message)}>` (+`status_message`; the status messages of a pass shown as indexing or a failed one, 04c714b), `fill_visible_evidence(Range)`, `conversation_at`; upstream 3708bb6 replaced `loading_state`), `SNAPSHOT_ROWS`, `BrowserOptions` (+ builders incl. `with_exclude_paths`, `embedder_factory`, `waker`, `semantic_available`, `all_kinds`), `HistoryLoader` (`new`, `reconfigure` (store mode: moves to the store root of the new env), `start_initial_load` (store mode: a reconcile pass), `start_refresh` (store mode: a pass, then `Refreshed` from the generation sizes), `set_time_filter` (store mode: re-scopes the cards at the next poll), `is_running`, `is_refreshing`, `uses_store`, `open_snapshot` (`&mut self`: enters store mode; every card and the index are opened on `generation-open` and installed by a later `poll`), `finish_snapshot_write` (waits for the running pass and the ones asked for after it, returns the last `store::generation::Publish`, e905169), `poll(&mut Browser) -> LoaderPoll` incl. `pending`, `swapped`; `BUSY_RETRY`, `GENERATION_POLL`), `LoaderOptions` (incl. `drain_budget`, default `DEFAULT_DRAIN_BUDGET` = 8 ms, upstream 93e17a5; `snapshot` = store mode, default off, 3708bb6, 358becb), `LoadEvent::{Loaded, NoHistory, LoadFailed, Refreshed, RefreshIncomplete, RefreshFailed, RefreshInterrupted}` (+`status_message`), `ListSearchMode`, `SemanticProgress`, `SemanticResultMetadata`, `UuidLookup`, `SemanticIndexing`, `PreparedSession` (`Send`; `PreparedSession::new(Conversation)` normalizes the lexical body of a re-parsed session, the O(text) step for a background task; consumed by `Browser::apply_renamed_session` and `Browser::resolve_uuid_lookup_session`, 503fe42), `RenameError`, `DeleteError` (both with `Unsupported(Source)`: the source's adapter cannot rename or delete, 9799550), `Waker`, `SemanticEmbedderFactory`, `query_has_literals`; K1–K4, K6, K18 additions |
 | `display_format` | `conversation_label(&Conversation)` (title, else summary, else first message, else session id; upstream 3c2ffeb), `build_row_header(&RowHeaderInput) -> RowHeader { project, custom_title, summary, message_count, semantic_score, duration, timestamp, recency, .. }` (`RowHeaderInput::show_kind_label`: the `auto`/`sub` tag of a listed automated or child conversation, cb990e6; the GUI draws it as its own run), `build_row_preview(&RowPreviewInput) -> RowPreview { preview, source, context }`, `HighlightQuery` (`parse`, `needs_literal_context`, `match_ranges`), `ViewSearchQuery` (`parse`, `is_empty`, `has_match`, `match_ranges_in(text, &text_match::NormalizedForm)`: the viewer find, d2c0f07; `NormalizedForm` is the fork's owned normalized form of a text), `HighlightedText`, `Recency`, `format_model_name`, `format_tokens`, `format_tokens_long`, `format_msg_count_long`, `format_duration_minutes`, `group_digits` (`7,185`, 04c714b), `format_header_timestamp`, `semantic_row_metadata`, `semantic_rationale_label`, `sanitize_preview` |
-| `view` | `ViewerModel { path, transcript: Arc<Transcript>, prefs, expanded }` (`open(history, path, prefs)` and `open_cancellable(…, cancelled)` through the environment's `history::service::HistoryService`, `from_transcript`, `entries()` (the transcript's `history::view::entries`, numbered; 9597669), `cycle_tool_display`, `toggle_thinking`, `toggle_timing`, `toggle_expanded`, `document`, `export_options`, `session_id`, `message_text`, `plain_display`), `ViewPrefs`, `ToolDisplayMode` (`Off` (d0aca95) / `Summary` (was `Hidden`) / `Truncated` / `Full`; +`next`, `status_label`), `ConversationDocument` (`navigable_indices`, `navigable_entry_indices`, `nav_position`, `message_at_nav_position`), `DocMessage`, `DocMessageKind`, `DocBlock` (`toggle_id`, `tool_output_id`, `plain_text`), `DocBlockKind`, `DocTiming`, `Fold`, `DocToolCall`, `DocToolResult`, `DocSubagentToolResult`, `ToolBodyLine`, `BodyLineKind`, `LabelRole` (+`color`), `ToolOutputId`, `fitted_name`, `NAME_WIDTH`, `TRUNCATED_BODY_LINES`, `TRUNCATED_RESULT_LINES`, `MessageNav`, `ViewSearch<M>` (`commit` returns `No matches for /<query>` for a query with text and no matches, d2c0f07), `ViewSearchMode`, `escape -> ViewEscape`, `capture_anchor_entry`, `find_entry_or_prev`; K5, K9 additions |
+| `view` | `ViewerModel { path, transcript: Arc<Transcript>, prefs, expanded }` (`open(history, path, prefs)` and `open_cancellable(…, cancelled)` through the environment's `history::service::HistoryService`, `from_transcript`, `entries()` (the transcript's `history::view::entries`, numbered; 9597669), `cycle_tool_display`, `toggle_thinking`, `toggle_timing`, `toggle_expanded`, `document`, `export_options`, `session_id`, `message_text`, `plain_display`), `ViewPrefs`, `ToolDisplayMode` (`Off` (d0aca95) / `Summary` (was `Hidden`) / `Calls` (a60dfe9) / `Truncated` / `Full`; +`next`, `groups_tools` (was `is_summary`), `status_label`), `ConversationDocument` (`navigable_indices`, `navigable_entry_indices`, `nav_position`, `message_at_nav_position`), `DocMessage`, `DocMessageKind`, `DocBlock` (`toggle_id`, `tool_output_id`, `plain_text`), `DocBlockKind`, `DocTiming`, `Fold`, `DocToolCall`, `DocToolResult`, `DocSubagentToolResult`, `ToolBodyLine`, `BodyLineKind`, `LabelRole` (+`color`), `ToolOutputId`, `fitted_name`, `NAME_WIDTH`, `TRUNCATED_BODY_LINES`, `TRUNCATED_RESULT_LINES`, `MessageNav`, `ViewSearch<M>` (`commit` returns `No matches for /<query>` for a query with text and no matches, d2c0f07), `ViewSearchMode`, `escape -> ViewEscape`, `capture_anchor_entry`, `find_entry_or_prev`; K5, K9 additions |
 | `export` | `ExportFormat::{ALL, from_index, index, label, extension}`, `ExportOptions`, `generate_export(&Transcript, format, options)`, `export_to_path(&Transcript, …) -> Result<(), ExportError>`, `default_export_file_name`, `plain_display(&Transcript, options)` (every generator renders `history::view::entries`; the caller decodes first with `view::open_conversation(history, path)`, whose error is `ExportError::Read`, 9597669), `exported_status`, constants `COPIED_TO_CLIPBOARD`, `MESSAGE_COPIED_TO_CLIPBOARD`, `NO_TEXT_CONTENT`, `MESSAGE_NOT_FOUND`, `PATH_COPIED_TO_CLIPBOARD`, `SESSION_ID_COPIED_TO_CLIPBOARD`; K11 |
 | `resume` | `plan_resume(env, conv, workspace, fork, &Launch) -> Result<ResumePlan>`, `plan_resume_target(…, &ResumeTarget, …)` (planned by the adapter of the target's source, `Adapter::resume`, 9799550; an action the conversation does not support, `history::actions::capabilities_of(source, provenance)`, is refused with `Failed to run Claude CLI: Resuming <source> sessions is not supported` / `Forking …`, or `… is unavailable: <source> no longer has this conversation's current history` for an orphaned one, eea6d37), `ResumeTarget { source, path, project_path, provenance }` (+`target()`), `ResumePlan { source, kind, strategy, session_path, launcher, args, cwd, copy, warnings, env }` (+`launch_spec(env)`: the launcher's program resolved (`AppError::AgentLaunch` when missing) and its arguments before `args`, `execute_copy()`, `display_command()` (`mise exec -- claude --resume …`); `env`: Codex's `CODEX_HOME`, eea6d37; `launcher`: 8a99ccc), `CopyPlan { files, dirs, existing_targets, target_dir, … }`, `CopyItem`, `CopyReport`, `ResumeStrategy`, `WORKSPACE_REQUIRED_RESUME`, `WORKSPACE_REQUIRED_FORK`; `terminal::{TerminalLauncher::from_setting, detect_launcher, prepare_terminal_command, build_terminal_command, prepare_launcher_command, LaunchOptions, LaunchSpec { program, args, cwd, env }, TerminalCommand (+display; `env` set on the launcher process), Platform, run_to_completion(spec) -> RunOutput { success, status, stderr }}` (the environment reaches the program through every launcher: `env NAME=value` in the POSIX line, `set "NAME=value" &&` in the `cmd.exe` line; `run_to_completion` runs a CLI without a terminal, refused under `cfg(test)`/`hermetic`, eea6d37); K17. **Forbidden in the GUI**: `resume::launch` (copies without confirmation) and direct `terminal::spawn_terminal` outside `services.rs` |
 | `maintenance` | `find_empty_candidates(env, &DeleteEmptyScope) -> Vec<EmptyCandidate>` (+`modified_within`, `cli_lines`), `delete_empty_candidates(&[EmptyCandidate]) -> DeleteEmptyOutcome { deleted, skipped, failure }`, `delete_empty_summary_line`, `format_delete_empty_report`, `find_session_copies(env, uuid) -> Vec<SessionCopyFiles>`, `delete_session_by_uuid(env, uuid) -> DeleteByUuidReport`, `delete_by_uuid_message`, `show_dir(env, workspace)`, `WORKSPACE_REQUIRED_SHOW_DIR`, `load_sorted_conversations(env, show_last, debug, &time_filter)`, `debug_search_report(convs, query, now, workspace) -> DebugSearchReport` (+`to_text`), `DEBUG_SEARCH_TOP`, `parse_error_report(conv)`, `log_parse_errors(env, conv)`; K4 (`plan_session_delete` (a source whose adapter cannot delete is refused with `AppError::Unsupported`: `Deleting <source> sessions is not supported`, 9799550), `execute_session_delete`, `execute_session_delete_with(env, plan, codex_launcher, run)` (a Codex plan, every rollout of the thread, runs `codex delete --force <thread id>` with `CODEX_HOME` through `run`: the GUI passes `PlatformServices::run_program`, eea6d37; started by the Codex `Launcher` with its leading arguments, a missing program fails before anything runs, 8a99ccc), `DeletePlan { source, path, session_id, files, dirs, metadata, kept }` (`metadata`: a sidecar's `.meta.json`; `kept`: a session's `/btw` forks, which stay; 3c2ffeb), `DeleteReport`, `SessionDeleteFailure { error, partial }`) |
@@ -629,7 +629,7 @@ Should-close handler: `cx.quit()` (PD6).
 │ ┌────────────────────────────────┐ │ 926k tokens · 2026-10-12 14:03                              │  order, wraps; summary
 │ │❯ token refresh        12/340 ✕│ │ Session token refresh flow and retry on 401                 │  same line if it fits)
 │ └────────────────────────────────┘ │─────────────────────────────────────────────────────────────│
-│ (Lexical|Semantic) (All|Workspace) │ Tools [Off|Summary|Truncated|Full] [Thinking] [Timing]       │ viewer toolbar
+│ (Lexical|Semantic) (All|Workspace) │ Tools [Off|Summary|Calls|Truncated|Full] [Thinking] [Timing] │ viewer toolbar
 │ [▣ proj ▾] [Any time ▾]        [⟳] │                       [Outline] [Resume] [Fork] [⋯]          │
 ├────────────────────────────────────┤─────────────────────────────────────────────────────────────│
 │ CC Fix login bug          3 min ago│ Sep 04 13:59      You │ How do I refresh the token when…    │ transcript
@@ -808,16 +808,16 @@ Out-of-root file (single-file window on an export or attachment): panel body "Ou
 
 ### 5.5 Single-file viewer window
 ```
-┌──────────────────────────────────────────────────────────────────────────┐
-│ File Edit View Help     3f2a19c0-….jsonl — Claude History         ─ ☐ ✕ │
-├──────────────────────────────────────────────────────────────────────────┤
-│ proj · Fix login bug · 42 messages · 2026-10-12 14:03                    │
-│ Tools [Off|Summary|Truncated|Full] [Thinking] [Timing]   [Outline] [⋯]   │
-├──────────────────────────────────────────────────────────────────────────┤
-│ (transcript as in the main window)                                       │
-├──────────────────────────────────────────────────────────────────────────┤
-│ [12/42] tools·sum think·off info·off │ / search  e export  q close  F1   │
-└──────────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────┐
+│ File Edit View Help     3f2a19c0-….jsonl — Claude History         ─ ☐ ✕   │
+├────────────────────────────────────────────────────────────────────────────┤
+│ proj · Fix login bug · 42 messages · 2026-10-12 14:03                      │
+│ Tools [Off|Summary|Calls|Truncated|Full] [Thinking] [Timing] [Outline] [⋯] │
+├────────────────────────────────────────────────────────────────────────────┤
+│ (transcript as in the main window)                                         │
+├────────────────────────────────────────────────────────────────────────────┤
+│ [12/42] tools·sum think·off info·off │ / search  e export  q close  F1     │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 The menu tree is the shared one (§8.10): Session items without a handler here (Resume, Fork, Rename, Delete,
 Select and exit) are disabled; File → "Show conversations" opens or focuses the main window.
@@ -1725,7 +1725,8 @@ gpui_kit::actions!(history, [
   // viewer
   ScrollLineDown, ScrollLineUp, NextMessage, PrevMessage, ScrollHalfPageDown, ScrollHalfPageUp,
   ScrollPageDown, ScrollPageUp, ScrollTop, ScrollBottom, StartSearch, NextMatch, PrevMatch, CommitSearch,
-  CancelSearch, FindClearQuery, CycleToolDisplay, SetToolsOff, SetToolsSummary, SetToolsTruncated, SetToolsFull,
+  CancelSearch, FindClearQuery, CycleToolDisplay, SetToolsOff, SetToolsSummary, SetToolsCalls, SetToolsTruncated,
+  SetToolsFull,
   ToggleThinking, ToggleTiming, ToggleOutputs, ViewerEscape, ViewerBack, OpenParentConversation,
   ShowSubagentsAndForks,
   // deep search / agent panel
@@ -1942,8 +1943,8 @@ Static rows such as `f5 → Refresh` are never removed by a rebinding (C-034). N
     PD6); plus GUI rows `Ctrl+E` End of line, `Alt+B / Alt+F` Word left/right, `Shift+F10` Row menu.
   * **Viewer** (TUI order): `j / ↓` Scroll down; `k / ↑` Scroll up; `J / ]` Next message; `K / [` Previous message;
     `d / Ctrl+D` Half page down; `u / Ctrl+U` Half page up; `g / Home` Jump to top; `G / End` Jump to bottom; `/`
-    Search; `n / N` Next / prev match; `t` Cycle tools: off/sum/trunc/full (TUI text, d0aca95); `T` Toggle thinking; `i`
-    Toggle timing; `e` Export to file; `y` Copy to clipboard / message; `p` Show file path; `Y` Copy path; `I` Copy
+    Search; `n / N` Next / prev match; `t` Cycle tools: off/sum/calls/trunc/full (TUI text, d0aca95, a60dfe9); `T`
+    Toggle thinking; `i` Toggle timing; `e` Export to file; `y` Copy to clipboard / message; `p` Show file path; `Y` Copy path; `I` Copy
     session ID; Subagents and forks (`s`); Open parent conversation (`P`); Resume; Fork resume; Delete; `q / Esc` Back (upstream 3c2ffeb; single-file: `Close`); plus GUI rows `x`
     Expand/collapse tool output, `o` Outline, `Ctrl+C` Copy selection.
   * **Agent panel**, **Deep search**, **Global** (Quit, Command palette, Settings, Keyboard shortcuts, Open JSONL
@@ -1996,8 +1997,8 @@ tree is rebuilt — and every open AppMenuBar `reload()`ed — after theme chang
 activation (check marks reflect the active window's viewer, tracked in `ActivePane`).
 * **File**: Open JSONL file…, Show conversations, Choose workspace…, Clear workspace, Export…, Close window, Quit.
 * **Edit**: Copy, Find in conversation, Find in all conversations….
-* **View**: Conversations, Deep search, Viewer, Focus viewer, Tool display ▸ Off/Summary/Truncated/Full, Show thinking,
-  Show timestamps, Search mode ▸ Lexical/Semantic, Scope ▸ All/Workspace, Show automated and subagent
+* **View**: Conversations, Deep search, Viewer, Focus viewer, Tool display ▸ Off/Summary/Calls/Truncated/Full,
+  Show thinking, Show timestamps, Search mode ▸ Lexical/Semantic, Scope ▸ All/Workspace, Show automated and subagent
   conversations (check mark, cb990e6), Theme ▸ System/Light/Dark, Refresh.
 * **Session**: Open, Resume, Fork, Rename…, Delete…, Export…, Copy to clipboard ▸ 4 formats, Copy message, Copy path,
   Copy session ID, Copy header session ID, Show file path, Reveal in file manager, Open parent conversation,
@@ -2045,6 +2046,7 @@ pub struct Lanes { pub timestamp: Option<SharedString>, pub label: Option<Shared
 pub enum ItemBody {
     Markdown { segments: Arc<Vec<Segment>>, thinking: bool },
     ToolSummary { sentence: SharedString, id: Option<ToolOutputId>, expanded: bool },
+    CallLine { header: SharedString, id: Option<ToolOutputId> },  // calls mode (a60dfe9): one row per call
     ToolCall { id: ToolOutputId, header: Option<SharedString>, lines: Arc<Segment> /* SegKind::ToolBody, this chunk */,
                more: Option<usize>, expandable: bool, expanded: bool },
     ToolResult { id: ToolOutputId, segments: Arc<Vec<Segment>>, more: Option<usize>, expandable: bool, expanded: bool },
@@ -2074,6 +2076,7 @@ pub fn build(doc: &ConversationDocument, model: &ViewerModel, cols: usize, cance
 | Markdown, note (Pi/OMP custom message, Codex `Fork`) | core label | TextSecondary | no | yes | Pad |
 | Thinking | `Thinking` | AccentDim | no | no (italic + thinking role) | first block only |
 | ToolSummary / ToolCall | message label | AccentDim | no | message dimmed | first block only |
+| CallLine (calls mode) | message label on the first line of a run, none after | AccentDim | no | message dimmed | first line only |
 | ToolResult (top-level) | `↳ Result` | ToolText | no | no | first block only |
 | SubagentToolResult | `↳ Tool` (header `<Result>`) | AccentDim | no | yes | Pad |
 | ToolSummaryDetails items | group label on the first item | AccentDim | no | yes | Pad |
@@ -2129,6 +2132,8 @@ h_flex().w_full().items_start()                       // one ledger row per item
  └─ content     v_flex flex_1 min_w_0 gap per 9.3
        ├─ Markdown: one SelText per segment (Code: bg(muted) rounded p_2 mono; TableRow: mono row + bottom border)
        ├─ ToolSummary: SelText sentence (tool_text, dimmed); chevron ▸/▾ button when clickable
+       ├─ CallLine: like ToolSummary, the call header clipped to `cols` (one row per call; every row of a group
+       │            toggles the group, a mixed message's rows toggle nothing)
        ├─ ToolCall: header row on the first chunk (tool_text; chevron if expandable) + empty spacer + body chunk (mono)
        │            + "(N more lines…)" row on the last chunk (dimmed, cursor pointer, toggles) when truncated
        ├─ ToolResult: rows/segments + indicator row as above
@@ -2138,7 +2143,7 @@ h_flex().w_full().items_start()                       // one ledger row per item
   (V-018 fix: no clipping) except collapsed tool lines, which are clipped to `cols` by design.
 * Hover: items of an expandable tool output get `hover(|s| s.bg(hover role))` (V-017).
 * Spacing between messages: `pt_3` on the first item of each message; `pt_1` between items of a message; chunk
-  items of the same block have no gap.
+  items of the same block and consecutive call lines have no gap.
 * Search highlights: `HighlightStyle { background_color: match role, color: on-match role }`; current match
   `background_color: current-match role (warning token), color: on-current role` (V-075). Style runs are built by a
   deterministic overlay (base spans, then code tokens, then match ranges on top; spike-list §6).
@@ -2253,7 +2258,7 @@ row), taken from the handle LRU (§9.7).
   `family-menu`, rows `family:row:<n>`): title `Subagents and forks`; one row per child, oldest first: `▶` on the
   selected row, `sub` / `fork`, the label, `<messages> · %m-%d %H:%M`; j/k/↑/↓ move, Enter or a click opens, Esc, `q`,
   `s` or [Esc] Cancel closes (upstream's `Children` dialog).
-* Toolbar (toolbar.rs): segmented `Off | Summary | Truncated | Full` (SetTools*; built with the View menu items
+* Toolbar (toolbar.rs): segmented `Off | Summary | Calls | Truncated | Full` (SetTools*; built with the View menu items
   from one table, `TOOL_DISPLAY_MODES`), toggles `Thinking`, `Timing`
   (`.selected(bool)`), spacer, find bar (when active), `Outline`, `Resume`, `Fork`, `⋯` dropdown (Export…, Copy to
   clipboard ▸, Copy message, Copy path, Copy session ID, Copy header session ID, Show file path, Reveal in file
@@ -2261,7 +2266,7 @@ row), taken from the handle LRU (§9.7).
   unknown-source targets: those items disabled with tooltip `Unknown conversation type`; items the conversation's
   capabilities refuse (Rename of a Codex thread, all four for an orphaned thread; eea6d37) disabled, the Resume
   and Fork buttons with core's refusal as tooltip.
-* Status bar (status.rs): `[i/N]` (mono), `tools·off|sum|trn|all  think·on|off  info·on|off` (`ToolDisplayMode::
+* Status bar (status.rs): `[i/N]` (mono), `tools·off|sum|cal|trn|all  think·on|off  info·on|off` (`ToolDisplayMode::
   status_label`; key letter accent, rest muted — clickable), `│`, hints (§8.7, focus-dependent, priority-trimmed).
 
 ---
@@ -2981,7 +2986,7 @@ when no config key is set and restore_session is on) or `Default: <value>`; "App
 | General | Default workspace | `[gui] default_workspace` | folder input + Browse… | existing dir | next start |
 | General | Restore last session | `[gui] restore_session` | Switch | default on | next start |
 | Display | Preview shows | `[display] last` | Segmented Last / First | | list refresh |
-| Display | Default tool display | `[display] no_tools` | Segmented Off / Summary / Full | true → Off, false → Full, unset = remembered/Summary (d0aca95); Summary removes the key, so config.toml or the remembered mode applies again (the control shows that value before Save, as after Reset) | next opened conversation + start |
+| Display | Default tool display | `[display] no_tools` | Segmented Off / Summary / Full | true → Off, false → Full, unset = remembered/Summary (d0aca95; a remembered Calls or Truncated shows as Summary); Summary removes the key, so config.toml or the remembered mode applies again (the control shows that value before Save, as after Reset) | next opened conversation + start |
 | Display | Show thinking and subagents by default | `[display] show_thinking` | Switch | | same |
 | Display | Ctrl+O prints plain text | `[display] plain` | Switch | | next Ctrl+O |
 | Display | (pager) | `[display] pager` | read-only "not used by the GUI" | | — |
@@ -3025,8 +3030,9 @@ Path: `<home>/.local/state/claude-history-gui/state.json` (the directory of `env
 ```
 Restored values are clamped (window to current displays, widths to the ranges and the window, PD1). `restore_session =
 false` → only `last_export_dir` and `recent_workspaces` are used. A version-1 file is read (its `time_filter_text` is
-ignored). `view.tool_display` is `off|summary|truncated|full` (`off`: d0aca95); a value this build does not know reads
-as never remembered instead of making the file corrupt.
+ignored). `view.tool_display` is `off|summary|calls|truncated|full` (`off`: d0aca95, `calls`: a60dfe9); a value
+this build does not know reads as never remembered instead of making the file corrupt (a build before a60dfe9
+forgets a remembered `calls`).
 
 ### 13.4 Data locations (core `env.rs`)
 | What | Location |

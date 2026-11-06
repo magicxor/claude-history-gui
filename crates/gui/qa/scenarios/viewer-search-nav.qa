@@ -9,7 +9,7 @@
 
 wait-for viewer.status == ready 20s
 expect focus == viewer
-key t
+key t t
 wait-for viewer.loading == false 5s
 expect viewer.tool_display == trn
 expect viewer.expanded == 0

@@ -595,7 +595,7 @@ fn render_content(ctx: &RenderCtx, item: &ViewerItem, item_ix: usize, cx: &mut A
             );
             continue;
         }
-        if item.kind == ItemKind::ToolSummary {
+        if matches!(item.kind, ItemKind::ToolSummary | ItemKind::CallLine) {
             let chevron = item
                 .toggle
                 .clone()
@@ -718,6 +718,14 @@ pub fn render_item(
         roles.separator
     };
     let content = render_content(ctx, item, item_ix, cx);
+    // Consecutive call lines of a message sit row on row, like the ledger's.
+    let continues_call_lines = item.kind == ItemKind::CallLine
+        && item_ix
+            .checked_sub(1)
+            .and_then(|previous| ctx.items.get(previous))
+            .is_some_and(|previous| {
+                previous.kind == ItemKind::CallLine && previous.message_index == item.message_index
+            });
     let painted = ctx.painted.clone();
     let weak = ctx.weak.clone();
     let hover_weak = ctx.weak.clone();
@@ -727,7 +735,10 @@ pub fn render_item(
         .items_start()
         .relative()
         .when(item.first_of_message, |d| d.pt_3())
-        .when(!item.first_of_message && item.first_chunk, |d| d.pt_1())
+        .when(
+            !item.first_of_message && item.first_chunk && !continues_call_lines,
+            |d| d.pt_1(),
+        )
         .when(focused, |d| d.bg(roles.focus_tint))
         .when(hovered && !focused, |d| d.bg(roles.list_hover))
         .on_mouse_down(MouseButton::Left, move |_, _, cx| {

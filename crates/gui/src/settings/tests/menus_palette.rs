@@ -183,9 +183,15 @@ fn view_checks_follow_the_viewer_and_the_collapsed_state(cx: &mut TestAppContext
         .filter(|(path, _, _)| path == "View › Tool display")
         .map(|(_, name, _)| name.as_str())
         .collect();
-    assert_eq!(modes, ["Off", "Summary", "Truncated", "Full"]);
+    assert_eq!(modes, ["Off", "Summary", "Calls", "Truncated", "Full"]);
     assert!(checked(&leaves, "View › Tool display", "Off"));
     assert!(!checked(&leaves, "View › Tool display", "Full"));
+    // Upstream a60dfe9's calls mode sits between Summary and Truncated.
+    cx.dispatch_action(handle, SetToolsCalls);
+    cx.run_until_parked();
+    let leaves = installed(cx);
+    assert!(checked(&leaves, "View › Tool display", "Calls"));
+    assert!(!checked(&leaves, "View › Tool display", "Off"));
     // Focus viewer mode.
     assert!(!checked(&leaves, "View", "Focus viewer"));
     cx.dispatch_action(handle, ToggleListPane);
@@ -233,6 +239,7 @@ fn the_tree_marks_each_state() {
         ("View › Theme", "System"),
         ("View › Tool display", "Off"),
         ("View › Tool display", "Summary"),
+        ("View › Tool display", "Calls"),
         ("View › Search mode", "Lexical"),
         ("View › Scope", "All"),
     ] {

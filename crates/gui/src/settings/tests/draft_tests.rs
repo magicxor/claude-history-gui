@@ -435,6 +435,7 @@ fn tool_display_is_off_summary_or_full() {
     for (tools, shown) in [
         (RememberedToolDisplay::Off, "Off"),
         (RememberedToolDisplay::Summary, "Summary"),
+        (RememberedToolDisplay::Calls, "Summary"),
         (RememberedToolDisplay::Truncated, "Summary"),
         (RememberedToolDisplay::Full, "Full"),
     ] {

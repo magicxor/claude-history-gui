@@ -8,8 +8,11 @@
 //! upstream, all mechanical: the palette comes from [`crate::theme::current`]
 //! instead of terminal detection (R3); `process_command_message` lives in
 //! [`crate::commands`]; a few items are re-exported `pub(crate)` for the
-//! layout-free [`crate::view::document`] builder; the agent-progress label is
-//! sliced by characters instead of bytes (W18). Rendering output is unchanged.
+//! layout-free [`crate::view::document`] builder (`group_summary_rows` takes
+//! the group's parsed range, parent and summary instead of the ledger's
+//! `PendingToolSummary`, so the builder can share it); the agent-progress
+//! label is sliced by characters instead of bytes (W18). Rendering output is
+//! unchanged.
 
 use crate::history::model::Transcript;
 use crate::history::service::HistoryService;
@@ -43,8 +46,8 @@ use summary::{PendingToolSummary, flush_tool_summary};
 pub(crate) use markdown::render_markdown_to_lines;
 pub(crate) use style::{assistant_label, subagent_label};
 pub(crate) use summary::{
-    ToolActivitySummary, entry_shows_nothing, group_summary_line, summarize_tool_calls,
-    summary_line, tool_only_assistant_summary, user_entry_is_only_tool_results,
+    ToolActivitySummary, entry_shows_nothing, group_summary_rows, summarize_tool_calls,
+    summary_rows, tool_only_assistant_summary, user_entry_is_only_tool_results,
 };
 pub(crate) use timing::{RowTiming, TimingSlot};
 pub(crate) use tools::{
@@ -92,23 +95,27 @@ pub enum ToolDisplayMode {
     Off,
     #[default]
     Summary,
+    /// Each tool call on one line, without results
+    Calls,
     Truncated,
     Full,
 }
 
 impl ToolDisplayMode {
-    /// Cycle to the next mode: Off → Summary → Truncated → Full → Off
+    /// Cycle to the next mode: Off → Summary → Calls → Truncated → Full → Off
     pub fn next(self) -> Self {
         match self {
             Self::Off => Self::Summary,
-            Self::Summary => Self::Truncated,
+            Self::Summary => Self::Calls,
+            Self::Calls => Self::Truncated,
             Self::Truncated => Self::Full,
             Self::Full => Self::Off,
         }
     }
 
-    pub fn is_summary(self) -> bool {
-        matches!(self, Self::Summary)
+    /// Whether runs of tool calls collapse into rows that expand on click
+    pub fn groups_tools(self) -> bool {
+        matches!(self, Self::Summary | Self::Calls)
     }
 
     /// Whether full or truncated tool details should be rendered
@@ -126,6 +133,7 @@ impl ToolDisplayMode {
         match self {
             Self::Off => "off",
             Self::Summary => "sum",
+            Self::Calls => "cal",
             Self::Truncated => "trn",
             Self::Full => "all",
         }
@@ -220,7 +228,7 @@ pub fn render_parsed_conversation(
     let mut pending_tool_summary: Option<PendingToolSummary> = None;
 
     for (parsed_idx, parsed) in entries.iter().enumerate() {
-        if options.tool_display.is_summary()
+        if options.tool_display.groups_tools()
             && try_extend_or_start_pending_summary(
                 &mut lines,
                 &mut messages,

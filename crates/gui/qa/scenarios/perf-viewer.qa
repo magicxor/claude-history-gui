@@ -79,7 +79,7 @@ wait-for viewer.loading == false 10s
 timing viewer.toggle_ms < 60ms
 timing viewer.install_ms < 50ms
 timing viewer.toggle_total_ms < 60ms
-key t t
+key t t t
 wait-for viewer.loading == false 10s
 expect viewer.tool_display == all
 

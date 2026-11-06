@@ -1062,7 +1062,7 @@ fn remembered(
 /// C-066 / V-049: tool display precedence.
 #[test]
 fn initial_tool_display_precedence() {
-    use RememberedToolDisplay::{Full, Off, Summary, Truncated};
+    use RememberedToolDisplay::{Calls, Full, Off, Summary, Truncated};
     let full = remembered(Some(Full), None, None, None);
     let summary = remembered(Some(Summary), None, None, None);
     let none = UiState::default();
@@ -1112,6 +1112,11 @@ fn initial_tool_display_precedence() {
     assert_eq!(
         tool(&[], None, None, &remembered(Some(Off), None, None, None)),
         off
+    );
+    // Upstream a60dfe9's calls mode is restored like the others.
+    assert_eq!(
+        tool(&[], None, None, &remembered(Some(Calls), None, None, None)),
+        ToolDisplayMode::Calls
     );
     // Flags beat both; `--no-tools` turns tools off (upstream d0aca95).
     assert_eq!(
