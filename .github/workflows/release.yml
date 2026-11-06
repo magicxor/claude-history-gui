@@ -87,7 +87,7 @@ jobs:
           }
           Expand-Archive -Path $zip -DestinationPath unzipped
           ./tools/ci/check-console.ps1 -Exe unzipped/claude-history-gui.exe
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: windows-x86_64
           path: |
@@ -139,7 +139,7 @@ jobs:
           # Really load the bundled dylib (ort::init_from), not just start the binary.
           out="$(CLAUDE_HISTORY_GUI_ORT_SELFTEST=1 "$app/Contents/MacOS/claude-history-gui")"
           test "$out" = "onnxruntime ok"
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: macos-aarch64
           path: |
@@ -191,7 +191,7 @@ jobs:
           # Really load the bundled library (ort::init_from), not just start the binary.
           out="$(CLAUDE_HISTORY_GUI_ORT_SELFTEST=1 "unpacked/claude-history-gui-v${VERSION}-linux-x86_64/claude-history-gui")"
           test "$out" = "onnxruntime ok"
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-x86_64
           path: |

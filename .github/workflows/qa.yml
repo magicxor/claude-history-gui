@@ -106,7 +106,7 @@ jobs:
             }
           }
           if ($failed.Count -gt 0) { throw "Scenarios failed: $($failed -join ', ')" }
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: qa-out
