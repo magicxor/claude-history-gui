@@ -299,14 +299,7 @@ impl OpsFixture {
     /// a script (macOS Terminal.app: `open -a Terminal <fresh path>`) the
     /// script, which holds the command line.
     pub fn terminal_commands(&self) -> Vec<String> {
-        self.recording
-            .terminal_commands()
-            .iter()
-            .map(|command| match &command.script {
-                Some(script) => script.contents.clone(),
-                None => command.display(),
-            })
-            .collect()
+        super::terminal_command_lines(&self.recording)
     }
 
     /// The clipboard writes recorded so far.

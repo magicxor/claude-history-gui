@@ -539,6 +539,20 @@ pub fn recording(cx: &TestAppContext) -> Arc<RecordingServices> {
     })
 }
 
+/// Every terminal command `recording` saw, as the text that holds its command
+/// line: the display string, or for a launch through a script (macOS
+/// Terminal.app: `open -a Terminal <fresh path>`) the script itself.
+pub fn terminal_command_lines(recording: &RecordingServices) -> Vec<String> {
+    recording
+        .terminal_commands()
+        .iter()
+        .map(|command| match &command.script {
+            Some(script) => script.contents.clone(),
+            None => command.display(),
+        })
+        .collect()
+}
+
 /// The platform label of a keystroke as the keymap and the hints show it
 /// (`ctrl-r` → `Ctrl+R`, on macOS `⌃R`; `secondary-q` → `Ctrl+Q` / `⌘Q`).
 pub fn kbd(keystroke: &str) -> String {

@@ -33,7 +33,7 @@ use crate::notify::ToastKind;
 use crate::test_support::fixtures_list::{ListFixture, SessionSpec, listed_corpus};
 use crate::test_support::fixtures_ops::{project_dir, write_gui_config};
 use crate::test_support::fixtures_viewer::{draw, wait_viewer_ready};
-use crate::test_support::{TestWorld, recording, synth};
+use crate::test_support::{TestWorld, recording, synth, terminal_command_lines};
 
 /// Publish the store generation of the world's corpus with every card titled
 /// `Card <n>` (newest first), so card rows are told apart from parsed rows.
@@ -256,24 +256,22 @@ fn the_first_cards_resume_and_fork_but_wait_to_edit(cx: &mut TestAppContext) {
 
     f.press(cx, "ctrl-r");
     settle(cx);
-    let commands = recording(cx).terminal_commands();
+    let commands = terminal_command_lines(&recording(cx));
     assert_eq!(commands.len(), 1, "{commands:?}");
     assert!(
-        commands[0].display().contains(&format!("--resume {stem}")),
+        commands[0].contains(&format!("--resume {stem}")),
         "{}",
-        commands[0].display()
+        commands[0]
     );
 
     f.press(cx, "ctrl-f");
     settle(cx);
-    let commands = recording(cx).terminal_commands();
+    let commands = terminal_command_lines(&recording(cx));
     assert_eq!(commands.len(), 2, "{commands:?}");
     assert!(
-        commands[1]
-            .display()
-            .contains(&format!("--resume {stem} --fork-session")),
+        commands[1].contains(&format!("--resume {stem} --fork-session")),
         "{}",
-        commands[1].display()
+        commands[1]
     );
 
     recording(cx).set_stdout_kind(crate::model::StdoutKind::Terminal);
