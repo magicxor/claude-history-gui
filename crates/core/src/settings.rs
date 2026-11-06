@@ -567,7 +567,7 @@ impl GuiLaunchArgs {
 /// not listed, as upstream.
 pub fn help_text(program: &str) -> String {
     format!(
-        "Browse Claude Code, Pi and OMP conversation history
+        "Browse Claude Code, Codex, Pi and OMP conversation history
 
 Usage: {program} [OPTIONS] [FILE]
        {program} delete-empty [--local|--all] [--yes]
@@ -1464,6 +1464,7 @@ mod tests {
         assert_eq!(parse_launch_args(["-V"]), Ok(LaunchCommand::Version));
         let help = help_text("claude-history-gui");
         assert!(help.contains("Usage: claude-history-gui [OPTIONS] [FILE]"));
+        assert!(help.starts_with("Browse Claude Code, Codex, Pi and OMP"));
         for option in [
             "--local",
             "--all-kinds",

@@ -1049,17 +1049,17 @@ Rows and labels: §8.7. Opens scrolled to the section of the region that had foc
 
 ### 5.18 About / Check for updates (Help)
 ```
-┌ About Claude History GUI ──────────────────────────────┐
-│ Claude History GUI 0.1.0 (core 0.1.76)                  │
-│ A desktop browser for Claude Code, Pi and OMP history.  │
-│ License: Unlicense. Core derived from claude-history    │
-│ (MIT, © 2024 Raine).                                    │
-│ Data: C:\Users\me\.claude                               │
-│ Cache: C:\Users\me\.cache\claude-history-gui            │
-│ Config: …\.config\claude-history\gui.toml (+config.toml)│
-│ State: …\.local\state\claude-history-gui\state.json     │
-│ [Check for updates…] [Open project page]      [Close]   │
-└────────────────────────────────────────────────────────┘
+┌ About Claude History GUI ─────────────────────────────────────┐
+│ Claude History GUI 0.1.0 (core 0.1.76)                        │
+│ A desktop browser for Claude Code, Codex, Pi and OMP history. │
+│ License: Unlicense. Core derived from claude-history          │
+│ (MIT, © 2024 Raine).                                          │
+│ Data: C:\Users\me\.claude                                     │
+│ Cache: C:\Users\me\.cache\claude-history-gui                  │
+│ Config: …\.config\claude-history\gui.toml (+config.toml)      │
+│ State: …\.local\state\claude-history-gui\state.json           │
+│ [Check for updates…] [Open project page]      [Close]         │
+└───────────────────────────────────────────────────────────────┘
 ┌ Check for updates ─────────────────────────────────────┐
 │ ⟳ Checking for updates…                                │
 │ → Available: "Claude History GUI 0.2.0 is available (you have 0.1.0)." + notes + [Open release page] │
