@@ -31,6 +31,8 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 - Pi and OMP tool calls (`bash`, `read`, `edit`, `write`, `grep`, `find`) now read like Claude Code ones: `Bash: ls`, `Read: a.rs:5-15`, edit diffs, and "Ran 2 shell commands" in summary rows.
 - Summary rows now name tools without their own wording (`Read 1 file, called mcp__docs__search, clock__sleep ×2`)
   instead of counting them as "Called N tools".
+- Skill tool calls show as the slash command they stand for, `Skill: /phased-implement add dark mode` or `Skill: /commit`,
+  instead of one line of JSON.
 - Semantic search uses the snowflake-arctic-embed-xs model (about 90 MB), which ranks as well or better than the
   previous one at half the indexing cost. After the update the history is re-embedded in the background, ranking
   what is indexed so far meanwhile, and the old model download is removed once the new one loads.
