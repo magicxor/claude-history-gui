@@ -20,7 +20,7 @@ jobs:
   qa:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Toolchain (rust-toolchain.toml)
         shell: bash
         run: rustup show active-toolchain || rustup toolchain install
