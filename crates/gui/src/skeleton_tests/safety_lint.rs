@@ -53,6 +53,7 @@ const RULES: &[(&str, &[&str])] = &[
         &["services.rs", "skeleton_tests.rs"],
     ),
     (concat!("resume::", "launch("), &["services.rs"]),
+    (concat!("run_to", "_completion"), &["services.rs"]),
     (concat!("execute", "_copy"), &["ops/resume.rs"]),
     // Desktop side effects (only through `PlatformServices`).
     (concat!("write_to", "_clipboard"), &["services.rs"]),

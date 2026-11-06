@@ -68,6 +68,7 @@ lint() {
     check "spawn_terminal""_checked" services.rs skeleton_tests.rs
     check "check_latest""_release" services.rs skeleton_tests.rs
     check "resume::""launch(" services.rs
+    check "run_to""_completion" services.rs
     check "execute""_copy" ops/resume.rs
     # Desktop side effects only through PlatformServices.
     check "write_to""_clipboard" services.rs

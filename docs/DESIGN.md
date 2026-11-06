@@ -3601,8 +3601,8 @@ ctor.workspace = true
   2. `bash tools/ci/safety-lint.sh` — fails when, outside the allow-listed files: `from_process_env` (allowed:
      `main.rs`), `home::home_dir`/`dirs::home_dir`/`std::env::var(_os)?`/`current_dir(` (allowed: `main.rs`,
      `qa/gate.rs`, `services.rs`), `std::process::Command` (allowed: `services.rs`, `ops/console.rs`),
-     `spawn_terminal`/`resume::launch(`/`check_latest_release` (allowed: `services.rs`), `execute_copy` (allowed:
-     `ops/resume.rs`), `write_to_clipboard`/`read_from_clipboard`/`prompt_for_new_path`/`prompt_for_paths`/
+     `spawn_terminal`/`resume::launch(`/`run_to_completion`/`check_latest_release` (allowed:
+     `services.rs`), `execute_copy` (allowed: `ops/resume.rs`), `write_to_clipboard`/`read_from_clipboard`/`prompt_for_new_path`/`prompt_for_paths`/
      `reveal_path`/`open_url`/`open_with_system` (allowed: `services.rs`) appear in `crates/gui/src`. As built, the
      same rules run as the source test `skeleton_tests/safety_lint.rs`, whose allow lists are the reference: they
      also allow the WP0 guard tests in `skeleton_tests.rs` (`from_process_env`, `home::home_dir`, `env::var(_os)`,
