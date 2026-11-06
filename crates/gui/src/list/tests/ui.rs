@@ -836,6 +836,51 @@ fn a_failing_workspace_reload_reverts(cx: &mut TestAppContext) {
     assert_eq!(f.paths(cx).len(), 1);
 }
 
+/// §15.4 rule 6: under the sandbox gate, a workspace whose Pi settings lead
+/// outside the sandbox home is refused with an error toast and the current
+/// workspace stays; one that stays inside is applied.
+#[gpui_kit::test]
+fn the_sandbox_gate_refuses_a_workspace_that_leads_outside(cx: &mut TestAppContext) {
+    let world = TestWorld::new();
+    SessionSpec::new("proj", 1).summary("One").write(&world);
+    let f = ListFixture::open_loaded(cx, &world, &[]);
+    cx.update(|cx| {
+        crate::globals::update_app_state(cx, |state, _| state.launch.sandbox_gate = true)
+    });
+    let dir = world.home().join("gated-workspace");
+    let settings = dir.join(".pi").join("settings.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(
+        &settings,
+        serde_json::json!({ "sessionDir": outside.path() }).to_string(),
+    )
+    .unwrap();
+    f.with_window(cx, |list, window, cx| {
+        list.apply_workspace_choice(dir.clone(), window, cx)
+    });
+    cx.run_until_parked();
+    assert!(!f.read(cx, |list, _| list.has_workspace()), "not applied");
+    assert!(cx.read(|cx| crate::globals::app_state(cx).workspace.is_none()));
+    let last = f.read(cx, |list, _| list.toasts().last().cloned()).unwrap();
+    assert!(
+        last.text.starts_with(&format!(
+            "Couldn't switch the workspace: sessionDir in {}",
+            settings.display()
+        )),
+        "{}",
+        last.text
+    );
+    assert_eq!(f.paths(cx).len(), 1, "the rows are kept");
+
+    std::fs::write(&settings, r#"{"sessionDir":"sessions"}"#).unwrap();
+    f.with_window(cx, |list, window, cx| {
+        list.apply_workspace_choice(dir.clone(), window, cx)
+    });
+    f.wait_loaded(cx);
+    assert!(f.read(cx, |list, _| list.has_workspace()), "applied");
+}
+
 /// L-049: the custom range dialog validates inline and Apply stays disabled.
 #[gpui_kit::test]
 fn the_custom_range_dialog_validates(cx: &mut TestAppContext) {

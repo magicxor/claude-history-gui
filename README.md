@@ -508,7 +508,14 @@ fake embedders, and terminal launching is tested on the commands it would spawn.
 
 Debug builds and `--features qa` builds refuse to start (exit 3, `Refusing to run: ...`) unless the home
 directory is a QA sandbox: it contains a `.qa-sandbox` marker, is not your real profile directory, and every data
-path variable stays inside it. Set `CHG_ALLOW_REAL_HOME=1` to use your real history in a debug build (qa builds
+path variable stays inside it (an empty `PI_*` path variable is refused: the app reads it as a relative path), as
+do the data folders the app reads wherever the variables move them and the data locations that config files inside
+the sandbox name (the Codex `config.toml` `sqlite_home`, the `sessionDir` of Pi's `settings.json`). A workspace is
+checked whenever it is applied, since Pi also reads `<workspace>/.pi/settings.json`: at startup a refusal exits 3,
+a later workspace change is refused with an error toast. A file opened by path (`FILE`, `--render FILE`, Open JSONL
+file) may lie anywhere, but a Codex rollout is read through its own Codex home and state database, which must stay
+inside the sandbox: refused at startup with exit 3, from the dialog with an error toast. Set
+`CHG_ALLOW_REAL_HOME=1` to use your real history in a debug build (qa builds
 never skip the gate). Debug builds also refuse to start a real `claude`, `pi`, `omp` or `codex` from Resume (or a
 Codex delete) unless `CHG_ALLOW_REAL_LAUNCH=1`, or `[gui] claude_path/pi_path/omp_path/codex_path` point at a
 harmless program inside the sandbox.

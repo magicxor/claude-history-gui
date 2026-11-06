@@ -142,6 +142,59 @@ fn open_jsonl_file_opens_a_window_per_file(cx: &mut TestAppContext) {
     );
 }
 
+/// §15.4 rule 7: under the sandbox gate, a chosen Codex rollout whose home
+/// names a state database directory outside the sandbox home is not opened
+/// and an error toast says why; the other chosen files open.
+#[gpui_kit::test]
+fn open_jsonl_file_skips_what_the_sandbox_gate_refuses(cx: &mut TestAppContext) {
+    let world = TestWorld::new();
+    let corpus = world.standard_corpus();
+    let (_f, handle) = main_window(cx, &world, &[]);
+    cx.update(|cx| {
+        crate::globals::update_app_state(cx, |state, _| state.launch.sandbox_gate = true)
+    });
+    let outside = tempfile::tempdir().unwrap();
+    let codex_home = world.home().join("second-codex");
+    let day = codex_home
+        .join("sessions")
+        .join("2026")
+        .join("09")
+        .join("03");
+    std::fs::create_dir_all(&day).unwrap();
+    let rollout =
+        day.join("rollout-2026-09-03T10-00-00-01a00000-0000-7000-8000-0000000000aa.jsonl");
+    std::fs::write(&rollout, "").unwrap();
+    let config = codex_home.join("config.toml");
+    std::fs::write(
+        &config,
+        format!("sqlite_home = '{}'\n", outside.path().display()),
+    )
+    .unwrap();
+
+    let before = cx.update(|cx| cx.windows().len());
+    recording(cx).answer_open(Ok(Some(vec![corpus[0].clone(), rollout.clone()])));
+    cx.update_window(handle, |_, window, cx| {
+        crate::tools::open_jsonl_file_dialog(window, cx)
+    })
+    .unwrap();
+    wait_for(cx, "one window", |cx| cx.windows().len() == before + 1);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|cx| cx.windows().len()),
+        before + 1,
+        "the refused file is not opened"
+    );
+    let toast = cx.read(last_toast);
+    assert!(
+        toast.starts_with(&format!(
+            "Couldn't open {}: sqlite_home in {} (",
+            rollout.display(),
+            config.display()
+        )),
+        "{toast}"
+    );
+}
+
 /// A cancelled picker opens nothing; a failing one says so.
 #[gpui_kit::test]
 fn open_jsonl_file_cancel_and_error(cx: &mut TestAppContext) {

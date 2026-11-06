@@ -578,6 +578,96 @@ fn the_env_selects_the_home_and_the_state_database() {
     assert!(CodexAdapter::from_env(&HistoryEnv::default()).is_none());
 }
 
+/// Fork: [`state_db_dir`] is the adapter's own resolution, public for the
+/// GUI's sandbox gate: `config.toml`'s `sqlite_home` (absolute, or relative
+/// to the home) wins over `CODEX_SQLITE_HOME`, which wins over the home; a
+/// missing, unparseable or non-string setting names nothing.
+#[test]
+fn the_state_database_directory_resolves_like_the_adapter() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let home = sandbox.path().join("codex-home");
+    let state = sandbox.path().join("codex-state");
+    assert_eq!(configured_sqlite_home(&home), None);
+    assert_eq!(state_db_dir(&home, None), home);
+    assert_eq!(state_db_dir(&home, Some(&state)), state);
+
+    std::fs::create_dir_all(&home).unwrap();
+    let config = home.join("config.toml");
+    std::fs::write(&config, "sqlite_home = \"db\"\n").unwrap();
+    assert_eq!(configured_sqlite_home(&home), Some(home.join("db")));
+    assert_eq!(state_db_dir(&home, Some(&state)), home.join("db"));
+
+    let elsewhere = sandbox.path().join("elsewhere");
+    std::fs::write(
+        &config,
+        format!("sqlite_home = '{}'\n", elsewhere.display()),
+    )
+    .unwrap();
+    assert_eq!(state_db_dir(&home, Some(&state)), elsewhere);
+    let mut env = HistoryEnv::sandbox(sandbox.path());
+    env.codex_home = Some(home.clone());
+    env.codex_sqlite_home = Some(state.clone());
+    assert_eq!(
+        CodexAdapter::from_env(&env).unwrap().sqlite_home(),
+        elsewhere
+    );
+
+    for text in ["sqlite_home = 3\n", "sqlite_home = [\n", "model = \"x\"\n"] {
+        std::fs::write(&config, text).unwrap();
+        assert_eq!(configured_sqlite_home(&home), None, "{text}");
+        assert_eq!(state_db_dir(&home, Some(&state)), state, "{text}");
+    }
+}
+
+/// Fork: [`view::state_db_dir_of`] names the state database directory that
+/// decoding a rollout opened by path opens, for the GUI's sandbox gate: in
+/// the env of its own home with the env's `CODEX_SQLITE_HOME`, else that
+/// of the rollout's home (its `config.toml`'s `sqlite_home`, else the
+/// home); a file that does not decode as a rollout names none.
+#[test]
+fn opened_rollouts_name_the_state_database_directory_they_open() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let home = home_copy(sandbox.path());
+    let state = sandbox.path().join("codex-state");
+    let rollout = discover::list(&home).unwrap()[0].path.clone();
+    let mut env = HistoryEnv::sandbox(sandbox.path());
+    env.codex_home = Some(home.clone());
+    env.codex_sqlite_home = Some(state.clone());
+    assert_eq!(view::state_db_dir_of(Some(&env), &rollout), Some(state));
+    assert_eq!(view::state_db_dir_of(None, &rollout), Some(home.clone()));
+    // An env whose Codex home is another one (`<sandbox>/.codex`).
+    let other = HistoryEnv {
+        codex_home: None,
+        ..env.clone()
+    };
+    assert_eq!(
+        view::state_db_dir_of(Some(&other), &rollout),
+        Some(home.clone())
+    );
+
+    // The rollout's home names a directory: every decode opens it.
+    let elsewhere = sandbox.path().join("elsewhere");
+    std::fs::write(
+        home.join("config.toml"),
+        format!("sqlite_home = '{}'\n", elsewhere.display()),
+    )
+    .unwrap();
+    for env in [Some(&env), Some(&other), None] {
+        assert_eq!(
+            view::state_db_dir_of(env, &rollout),
+            Some(elsewhere.clone())
+        );
+    }
+
+    // Files that do not decode as rollouts.
+    let loose = sandbox.path().join("session.jsonl");
+    let stray = home.join("sessions").join("notes.jsonl");
+    for path in [loose, stray] {
+        assert_eq!(view::state_db_dir_of(Some(&env), &path), None, "{path:?}");
+        assert_eq!(view::state_db_dir_of(None, &path), None, "{path:?}");
+    }
+}
+
 #[test]
 fn viewed_threads_show_the_dialogue_and_where_a_fork_begins() {
     use crate::history::view::{self, Entry, EntryKind};

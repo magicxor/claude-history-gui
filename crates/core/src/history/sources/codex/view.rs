@@ -20,13 +20,17 @@
 //!   without an env ([`decode_path`], `sources::decode_path`), decodes
 //!   through [`CodexAdapter::new`]: its state database is the `sqlite_home`
 //!   of its home's `config.toml`, else that home.
+//! * **The state database directory of a rollout, public.**
+//!   [`state_db_dir_of`] names the directory decoding a rollout opened by
+//!   path opens, so the GUI's QA sandbox gate checks it before a file is
+//!   opened without resolving it again.
 
 use super::{CodexAdapter, discover};
 use crate::env::HistoryEnv;
 use crate::error::{AppError, Result};
 use crate::history::adapter::Adapter;
 use crate::history::model::{Event, Transcript};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// The thread of the rollout at `path`, decoded through the Codex home
@@ -64,6 +68,18 @@ pub(crate) fn decode_path_into(
                 })
             }),
     )
+}
+
+/// Fork: the directory of the state database that decoding the rollout at
+/// `path` with `env` ([`decode_path_into`]; `None`: [`decode_path`]) opens,
+/// as [`super::state_db_dir`] resolves it for the adapter of the Codex home
+/// holding the file. `None` when `path` is not a rollout of a Codex home
+/// (it does not decode as one). Decoding also reads that home (its session
+/// index, the listing of its rollouts).
+pub fn state_db_dir_of(env: Option<&HistoryEnv>, path: &Path) -> Option<PathBuf> {
+    let home = discover::home_of(path)?;
+    discover::rollout_of(path, false)?;
+    Some(adapter_of(env, home).sqlite_home())
 }
 
 /// The adapter of the Codex home `home`: `env`'s own, with its

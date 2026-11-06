@@ -33,7 +33,9 @@ thread_local! {
     pub static IS_DIR_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// `path.is_dir()`; the only file-system access of the workspace picker.
+/// `path.is_dir()`: the picker's own file-system access (the menu builder
+/// makes none). Applying a choice in a build that enforces the sandbox gate
+/// also reads the settings files the gate checks (`startup::workspace_refusal`).
 pub fn path_is_dir(path: &Path) -> bool {
     #[cfg(test)]
     IS_DIR_CALLS.with(|calls| calls.set(calls.get() + 1));
@@ -116,6 +118,18 @@ impl ListPane {
         }
         match WorkspaceScope::new(&dir) {
             Ok(scope) => {
+                // The sandbox gate's workspace rule (§15.4): the workspace stays.
+                if let Some(reason) =
+                    crate::workspace::startup::workspace_refusal(app_state(cx), &scope)
+                {
+                    self.toast(
+                        Toast::error(format!("Couldn't switch the workspace: {reason}")),
+                        Vec::new(),
+                        window,
+                        cx,
+                    );
+                    return;
+                }
                 let for_state = scope.clone();
                 update_app_state(cx, |state, _| state.set_workspace(Some(for_state)));
                 self.set_workspace(Some(scope), cx);

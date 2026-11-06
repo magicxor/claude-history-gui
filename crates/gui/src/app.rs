@@ -10,7 +10,8 @@
 //! 1. `debug_sink::install` (WP7);
 //! 2. `startup::load_config` (WP7) — config.toml and gui.toml independently;
 //! 3. `persist::load` (WP6);
-//! 4. `startup::resolve_workspace` (WP7, PD3);
+//! 4. `startup::startup_workspace` (WP7, PD3; with the sandbox gate's
+//!    workspace rule, §15.4: a refusal exits 3 before any window opens);
 //! 5. `startup::resolve_initial_view` (WP7, PD17);
 //! 6. `AppState`, `SemanticGate`, `MainPanes`, `ActivePane`, `OpenTargets`,
 //!    `LastToast`, `CorpusBus`; `ops::resume::TerminalVar` (`$TERMINAL` as
@@ -115,7 +116,7 @@ fn install_global_handlers(cx: &mut App) {
 fn install_state(cx: &mut App, launch: LaunchContext, env: HistoryEnv) {
     let (config, config_errors) = workspace::startup::load_config(&env);
     let ui = persist::load(&env);
-    let workspace_scope = workspace::startup::resolve_workspace(&launch, &env, &config.gui, &ui);
+    let workspace_scope = workspace::startup::startup_workspace(&launch, &env, &config.gui, &ui);
     let settings = launch.args.settings(&config.effective);
     // `$TERMINAL` as `main` read it, for the launcher detection (§11.10 step 6).
     crate::ops::resume::set_terminal_var(cx, launch.terminal_var.clone());

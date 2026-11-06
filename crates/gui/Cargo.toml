@@ -39,7 +39,7 @@ serde_json.workspace = true
 chrono.workspace = true
 pulldown-cmark.workspace = true
 unicode-width.workspace = true
-home.workspace = true                # qa/gate.rs only (safety-lint allow-listed)
+home.workspace = true                # services.rs and skeleton_tests.rs only (safety-lint allow-listed)
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true

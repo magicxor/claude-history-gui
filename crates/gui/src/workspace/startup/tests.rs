@@ -84,7 +84,7 @@ fn run(world: &TestWorld, args: &[&str], kind: StdoutKind, cwd: Option<&Path>) -
     rec.set_stdout_kind(kind);
     let process = ProcessInfo {
         launch_cwd: cwd.map(Path::to_path_buf),
-        qa: None,
+        ..ProcessInfo::default()
     };
     let env = world.env.clone();
     let flow = dispatch(
@@ -719,6 +719,172 @@ fn agent_runs_headless_with_the_core_protocol_output() {
     );
 }
 
+/// §15.4 rule 6: under the sandbox gate, the launch directory of the agent
+/// commands and the GUI's startup workspace must not lead Pi outside the
+/// sandbox home; a refusal exits 3 with the gate's text.
+#[test]
+fn the_sandbox_gate_checks_the_startup_workspace() {
+    let world = TestWorld::new();
+    let cwd = world.home().join("gated");
+    let outside = tempfile::tempdir().unwrap();
+    let settings = cwd.join(".pi").join("settings.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(
+        &settings,
+        serde_json::json!({ "sessionDir": outside.path() }).to_string(),
+    )
+    .unwrap();
+    let gated = |args: &[&str]| {
+        let raw = os(args);
+        let rec = Arc::new(RecordingServices::new());
+        rec.set_stdout_kind(StdoutKind::Redirected);
+        let process = ProcessInfo {
+            launch_cwd: Some(cwd.clone()),
+            sandbox_gate: true,
+            ..ProcessInfo::default()
+        };
+        let env = world.env.clone();
+        let flow = dispatch(
+            parse_launch_args(raw.clone()),
+            &raw,
+            &process,
+            &*rec,
+            &mut || Ok(env.clone()),
+        );
+        (flow, rec)
+    };
+
+    // `agent …`: refused before any search.
+    let (flow, rec) = gated(&["agent", "search", "alpha"]);
+    assert!(matches!(flow, Flow::Exit(exit::EXIT_REFUSED)), "{flow:?}");
+    let stderr = rec.stderr();
+    assert!(
+        stderr.starts_with(&format!(
+            "Refusing to run: sessionDir in {}",
+            settings.display()
+        )),
+        "{stderr}"
+    );
+    assert!(rec.stdout().is_empty());
+    let ungated = run(
+        &world,
+        &["agent", "search", "alpha"],
+        StdoutKind::Redirected,
+        Some(&cwd),
+    );
+    assert_ne!(ungated.code(), exit::EXIT_REFUSED, "no gate, no check");
+
+    // The GUI: the launch carries the flag and its startup workspace is refused.
+    let workspace_arg = cwd.display().to_string();
+    let (flow, _) = gated(&["--workspace", &workspace_arg]);
+    let Flow::Gui(launch, env) = flow else {
+        panic!("expected a GUI launch, got {flow:?}");
+    };
+    assert!(launch.sandbox_gate);
+    let (gui, ui) = (GuiSettings::default(), UiState::default());
+    let refusal = checked_startup_workspace(&launch, &env, &gui, &ui).unwrap_err();
+    assert!(
+        refusal.starts_with(&format!(
+            "Refusing to run: sessionDir in {}",
+            settings.display()
+        )),
+        "{refusal}"
+    );
+    let mut ungated = (*launch).clone();
+    ungated.sandbox_gate = false;
+    assert_eq!(
+        checked_startup_workspace(&ungated, &env, &gui, &ui),
+        Ok(Some(WorkspaceScope::new(&cwd).unwrap()))
+    );
+    // A session directory inside the sandbox passes.
+    std::fs::write(&settings, r#"{"sessionDir":"sessions"}"#).unwrap();
+    assert_eq!(
+        checked_startup_workspace(&launch, &env, &gui, &ui),
+        Ok(Some(WorkspaceScope::new(&cwd).unwrap()))
+    );
+}
+
+/// §15.4 rule 7: under the sandbox gate, `[FILE]` and `--render FILE`
+/// (headless or in a window, absolute or relative to the launch directory)
+/// exit 3 with the gate's text when the file is a Codex rollout whose home
+/// names a state database directory outside the sandbox home; any other
+/// file opens, and without the gate nothing is checked.
+#[test]
+fn the_sandbox_gate_checks_files_opened_at_startup() {
+    let world = TestWorld::new();
+    let outside = tempfile::tempdir().unwrap();
+    let codex_home = world.home().join("second-codex");
+    let day = codex_home
+        .join("sessions")
+        .join("2026")
+        .join("09")
+        .join("03");
+    std::fs::create_dir_all(&day).unwrap();
+    let rollout =
+        day.join("rollout-2026-09-03T10-00-00-01a00000-0000-7000-8000-0000000000aa.jsonl");
+    std::fs::write(&rollout, "").unwrap();
+    let config = codex_home.join("config.toml");
+    std::fs::write(
+        &config,
+        format!("sqlite_home = '{}'\n", outside.path().display()),
+    )
+    .unwrap();
+    let dispatch_with = |args: &[&str], kind: StdoutKind, sandbox_gate: bool| {
+        let raw = os(args);
+        let rec = Arc::new(RecordingServices::new());
+        rec.set_stdout_kind(kind);
+        let process = ProcessInfo {
+            launch_cwd: Some(world.home().to_path_buf()),
+            sandbox_gate,
+            ..ProcessInfo::default()
+        };
+        let env = world.env.clone();
+        let flow = dispatch(
+            parse_launch_args(raw.clone()),
+            &raw,
+            &process,
+            &*rec,
+            &mut || Ok(env.clone()),
+        );
+        Run { flow, rec }
+    };
+
+    let file = rollout.display().to_string();
+    let relative = rollout
+        .strip_prefix(world.home())
+        .unwrap()
+        .display()
+        .to_string();
+    let expected = format!("Refusing to run: sqlite_home in {} (", config.display());
+    for (args, kind) in [
+        (vec![file.as_str()], StdoutKind::None),
+        (vec![relative.as_str()], StdoutKind::None),
+        (vec!["--render", file.as_str()], StdoutKind::Redirected),
+        (vec!["--render", relative.as_str()], StdoutKind::Redirected),
+        (vec!["--render", file.as_str()], StdoutKind::None),
+    ] {
+        let gated = dispatch_with(&args, kind, true);
+        assert_eq!(gated.code(), exit::EXIT_REFUSED, "{args:?}");
+        let stderr = gated.rec.stderr();
+        assert!(stderr.starts_with(&expected), "{args:?}: {stderr}");
+        assert!(gated.rec.stdout().is_empty(), "{args:?}");
+        let ungated = dispatch_with(&args, kind, false);
+        assert!(
+            !matches!(ungated.flow, Flow::Exit(exit::EXIT_REFUSED)),
+            "{args:?}: no gate, no check"
+        );
+    }
+
+    // The state database inside the sandbox: opened.
+    std::fs::write(&config, "sqlite_home = \"db\"\n").unwrap();
+    assert!(dispatch_with(&[&file], StdoutKind::None, true).is_gui());
+    // Any other file, even outside the sandbox (the user named it): opened.
+    let loose = outside.path().join("session.jsonl");
+    std::fs::write(&loose, "").unwrap();
+    let loose = loose.display().to_string();
+    assert!(dispatch_with(&[&loose], StdoutKind::None, true).is_gui());
+}
+
 #[test]
 fn usage_lines_name_the_subcommand() {
     assert_eq!(
@@ -965,9 +1131,12 @@ fn recorded_cwd_entry_updates_the_app_workspace(cx: &mut TestAppContext) {
             state.launch.launch_cwd = Some(project.clone());
             state.set_workspace(None);
         });
-        assert!(!apply_recorded_cwd_workspace(cx, [world.home()]));
+        assert_eq!(apply_recorded_cwd_workspace(cx, [world.home()]), Ok(false));
         assert!(app_state(cx).workspace.is_none());
-        assert!(apply_recorded_cwd_workspace(cx, [project.as_path()]));
+        assert_eq!(
+            apply_recorded_cwd_workspace(cx, [project.as_path()]),
+            Ok(true)
+        );
         assert_eq!(
             app_state(cx)
                 .workspace
@@ -975,7 +1144,35 @@ fn recorded_cwd_entry_updates_the_app_workspace(cx: &mut TestAppContext) {
                 .map(|w| w.dir().to_path_buf()),
             Some(canon(&project))
         );
-        assert!(!apply_recorded_cwd_workspace(cx, [project.as_path()]));
+        assert_eq!(
+            apply_recorded_cwd_workspace(cx, [project.as_path()]),
+            Ok(false)
+        );
+    });
+
+    // §15.4 rule 6: under the sandbox gate, a launch directory whose Pi
+    // settings lead outside the sandbox home is not applied.
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(project.join(".pi")).unwrap();
+    std::fs::write(
+        project.join(".pi").join("settings.json"),
+        serde_json::json!({ "sessionDir": outside.path() }).to_string(),
+    )
+    .unwrap();
+    cx.update(|cx| {
+        update_app_state(cx, |state, _| state.set_workspace(None));
+        assert_eq!(
+            apply_recorded_cwd_workspace(cx, [project.as_path()]),
+            Ok(true),
+            "not checked without the gate"
+        );
+        update_app_state(cx, |state, _| {
+            state.set_workspace(None);
+            state.launch.sandbox_gate = true;
+        });
+        let reason = apply_recorded_cwd_workspace(cx, [project.as_path()]).unwrap_err();
+        assert!(reason.contains("sessionDir in "), "{reason}");
+        assert!(app_state(cx).workspace.is_none(), "the workspace stays");
     });
 }
 

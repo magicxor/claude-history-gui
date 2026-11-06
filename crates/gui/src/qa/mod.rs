@@ -1,7 +1,9 @@
 //! QA infrastructure (DESIGN §15.3, §15.4). WP0 stub → WP7.
 //!
 //! * [`gate`]: the sandbox gate. It runs in `main` for every debug build and
-//!   every `--features qa` build, before any data is read.
+//!   every `--features qa` build, before any data is read, and checks every
+//!   workspace the app applies (`gate::check_workspace`) and every file it
+//!   opens by path (`gate::check_opened_file`).
 //! * `dsl`, `runner`, `probe` (feature `qa`): the in-process scenario runner.
 
 pub mod gate;

@@ -496,7 +496,7 @@ truth.
 | `semantic_ops` | `generate_semantic_cache(env, convs, workspace, &time_filter, embedder, progress, &cancel) -> GenerateReport`, `GenerateProgress`, `GenerateOutcome`, `clear_semantic_cache(env) -> ClearReport` (K6 as built: empties `<cache root>/semantic` but keeps the directory and its `embeddings.lock`), `semantic_search_report(env, query, convs, top, workspace, embedder)`, `semantic_debug_report(env, query, convs, workspace, embedder)`, `semantic_status(env, convs, workspace)` (`CacheFileState::{Missing, Unreadable, Incompatible, Ready, Legacy}`: 8919a76 made `Incompatible` field-less, the matrix keeps only a model hash, and added `Legacy` for an unconverted `embeddings-v1.bin`), `clear_embedding_cache(env)` (the matrix and an unconverted v1 file), `EmbedderFactory<'a>`, `fastembed_factory(env)` (every core, `EmbedPriority::Foreground`), `no_conversations_message`; `semantic::fastembed::{FastembedEmbedder::new_in(model_dir, show_download_progress, EmbedPriority), EmbedPriority::{Foreground, Background}}` (the shared embedder, §7.6; upstream 8322afe) |
 | `agent` | `AgentRequest::{Search, Within, Read, Outline}`, `args::{AgentSearchArgs, AgentWithinArgs, AgentReadArgs, AgentOutlineArgs, AgentOutputFlags, AgentSearchModeArgs, TimeRangeArgs, DEFAULT_READ_CONTEXT}` (+`validate`), `AgentService::{new, with_embedder_factory, with_notice_sink, with_cancellation, respond}`, `agent::execute(env, config, request) -> AgentResponse` (headless `agent …`), `cli::{AgentCli::{Request, Help}, parse_agent_args}`, `AgentResponse { stdout, stderr, exit_code, result, warnings, error, notices }` (+`text`, `error_text`, `is_success`), `AgentResult::{Search, Within, Read, Outline}`, `AgentSearchResult { output, conversations }` (+`hits`, `conversation(ref)`), `AgentReadResult`, `AgentOutlineResult`, `AgentConversationInfo { reference, full_ref, uuid, project_id, source, session_id, session_filename, path }`, `AgentNotice::{SemanticProgress, UncachedPassages}`, `agent::service::{EmbedderFactory, discover_agent_keys(env, workspace, listed, all_kinds)}` (`AgentSearchArgs::all_kinds` = `--all-kinds`; `user_only` = `--user-only` (dcd3978: hits only from the authored text of top-level, non-note user messages, `AgentTranscript::notes` holding the Pi/OMP note ordinals; conversations ranked over `search::user_only_view`; semantic and hybrid fall back to lexical with a `semantic-unavailable` warning; `forces_lexical()`: the Deep search worker's semantic gate does not refuse such a search); read, outline, within and the GUI's ref lookups pass `all_kinds = true`, cb990e6); agent search leaves out the conversations under a `[tui] exclude_paths` prefix of its config (before reading their text) and drops their discovered keys, so they are not reported as skipped, and likewise conversations of a `[tui] exclude_projects` project (by name, 525e93f); results come in the list's keyword-search rank order; read, outline and within still open them (982aea9), `refs::{AgentConversationKey::from_conversation_in(conversation, &Registry), conversation_ref, full_ref, full_ref_for_candidate}`, `diagnostic::{AgentError, AgentWarning}`, `protocol::{ReadMessage, OutlineItem, ProtocolOptions, MessageLineRange}`; K5, K7, K8, K15 |
 | `update` | `check_latest_release(current) -> UpdateStatus` (services only), `update_status_from_response`, `UpdateStatus::{UpToDate, Available, Newer, NoRelease}`, `ReleaseInfo { tag, version, name, url, notes, … }` (+`asset_for(os, arch)`), `RELEASES_PAGE_URL`, `REPOSITORY` |
-| `history` | `Workspace` (`new(&WorkspaceScope, home)`, `of_env(env)`, `contains(conversation)`, `contains_project_key(key, key_is_path)`, `contains_cwd(path)`, `display()`: which conversations belong to the workspace, upstream 82b355a with no process cwd or home read; `path::{path_is_within, tilde_path}`), `Conversation` (+`cwds`: every distinct recorded cwd, at most `model::MAX_CWDS` = 16, `model::push_cwd`, 82b355a; +`provenance: Provenance` with `hidden_by_default`, `list_label` = `auto`/`sub`/`fork` (`Provenance::branch`: a `/btw` fork, 3c2ffeb), 8f60c5f, cb990e6; +`parent`: the session id a Claude subagent or fork belongs to, 3c2ffeb, with `history::is_parent_of(parent, child)`; +`own_text`: the authored text parts of top-level user messages, `messages::authored_text`, empty for a child conversation, ae7ae39), `model::SourceKind` (`Claude`, `Pi`, `Omp`, `Codex` (list label `CX`, 7f5c443); +`label`, `list_label`, `assistant_name`; the `history::Source` alias is gone since 9597669), `model` (normalized transcript model: `Transcript`, `Event`, `Revision`, `ConversationKey`), `adapter` (`Adapter`, `Stamp`, `Located` (+`native`: the adapter's own resolution), `Completeness`, `Discovery`, `Adapter::native_id_of`; an adapter also declares the actions its tool supports, `capabilities` (+`capabilities_for(provenance)`: a Claude subagent or fork can only be resumed, 3c2ffeb), and resumes, deletes and renames its conversations, 9799550), `actions` (`Capabilities` (+`ALL`, `NONE`), `capabilities_of(source, provenance)` (none for an orphaned conversation), `refusal(source, provenance, doing)`, `Target`; eea6d37; `Launcher { program, args, configured_at }` (+`default_for(source)`, `configured(env, command, at)`, `program_path(env, path, at)`, `resolve(env, source) -> ResolvedProgram`, `check(env, source)`, `words()`), `ConfiguredAt::{Config, Gui, GuiPath}` (names key and file in the error), `Launch { launcher, default_args }`, `config_table(source)`; 8a99ccc; `Adapter::resume` takes the `Launch`, `Adapter::delete` the `Launcher`) and `sources::Registry::from_env(env)` (+`for_source(kind)`: the adapter that acts on a source's conversations, 9799550) (one adapter per configured root, the Codex home included: `sources::codex::CodexAdapter::from_env(env)` lists the rollouts of `<codex home>/sessions` and `archived_sessions`, picks each thread's head with Codex's read-only state database and decodes its rollout chain, 7f5c443; it resumes and forks through the Codex CLI (`resume::plan_codex`, `CODEX_HOME`), deletes through `codex delete --force` (`sources::codex::{delete_spec, delete_outcome, thread_rollouts}`) and cannot rename, eea6d37; `sources::codex::view::decode_path` decodes a rollout opened by path as its thread (`process_conversation_file` shows such Codex threads); fork: single-file windows parse in their env (`Browser::new_single_file` through `process_conversation_file_in(env, …)` and `sources::decode_path_in(env, …)`), so a rollout of the env's own Codex home decodes through `CodexAdapter::from_env` with the env's `CODEX_SQLITE_HOME`, as the viewer's `HistoryService` does, and one of another home through that home's `config.toml` `sqlite_home`, else the home; the store's reconcile pass discovers through it, 8daac4c, and decodes each changed file through `Adapter::decode_into` (`decode` collects the events into a `Transcript`), feeding the events into `index::Indexer` (`push` per event, `finish` with the transcript metadata) to build the card's `Conversation`, fd27225, 350314d), `view::{entries, Entry, EntryKind}` (what a reader is shown of a transcript, in order: messages with the source's speaker, subagent reports, searchable notes, hidden records, and a `Fork` note where a forked thread's own records begin; the viewer, exports, copy-message and `--plain`/`--render` render from it, 9597669; fork: `entries_with_events` names each entry's event), `process_conversation_file(path, mtime, debug)` (`sources::decode_path_into` feeding `index::Indexer`, 350314d; fork: the list loaders stream through `decode_path_into` too; `process_conversation_file_in(env, path, mtime, debug)` parses a file opened in `env`, see above), `service::HistoryService` (`from_env(env)`, `open(key)`, `open_path(path)`; reuses the decoded `Arc<Transcript>` while the stamp is unchanged and keeps the 8 opened last, 9597669; the agent commands load transcripts through it, 59b9565; fork: one per environment, not upstream's process-wide `shared()` (the GUI's `globals::EnvHistory`), and `open_cancellable`/`open_path_cancellable` give a decode up when a flag is set, checked at each read of a Claude, Pi or OMP session file, `adapter::is_cancelled`; `decodes()` counts the decodes it ran, so the GUI's tests check one decode per viewer open), `sources::Registry::for_path(source, path)` (the instance whose root holds the file acts on it: resume, fork, rename, delete, 9597669), `DeleteEmptyScope::{All, Local(WorkspaceScope)}`, `pi_loader::session_root`, `omp_loader::session_root`; K2 |
+| `history` | `Workspace` (`new(&WorkspaceScope, home)`, `of_env(env)`, `contains(conversation)`, `contains_project_key(key, key_is_path)`, `contains_cwd(path)`, `display()`: which conversations belong to the workspace, upstream 82b355a with no process cwd or home read; `path::{path_is_within, tilde_path}`), `Conversation` (+`cwds`: every distinct recorded cwd, at most `model::MAX_CWDS` = 16, `model::push_cwd`, 82b355a; +`provenance: Provenance` with `hidden_by_default`, `list_label` = `auto`/`sub`/`fork` (`Provenance::branch`: a `/btw` fork, 3c2ffeb), 8f60c5f, cb990e6; +`parent`: the session id a Claude subagent or fork belongs to, 3c2ffeb, with `history::is_parent_of(parent, child)`; +`own_text`: the authored text parts of top-level user messages, `messages::authored_text`, empty for a child conversation, ae7ae39), `model::SourceKind` (`Claude`, `Pi`, `Omp`, `Codex` (list label `CX`, 7f5c443); +`label`, `list_label`, `assistant_name`; the `history::Source` alias is gone since 9597669), `model` (normalized transcript model: `Transcript`, `Event`, `Revision`, `ConversationKey`), `adapter` (`Adapter`, `Stamp`, `Located` (+`native`: the adapter's own resolution), `Completeness`, `Discovery`, `Adapter::native_id_of`; an adapter also declares the actions its tool supports, `capabilities` (+`capabilities_for(provenance)`: a Claude subagent or fork can only be resumed, 3c2ffeb), and resumes, deletes and renames its conversations, 9799550), `actions` (`Capabilities` (+`ALL`, `NONE`), `capabilities_of(source, provenance)` (none for an orphaned conversation), `refusal(source, provenance, doing)`, `Target`; eea6d37; `Launcher { program, args, configured_at }` (+`default_for(source)`, `configured(env, command, at)`, `program_path(env, path, at)`, `resolve(env, source) -> ResolvedProgram`, `check(env, source)`, `words()`), `ConfiguredAt::{Config, Gui, GuiPath}` (names key and file in the error), `Launch { launcher, default_args }`, `config_table(source)`; 8a99ccc; `Adapter::resume` takes the `Launch`, `Adapter::delete` the `Launcher`) and `sources::Registry::from_env(env)` (+`for_source(kind)`: the adapter that acts on a source's conversations, 9799550) (one adapter per configured root, the Codex home included: `sources::codex::CodexAdapter::from_env(env)` lists the rollouts of `<codex home>/sessions` and `archived_sessions`, picks each thread's head with Codex's read-only state database and decodes its rollout chain, 7f5c443; it resumes and forks through the Codex CLI (`resume::plan_codex`, `CODEX_HOME`), deletes through `codex delete --force` (`sources::codex::{delete_spec, delete_outcome, thread_rollouts}`) and cannot rename, eea6d37; `sources::codex::view::decode_path` decodes a rollout opened by path as its thread (`process_conversation_file` shows such Codex threads); fork: single-file windows parse in their env (`Browser::new_single_file` through `process_conversation_file_in(env, …)` and `sources::decode_path_in(env, …)`), so a rollout of the env's own Codex home decodes through `CodexAdapter::from_env` with the env's `CODEX_SQLITE_HOME`, as the viewer's `HistoryService` does, and one of another home through that home's `config.toml` `sqlite_home`, else the home; the store's reconcile pass discovers through it, 8daac4c, and decodes each changed file through `Adapter::decode_into` (`decode` collects the events into a `Transcript`), feeding the events into `index::Indexer` (`push` per event, `finish` with the transcript metadata) to build the card's `Conversation`, fd27225, 350314d), `view::{entries, Entry, EntryKind}` (what a reader is shown of a transcript, in order: messages with the source's speaker, subagent reports, searchable notes, hidden records, and a `Fork` note where a forked thread's own records begin; the viewer, exports, copy-message and `--plain`/`--render` render from it, 9597669; fork: `entries_with_events` names each entry's event), `process_conversation_file(path, mtime, debug)` (`sources::decode_path_into` feeding `index::Indexer`, 350314d; fork: the list loaders stream through `decode_path_into` too; `process_conversation_file_in(env, path, mtime, debug)` parses a file opened in `env`, see above), `service::HistoryService` (`from_env(env)`, `open(key)`, `open_path(path)`; reuses the decoded `Arc<Transcript>` while the stamp is unchanged and keeps the 8 opened last, 9597669; the agent commands load transcripts through it, 59b9565; fork: one per environment, not upstream's process-wide `shared()` (the GUI's `globals::EnvHistory`), and `open_cancellable`/`open_path_cancellable` give a decode up when a flag is set, checked at each read of a Claude, Pi or OMP session file, `adapter::is_cancelled`; `decodes()` counts the decodes it ran, so the GUI's tests check one decode per viewer open), `sources::Registry::for_path(source, path)` (the instance whose root holds the file acts on it: resume, fork, rename, delete, 9597669), `DeleteEmptyScope::{All, Local(WorkspaceScope)}`, `pi_loader::session_root`, `omp_loader::session_root`; fork: `pi_loader::session_dir_settings(env)` (every Pi settings file naming a `sessionDir`, with the directory resolved as `session_root` resolves it) and `sources::codex::{state_db_dir(home, env_sqlite_home), configured_sqlite_home(home)}` (the adapter's own state database resolution) and `sources::codex::view::state_db_dir_of(env, path)` (the state database directory that decoding a rollout opened by path opens) for the sandbox gate (§15.4); K2 |
 | `theme`, `syntax`, `bench`, `debug`, `debug_log`, `markdown`, `time_filter`, `error` | `theme::{set_theme, kind, current, theme_for, ThemeKind, ThemePreference (+resolve), Theme, Rgb}`; `syntax::highlight_code(code, lang)`; `bench::{start(sink), enabled, mark, mark_peak_rss}` (upstream 40fa627 timing marks; explicit sink, no env read, no `--bench-startup`); `debug::{set_sink, reset_sink, DebugLevel (+tag), log, info, warn, error, should_log}`; `debug_log::{log_debug, log_display_error}`; `markdown::expand_tabs` (K10); `time_filter::{TimePoint, TimeFilter (+resolve, matches, is_active), TimeFilterError}`; `AppError`, `Result` |
 
 Duplicates the GUI must **not** write (each was planned in revision 1): its own loader bridge and refresh buffer
@@ -1378,7 +1378,10 @@ signature):
 2. `startup::load_config(&env) -> (LayeredConfig, ConfigErrors)` (WP7) — `load_config_from` and
    `load_gui_config_from` independently; a failing file contributes defaults.
 3. `persist::load(&env) -> UiState` (WP6).
-4. `startup::resolve_workspace(&launch, &env, &config.gui, &ui) -> Option<WorkspaceScope>` (WP7, PD3).
+4. `startup::startup_workspace(&launch, &env, &config.gui, &ui) -> Option<WorkspaceScope>` (WP7, PD3):
+   `startup::resolve_workspace`, then, when the process enforces the sandbox gate (`launch.sandbox_gate`), its
+   workspace rule (§15.4 rule 6, `startup::checked_startup_workspace`); a refusal goes to stderr and the process
+   exits 3 before any window opens.
 5. `startup::resolve_initial_view(&launch, &config, &settings, &ui) -> (ViewPrefs, ListSearchMode)` (WP7, PD17).
 6. set `AppState`, `Services`, `DebugBufferHandle`, `SemanticGate`, other globals.
 7. `embedder::install(cx)` (WP7).
@@ -2426,13 +2429,16 @@ recorded each frame (for the keyboard context menu position).
    * `Agent(cli)` (K15) → headless §11.23. `--show-dir`, `--render FILE` with stdout available → headless §11.23.
    * `args.time_filter()` error → stderr `Error: Invalid time range: <e>` (AppError Display), **exit 1** (upstream
      runtime error, C-005).
-   * Debug builds and `--features qa`: the sandbox gate (§15.4) runs here, before any data is read.
+   * Debug builds and `--features qa`: the sandbox gate (§15.4) runs here, on the `HistoryEnv` just built (the one
+     the app gets), before any data is read; `[FILE]` and `--render FILE` are then checked against its rule for
+     files opened by path (rule 7: refused → `Refusing to run: …`, exit 3).
 2. `claude_history_gui::run(launch, env)` → gpui application → `app::init` (§7.3 order):
    * config: `config.toml` and `gui.toml` loaded **independently** (`load_config_from`, `load_gui_config_from`); a
      failing file → its error in `ConfigErrors`, defaults for its part; effective = `cli.overlaid_with(&gui_file)`;
      `settings = effective_settings(&effective, &args.display_flags(), args.search_mode_override())`;
    * UiState (state.json);
-   * workspace (PD3);
+   * workspace (PD3; debug and QA builds also check it against the sandbox gate's workspace rule, §15.4: a refusal
+     prints `Refusing to run: …` and exits 3 before any window opens);
    * **initial view and list mode** (`startup::resolve_initial_view`, P table test C-066), per field:
 
 | Field | 1st | 2nd | 3rd (only if `[gui] restore_session`) | default |
@@ -2746,7 +2752,11 @@ the worker (§9.6); Active search `refresh`ed. Clicking an expandable control al
   ID → `Session ID copied to clipboard`; show path → toast with the full path and Copy/Reveal buttons.
 
 ### 11.12 Single-file
-`claude-history-gui FILE`, `--render FILE` without redirection, or File → Open JSONL file…: validate (`File not
+`claude-history-gui FILE`, `--render FILE` without redirection, or File → Open JSONL file…: (debug and QA builds) the
+sandbox gate's rule for files opened by path (§15.4 rule 7): a Codex rollout whose Codex home or state database
+lies outside the sandbox home is refused — at startup `Refusing to run: …`, exit 3 (`startup::dispatch`); from the
+dialog an error toast `Couldn't open <p>: <reason>` and that file is not opened (`startup::opened_file_refusal`) —
+then validate (`File not
 found: <p>` / `Not a file: <p>` → window opens in an error state), open `SingleFileWindow` with
 `ViewerPane(SingleFile)`, header from `Browser::new_single_file` in the background
 (`history::process_conversation_file_in(env, path, mtime, None)`: a Codex rollout of the env's home honors
@@ -2862,7 +2872,10 @@ caches, anchored re-render), list notify; menus/palette rebuilt (check marks); t
 theme applies to this session only and a warning toast says `Theme not saved: gui.toml has errors`.
 
 ### 11.20 Workspace change
-Picker selection / Choose folder… / Clear → validate dir → `AppState.workspace` + `env.workspace_dir` (new
+Picker selection / Choose folder… / Clear → validate dir → (debug and QA builds) the sandbox gate's workspace rule
+(§15.4 rule 6, `startup::workspace_refusal`): a workspace whose Pi settings lead outside the sandbox home → error
+toast `Couldn't switch the workspace: <reason>`, nothing changes (PD3 rule 3 (c) likewise keeps no workspace and
+shows `Couldn't use the launch folder as the workspace: <reason>`) → `AppState.workspace` + `env.workspace_dir` (new
 `Arc<HistoryEnv>`) → `browser.set_workspace(scope)` → recents (state.json) → title → reload with
 `loader.start_refresh_with(RefreshPolicy::ApplyPartial)` (K18): the rows always match the new workspace;
 `project_errors > 0` → warning toast `N project(s) could not be loaded. See Tools → Debug log.`; `RefreshFailed(e)`
@@ -2892,14 +2905,16 @@ after a failed pass re-scopes the cards at once.
 ### 11.23 Headless paths (no window)
 * `help …` / `<subcommand> --help` (K14 as built): `SubcommandHelp(text)` → stdout, exit 0.
 * `claude-history-gui agent …` (K15): `Help(text)` → stdout, exit 0; `Request(req)` →
-  `core::agent::execute(&env, &config.effective, req)` with the env's workspace = launch cwd (upstream used the cwd)
-  → write `stdout`/`stderr` verbatim, exit `exit_code`; parse error → stderr clap-style text, exit 2. Semantic
+  `core::agent::execute(&env, &config.effective, req)` with the env's workspace = launch cwd (upstream used the cwd;
+  debug and QA builds first check it against the sandbox gate's workspace rule, §15.4: refused → `Refusing to run: …`,
+  exit 3) → write `stdout`/`stderr` verbatim, exit `exit_code`; parse error → stderr clap-style text, exit 2. Semantic
   requests load the real model (as upstream); no window is created.
 * `--show-dir` with stdout available: workspace = PD3 rules 1–3 (no GUI state) → `maintenance::show_dir(env,
   workspace)` → stdout path + `\n`, exit 0; error → stderr `Error: <e>`, exit 1. Without stdout → open the GUI and
   show the projects-directory toast (AD14).
-* `--render FILE` with stdout **redirected**: the file decoded through `HistoryService::from_env(env)`, then
-  `generate_export(Ledger, settings options)` (no ANSI, `[dev]` vs
+* `--render FILE` with stdout **redirected**: (debug and QA builds) the sandbox gate's rule for files opened by path
+  first (§15.4 rule 7: refused → `Refusing to run: …`, exit 3); the file decoded through
+  `HistoryService::from_env(env)`, then `generate_export(Ledger, settings options)` (no ANSI, `[dev]` vs
   upstream's ANSI ledger) → stdout, exit 0; errors → stderr, exit 1. Otherwise the single-file window (C-011).
 
 * `--dump-semantic-turns PATH` (hidden, upstream f222b3c): the corpus of §11.24 (`load_sorted_conversations`, no time
@@ -3367,20 +3382,52 @@ quit 0
   `codex delete`).
 
 ### 15.4 Sandbox gate, sandbox procedure (dev runs and QA)
-* **Gate** (`qa/gate.rs`, runs in `main` for `--features qa` builds **and every debug build**): refuse with exit 3
+* **Gate** (`qa/gate.rs`, runs in `main` for `--features qa` builds **and every debug build**, on the `HistoryEnv`
+  the app gets: `main` builds it first, which reads no data, and `qa::gate::run(&env)` checks exactly that value):
+  refuse with exit 3
   and `Refusing to run: <reason>. Create a sandbox with tools/qa/new-sandbox.ps1 or set CHG_ALLOW_REAL_HOME=1.`
-  unless all hold: (1) the resolved home (`home::home_dir()`) contains a `.qa-sandbox` file; (2) the home is not the
+  unless all hold: (1) the env's home (`home::home_dir()`) contains a `.qa-sandbox` file; (2) the home is not the
   OS profile directory of the current user, obtained from the OS, not from variables (Windows
   `SHGetKnownFolderPath(FOLDERID_Profile)`, Unix `getpwuid_r(getuid())` → `pw_dir`); (3) each of
   `CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`, `CODEX_HOME`,
   `CODEX_SQLITE_HOME`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` is unset or
-  (canonically) inside the home; (4) `OMP_PROFILE`
-  and `PI_PROFILE` are unset or plain names. As built (WP0): when the OS cannot tell the profile directory the gate
-  refuses (fails closed), and the default data locations used while the variables are unset (`<home>/.claude`,
+  (canonically) inside the home; set but empty, a variable counts as unset only where the app reads it so
+  (`qa::gate::EMPTY_MEANS_UNSET`): the app reads an empty `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR` or
+  `PI_CONFIG_DIR` as a relative path (an empty `PI_CODING_AGENT_SESSION_DIR` is the launch directory), so it is
+  refused; (4) `OMP_PROFILE`
+  and `PI_PROFILE` are unset or plain names; (5) the data locations the app reads, derived from exactly that env
+  and from config files inside the sandbox, canonically stay inside the home: the Claude data and projects
+  directories (`HistoryEnv::claude_dir`, `claude_projects_root`), the Codex home (`CODEX_HOME`, else
+  `<home>/.codex`) with its `sessions` and `archived_sessions` directories and its state database directory (its
+  `config.toml` `sqlite_home`, absolute or relative to the Codex home, else `CODEX_SQLITE_HOME`, else the Codex
+  home: core `sources::codex::state_db_dir`), the store and semantic cache directories (`cache_base_dir`, which
+  `CLAUDE_CONFIG_DIR` moves into `config-<hash>`, `semantic_cache_dir`), the `sessionDir` of Pi's `settings.json`
+  in the agent directory (`PI_CODING_AGENT_DIR`, else `<home>/.pi/agent`; core `pi_loader::session_dir_settings`),
+  and the Pi and OMP session roots (`pi_loader::session_root`, `omp_loader::session_root`; OMP reads no settings
+  file). A config file that is missing or does not parse adds
+  nothing (the app then uses the locations already checked); the refusal names the file and the setting
+  (`sqlite_home in <file>`, `sessionDir in <file>`). (6) Every workspace the app applies is checked too
+  (`qa::gate::check_workspace`: rule 5 with that workspace): Pi also reads `<workspace>/.pi/settings.json`, and a
+  relative `sessionDir` (in either file) resolves against the workspace, so the `sessionDir` of both files and the
+  Pi session root with that workspace must stay inside the home. (7) Every file opened by path (`[FILE]`,
+  `--render FILE`, File → Open JSONL file…) is checked too (`qa::gate::check_opened_file`): the file itself is read
+  as named, wherever it lies (opening it is the user's explicit choice; QA scenarios open copies inside the
+  sandbox), but a Codex rollout decodes
+  through the Codex home holding it, which may be another home than the env's: that home, its `sessions` and
+  `archived_sessions` directories and the state database directory decoding the rollout opens (that home's
+  `config.toml` `sqlite_home`, else the home; core `sources::codex::view::state_db_dir_of`) must canonically stay
+  inside the sandbox home. `main` passes `qa::gate::enforced()` on (`ProcessInfo::sandbox_gate` →
+  `LaunchContext::sandbox_gate`); the GUI's startup workspace (`startup::startup_workspace`), the launch
+  directory of the headless `agent` commands and the files of `[FILE]` and `--render FILE` (`startup::dispatch`)
+  are refused like the gate (exit 3); a runtime workspace change (workspace picker, PD3 rule 3 (c);
+  `startup::workspace_refusal`) with an error toast while the previous workspace stays (§11.20), a file chosen in
+  File → Open JSONL file… (`startup::opened_file_refusal`) with an error toast and the file is not opened
+  (§11.12). As built (WP0): when
+  the OS cannot tell the profile directory the gate refuses (fails closed), and the default data locations used while the variables are unset (`<home>/.claude`,
   `.claude.json`, `.pi`, `.omp`, `.codex`, `.config`, `.cache`, `.local` and their data subfolders,
   `qa::gate::DEFAULT_DATA_PATHS`) must canonically stay inside the home when they exist — a junction or symlink to
-  real data is refused. Debug builds skip the gate only with `CHG_ALLOW_REAL_HOME=1` (the user's
-  own choice); `--features qa` builds never skip it.
+  real data is refused. Debug builds skip the gate (rules 6 and 7 included) only with `CHG_ALLOW_REAL_HOME=1` (the
+  user's own choice); `--features qa` builds never skip it.
 * Debug builds of `RealServices` also refuse to spawn a terminal whose program is a resolved `claude`/`pi`/`omp`
   unless `[gui] <prog>_path` is set to a harmless program inside the sandbox or `CHG_ALLOW_REAL_LAUNCH=1`.
 * Procedure:

@@ -3,7 +3,8 @@
 //! Thin: read the process state once (arguments, launch cwd, environment),
 //! let `startup::dispatch` decide (help/version/usage errors, the headless
 //! `agent`/`--show-dir`/`--render` paths, or a GUI launch), run the sandbox
-//! gate (debug and QA builds) before any data is read, then hand over to
+//! gate (debug and QA builds) on the environment the app gets, before any
+//! data is read, then hand over to
 //! `claude_history_gui::run`. This is the only place that reads the process
 //! environment (`HistoryEnv::from_process_env`, `current_dir`).
 
@@ -62,13 +63,18 @@ fn main() {
     let process = ProcessInfo {
         launch_cwd: launch_cwd.clone(),
         qa,
+        // Debug and QA builds check every workspace applied and every file
+        // opened by path too (§15.4).
+        sandbox_gate: gate::enforced(),
     };
     let output = RealServices::new();
     let mut prepare = || {
-        // The sandbox gate (§15.4; debug and QA builds): refuse before any
-        // data is read.
-        gate::run()?;
-        Ok(process_env(launch_cwd.as_deref()))
+        // The environment the app runs with (building it reads no data),
+        // then the sandbox gate (§15.4; debug and QA builds) on exactly that
+        // environment: refuse before any data is read.
+        let env = process_env(launch_cwd.as_deref());
+        gate::run(&env)?;
+        Ok(env)
     };
     match startup::dispatch(parsed, &args, &process, &output, &mut prepare) {
         Flow::Exit(code) => std::process::exit(code),

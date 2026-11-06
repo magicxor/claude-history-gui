@@ -36,20 +36,7 @@ fn session_root_from(
 ) -> Result<PiSessionRoot> {
     let base = cwd.as_deref();
     let env_base = env_base.as_deref();
-    let agent_dir = if let Some(value) = agent_override {
-        expand_path_with_home(value, home_dir.as_deref(), env_base)?
-    } else {
-        home_dir
-            .clone()
-            .ok_or_else(|| {
-                AppError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "Could not determine home directory",
-                ))
-            })?
-            .join(".pi")
-            .join("agent")
-    };
+    let agent_dir = agent_dir_from(agent_override, home_dir.as_deref(), env_base)?;
 
     if let Some(value) = session_override {
         return Ok(PiSessionRoot {
@@ -73,6 +60,61 @@ fn session_root_from(
         path: agent_dir.join("sessions"),
         flat: false,
     })
+}
+
+/// Pi's agent directory: `PI_CODING_AGENT_DIR` (resolved like
+/// [`session_root`] resolves it), else `<home>/.pi/agent`.
+fn agent_dir_from(
+    agent_override: Option<PathBuf>,
+    home_dir: Option<&Path>,
+    env_base: Option<&Path>,
+) -> Result<PathBuf> {
+    if let Some(value) = agent_override {
+        return expand_path_with_home(value, home_dir, env_base);
+    }
+    Ok(home_dir
+        .ok_or_else(|| {
+            AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Could not determine home directory",
+            ))
+        })?
+        .join(".pi")
+        .join("agent"))
+}
+
+/// Fork: the Pi settings files of `env` that name a `sessionDir`, each with
+/// the directory it names, resolved as [`session_root`] resolves it (`~`
+/// against the home, a relative value against the workspace): the agent
+/// directory's `settings.json`, then the workspace's `.pi/settings.json`.
+/// A file that is missing or not JSON, names no (or a blank) `sessionDir`,
+/// or whose value cannot be resolved (relative, without a workspace) is
+/// left out: [`session_root`] then does not use it either. Whichever of
+/// them [`session_root`] picks (the workspace's wins), the GUI's QA
+/// sandbox gate checks every one.
+pub fn session_dir_settings(env: &HistoryEnv) -> Vec<(PathBuf, PathBuf)> {
+    let home_dir = env.home_dir.as_deref();
+    let cwd = env.workspace_base_dir();
+    let env_base = env.env_value_base_dir();
+    let global = agent_dir_from(
+        env.pi_coding_agent_dir.clone(),
+        home_dir,
+        env_base.as_deref(),
+    )
+    .ok()
+    .map(|agent_dir| agent_dir.join("settings.json"));
+    let project = cwd
+        .as_deref()
+        .map(|cwd| cwd.join(".pi").join("settings.json"));
+    global
+        .into_iter()
+        .chain(project)
+        .filter_map(|file| {
+            let value = configured_session_dir(&file)??;
+            let dir = expand_path_with_home(value, home_dir, cwd.as_deref()).ok()?;
+            Some((file, dir))
+        })
+        .collect()
 }
 
 fn configured_session_dir(path: &Path) -> Option<Option<PathBuf>> {
@@ -305,6 +347,77 @@ mod tests {
         trailing.push(std::path::MAIN_SEPARATOR_STR);
         let root = session_root(&env.clone().with_workspace(trailing)).unwrap();
         assert_eq!(root.path, workspace.join("relative-sessions"));
+    }
+
+    /// Fork: the settings that can choose the session root, each resolved
+    /// as `session_root` resolves it (the GUI's sandbox gate checks them).
+    #[test]
+    fn session_dir_settings_name_every_configured_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let env = HistoryEnv::sandbox(home.path());
+        assert!(session_dir_settings(&env).is_empty(), "no settings files");
+
+        let agent = home.path().join(".pi").join("agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        let global = agent.join("settings.json");
+        std::fs::write(&global, r#"{"sessionDir":"~/global-sessions"}"#).unwrap();
+        let named = home.path().join("global-sessions");
+        assert_eq!(
+            session_dir_settings(&env),
+            vec![(global.clone(), named.clone())]
+        );
+        assert_eq!(session_root(&env).unwrap().path, named);
+
+        // A relative value resolves against the workspace; without one it
+        // names nothing (and `session_root` fails).
+        std::fs::write(&global, r#"{"sessionDir":"relative"}"#).unwrap();
+        assert!(session_dir_settings(&env).is_empty());
+        assert!(session_root(&env).is_err());
+        let workspace = home.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(".pi")).unwrap();
+        let env = env.with_workspace(&workspace);
+        assert_eq!(
+            session_dir_settings(&env),
+            vec![(global.clone(), workspace.join("relative"))]
+        );
+
+        // The workspace's own settings follow (and win in `session_root`).
+        let project = workspace.join(".pi").join("settings.json");
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            &project,
+            serde_json::json!({ "sessionDir": outside.path() }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            session_dir_settings(&env),
+            vec![
+                (global.clone(), workspace.join("relative")),
+                (project.clone(), outside.path().to_path_buf()),
+            ]
+        );
+        assert_eq!(session_root(&env).unwrap().path, outside.path());
+
+        // Blank values and files that are not JSON name nothing.
+        std::fs::write(&global, r#"{"sessionDir":"  "}"#).unwrap();
+        std::fs::write(&project, "not json").unwrap();
+        assert!(session_dir_settings(&env).is_empty());
+
+        // PI_CODING_AGENT_DIR moves the agent directory's settings file.
+        let other_agent = home.path().join("other-agent");
+        std::fs::create_dir_all(&other_agent).unwrap();
+        std::fs::write(
+            other_agent.join("settings.json"),
+            r#"{"sessionDir":"~/other-sessions"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            session_dir_settings(&env.with_pi_coding_agent_dir(&other_agent)),
+            vec![(
+                other_agent.join("settings.json"),
+                home.path().join("other-sessions")
+            )]
+        );
     }
 
     #[test]

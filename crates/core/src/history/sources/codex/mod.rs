@@ -17,6 +17,11 @@
 //!   the env's home. The state database directory is resolved when the home
 //!   is scanned, not when the adapter is built (upstream does the same from
 //!   eea6d37 on), so building a registry reads no file.
+//! * **The state database directory, public.** [`state_db_dir`] (the
+//!   adapter's resolution: `config.toml`'s `sqlite_home`, else
+//!   `CODEX_SQLITE_HOME`, else the home) and [`configured_sqlite_home`] are
+//!   public (upstream: private to the adapter), so the GUI's QA sandbox gate
+//!   checks the directory the adapter opens without resolving it again.
 //! * **Actions as the fork's plans.** Upstream plans `codex [args]
 //!   resume|fork <id>` as a `std::process::Command` with `CODEX_HOME` set
 //!   and runs `codex delete --force <id>` itself. Here
@@ -97,14 +102,13 @@ impl CodexAdapter {
     }
 
     /// The directory of the state database: the `sqlite_home` of the
-    /// home's `config.toml`, else `CODEX_SQLITE_HOME`, else the home.
+    /// home's `config.toml`, else `CODEX_SQLITE_HOME`, else the home
+    /// ([`state_db_dir`]).
     fn sqlite_home(&self) -> PathBuf {
         let home = &self.instance.root;
         self.sqlite_home
             .clone()
-            .or_else(|| configured_sqlite_home(home))
-            .or_else(|| self.env_sqlite_home.clone())
-            .unwrap_or_else(|| home.clone())
+            .unwrap_or_else(|| state_db_dir(home, self.env_sqlite_home.as_deref()))
     }
 
     /// Every rollout of the home with the state that chooses among them,
@@ -162,8 +166,21 @@ impl CodexAdapter {
     }
 }
 
-/// `sqlite_home` of the home's `config.toml`.
-fn configured_sqlite_home(home: &Path) -> Option<PathBuf> {
+/// Fork (public): the directory of the state database of the Codex home
+/// `home`, as the adapter opens it: the `sqlite_home` of the home's
+/// `config.toml` ([`configured_sqlite_home`]), else `env_sqlite_home` (the
+/// resolved `CODEX_SQLITE_HOME`, [`HistoryEnv::codex_sqlite_home`]), else
+/// the home.
+pub fn state_db_dir(home: &Path, env_sqlite_home: Option<&Path>) -> PathBuf {
+    configured_sqlite_home(home)
+        .or_else(|| env_sqlite_home.map(Path::to_path_buf))
+        .unwrap_or_else(|| home.to_path_buf())
+}
+
+/// `sqlite_home` of the home's `config.toml` (a relative value resolves
+/// against the home); `None` when the file is missing or unreadable, is not
+/// TOML or names no `sqlite_home` string. Fork: public.
+pub fn configured_sqlite_home(home: &Path) -> Option<PathBuf> {
     let text = std::fs::read_to_string(home.join("config.toml")).ok()?;
     let config: toml::Table = toml::from_str(&text).ok()?;
     let path = PathBuf::from(config.get("sqlite_home")?.as_str()?);

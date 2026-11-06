@@ -705,6 +705,13 @@ pub struct LaunchContext {
     /// `$TERMINAL` (Linux launcher detection, §11.10 step 6, §14.1), read once
     /// by `main`; `app::init` stores it for `ops::resume` (integrator, Phase B).
     pub terminal_var: Option<std::ffi::OsString>,
+    /// This process enforces the sandbox gate (§15.4, `qa::gate::enforced`,
+    /// from `main` through `startup::ProcessInfo`): every workspace applied
+    /// must pass `qa::gate::check_workspace` (the startup workspace or exit
+    /// 3, a runtime change or an error toast), every file opened by path
+    /// `qa::gate::check_opened_file` (`file` is checked in `startup::dispatch`,
+    /// File → Open JSONL file… shows an error toast). Off in tests unless set.
+    pub sandbox_gate: bool,
 }
 
 impl LaunchContext {

@@ -683,7 +683,7 @@ impl Workspace {
                     self.viewer
                         .update(cx, |viewer, cx| viewer.set_header(header, cx));
                 }
-                self.apply_recorded_cwd_once(cx);
+                self.apply_recorded_cwd_once(window, cx);
                 // Only when a check mark changed (X-038: an edit of a 20k
                 // corpus must not rebuild and reload every menu).
                 menus::refresh_if_changed(cx);
@@ -698,7 +698,9 @@ impl Workspace {
     /// directory recorded as the cwd of a loaded Pi/OMP conversation becomes
     /// the workspace when rules 1–5 chose none; the list then re-scopes and
     /// reloads (integrator, Phase A, WP7 request).
-    fn apply_recorded_cwd_once(&mut self, cx: &mut Context<Self>) {
+    /// A workspace the sandbox gate refuses (§15.4) is not applied: an
+    /// error toast says why.
+    fn apply_recorded_cwd_once(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let list = self.list.read(cx);
         if self.recorded_cwd_checked || list.is_loading() || list.is_reconciling() {
             return;
@@ -709,10 +711,22 @@ impl Workspace {
             return;
         }
         let cwds = self.list.read(cx).recorded_agent_cwds();
-        if startup::apply_recorded_cwd_workspace(cx, cwds.iter().map(std::path::PathBuf::as_path)) {
-            let workspace = app_state(cx).workspace.clone();
-            self.list
-                .update(cx, |list, cx| list.set_workspace(workspace, cx));
+        match startup::apply_recorded_cwd_workspace(
+            cx,
+            cwds.iter().map(std::path::PathBuf::as_path),
+        ) {
+            Ok(true) => {
+                let workspace = app_state(cx).workspace.clone();
+                self.list
+                    .update(cx, |list, cx| list.set_workspace(workspace, cx));
+            }
+            Ok(false) => {}
+            Err(reason) => {
+                crate::notify::Toast::error(format!(
+                    "Couldn't use the launch folder as the workspace: {reason}"
+                ))
+                .show(window, cx);
+            }
         }
     }
 
