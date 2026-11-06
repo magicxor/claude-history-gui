@@ -4,6 +4,8 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 ## Unreleased
 
+- A shared `config.toml` written for the CLI with `[semantic] daemon = true` (or `pause_on_battery`) loads again
+  instead of being rejected. The GUI has no background daemon and ignores these keys.
 - Loading and refreshing the history spends less CPU checking session files: project folders are no longer looked up
   one by one, and the check runs on at most four threads at a lower priority.
 - While you search, the viewer shows the selected result at the match instead of at its start: scrolled to the

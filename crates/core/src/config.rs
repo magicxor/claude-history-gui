@@ -61,6 +61,34 @@ pub struct ConfigFile {
     pub search: Option<SearchConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<AgentConfig>,
+    /// Upstream's background-daemon table (939c20b). Accepted so a shared
+    /// `config.toml` written for the CLI still loads; the GUI has no daemon
+    /// (decisions.md #22) and ignores it, and `gui.toml` has no such table.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic: Option<SemanticConfig>,
+}
+
+/// `[semantic]`: settings of upstream's opt-in background daemon. Parsed for
+/// compatibility only; the GUI neither starts a daemon nor reads these.
+#[derive(Clone, Copy, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticConfig {
+    /// Keep the caches warm in a background process that any launch starts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daemon: Option<bool>,
+    /// Whether the background process pauses embedding on battery power.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pause_on_battery: Option<bool>,
+}
+
+impl SemanticConfig {
+    pub fn daemon(&self) -> bool {
+        self.daemon.unwrap_or(false)
+    }
+
+    pub fn pause_on_battery(&self) -> bool {
+        self.pause_on_battery.unwrap_or(true)
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
@@ -844,6 +872,7 @@ impl ConfigFile {
             tui,
             search,
             agent,
+            semantic,
         } = self;
 
         let display = match &gui.display {
@@ -964,6 +993,7 @@ impl ConfigFile {
             tui,
             search,
             agent,
+            semantic,
         }
     }
 }
@@ -1435,6 +1465,33 @@ semantic_search = true
     }
 
     #[test]
+    fn semantic_daemon_is_off_and_pauses_on_battery_by_default() {
+        let config: ConfigFile = toml::from_str("").unwrap();
+        let semantic = config.semantic.unwrap_or_default();
+        assert!(!semantic.daemon());
+        assert!(semantic.pause_on_battery());
+
+        let config: ConfigFile = toml::from_str(
+            "[semantic]
+daemon = true
+pause_on_battery = false
+",
+        )
+        .unwrap();
+        let semantic = config.semantic.unwrap();
+        assert!(semantic.daemon());
+        assert!(!semantic.pause_on_battery());
+        assert!(
+            toml::from_str::<ConfigFile>(
+                "[semantic]
+deamon = true
+"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn search_mode_parses_hybrid_mode() {
         let config: ConfigFile = toml::from_str(
             r#"
@@ -1516,6 +1573,35 @@ default_args = ["--yolo"]
             Some(PathBuf::from("C:/tools/codex.exe"))
         );
         assert!(toml::from_str::<ConfigFile>("[resume.codex]\nmodel = \"x\"\n").is_err());
+    }
+
+    #[test]
+    fn semantic_daemon_table_from_the_cli_config_loads_and_survives_the_overlay() {
+        let cli: ConfigFile = toml::from_str(
+            "[semantic]
+daemon = true
+pause_on_battery = false
+",
+        )
+        .unwrap();
+        let gui: GuiConfigFile = toml::from_str(
+            "[display]
+plain = true
+",
+        )
+        .unwrap();
+        let effective = cli.clone().overlaid_with(&gui);
+        assert_eq!(effective.semantic, cli.semantic);
+        assert!(effective.semantic.unwrap().daemon());
+        // gui.toml has no `[semantic]` table: the GUI ignores the daemon.
+        assert!(
+            toml::from_str::<GuiConfigFile>(
+                "[semantic]
+daemon = false
+"
+            )
+            .is_err()
+        );
     }
 
     /// `config.toml` alone, as the layered configuration of a GUI without

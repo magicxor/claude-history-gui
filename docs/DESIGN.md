@@ -3031,6 +3031,8 @@ Subcommands cannot be combined with top-level flags.
   `[resume] command`, `[resume.pi] command`, `[resume.omp] command` and `[resume.codex] command` (upstream 8a99ccc):
   the program that starts each agent, a string (never split) or an array (program + leading arguments); an empty
   command or one with a blank program is a parse error (`command must …`).
+* `config.toml`'s `[semantic]` table (`daemon`, `pause_on_battery`; upstream 939c20b) is part of the accepted schema but
+  ignored by the GUI (no background daemon); `gui.toml` has no `[semantic]` table.
 * `gui.toml` (`~/.config/claude-history/gui.toml`, core `GuiConfigFile`): may override `[display]`, `[resume]`,
   `[keys]`, `[tui]`, `[search]`, `[agent]` and holds `[gui]`. Effective value = gui.toml > config.toml > default.
   Written only by `save_gui_config_changes` (K12): changed keys only, comments preserved, refused while the file is
