@@ -10,6 +10,8 @@ Release notes are taken from the `## v<version>` section of this file by the rel
   and the other calls of the run stay on one line. The mode is remembered like the others.
 - Expanding or collapsing a Summary row (or the first line of a run in Calls mode) keeps it in place instead of
   scrolling its message to the top of the viewer.
+- Expanding a row in Calls mode no longer inserts a blank line above it, so the clicked line stays under the cursor;
+  the blank line now only follows an expanded call.
 - Summary mode keeps a run of tool calls in one row even when records that show nothing (bookkeeping entries,
   thinking-only messages while thinking is hidden) sit between the calls, instead of one "Ran 1 shell command" row per call.
 - Tool calls without a dedicated format (MCP tools and the like) now show as one line of JSON, for example
