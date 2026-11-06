@@ -32,8 +32,12 @@ pub fn gui_version() -> &'static str {
 /// The core crate's version (its `Cargo.toml`, read at compile time; the core
 /// exposes no constant).
 pub fn core_version() -> &'static str {
-    const MANIFEST: &str = include_str!("../../../core/Cargo.toml");
-    MANIFEST
+    manifest_version(include_str!("../../../core/Cargo.toml"))
+}
+
+/// The `version = "..."` of a `Cargo.toml` (`unknown` without one).
+fn manifest_version(manifest: &'static str) -> &'static str {
+    manifest
         .lines()
         .map(str::trim)
         .find_map(|line| {
@@ -43,7 +47,7 @@ pub fn core_version() -> &'static str {
         .unwrap_or("unknown")
 }
 
-/// `Claude History GUI 0.1.0 (core 0.1.76)`.
+/// `Claude History GUI 1.2.3 (core 4.5.6)`.
 pub fn version_line() -> String {
     format!(
         "Claude History GUI {} (core {})",
@@ -202,8 +206,31 @@ mod tests {
 
     #[test]
     fn versions_are_read_from_the_manifests() {
-        assert_eq!(gui_version(), "0.1.1");
-        assert_eq!(core_version(), "0.1.76");
-        assert_eq!(version_line(), "Claude History GUI 0.1.1 (core 0.1.76)");
+        // Compared with the manifests themselves, so a version bump needs no
+        // test edit.
+        assert_eq!(
+            gui_version(),
+            manifest_version(include_str!("../../Cargo.toml"))
+        );
+        let core = core_version();
+        assert_eq!(core.split('.').count(), 3, "{core}");
+        assert!(
+            core.split('.')
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())),
+            "{core}"
+        );
+        assert_eq!(
+            version_line(),
+            format!("Claude History GUI {} (core {core})", gui_version())
+        );
+    }
+
+    #[test]
+    fn manifest_version_takes_the_package_version() {
+        assert_eq!(
+            manifest_version("[package]\nname = \"x\"\nversion = \"1.2.3\"\n"),
+            "1.2.3"
+        );
+        assert_eq!(manifest_version("[package]\nname = \"x\"\n"), "unknown");
     }
 }

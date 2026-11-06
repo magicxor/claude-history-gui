@@ -186,7 +186,13 @@ fn about_shows_versions_and_paths(cx: &mut TestAppContext) {
     settle(cx, handle);
     let dialog = cx.read(current_about).expect("About is open");
     let lines = cx.read(|cx| dialog.read(cx).lines().to_vec());
-    assert_eq!(lines[0], "Claude History GUI 0.1.1 (core 0.1.76)");
+    assert_eq!(
+        lines[0],
+        format!(
+            "Claude History GUI {GUI_VERSION} (core {})",
+            about::core_version()
+        )
+    );
     assert_eq!(lines[1], about::TAGLINE);
     let env = &world.env;
     assert!(

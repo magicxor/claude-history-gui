@@ -292,8 +292,9 @@ fn help_and_version_print_and_exit_zero() {
     let world = TestWorld::new();
     let version = run(&world, &["--version"], StdoutKind::Redirected, None);
     assert_eq!(version.code(), 0);
-    assert_eq!(version.rec.stdout(), "claude-history-gui 0.1.1\n");
-    assert_eq!(version_text(), "claude-history-gui 0.1.1\n");
+    let expected = format!("claude-history-gui {}\n", env!("CARGO_PKG_VERSION"));
+    assert_eq!(version.rec.stdout(), expected);
+    assert_eq!(version_text(), expected);
     let help = run(&world, &["--help"], StdoutKind::Redirected, None);
     assert_eq!(help.code(), 0);
     assert_eq!(help.rec.stdout(), help_text("claude-history-gui"));
@@ -315,9 +316,12 @@ fn help_and_version_print_and_exit_zero() {
     let silent = run(&world, &["--version"], StdoutKind::None, None);
     assert_eq!(silent.code(), 0);
     assert!(silent.rec.stdout().is_empty());
-    assert!(silent.rec.calls().contains(&ServiceCall::StdoutFailed(
-        "claude-history-gui 0.1.1\n".to_string()
-    )));
+    assert!(
+        silent
+            .rec
+            .calls()
+            .contains(&ServiceCall::StdoutFailed(expected))
+    );
 }
 
 /// C-018: subcommands.
