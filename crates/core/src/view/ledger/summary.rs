@@ -49,8 +49,8 @@ impl ToolActivitySummary {
             "Edit" | "edit" => self.edited_files += 1,
             "Write" | "write" => self.wrote_files += 1,
             "Task" => self.agents += 1,
-            "WebFetch" => self.fetched_urls += 1,
-            "WebSearch" => self.web_searches += 1,
+            "WebFetch" | "fetch_content" => self.fetched_urls += 1,
+            "WebSearch" | "web_search" => self.web_searches += 1,
             _ => self.add_other_tool(name, 1),
         }
     }
@@ -588,10 +588,43 @@ pub(crate) fn summary_rows<'a>(
         .collect()
 }
 
-/// A tool call as one formatted line cut to `width`.
+/// A tool call as one formatted line cut to `width`. A call with more to
+/// show than its header, such as a multi-line command, ends with how many
+/// lines it hides.
 pub(crate) fn call_line(name: &str, input: &serde_json::Value, width: usize) -> String {
-    let header = crate::tool_format::format_tool_call(name, input, 0).header;
-    truncate_end(&header, width)
+    let (header, hidden) = call_header(name, input);
+    if hidden == 0 {
+        return truncate_end(&header, width);
+    }
+    let suffix = hidden_lines_suffix(hidden);
+    let header_width = width.saturating_sub(UnicodeWidthStr::width(suffix.as_str()));
+    format!("{}{suffix}", truncate_end(&header, header_width))
+}
+
+/// A call's whole header and the number of body lines a calls row hides.
+pub(crate) fn call_header(name: &str, input: &serde_json::Value) -> (String, usize) {
+    let formatted = crate::tool_format::format_tool_call(name, input, 0);
+    let hidden = formatted
+        .body
+        .as_deref()
+        .map_or(0, |body| body.lines().count());
+    (formatted.header, hidden)
+}
+
+/// ` (N more lines)`, the end of a calls row whose call has a body.
+pub(crate) fn hidden_lines_suffix(hidden: usize) -> String {
+    let noun = if hidden == 1 { "line" } else { "lines" };
+    format!(" ({hidden} more {noun})")
+}
+
+/// The calls among `parts` as (whole header, hidden body lines) pairs.
+pub(crate) fn call_rows<'a>(parts: impl Iterator<Item = &'a Part>) -> Vec<(String, usize)> {
+    parts
+        .filter_map(|part| match part {
+            Part::ToolCall { name, input, .. } => Some(call_header(name, input)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The summary text for the calls among `parts`. A single call to a tool

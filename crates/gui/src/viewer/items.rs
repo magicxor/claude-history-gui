@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use claude_history_core::view::{
     ConversationDocument, DocBlock, DocBlockKind, DocMessage, DocSubagentToolResult, DocToolCall,
-    DocToolResult, Fold, LabelRole, ToolOutputId, ViewerModel, fitted_name,
+    DocToolResult, Fold, LabelRole, ToolOutputId, ViewerModel, call_line_suffix, fitted_name,
 };
 
 use super::segments::{self, SegKind, Segment, Style};
@@ -412,12 +412,27 @@ impl MessageCtx<'_> {
                     cols_dependent,
                 });
             }
-            DocBlockKind::ToolCallLine { id, header } => {
+            DocBlockKind::ToolCallLine {
+                id,
+                header,
+                hidden_lines,
+            } => {
                 // One row like the summary sentence: the document keeps the
                 // header whole, the row clips it to the content columns.
-                let clipped = segments::clip_to_cols(header, self.cols);
+                // A call with a body ends with ` (N more lines)`, which stays
+                // whole: the header is clipped to the columns left of it.
+                let suffix = match hidden_lines {
+                    0 => String::new(),
+                    n => call_line_suffix(*n),
+                };
+                let suffix_width = unicode_width::UnicodeWidthStr::width(suffix.as_str());
+                let clipped = format!(
+                    "{}{suffix}",
+                    segments::clip_to_cols(header, self.cols.saturating_sub(suffix_width))
+                );
                 // A narrower window could clip any line wider than the 8-column floor.
-                let cols_dependent = unicode_width::UnicodeWidthStr::width(header.as_str()) > 8;
+                let cols_dependent =
+                    unicode_width::UnicodeWidthStr::width(header.as_str()) + suffix_width > 8;
                 let segment = segments::styled_line(&clipped, Style::TOOL | Style::DIMMED);
                 // A group's row has its own id (upstream a1c88f8); the lines
                 // of a mixed message have none and go by position.

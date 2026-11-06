@@ -58,7 +58,7 @@ pub use crate::commands::process_command_message;
 pub use document::{
     BodyLineKind, ConversationDocument, DocBlock, DocBlockKind, DocMessage, DocMessageKind,
     DocSubagentToolResult, DocTiming, DocToolCall, DocToolResult, Fold, LabelRole, ToolBody,
-    ToolBodyLine, build_document, markdown_plain_text,
+    ToolBodyLine, build_document, call_line_suffix, markdown_plain_text,
 };
 pub use ledger::{
     GUTTER_WIDTH, LineStyle, MessageRange, NAME_WIDTH, RenderOptions, RenderableEntry,

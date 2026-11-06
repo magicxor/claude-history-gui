@@ -525,11 +525,11 @@ fn assert_ledger_parity(
         // message, in order; a collapsed group is nothing but its call lines,
         // one row each with the line's timing slot. The fixtures keep every
         // header narrower than 80 columns, so the ledger does not cut them.
-        let call_lines: Vec<(&DocTiming, &str)> = message
+        let call_lines: Vec<(&DocTiming, String)> = message
             .blocks
             .iter()
             .filter_map(|block| match &block.kind {
-                DocBlockKind::ToolCallLine { header, .. } => Some((&block.timing, header.as_str())),
+                DocBlockKind::ToolCallLine { .. } => Some((&block.timing, block.plain_text())),
                 _ => None,
             })
             .collect();
@@ -757,6 +757,7 @@ fn calls_tool_mode_lists_each_call_on_one_line_without_results() {
     let line = |id: &ToolOutputId, header: &str| DocBlockKind::ToolCallLine {
         id: Some(id.clone()),
         header: header.to_string(),
+        hidden_lines: 0,
     };
     assert_eq!(
         lines,
@@ -1587,9 +1588,54 @@ fn assistant_block_order_calls_mode_text_then_call_lines_then_thinking() {
         DocBlockKind::ToolCallLine {
             id: None,
             header: "Bash: echo hi".to_string(),
+            hidden_lines: 0,
         }
     );
     assert_eq!(doc.messages[0].blocks[1].toggle_id(), None);
+}
+
+/// Calls mode: a call with a body (a multi-line command) carries the count
+/// of lines its row hides, apart from the header, and the plain text ends
+/// with the same `(N more lines)` as the ledger row.
+#[test]
+fn calls_mode_call_lines_carry_hidden_line_counts() {
+    let tools = r#"{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"python3 - <<'EOF'\nprint(1)\nEOF"}},{"type":"tool_use","id":"toolu_2","name":"Bash","input":{"command":"ls"}}"#;
+    let grouped = entry(
+        0,
+        &format!(r#"{{"type":"assistant","message":{{"role":"assistant","content":[{tools}]}}}}"#),
+    );
+    let mixed = entry(
+        1,
+        &format!(
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"TEXT"}},{tools}]}}}}"#
+        ),
+    );
+    for entry in [grouped, mixed] {
+        let doc = assert_ledger_parity(&[entry], &prefs(ToolDisplayMode::Calls), &BTreeSet::new());
+        let lines: Vec<(&str, usize, String)> = doc.messages[0]
+            .blocks
+            .iter()
+            .filter_map(|block| match &block.kind {
+                DocBlockKind::ToolCallLine {
+                    header,
+                    hidden_lines,
+                    ..
+                } => Some((header.as_str(), *hidden_lines, block.plain_text())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                (
+                    "Bash: python3 - <<'EOF'",
+                    2,
+                    "Bash: python3 - <<'EOF' (2 more lines)".to_string()
+                ),
+                ("Bash: ls", 0, "Bash: ls".to_string()),
+            ]
+        );
+    }
 }
 
 #[test]

@@ -168,6 +168,7 @@ Release notes are taken from the `## v<version>` section of this file by the rel
   and the arguments of the new `[resume.codex] default_args`; Delete runs `codex delete --force` after the usual
   confirmation. Renaming a Codex thread is refused with a message, and a thread whose current history Codex no
   longer has allows no action. Settings has fields for the codex program and the Codex default arguments.
+- Pi tools `codemode`, `ls`, `web_search`, `fetch_content`, `process` and the `suba` family now get readable headers (`Codemode: <first script line>`, `List: src`, `Search: "a", "b"`, `Fetch: <url>`, `Process start: <name>`, `Suba: <name>`) instead of one line of JSON, and Summary rows count `web_search` and `fetch_content` as searches and fetched URLs. In Calls mode a row whose call has more to show, such as a multi-line command, ends with `(N more lines)`. Claude Code's `<persisted-output>` results drop their wrapper tags.
 
 ## v0.1.1
 

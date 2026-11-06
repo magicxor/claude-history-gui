@@ -60,10 +60,11 @@ use super::ViewPrefs;
 use super::ledger::{
     RenderOptions, RenderableEntry, RowTiming, TRUNCATED_BODY_LINES, TRUNCATED_RESULT_LINES,
     TimingSlot, ToolActivitySummary, ToolDisplayMode, ToolOutputId, ToolOutputKind,
-    assistant_label, call_line, entry_shows_nothing, format_timestamp, group_call_result,
-    group_messages, group_summary_line, make_tool_output_id, make_tool_summary_output_id,
-    render_markdown_to_lines, subagent_label, summarize_tool_calls, summary_rows,
-    tool_only_assistant_summary, tool_result_display_text, user_entry_is_only_tool_results,
+    assistant_label, call_header, call_rows, entry_shows_nothing, format_timestamp,
+    group_call_result, group_messages, group_summary_line, hidden_lines_suffix,
+    make_tool_output_id, make_tool_summary_output_id, render_markdown_to_lines, subagent_label,
+    summarize_tool_calls, summary_rows, tool_only_assistant_summary, tool_result_display_text,
+    user_entry_is_only_tool_results,
 };
 use crate::commands::process_command_message;
 use crate::history::model::{Message, Part, Role};
@@ -249,6 +250,9 @@ pub enum DocBlockKind {
     ToolCallLine {
         id: Option<ToolOutputId>,
         header: String,
+        /// Lines of the call's body the row hides (a multi-line command);
+        /// the ledger ends the row with ` (N more lines)`.
+        hidden_lines: usize,
     },
     /// An expanded summary group or calls row. A summary group (summary
     /// mode) shows every call and result of the group; a calls row (calls
@@ -733,7 +737,14 @@ impl DocBlock {
                 markdown_plain_text(text)
             }
             DocBlockKind::ToolSummary { sentence, .. } => sentence.clone(),
-            DocBlockKind::ToolCallLine { header, .. } => header.clone(),
+            DocBlockKind::ToolCallLine {
+                header,
+                hidden_lines,
+                ..
+            } => match hidden_lines {
+                0 => header.clone(),
+                n => format!("{header}{}", hidden_lines_suffix(*n)),
+            },
             DocBlockKind::ToolSummaryDetails { items, .. } => items
                 .iter()
                 .map(DocBlock::plain_text)
@@ -797,6 +808,12 @@ impl ConversationDocument {
             .nth(position)
             .map(|(index, _)| index)
     }
+}
+
+/// ` (N more lines)`: the end of a calls row (and its plain text) whose call
+/// has `hidden_lines` body lines.
+pub fn call_line_suffix(hidden_lines: usize) -> String {
+    hidden_lines_suffix(hidden_lines)
 }
 
 /// The visible text of rendered markdown, unwrapped: what the ledger shows
@@ -1211,7 +1228,14 @@ impl Builder<'_> {
         if summary.is_empty() {
             return;
         }
-        let rows = summary_rows(&summary, content.iter(), &self.options);
+        let rows = if self.prefs.tool_display == ToolDisplayMode::Calls {
+            call_rows(content.iter())
+        } else {
+            summary_rows(&summary, content.iter(), &self.options)
+                .into_iter()
+                .map(|row| (row, 0))
+                .collect()
+        };
         blocks.extend(self.summary_blocks(None, timing.consume(), rows));
     }
 
@@ -1223,17 +1247,18 @@ impl Builder<'_> {
         &self,
         id: Option<&ToolOutputId>,
         slot: TimingSlot<'_>,
-        rows: Vec<String>,
+        rows: Vec<(String, usize)>,
     ) -> Vec<DocBlock> {
         let calls = self.prefs.tool_display == ToolDisplayMode::Calls;
         rows.into_iter()
             .enumerate()
-            .map(|(i, row)| DocBlock {
+            .map(|(i, (row, hidden))| DocBlock {
                 timing: DocTiming::from_slot(if i == 0 { slot } else { slot.continuation() }),
                 kind: if calls {
                     DocBlockKind::ToolCallLine {
                         id: id.cloned(),
                         header: row,
+                        hidden_lines: hidden,
                     }
                 } else {
                     DocBlockKind::ToolSummary {
@@ -1535,7 +1560,7 @@ impl Builder<'_> {
                 &group.summary,
                 self.options.content_width,
             );
-            self.summary_blocks(Some(&group.id), slot, vec![line])
+            self.summary_blocks(Some(&group.id), slot, vec![(line, 0)])
         };
 
         let is_subagent = group.parent_id.is_some();
@@ -1596,9 +1621,11 @@ impl Builder<'_> {
                         ),
                     }
                 } else {
+                    let (header, hidden_lines) = call_header(name, input);
                     DocBlockKind::ToolCallLine {
                         id: Some(row_id),
-                        header: call_line(name, input, self.options.content_width),
+                        header,
+                        hidden_lines,
                     }
                 };
                 blocks.push(DocBlock {

@@ -581,6 +581,29 @@ mod pure {
         assert!(!text.contains("grep result") && !text.contains("bash result"));
     }
 
+    /// A call row with a body (a multi-line command) ends with
+    /// ` (N more lines)` that survives clipping: the header gives way.
+    #[test]
+    fn calls_mode_row_keeps_the_hidden_lines_suffix_when_clipped() {
+        let long = "x".repeat(200);
+        let lines = vec![
+            user("q"),
+            bash_call("b1", &format!("echo {long}\n line2\n line3"), 1),
+            tool_result("b1", "bash result", 1),
+        ];
+        for cols in [60, 20] {
+            let items = items_for(&lines, prefs(ToolDisplayMode::Calls, false, true), cols);
+            let row = items
+                .iter()
+                .find(|i| i.kind == ItemKind::CallLine)
+                .expect("a call row");
+            let text = items::item_text(row);
+            assert!(text.starts_with("Bash"), "{text}");
+            assert!(text.ends_with("… (2 more lines)"), "{text}");
+            assert!(unicode_width::UnicodeWidthStr::width(text.as_str()) <= cols);
+        }
+    }
+
     /// Calls mode: a mixed text + tools message lists its calls as rows that
     /// do not toggle anything.
     #[test]
