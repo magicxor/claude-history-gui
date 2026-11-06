@@ -928,6 +928,11 @@ impl ViewSearchQuery {
         self.0.covers_all_terms(matched)
     }
 
+    /// Whether `text` holds every word and literal of the query.
+    pub fn has_full_match(&self, text: &str) -> bool {
+        self.has_match(text) && self.covers_all_terms(text)
+    }
+
     /// Merged byte ranges of the matches in `text`, per line (see the type).
     pub fn match_ranges(&self, text: &str) -> Vec<(usize, usize)> {
         self.match_ranges_in(text, &NormalizedForm::new(text))
