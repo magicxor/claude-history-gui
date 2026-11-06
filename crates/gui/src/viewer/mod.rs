@@ -108,7 +108,7 @@ use self::items::{BuildInfo, ItemId, ViewerItem};
 use self::lru::{HandleCache, TokenCache};
 use self::search::{MatchesByItem, SearchIndex, SegMatch};
 use self::seltext::LinkHandler;
-use self::worker::{BuildJob, BuildResult, ViewerWorker};
+use self::worker::{BuildJob, BuildResult, ParseCount, Recounter, ViewerWorker};
 use gpui_kit::AnyWindowHandle;
 
 /// Uniform item height hint (rem) for unmeasured rows (scrollbar size).
@@ -381,26 +381,20 @@ pub struct ViewerPane {
     window: AnyWindowHandle,
     /// The latest build request (dropping it cancels an unstarted build).
     _build_task: Task<()>,
-    /// Counts the open file's malformed lines when the header does not know
-    /// them (a card's header).
-    _parse_count_task: Task<()>,
-    /// The last count of a file's malformed lines, kept for the headers
-    /// that replace a card's header (each corpus change) until the file
-    /// changes (V-008).
+    /// The malformed lines of the last file opened (counted by its open
+    /// build) or counted again after it changed: the badge of a header that
+    /// does not know them (a card's, V-008), kept through the headers of
+    /// later corpus changes.
     parse_count: Option<ParseCount>,
-    /// Tests: the files counted so far.
-    #[cfg(test)]
-    parse_counts: usize,
+    /// Counts them again when a card's header arrives after the file changed.
+    recounter: Recounter,
+    /// The latest recount (dropping it cancels an unstarted one).
+    _parse_count_task: Task<()>,
+    /// A recount is running.
+    recounting: bool,
+    /// A header arrived while a recount ran: stat the file again after it.
+    recount_again: bool,
     _subscriptions: Vec<Subscription>,
-}
-
-/// Malformed lines counted in a file for a card's header (V-008).
-#[derive(Clone, Debug)]
-struct ParseCount {
-    path: std::path::PathBuf,
-    /// The file's modification time when it was counted.
-    modified: Option<std::time::SystemTime>,
-    errors: usize,
 }
 
 impl EventEmitter<ViewerPaneEvent> for ViewerPane {}
@@ -486,10 +480,11 @@ impl ViewerPane {
             action_log: Vec::new(),
             window: window.window_handle(),
             _build_task: Task::ready(()),
-            _parse_count_task: Task::ready(()),
             parse_count: None,
-            #[cfg(test)]
-            parse_counts: 0,
+            recounter: Recounter::new(),
+            _parse_count_task: Task::ready(()),
+            recounting: false,
+            recount_again: false,
             _subscriptions: subscriptions,
         }
     }
@@ -543,6 +538,7 @@ impl ViewerPane {
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.worker.invalidate();
         self._build_task = Task::ready(());
+        self.cancel_recount();
         self.pending = None;
         self.reset_view_state();
         self.loaded = None;
@@ -675,80 +671,95 @@ impl ViewerPane {
 
     /// The header from the live corpus (`None`: the file stem only, V-006).
     /// A header that does not know its parse errors (a card in store mode)
-    /// gets them counted from the file in the background (V-008): once per
-    /// file and modification time, so the headers of later corpus changes
-    /// (a generation swapped in every few seconds while the store is
-    /// indexed) keep the last count instead of dropping the badge and
-    /// parsing the file again.
+    /// shows the count the open build took from the transcript it decoded
+    /// (V-008), so the headers of later corpus changes (a generation swapped
+    /// in every few seconds while the store is indexed) keep it without
+    /// reading the file. Only when the file changed since it was counted is
+    /// it counted again, in the background and cancellably (V-101).
     pub fn set_header(&mut self, info: Option<HeaderInfo>, cx: &mut Context<Self>) {
-        let mut info = info;
-        let mut count = None;
-        if let (Some(header), Some(target)) = (info.as_mut(), self.target.as_ref())
-            && !header.parse_errors_known
-        {
-            let known = self
-                .parse_count
-                .clone()
-                .filter(|known| same_path(&known.path, &target.path));
-            if let Some(known) = &known {
-                header.parse_error_count = known.errors;
-                header.parse_errors_known = true;
-            }
-            count = Some((target.path.clone(), known));
-        }
+        let unknown = info
+            .as_ref()
+            .is_some_and(|header| !header.parse_errors_known);
         self.header = info;
-        if let Some((path, known)) = count {
-            let counted = path.clone();
-            let history = crate::globals::env_history(cx);
-            let task = cx.background_executor().spawn(async move {
-                let modified = std::fs::metadata(&counted)
-                    .and_then(|meta| meta.modified())
-                    .ok();
-                if known.is_some_and(|known| modified.is_some() && known.modified == modified) {
-                    return None;
-                }
-                let errors =
-                    claude_history_core::view::open_conversation(history.service(), &counted)
-                        .map(|transcript| {
-                            claude_history_core::export::display_parse_errors(&transcript).len()
-                        })
-                        .unwrap_or(0);
-                Some((modified, errors))
-            });
-            self._parse_count_task = cx.spawn(async move |this, cx| {
-                let Some((modified, errors)) = task.await else {
-                    return;
-                };
-                this.update(cx, |this, cx| {
-                    #[cfg(test)]
-                    {
-                        this.parse_counts += 1;
-                    }
-                    this.parse_count = Some(ParseCount {
-                        path: path.clone(),
-                        modified,
-                        errors,
-                    });
-                    let same = this
-                        .target
-                        .as_ref()
-                        .is_some_and(|target| same_path(&target.path, &path));
-                    if let Some(header) = this.header.as_mut().filter(|_| same) {
-                        header.parse_error_count = errors;
-                        header.parse_errors_known = true;
-                        cx.notify();
-                    }
-                })
-                .ok();
-            });
+        // A pending open brings its own count.
+        let opening = matches!(
+            self.pending,
+            Some(PendingBuild {
+                kind: PendingKind::Open { .. },
+                ..
+            })
+        );
+        if unknown && !opening {
+            self.recount_if_changed(cx);
         }
         cx.notify();
     }
 
-    /// Tests: how many times a card's file was counted for its header.
-    #[cfg(test)]
-    pub fn parse_counts(&self) -> usize {
-        self.parse_counts
+    /// The open file's malformed lines for a header that does not know them
+    /// (a card's; V-008): the count of the file shown, once there is one.
+    fn counted_parse_errors(&self) -> Option<usize> {
+        let target = self.target.as_ref()?;
+        if self.header.as_ref()?.parse_errors_known {
+            return None;
+        }
+        self.parse_count
+            .as_ref()
+            .filter(|count| same_path(&count.path, &target.path))
+            .map(|count| count.errors)
+    }
+
+    /// Count the open file's malformed lines again if it changed since its
+    /// count (no build re-reads it, V-082); a stat only when it did not.
+    /// While a recount runs, later headers wait for its count rather than
+    /// start the decode over (a live file changes at every corpus change);
+    /// the count belongs to the version read before its decode, so the
+    /// file is checked once more afterwards.
+    fn recount_if_changed(&mut self, cx: &mut Context<Self>) {
+        if self.recounting {
+            self.recount_again = true;
+            return;
+        }
+        let Some(target) = self.target.as_ref() else {
+            return;
+        };
+        // Without a count (a failed open) there is nothing to recount.
+        let Some(known) = self
+            .parse_count
+            .clone()
+            .filter(|count| same_path(&count.path, &target.path))
+        else {
+            return;
+        };
+        let work = self.recounter.job(known, crate::globals::env_history(cx));
+        self.recounting = true;
+        self._parse_count_task = cx.spawn(async move |this, cx| {
+            let count = cx.background_spawn(async move { work() }).await;
+            this.update(cx, |this, cx| {
+                this.recounting = false;
+                if let Some(count) = count {
+                    let shown = this
+                        .target
+                        .as_ref()
+                        .is_some_and(|target| same_path(&target.path, &count.path));
+                    if shown {
+                        this.parse_count = Some(count);
+                        cx.notify();
+                    }
+                }
+                if std::mem::take(&mut this.recount_again) {
+                    this.recount_if_changed(cx);
+                }
+            })
+            .ok();
+        });
+    }
+
+    /// Cancel a running recount (another open counts the file itself).
+    fn cancel_recount(&mut self) {
+        self.recounter.cancel();
+        self._parse_count_task = Task::ready(());
+        self.recounting = false;
+        self.recount_again = false;
     }
 
     /// Export options of the open conversation's current view.
@@ -1062,11 +1073,15 @@ impl ViewerPane {
     /// The header laid out for the current width (V-004, V-006).
     pub fn header_layout(&self) -> Option<header::HeaderLayout> {
         let target = self.target.as_ref()?;
-        Some(header::layout(
+        let mut layout = header::layout(
             self.header.as_ref(),
             &target.file_stem,
             self.pane_cells.max(60),
-        ))
+        );
+        if let Some(errors) = self.counted_parse_errors() {
+            layout.parse_errors = errors;
+        }
+        Some(layout)
     }
 
     /// The status hints shown with focus in the transcript (V-011).
@@ -1230,6 +1245,8 @@ impl ViewerPane {
         let Some(target) = self.target.clone() else {
             return;
         };
+        // The open counts the file's malformed lines itself.
+        self.cancel_recount();
         self.reset_view_state();
         self.status = LoadStatus::Loading;
         let generation = self.submit(
@@ -1274,6 +1291,11 @@ impl ViewerPane {
                 }
             }
             Ok(mut built) => {
+                // An open's count of the file's malformed lines (V-008),
+                // shown with the header even while a width rebuild follows.
+                if let Some(count) = built.parse_count.take() {
+                    self.parse_count = Some(count);
+                }
                 // Built at a stale width (the pane was measured while it was
                 // building): rebuild at the measured one before showing it.
                 if matches!(pending.kind, PendingKind::Open { .. })

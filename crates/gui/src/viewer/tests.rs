@@ -2025,27 +2025,63 @@ mod gui {
         }
     }
 
-    /// V-008 in store mode (review fix): a card's header does not know its
-    /// malformed lines, so the viewer counts them from the file once; the
-    /// headers that replace it at each corpus change keep that count at
-    /// once (no badge flicker) and do not parse the unchanged file again; a
-    /// changed file is counted again.
-    #[gpui_kit::test]
-    fn v008_a_cards_parse_errors_are_counted_once_per_file_version(cx: &mut TestAppContext) {
-        let world = TestWorld::new();
-        let paths = world.standard_corpus();
-        let broken = paths
+    /// Decodes run by the app's `HistoryService` (the viewer's builds and
+    /// recounts read files through it).
+    fn decodes(cx: &mut TestAppContext) -> usize {
+        cx.read(|cx| crate::globals::env_history(cx).service().decodes())
+    }
+
+    /// Let background work and corpus changes run for a while.
+    fn run_a_while(cx: &mut TestAppContext) {
+        for _ in 0..20 {
+            cx.executor().allow_parking();
+            std::thread::sleep(Duration::from_millis(5));
+            cx.run_until_parked();
+        }
+    }
+
+    /// Stamp `path` in the future like a file being written: the
+    /// `HistoryService` never reuses a transcript of it, so every read of
+    /// it is a decode.
+    fn stamp_unsettled(path: &std::path::Path) {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(3600))
+            .unwrap();
+    }
+
+    /// The standard corpus's transcript with a malformed line.
+    fn malformed_session(paths: &[std::path::PathBuf]) -> std::path::PathBuf {
+        paths
             .iter()
             .find(|p| {
                 p.to_string_lossy()
                     .contains(&crate::test_support::synth::uuid(91))
             })
             .unwrap()
-            .clone();
+            .clone()
+    }
+
+    /// V-008 in store mode (review fixes): a card's header does not know
+    /// its malformed lines, so the badge shows the count the open build took
+    /// from the transcript it decoded: one open decodes the file once (no
+    /// second decode beside the build); the headers that replace it at each
+    /// corpus change keep that count at once (no badge flicker) and read
+    /// nothing; a changed file is counted again.
+    #[gpui_kit::test]
+    fn v008_a_cards_parse_errors_are_counted_once_per_file_version(cx: &mut TestAppContext) {
+        let world = TestWorld::new();
+        let broken = malformed_session(&world.standard_corpus());
+        stamp_unsettled(&broken);
         let (main, ws) = crate::test_support::open_main(cx, &world, &[]);
+        crate::test_support::wait_loaded(cx, &ws);
+        let before = decodes(cx);
         let viewer = open_in_main(cx, main, &ws, &broken, true);
         wait_parse_errors(cx, &viewer, 1);
-        assert_eq!(read(cx, &viewer, |v| v.parse_counts()), 1);
+        run_a_while(cx);
+        assert_eq!(decodes(cx) - before, 1, "one open, one decode");
 
         let list = cx.read(|cx| ws.read(cx).list().clone());
         let header = cx
@@ -2058,15 +2094,11 @@ mod gui {
             1,
             "the count is kept at once"
         );
-        for _ in 0..20 {
-            cx.executor().allow_parking();
-            std::thread::sleep(Duration::from_millis(5));
-            cx.run_until_parked();
-        }
+        run_a_while(cx);
         assert_eq!(
-            read(cx, &viewer, |v| v.parse_counts()),
+            decodes(cx) - before,
             1,
-            "the unchanged file is not parsed again"
+            "the unchanged file is not read again"
         );
 
         // A second malformed line (a later modification time, whatever the
@@ -2082,7 +2114,57 @@ mod gui {
         drop(file);
         viewer.update(cx, |v, cx| v.set_header(Some(header), cx));
         wait_parse_errors(cx, &viewer, 2);
-        assert_eq!(read(cx, &viewer, |v| v.parse_counts()), 2);
+        assert_eq!(decodes(cx) - before, 2, "the recount's decode");
+    }
+
+    /// V-101 with V-008 (review fix): of two card conversations opened in a
+    /// row, only the second is decoded (the first's open never reads the
+    /// file, and no count of it runs beside the builds); its header shows
+    /// its own count, not the first one's; each later open decodes once.
+    #[gpui_kit::test]
+    fn v101_a_superseded_card_open_decodes_nothing(cx: &mut TestAppContext) {
+        let world = TestWorld::new();
+        let paths = world.standard_corpus();
+        let broken = malformed_session(&paths);
+        let clean = paths[0].clone();
+        stamp_unsettled(&broken);
+        stamp_unsettled(&clean);
+        let (main, ws) = crate::test_support::open_main(cx, &world, &[]);
+        crate::test_support::wait_loaded(cx, &ws);
+        let viewer = cx.read(|cx| ws.read(cx).viewer().clone());
+        let (before, builds) = (decodes(cx), read(cx, &viewer, |v| v.completed_builds()));
+        cx.update_window(main, |_, window, cx| {
+            ws.update(cx, |ws, cx| {
+                for path in [&broken, &clean] {
+                    let target = ConversationTarget::from_parsed_file(path, None);
+                    ws.open_request(OpenRequest::new(target, false), false, window, cx);
+                }
+            })
+        })
+        .unwrap();
+        wait_viewer_ready(cx, main, &viewer);
+        run_a_while(cx);
+        assert_eq!(
+            read(cx, &viewer, |v| v.target().unwrap().path.clone()),
+            clean
+        );
+        let header = cx.read(|cx| ws.read(cx).list().read(cx).header_info(&clean));
+        assert!(
+            header.is_some_and(|header| !header.parse_errors_known),
+            "a card's header"
+        );
+        assert_eq!(
+            read(cx, &viewer, |v| v.header_layout().unwrap().parse_errors),
+            0,
+            "the second conversation's own count"
+        );
+        assert_eq!(decodes(cx) - before, 1, "only the second open decoded");
+        assert_eq!(read(cx, &viewer, |v| v.completed_builds()) - builds, 1);
+
+        open_in_main(cx, main, &ws, &broken, false);
+        wait_parse_errors(cx, &viewer, 1);
+        run_a_while(cx);
+        assert_eq!(decodes(cx) - before, 2, "one decode per open");
     }
 
     // ----- status, toggles ---------------------------------------------------------

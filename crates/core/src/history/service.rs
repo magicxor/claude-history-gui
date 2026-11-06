@@ -14,6 +14,9 @@
 //!   [`HistoryService::open_path_cancellable`] give a decode up once a flag
 //!   is set (the GUI viewer abandons an open the user moved past, V-101),
 //!   with the error [`super::adapter::is_cancelled`] recognizes.
+//! * **Decode count.** [`HistoryService::decodes`] counts the decodes the
+//!   service ran, so the GUI's tests can check that opening a conversation
+//!   decodes it once (V-008, V-101).
 
 use super::adapter::{Located, Stamp};
 use super::model::{ConversationKey, Revision, Transcript};
@@ -22,6 +25,7 @@ use crate::error::{AppError, Result};
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -33,6 +37,8 @@ type Opened = HashMap<ConversationKey, (u64, Stamp, Arc<Transcript>)>;
 pub struct HistoryService {
     registry: Registry,
     opened: Mutex<(u64, Opened)>,
+    /// Decodes started (fork, see the module docs).
+    decodes: AtomicUsize,
 }
 
 /// Fork: no instances (the registry is built from a `HistoryEnv`, never the
@@ -48,7 +54,15 @@ impl HistoryService {
         Self {
             registry,
             opened: Mutex::default(),
+            decodes: AtomicUsize::new(0),
         }
+    }
+
+    /// How many histories this service has decoded: the opens its kept
+    /// transcripts did not answer, given-up and failed ones included (fork,
+    /// see the module docs).
+    pub fn decodes(&self) -> usize {
+        self.decodes.load(Ordering::Relaxed)
     }
 
     /// The service over the instances `env` configures (fork: upstream's
@@ -80,6 +94,7 @@ impl HistoryService {
         if let Some(transcript) = self.reusable(key, &located) {
             return Ok((transcript.revision, transcript));
         }
+        self.decodes.fetch_add(1, Ordering::Relaxed);
         let Some(transcript) = adapter.decode_cancellable(&located, cancelled)? else {
             return Err(not_found(&format!(
                 "{} holds no conversation",
@@ -121,6 +136,7 @@ impl HistoryService {
         match self.registry.key_of(path) {
             Some(key) => self.open_cancellable(&key, cancelled),
             None => {
+                self.decodes.fetch_add(1, Ordering::Relaxed);
                 let transcript = Arc::new(super::sources::decode_path_cancellable(
                     path, None, false, cancelled,
                 )?);
@@ -198,6 +214,7 @@ mod tests {
         assert_eq!(revision, again);
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(first.events.len(), 1);
+        assert_eq!(service.decodes(), 1, "fork: decoded once");
     }
 
     #[test]
@@ -210,6 +227,26 @@ mod tests {
         let (changed, transcript) = service.open(&key).unwrap();
         assert_ne!(revision, changed);
         assert_eq!(transcript.events.len(), 2);
+        assert_eq!(service.decodes(), 2);
+    }
+
+    /// Fork: a history whose modification time is not known to be settled
+    /// (a live session, here one stamped in the future) is decoded at every
+    /// open.
+    #[test]
+    fn unsettled_histories_are_decoded_at_every_open() {
+        let (_dir, service, key) = fixture();
+        let path = key.instance.root.join(&key.native_id);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(3600))
+            .unwrap();
+        let (_, first) = service.open(&key).unwrap();
+        let (_, second) = service.open(&key).unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(service.decodes(), 2);
     }
 
     #[test]
@@ -223,6 +260,7 @@ mod tests {
         fs::write(&loose, format!("{USER}\n")).unwrap();
         let (_, transcript) = service.open_path(&loose).unwrap();
         assert_eq!(transcript.path(), loose);
+        assert_eq!(service.decodes(), 2, "fork: loose files count too");
     }
 
     /// Fork: upstream has no test of the LRU of [`KEPT`] transcripts.
