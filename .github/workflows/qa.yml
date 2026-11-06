@@ -28,7 +28,7 @@ jobs:
         with:
           key: qa
       - name: Cache the ONNX Runtime download
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/AppData/Local/ort.pyke.io
           key: ort-Windows-${{ hashFiles('Cargo.lock') }}

@@ -51,7 +51,7 @@ jobs:
       # ort-sys downloads the static ONNX Runtime on first use (the default
       # build links the downloaded static library on every OS): keep it between runs.
       - name: Cache the ONNX Runtime download
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cache/ort.pyke.io
