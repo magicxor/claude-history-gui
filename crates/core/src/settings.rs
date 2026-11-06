@@ -98,7 +98,7 @@ pub struct EffectiveSettings {
     /// `[tui].exclude_projects`: display names hidden from the list.
     pub exclude_projects: Vec<String>,
     /// `[tui].exclude_paths` (upstream 982aea9): working-directory prefixes
-    /// hidden from the list (literal, case-sensitive).
+    /// hidden from the list (literal; case-sensitive except on Windows).
     pub exclude_paths: Vec<String>,
     /// `[keys]` with defaults.
     pub keys: KeyBindings,

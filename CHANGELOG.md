@@ -4,189 +4,102 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 ## Unreleased
 
-- The conversation list shows how many prompts you typed, such as `12 prompts`, instead of a message count that
-  included every tool call and tool result; the viewer header shows prompts and tool calls, such as
-  `113 prompts · 948 tool calls`. The list's index is rebuilt once after the update.
-- A shared `config.toml` written for the CLI with `[semantic] daemon = true` (or `pause_on_battery`) loads again
-  instead of being rejected. The GUI has no background daemon and ignores these keys.
-- Loading and refreshing the history spends less CPU checking session files: project folders are no longer looked up
-  one by one, and the check runs on at most four threads at a lower priority.
-- While you search, the viewer shows the selected result at the match instead of at its start: scrolled to the
-  first line that matches the query, preferring lines that hold every query word (for a semantic result, the matching passage closest to the one its row shows), with that message marked
-  and the query's matches highlighted. Typing more moves it to the new match; clearing the query or a search with
-  `/` in the viewer removes the highlights.
-- In that preview only the match the result was found by stands out: matches of the whole query in that message get
-  the highlight fill, other matches get a soft wash. Highlights cover whole words, so a search for `test`
-  marks all of `tests`.
-- Tool results show screenshots and documents as `[image: image/png]` or `[document: application/pdf]` instead of
-  pages of base64 data, also next to text (where the image used to be dropped), tool errors as `Error: ...` and
-  one-line JSON results pretty-printed. Subagent results show their text instead of a quoted JSON string. Exports
-  and copied conversations format results the same way.
-- The viewer has a new **Calls** tool display between Summary and Truncated (toolbar, View > Tool display, and the
-  `t` cycle: Off, Summary, Calls, Truncated, Full). It lists every tool call of a run on its own line, such as
-  `Bash: cargo test`, without the results; a click on one of these lines expands just that call and its result,
-  and the other calls of the run stay on one line. The mode is remembered like the others.
-- Expanding or collapsing a Summary row (or the first line of a run in Calls mode) keeps it in place instead of
-  scrolling its message to the top of the viewer.
-- Expanding a row in Calls mode no longer inserts a blank line above it, so the clicked line stays under the cursor;
-  the blank line now only follows an expanded call.
-- Summary mode keeps a run of tool calls in one row even when records that show nothing (bookkeeping entries,
-  thinking-only messages while thinking is hidden) sit between the calls, instead of one "Ran 1 shell command" row per call.
-- Tool calls without a dedicated format (MCP tools and the like) now show as one line of JSON, for example
-  `clock__sleep: { "duration_ms": 20000 }`, instead of a bare name with a pretty-printed body. In Summary mode a group
-  of exactly one such call shows that line instead of "Called 1 tool".
-- Pi and OMP tool calls (`bash`, `read`, `edit`, `write`, `grep`, `find`) now read like Claude Code ones: `Bash: ls`, `Read: a.rs:5-15`, edit diffs, and "Ran 2 shell commands" in summary rows.
-- Summary rows now name tools without their own wording (`Read 1 file, called mcp__docs__search, clock__sleep ×2`)
-  instead of counting them as "Called N tools".
-- Skill tool calls show as the slash command they stand for, `Skill: /phased-implement add dark mode` or `Skill: /commit`,
-  instead of one line of JSON.
-- Semantic search uses the snowflake-arctic-embed-xs model (about 90 MB), which ranks as well or better than the
-  previous one at half the indexing cost. After the update the history is re-embedded in the background, ranking
-  what is indexed so far meanwhile, and the old model download is removed once the new one loads.
-- Semantic indexing is several times faster: the embedding model now runs on half of the processor cores instead of
-  one, and embeds passages of similar length together. The embedding threads and the background pass that updates
-  the list index run at a lower priority, also on Windows, and the embedding threads sleep while there is nothing to
-  embed, so the app and other programs stay responsive meanwhile.
-- Semantic search answers right away from the conversations it has already embedded, and embeds new ones in the
-  background ("sem indexing 40%  1200/3000 chunks" with a progress bar in the list footer) instead of making every
-  search wait until all of them are embedded. When indexing finishes, the results are refreshed, keeping the row you
-  selected; a search that nothing embedded so far matches shows the keyword matches until something indexed matches,
-  which is after the first slice, about two seconds in. Tools > Generate semantic cache and Clear semantic cache
-  pause the background indexing without freezing the window while it finishes the batch it is embedding; they
-  start once it has stopped.
-- Claude Code `/btw` side questions are listed and searched as conversations of their own, tagged `fork`, and the
-  question is also searchable in the session it was asked in.
-- Claude Code subagent transcripts are indexed with their session and can be read in full. The viewer header of a
-  session names its subagents and forks: press `s` (or click the count) to open one; the header of a subagent or
-  fork names its session: press Shift+P (or click it) to open that. Esc and `q` go back through the conversations
-  opened this way before returning to the list. Subagents stay hidden from the list unless Ctrl+G or `--all-kinds`
-  is on. Resuming a subagent or fork resumes its session; deleting one removes only its own files; deleting a
-  session keeps its `/btw` forks. The list index is rebuilt once after the update.
-- The Workspace scope also lists conversations that worked in the workspace or a folder below it, not only those
-  started there: a session started in `~/code` that moved into `~/code/repo` shows up in `~/code/repo`'s scope.
-  Pi, OMP and Codex sessions now also count from a parent folder, so a workspace at `~/code` includes the sessions
-  of every repo below it. The same rule applies to Deep search's Workspace scope, Debug search and the semantic
-  tools. While the scope is on, the search prompt shows the workspace folder (`~/code/repo ❯`) instead of
-  `Project`. The list index is rebuilt once after the update.
-- Resume, Fork and the Codex delete can start an agent through your own command or wrapper (a mise or nix shim, a
-  script that sets environment variables first, a differently named binary): set it in Settings > Resume (one word
-  per line) or as `command` under `[resume]` (Claude Code), `[resume.pi]`, `[resume.omp]` or `[resume.codex]`, for
-  example `command = ["mise", "exec", "--", "claude"]`. A command in gui.toml wins over the program path on the
-  General page, which wins over a command in config.toml. When the program cannot be found, the error names it and
-  where it is set, before anything is copied or started.
-- The viewer has a new **Off** tool display (toolbar, View > Tool display, and first in the `t` cycle: Off, Summary,
-  Truncated, Full) that shows only the conversation text: tool calls, results and summaries are hidden, messages
-  that hold only tools disappear, and message navigation skips them. `--no-tools` and `no_tools = true` now start
-  the viewer with tools off (they used to start in Summary); Settings > Display > Default tool display offers Off,
-  Summary and Full. If you chose Summary in Settings with an earlier version, it was saved as `no_tools = true` and
-  now starts in Off; choose Summary again to remove the key (the remembered mode or config.toml then applies).
-- On Windows the Workspace scope, Deep search local scope and `exclude_paths` ignore letter case in project paths, so
-  `C:\Users\Foo\myproject` finds sessions recorded under `MyProject`.
-- Deep search lists conversations in the same order as the list search and no longer drops conversations that match
-  only through their title, summary or project, or whose words are spread over several messages; such a
-  conversation shows one hit at its first message. Queries with Chinese characters (also kanji) match anywhere in a message,
-  and projects in Excluded projects stay out of Deep search.
-- Find in conversation (`/`) matches words the way the list search does: `istanbul` finds `İstanbul`, `strasse`
-  finds `Straße`, `needle token` finds `needle_token` (highlighted as one match), any word of the query can match,
-  quoted text matches exactly, and a word no longer matches inside a longer one (`ired` does not find `fired`).
-  Pressing Enter on a search with no matches says so.
-- Search ignores how letters are encoded and folds case fully: a decomposed `é` finds a composed one, `strasse`
-  finds `straße`, `istanbul` finds `İstanbul` and `λογος` finds `ΛΟΓΟΣ`. Accents still count: `cafe` does not
-  find `café`. The conversation index is rebuilt once.
-- List highlights and match snippets follow the search rules: `İstanbul`, `Straße` and CJK words inside a longer run
-  are highlighted and shown, and `.net` is no longer highlighted inside `asp.net`.
-- Search finds a word that starts inside a longer match: `1.1` now matches `v1.1.1`.
-- A switch between a letter and a digit starts a word: `1.2.3` finds `v1.2.3`, `264` finds `h264` and `8` finds `utf8`.
-  `AppConfig` is still not split (`onfig` does not find it). The conversation index is rebuilt once.
-- Searching only your own messages, and list previews, keep text after an unclosed tag or an `[Image...` lookalike:
-  `[Image upload fails` and a typed `<system-reminder>` stay as typed text (only `[Image]`, `[Image #N]` and
-  `[Image: description]` are placeholders), and previews drop a tag only when its opening and closing tag both
-  occur, so `a < b` and `Vec<T>` stay. The conversation index is rebuilt once.
-- Search only your own messages: the list's new **You only** toggle (Alt+U, View > Search only your own messages,
-  rebindable as `[keys] user_only`) makes lexical search match only what you typed, leaving out assistant replies,
-  tool output, injected context, subagent prompts and titles; snippets come from your messages too. The query and
-  the selection stay when you switch, and the footer shows `you only` while it is on. Semantic search ignores it.
-  The conversation index is rebuilt once to include what you typed.
-- New setting `[tui] exclude_paths` (Settings → Search → Excluded working directories): conversations whose recorded
-  working directory starts with a listed prefix, such as throwaway runs under `/tmp/` or your Temp folder, are hidden
-  from the list, its searches and Deep Search, for Claude, Pi, OMP and Codex alike. Prefixes match literally and
-  case-sensitively. Hidden conversations stay on disk and still open by session ID, file path or agent ref.
-- Conversations are dated by their last message, not the file's modified time: a session that Claude touched on
-  reopening, or whose Codex rollout got a settings record, no longer jumps to the top of the list as just used. This
-  also moves the time column, the time filter and the viewer's date; sessions last used long ago can leave a recent
-  time range. The index is rebuilt once.
-- While the conversation index is being built (the first start, or after an update changed its format), the list
-  footer shows its progress ("Indexing conversations… 2,345 / 7,185") and says that search results may be
-  incomplete while you type; a message says when it is done. A failed index update is reported ("Indexing
-  failed: …", with the debug log one click away) instead of only in the debug log, and when nothing could be
-  listed at all the list shows the error with Retry.
-- Codex exec runs and subagent threads can be listed on request: Ctrl+G (View > Show automated and subagent
-  conversations, rebindable as `[keys] all_kinds`) or `--all-kinds` brings them into the list and its keyword search,
-  tagged `auto` or `sub`, keeping the query and the selection. Deep Search's "Include exec and subagent runs" (`agent
-  search --all-kinds`) searches them too, and their refs open in the agent panel either way. Semantic search never
-  finds them.
-- Deep Search has an "Only my messages" option (`agent search --user-only`): hits come only from what you typed, not
-  from replies or tool output. Semantic and hybrid modes search by keywords instead and show a warning.
-- Conversation refs and message anchors in Deep Search and the agent panel change once: a Codex thread keeps its ref
-  across reverts and archiving, and a Pi or OMP ref no longer depends on its working directory still existing. Old
-  refs and anchors still resolve; an anchor whose message was edited or dropped is reported as `stale-anchor`.
-- Pi and OMP messages in Deep Search and the agent panel are numbered by their line in the session file. Reopening
-  a conversation viewed recently no longer reads its file again while it is unchanged, and Codex threads open in the
-  viewer, exports and single-file windows with the state database `CODEX_SQLITE_HOME` names. Print with `--debug`
-  reports only the records of a Pi or OMP session that could not be read.
-- Deep Search and the agent panel find, read and outline Codex threads; Codex exec runs and subagent threads stay out
-  of agent search, for every source.
-- First rows appear sooner with large Pi or OMP histories: Claude, Pi and OMP conversations load at the same time
-  and stream into the list in small batches, and the list keeps drawing while they arrive.
-- Lower memory use: conversation text is shared instead of copied, and search no longer keeps a second copy of it.
-- The list shows the newest conversations right away at startup, taken from a snapshot of the previous complete
-  load, and they can be opened, resumed and forked at once; rename and delete become available when loading
-  finishes, which swaps in the loaded list without moving the selection. The snapshot is kept per workspace and
-  Pi/OMP session folder, so a different one never shows another's conversations at startup.
-- Quoted and identifier literals match only at word starts (after a non-alphanumeric character or at a switch
-  between a letter and a digit): "Config" no longer matches inside AppConfig.
-- Searching works right after startup: while the history is still loading, a keyword query answers from the search
-  index saved with the startup snapshot, showing the first page of results before the rest. The snapshot now also
-  stores the conversation text and that index (rebuilt in the background after a load that changed anything; quitting
-  does not wait for the rebuild, which then runs again at the next start).
-- Updating the startup snapshot after a load is much cheaper: only conversation files that are new or changed since
-  the last update are read again and added to it, and nothing is written when no file changed. An update cut short by
-  quitting keeps what it saved and continues at the next start.
-- The list no longer loads the whole history at startup: it shows and searches the conversations straight from that
-  index, which is brought up to date in the background at start, on refresh and after a rename or delete, and newer
-  results replace the list without moving the selection or clearing a search. Startup is faster and uses far less
-  memory with a large history. Rename and delete become available moments after the first rows appear; a deleted
-  conversation disappears at once. Changing the time filter no longer reads the history again. Semantic search reads
-  only what it needs from that index the first time it is used ("sem loading conversations") instead of every
-  conversation, and keeps answering while it reads a newer one.
-- Semantic search and Deep search use less memory and start faster: the embedding cache is now a memory-mapped file
-  that is read in place instead of being loaded into memory by each search. The existing cache is converted once
-  on the first semantic search after the update. The list, Deep search and another running instance of the
-  app no longer overwrite each other's newly computed embeddings when they save the cache.
-- Debug search, the semantic search report and debug dump, Generate semantic cache and Deep search read the
-  conversations from the history index (after bringing it up to date, waiting while the list is still indexing)
-  instead of parsing every session file again. Deep search still warns about malformed transcripts: the index now
-  keeps their parse errors, so it is rebuilt once on the first start after the update. When the Pi and OMP session
-  folders are the same folder, its OMP conversations are no longer left out of the list.
-- The per-project and Pi/OMP conversation caches of earlier versions are no longer used: the first index update of
-  this version removes them from `~/.cache/claude-history-gui` (only files the app wrote there, never the
-  claude-history CLI's cache), freeing their disk space.
-- Parse errors that follow a skipped user message (a Warmup message, the records `/clear` leaves behind) show their
-  own line number and surrounding lines in Tools > Debug log > Parse errors and in debug.log; they were reported one
-  line early, with the wrong context. Claude conversation files are also recognized and read with less work.
+Update notes: the history store is rebuilt once on the first start (the list footer shows its progress), and the
+semantic search model changed, so the history is re-embedded in the background after the update. The caches of
+earlier versions in `~/.cache/claude-history-gui` are removed by the first update (only files the app wrote there).
+
+### New
+
 - Codex threads are listed and searchable next to Claude Code, Pi and OMP conversations (marked `CX`), read from
-  `~/.codex` or `CODEX_HOME`, including archived and compressed sessions, with the titles Codex keeps in its state
-  database (only ever read).
-- Automated runs (such as `codex exec`) and subagent threads no longer appear in the list, list search or semantic
-  search (Deep search still finds them); Codex subagent threads whose task came from their parent are no longer
-  skipped as empty.
-- Codex threads open in the viewer, in single-file windows and in every export and copy format; a forked thread
-  shows the history it continues from, then a "Fork" marker where its own messages begin. Resume and Fork run
-  `codex resume` / `codex fork` with the thread's id in a new terminal, with `CODEX_HOME` set to the thread's home
-  and the arguments of the new `[resume.codex] default_args`; Delete runs `codex delete --force` after the usual
-  confirmation. Renaming a Codex thread is refused with a message, and a thread whose current history Codex no
-  longer has allows no action. Settings has fields for the codex program and the Codex default arguments.
-- Pi tools `codemode`, `ls`, `web_search`, `fetch_content`, `process` and the `suba` family now get readable headers (`Codemode: <first script line>`, `List: src`, `Search: "a", "b"`, `Fetch: <url>`, `Process start: <name>`, `Suba: <name>`) instead of one line of JSON, and Summary rows count `web_search` and `fetch_content` as searches and fetched URLs. In Calls mode a row whose call has more to show, such as a multi-line command, ends with `(N more lines)`. Claude Code's `<persisted-output>` results drop their wrapper tags.
+  `~/.codex` or `CODEX_HOME`, including archived and compressed sessions. They open in the viewer, single-file
+  windows, exports and copies (a forked thread shows the history it continues from, then a "Fork" marker). Resume
+  and Fork run `codex resume` / `codex fork` in a new terminal, Delete runs `codex delete --force` after the usual
+  confirmation; renaming a Codex thread is refused. Deep Search and the agent panel find, read and outline them.
+- Claude Code subagent transcripts and `/btw` side questions are indexed. Subagents are opened from their session's
+  viewer header (`s`, or click the count) and Shift+P in a subagent or fork opens its session; `/btw` forks are listed and searched as
+  conversations of their own, tagged `fork`. Resuming a subagent or fork resumes its session, deleting one removes
+  only its own files, and deleting a session keeps its forks.
+- Automated Codex runs and subagent threads are hidden by default. Ctrl+G (View > Show automated and subagent
+  conversations, `[keys] all_kinds`) or `--all-kinds` shows them in the list, tagged `auto` or `sub`; Deep Search's
+  "Include exec and subagent runs" (`agent search --all-kinds`) searches them. Semantic search never finds them.
+- **You only** toggle (Alt+U, View > Search only your own messages, `[keys] user_only`): lexical search matches only
+  what you typed, and snippets come from your messages. Deep Search has the same as "Only my messages"
+  (`agent search --user-only`); semantic and hybrid modes fall back to keywords with a warning.
+- Viewer tool display **Calls**, between Summary and Truncated (`t` cycle: Off, Summary, Calls, Truncated, Full):
+  one line per tool call, such as `Bash: cargo test`; a click expands just that call and its result.
+- Viewer tool display **Off** shows only the conversation text; messages that hold only tools disappear and
+  navigation skips them. `--no-tools` and `no_tools = true` start in Off, and Settings > Display > Default tool
+  display offers Off, Summary and Full. A Summary chosen in Settings with an earlier version was saved as
+  `no_tools = true` and now starts in Off; choose Summary again to fix it.
+- Settings > Search > Excluded working directories (`[tui] exclude_paths`): conversations whose working directory
+  starts with a listed prefix are hidden from the list, its searches and Deep Search. Prefixes match literally,
+  case-sensitively except on Windows. Hidden conversations still open by session ID, file path or agent ref.
+- Resume, Fork and the Codex delete can run through your own command or wrapper (a mise or nix shim, a script
+  that sets variables first): Settings > Resume or `command` under `[resume]`, `[resume.pi]`, `[resume.omp]` or
+  `[resume.codex]`, for example `command = ["mise", "exec", "--", "claude"]`. gui.toml wins over the program path
+  on the General page, which wins over config.toml. A missing program is reported, naming where it is set, before
+  anything starts.
+- The conversation list shows your prompt count (`12 prompts`) rather than counting tool calls and results; the
+  viewer header shows both, such as `113 prompts · 948 tool calls`.
+- A shared `config.toml` with `[semantic] daemon` or `pause_on_battery` is accepted; the GUI ignores those keys.
+
+### Changed
+
+- Startup is faster and uses much less memory: the list and searches read from the history index, which is brought
+  up to date in the background (at start, on refresh, after rename or delete) and replaces the list without
+  moving the selection or clearing a search. Rename and delete become available moments after the first rows
+  appear. Changing the time filter does not reload the history. Updates read only new or changed files.
+- Semantic search uses the snowflake-arctic-embed-xs model (about 90 MB), which ranks as well or better at half the
+  indexing cost; the old model download is removed once the new one loads. Indexing is several times faster and
+  runs at a lower priority so the app stays responsive.
+- Semantic search answers at once from what is embedded and embeds the rest in the background (progress in the list
+  footer), refreshing the results when done. Generate and Clear semantic cache pause the background indexing
+  first. The embedding cache is a memory-mapped file, converted once on first use.
+- Debug search, the semantic report and dump, Generate semantic cache and Deep search read from the history index,
+  which keeps parse errors so Deep search still warns about malformed transcripts.
+- Conversations are dated by their last message, not the file's modified time, so a session that was merely
+  touched no longer jumps to the top; this also affects the time column, time filter and viewer date.
+- The Workspace scope (and Deep search's, Debug search and the semantic tools) also lists conversations that
+  worked in the workspace or a folder below it, including Pi, OMP and Codex sessions; the search prompt shows the
+  workspace folder instead of `Project`. On Windows these scopes and `exclude_paths` ignore letter case.
+- Search folds case and Unicode encoding fully (`strasse` finds `straße`, `istanbul` finds `İstanbul`, a decomposed
+  `é` finds a composed one; accents still count). A letter-digit switch starts a word (`264` finds `h264`), `1.1`
+  finds `v1.1.1`, and quoted or identifier literals match only at word starts, so "Config" misses `AppConfig`.
+  Chinese queries match anywhere in a message.
+- Find in conversation (`/`) follows the same word rules (`needle token` finds `needle_token`, `ired` no longer
+  finds `fired`), any query word can match, and Enter on no matches says so. List highlights and snippets agree
+  with the search, so `.net` is no longer highlighted inside `asp.net`.
+- Deep search orders conversations like the list search, keeps conversations that match only by title, summary,
+  project or words spread over several messages (one hit at the first message), and leaves out Excluded projects.
+  It also leaves out automated and subagent runs unless "Include exec and subagent runs" is on.
+- Searching only your own messages and list previews keep text after an unclosed tag or `[Image...` lookalike;
+  only `[Image]`, `[Image #N]` and `[Image: description]` are placeholders.
+- While you search, the viewer opens the selected result at its match (for a semantic result, the passage closest
+  to the row's), marks that message and highlights the query; the match found stands out and others get a soft
+  wash. Clearing the query or searching with `/` removes the highlights.
+- Tool display: results show images and documents as `[image: image/png]` instead of base64, tool errors as
+  `Error: ...`, and one-line JSON pretty-printed; subagent results show their text. Exports and copies match.
+  Calls without their own format show one line of JSON (`clock__sleep: { "duration_ms": 20000 }`), Pi and OMP
+  tools (`bash`, `read`, `edit`, `write`, `grep`, `find`, `codemode`, `ls`, `web_search`, `fetch_content`,
+  `process`, `suba`) read like Claude Code ones, and `Skill` calls show as `Skill: /commit`. Summary rows name
+  tools without their own wording instead of "Called N tools", and keep one run together across records that show
+  nothing. In Calls mode a call with more to show ends with `(N more lines)`; `<persisted-output>` loses its tags.
+- Expanding or collapsing a Summary row keeps it in place instead of scrolling its message to the top.
+- Conversation refs and message anchors in Deep Search and the agent panel change once (a Codex ref survives
+  reverts and archiving; a Pi or OMP ref no longer depends on its working directory). Old ones still resolve; an
+  edited or dropped message is reported as `stale-anchor`. Pi and OMP messages are numbered by file line.
+
+### Fixed
+
+- The list footer reports index progress ("Indexing conversations… 2,345 / 7,185"), says results may be incomplete
+  meanwhile, and shows failures ("Indexing failed: …") instead of only logging them; if nothing can be listed, the
+  list shows the error with Retry.
+- Parse errors after a skipped user message (a Warmup message, `/clear` leftovers) show the right line number and
+  context in Tools > Debug log > Parse errors.
+- When the Pi and OMP session folders are the same folder, its OMP conversations are no longer left out.
+- Less CPU spent checking session files, and the embedding cache is no longer overwritten by another running
+  instance when it saves. Reopening a recently viewed conversation does not reread an unchanged file, and Codex
+  threads honor `CODEX_SQLITE_HOME`.
 
 ## v0.1.1
 
