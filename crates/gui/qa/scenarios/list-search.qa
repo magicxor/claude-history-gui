@@ -1,7 +1,7 @@
 # WP1 list-search: typing filters on a worker thread, highlights and the
 # literal context line appear, Esc clears, the scope toggles, the row menu is
 # built (clicks and the row menu are covered by the G tests; FEATURES L-012, L-024, L-027, L-028, L-031,
-# L-052, L-053, L-054, L-056, L-078, S-004, S-005, S-009).
+# L-052, L-053, L-054, L-056, L-078, L-109, S-004, S-005, S-009).
 wait-loaded 30s
 # The shots are named for the light theme (the system theme otherwise; integrator, Phase C).
 set-theme light
@@ -9,6 +9,11 @@ type "token"
 wait 50ms
 wait-for list.searching == false 5s
 expect list.query == "token"
+# The selected result previews in the viewer at its hit (L-109, upstream 411e227): a line matching
+# the query; the list keeps the focus.
+wait-for viewer.hit == "token" 5s
+wait-for viewer.hit_line contains "oken" 5s
+expect focus == list
 shot list-search-light
 key escape
 expect list.query == ""

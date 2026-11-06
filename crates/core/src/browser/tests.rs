@@ -1436,6 +1436,70 @@ fn semantic_response_applies_ranked_indices_and_metadata() {
     );
 }
 
+/// Upstream 411e227 `list_preview_needs_a_query`: the selected result is
+/// previewed at its hit only while the query is not blank.
+#[test]
+fn list_hit_needs_a_query_and_a_selection() {
+    let sandbox = Sandbox::new();
+    let mut app = app(&sandbox, vec![visible()], vec![]);
+    assert_eq!(app.selected(), Some(0));
+    assert!(!app.list_preview_wanted());
+    assert_eq!(app.list_hit(), None);
+
+    app.query = " ".to_string();
+    assert_eq!(app.list_hit(), None, "a blank query has no hit");
+
+    app.query = "needle".to_string();
+    assert!(app.list_preview_wanted());
+    assert_eq!(
+        app.list_hit(),
+        Some(ListHit {
+            query: "needle".to_string(),
+            evidence: None,
+        }),
+        "a lexical result has no evidence"
+    );
+
+    app.selected = None;
+    assert_eq!(app.list_hit(), None, "nothing selected");
+}
+
+/// A semantic result is found by the evidence its row shows (upstream
+/// 411e227 `fill_list_preview`).
+#[test]
+fn list_hit_of_a_semantic_result_carries_its_evidence() {
+    let sandbox = Sandbox::new();
+    let mut app = app_with_semantic_mode(&sandbox, vec![visible()]);
+    let (_request_tx, request_rx) = mpsc::channel();
+    let (response_tx, response_rx) = mpsc::channel();
+    app.semantic_search.worker_tx = Some(_request_tx);
+    app.semantic_search.worker_rx = Some(response_rx);
+    app.list_search_mode = ListSearchMode::Semantic;
+    app.query = "keeps embeddings warm".to_string();
+    app.search_generation = 3;
+    app.search_in_flight = true;
+    app.semantic_search.pending_generation = Some(3);
+    drop(request_rx);
+    let metadata = HashMap::from([(0, test_semantic_metadata(0, "daemon keeps embeddings"))]);
+    send_semantic_complete_response(
+        &response_tx,
+        3,
+        vec![0],
+        metadata,
+        SemanticProgress::Complete,
+    );
+
+    assert!(app.poll());
+
+    assert_eq!(
+        app.list_hit(),
+        Some(ListHit {
+            query: "keeps embeddings warm".to_string(),
+            evidence: Some("daemon keeps embeddings".to_string()),
+        })
+    );
+}
+
 #[test]
 fn semantic_empty_query_clears_error() {
     let sandbox = Sandbox::new();

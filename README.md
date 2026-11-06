@@ -51,6 +51,9 @@ All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-h
   **semantic** search (local embedding model, snowflake-arctic-embed-xs, about 90 MB, downloaded on first use; it answers from the conversations embedded
   so far while it embeds new ones in the background, and falls back to lexical while nothing embedded matches).
   Ctrl+T toggles the mode.
+* While you search, the selected result opens in the viewer at the match: scrolled to a line that matches the query
+  (for a semantic result, the passage its row shows), with that message marked and the query's matches
+  highlighted. Typing more moves it to the new match.
 * **You only** (Alt+U, View > Search only your own messages, `[keys] user_only`): lexical search matches only what
   you typed. A conversation is found only when every word and quoted phrase of the query occurs in your own
   messages; assistant replies, tool calls and output, injected context such as system reminders and hook output,

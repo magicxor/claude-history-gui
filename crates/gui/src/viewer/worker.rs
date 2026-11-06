@@ -21,12 +21,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
+use claude_history_core::browser::ListHit;
 use claude_history_core::view::{ConversationDocument, ViewPrefs, ViewerModel};
 
+use super::hit::{self, HitFound};
 use super::items::{self, BuildInfo, ViewerItem};
 use crate::globals::EnvHistory;
 
-/// What to build.
+/// What to build. With a `hit`, the build also finds the list's search hit
+/// in its items (L-109), so they are installed together.
 pub enum BuildJob {
     /// Decode `path` through `history` (`ViewerModel::open`) with `prefs`,
     /// then build.
@@ -34,10 +37,14 @@ pub enum BuildJob {
         path: PathBuf,
         prefs: ViewPrefs,
         history: EnvHistory,
+        hit: Option<ListHit>,
     },
     /// Rebuild from the decoded transcript of `model` (toggles, expansion,
     /// width): the file is never re-read (V-002).
-    Rebuild { model: ViewerModel },
+    Rebuild {
+        model: ViewerModel,
+        hit: Option<ListHit>,
+    },
 }
 
 /// A finished build.
@@ -47,6 +54,8 @@ pub struct Built {
     pub items: Arc<Vec<ViewerItem>>,
     pub info: Arc<BuildInfo>,
     pub cols: usize,
+    /// The job's search hit and what was found for it in `items`.
+    pub hit: Option<(ListHit, HitFound)>,
     /// Wall time of the build (background thread).
     pub build_ms: f64,
 }
@@ -136,16 +145,17 @@ fn run(
     stale: &dyn Fn() -> bool,
 ) -> Option<BuildResult> {
     let started = Instant::now();
-    let (opened, path, model) = match job {
+    let (opened, path, model, hit) = match job {
         BuildJob::Open {
             path,
             prefs,
             history,
+            hit,
         } => {
             match ViewerModel::open_cancellable(history.service(), &path, prefs, stale) {
                 // Superseded mid-parse (V-101): abandon at once.
                 Ok(None) => return None,
-                Ok(Some(model)) => (true, path, model),
+                Ok(Some(model)) => (true, path, model, hit),
                 Err(error) => {
                     return Some(BuildResult {
                         generation,
@@ -156,7 +166,7 @@ fn run(
                 }
             }
         }
-        BuildJob::Rebuild { model } => (false, model.path.clone(), model),
+        BuildJob::Rebuild { model, hit } => (false, model.path.clone(), model, hit),
     };
     if stale() {
         return None;
@@ -166,6 +176,13 @@ fn run(
         return None;
     }
     let (items, info) = items::build_with_info(&doc, &model, cols, stale)?;
+    if stale() {
+        return None;
+    }
+    let hit = hit.map(|hit| {
+        let found = hit::find(&items, &info, &hit);
+        (hit, found)
+    });
     if stale() {
         return None;
     }
@@ -179,6 +196,7 @@ fn run(
             items: Arc::new(items),
             info: Arc::new(info),
             cols,
+            hit,
             build_ms: started.elapsed().as_secs_f64() * 1000.0,
         }),
     })
@@ -200,6 +218,7 @@ mod tests {
                 path: PathBuf::from("does-not-exist.jsonl"),
                 prefs: ViewPrefs::default(),
                 history: EnvHistory::default(),
+                hit: None,
             },
             80,
         );
@@ -241,6 +260,7 @@ mod tests {
                 path,
                 prefs: ViewPrefs::default(),
                 history: EnvHistory::default(),
+                hit: None,
             },
             80,
             &stale,

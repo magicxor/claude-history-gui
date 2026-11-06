@@ -12,11 +12,13 @@
 //! * `windows` — main-window close and Show conversations (C-065), multiple
 //!   windows (X-033);
 //! * `measure` — the UI-thread spans of X-038, the frame counter of X-007,
-//!   the live text view of the Debug log.
+//!   the live text view of the Debug log;
+//! * `list_hit` — the previewed search result at its hit (L-109).
 
 mod corpus;
 mod dispatch;
 mod focus;
+mod list_hit;
 mod measure;
 mod windows;
 

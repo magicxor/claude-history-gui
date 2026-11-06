@@ -52,8 +52,8 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
 use claude_history_core::browser::{
-    Browser, BrowserOptions, HistoryLoader, ListSearchMode, LoaderOptions, PreparedSession,
-    RenameError,
+    Browser, BrowserOptions, HistoryLoader, ListHit, ListSearchMode, LoaderOptions,
+    PreparedSession, RenameError,
 };
 #[cfg(test)]
 use claude_history_core::browser::{LoadEvent, UuidLookup};
@@ -86,13 +86,22 @@ use crate::workspace::routing::{self, SessionRoute};
 use load::{ReloadState, ViewState};
 use rows::{RowContext, RowStyle};
 
-/// Events of the conversation list (§7.2).
+/// Events of the conversation list (§7.2). The search hit of the selected
+/// row ([`ListPane::list_hit_for`]) goes with `SelectionChanged` and
+/// `OpenRequested`: the workspace reads it when it handles them.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ListPaneEvent {
     /// Selection changed (any cause). `user` = keyboard/mouse navigation by the user.
     SelectionChanged {
         target: Option<ConversationTarget>,
         user: bool,
+    },
+    /// The selected row stayed, but its search hit changed: the query was
+    /// edited or cleared, or semantic results brought other evidence
+    /// (upstream 411e227 list preview; `None`: the query is blank).
+    HitChanged {
+        target: ConversationTarget,
+        hit: Option<ListHit>,
     },
     /// Enter / double-click / row-menu Open; with `agent_tab` also the agent
     /// panel on that tab (row menu Search within conversation… / Outline,
@@ -215,6 +224,9 @@ pub struct ListPane {
     /// The selected row index when `emitted_selection` was last checked: a kept
     /// path that moved (refreshed results) is scrolled back into view.
     emitted_position: Option<usize>,
+    /// The search hit of the selected row when the last `SelectionChanged`
+    /// or `HitChanged` was emitted.
+    emitted_hit: Option<ListHit>,
     /// `[tui] exclude_projects` (for the empty-scope state, L-079).
     exclude_projects: Vec<String>,
     time_filter: TimeFilter,
@@ -491,6 +503,7 @@ impl ListPane {
             now,
             emitted_selection: None,
             emitted_position: None,
+            emitted_hit: None,
             exclude_projects: excluded,
             time_filter: launch_filter,
             time_label: crate::widgets::time_range::launch_filter_label(&launch_filter, now),
@@ -571,6 +584,17 @@ impl ListPane {
         self.browser
             .selected_conversation()
             .map(ConversationTarget::from_conversation)
+    }
+
+    /// The search hit the viewer shows `path` at, when `path` is the
+    /// selected row and the query is not blank (core `Browser::list_hit`,
+    /// upstream 411e227 list preview; L-109).
+    pub fn list_hit_for(&self, path: &Path) -> Option<ListHit> {
+        let selected = self.browser.selected_conversation()?;
+        if !path_matches(&selected.path, path) {
+            return None;
+        }
+        self.browser.list_hit()
     }
 
     /// The loaded conversation at `path` (live `project_path`).
@@ -1061,6 +1085,9 @@ impl ListPane {
         self.highlight = HighlightQuery::parse(&query);
         self.literal = rows::literal_mode_of(&self.highlight, &query);
         self.browser.set_query(query);
+        // The selected row's hit follows the query at once (the rows follow
+        // when the search answers).
+        self.emit_hit(cx);
         self.check_uuid_lookup(window, cx);
         cx.notify();
     }
@@ -1120,7 +1147,7 @@ impl ListPane {
     }
 
     /// Emit `SelectionChanged` when the selected path differs from the last
-    /// one emitted.
+    /// one emitted, else `HitChanged` when only its search hit did.
     fn emit_selection(&mut self, user: bool, cx: &mut Context<Self>) {
         let path = self.browser.selected_path();
         let position = self.browser.selected();
@@ -1130,15 +1157,31 @@ impl ListPane {
                 self.emitted_position = position;
                 self.scroll_to_selection();
             }
+            self.emit_hit(cx);
             return;
         }
         self.emitted_position = position;
         self.emitted_selection = path;
+        self.emitted_hit = self.browser.list_hit();
         // Every selection change keeps the row visible (§10.5): a new result
         // set resets the selection to row 0 without going through navigate().
         self.scroll_to_selection();
         let target = self.selected_target();
         cx.emit(ListPaneEvent::SelectionChanged { target, user });
+    }
+
+    /// Emit `HitChanged` when the selected row's search hit differs from
+    /// the last one emitted (the query changed, or semantic results brought
+    /// other evidence; upstream 411e227 re-finds the hit every frame).
+    fn emit_hit(&mut self, cx: &mut Context<Self>) {
+        let hit = self.browser.list_hit();
+        if hit == self.emitted_hit {
+            return;
+        }
+        self.emitted_hit = hit.clone();
+        if let Some(target) = self.selected_target() {
+            cx.emit(ListPaneEvent::HitChanged { target, hit });
+        }
     }
 
     /// Keyboard navigation: apply, keep the selection visible, notify.

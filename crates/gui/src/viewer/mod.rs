@@ -24,6 +24,13 @@
 //! `view::ViewSearch<SegMatch>` (find bar, n/N), `view::escape` (Esc order),
 //! `capture_anchor_entry` / `find_entry_or_prev` (anchored rebuilds).
 //!
+//! The list's search hit (upstream 411e227 list preview, [`hit`], §9.8a): a
+//! conversation opened from the list while it has a query is shown at the
+//! hit (its message focused, the query's matches highlighted); a new hit
+//! for the conversation shown re-anchors it without a rebuild. The hit's
+//! overlay and the `/` search's are never drawn together: the newer one
+//! replaces the other.
+//!
 //! Related conversations (upstream 3c2ffeb, [`family`]): the header's family
 //! line names the conversation's parent and counts its subagents and forks;
 //! `P` (`OpenParentConversation`) opens the parent, `s`
@@ -36,6 +43,7 @@
 pub mod code;
 pub mod family;
 pub mod header;
+pub mod hit;
 pub mod items;
 pub mod lru;
 pub mod nav;
@@ -56,6 +64,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use claude_history_core::browser::ListHit;
 use claude_history_core::export::ExportOptions;
 use claude_history_core::theme::ThemeKind;
 use claude_history_core::view::{
@@ -94,6 +103,7 @@ use crate::services::services;
 use crate::theme_tokens;
 use crate::workspace::routing;
 
+use self::hit::{HitAnchor, HitFound};
 use self::items::{BuildInfo, ItemId, ViewerItem};
 use self::lru::{HandleCache, TokenCache};
 use self::search::{MatchesByItem, SearchIndex, SegMatch};
@@ -197,6 +207,32 @@ struct RevealTarget {
     item: usize,
     segment: usize,
     byte: usize,
+}
+
+/// What was found for the list's search hit in the installed items.
+struct HitView {
+    anchor: Option<HitAnchor>,
+    matches: Rc<MatchesByItem>,
+}
+
+/// The list hit's placement in progress (upstream `ListPreview::
+/// scroll_offset` in pixels): the hit's message starts at the top while the
+/// hit stays in the upper two thirds of the viewport, else the hit sits a
+/// third of the way down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HitScroll {
+    phase: HitPhase,
+    /// A frame was drawn in this phase (its paint reports the hit's y).
+    shown: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HitPhase {
+    /// The message's first item is at the viewport top.
+    MessageTop,
+    /// The hit's item is at the viewport top (the hit lies too far into
+    /// its message, or in no navigable message).
+    Third,
 }
 
 /// Performance probes (§15.8).
@@ -310,6 +346,16 @@ pub struct ViewerPane {
     hovered_link: Option<SharedString>,
     reveal: Option<RevealTarget>,
     reveal_y: Rc<Cell<Option<Point<Pixels>>>>,
+    /// The list's search hit the conversation is shown at (upstream 411e227
+    /// list preview, L-109): kept until another conversation opens without
+    /// one, the list's query is cleared or a `/` search starts.
+    list_hit: Option<ListHit>,
+    /// What was found for `list_hit` in the installed items.
+    hit_view: Option<HitView>,
+    /// The hit's placement in progress (drives `reveal`).
+    hit_scroll: Option<HitScroll>,
+    /// Finds a new `list_hit` in the installed items.
+    _hit_task: Task<()>,
     probe: Option<RevealTarget>,
     probe_point: Rc<Cell<Option<Point<Pixels>>>>,
     painted: Rc<RefCell<Vec<usize>>>,
@@ -423,6 +469,10 @@ impl ViewerPane {
             hovered_link: None,
             reveal: None,
             reveal_y: Rc::new(Cell::new(None)),
+            list_hit: None,
+            hit_view: None,
+            hit_scroll: None,
+            _hit_task: Task::ready(()),
             probe: None,
             probe_point: Rc::new(Cell::new(None)),
             painted: Rc::new(RefCell::new(Vec::new())),
@@ -451,8 +501,9 @@ impl ViewerPane {
     // ----- public API (§17.4) ----------------------------------------------------
 
     /// Show `req.target` (keeps the previous content until the new one is
-    /// installed); a request for the shown path only focuses/reveals. With
-    /// `req.agent_tab` the agent panel opens on that tab and takes the focus.
+    /// installed); a request for the shown path only focuses/reveals, and
+    /// with a list hit shows that hit. With `req.agent_tab` the agent panel
+    /// opens on that tab and takes the focus.
     pub fn open(&mut self, req: OpenRequest, window: &mut Window, cx: &mut Context<Self>) {
         let same = self
             .target
@@ -466,13 +517,19 @@ impl ViewerPane {
             self.header = None;
             self.file_error = None;
             self.prefs = app_state(cx).view_defaults;
+            self.list_hit = req.list_hit.clone();
             self.start_open(req.reveal.clone(), cx);
             self.agent_panel.update(cx, |panel, cx| {
                 panel.set_viewer_target(Some(req.target.clone()), cx)
             });
             cx.emit(ViewerPaneEvent::TargetChanged(Some(req.target)));
-        } else if let Some(reveal) = req.reveal {
-            self.reveal(reveal, window, cx);
+        } else {
+            if req.list_hit.is_some() {
+                self.set_list_hit(req.list_hit, cx);
+            }
+            if let Some(reveal) = req.reveal {
+                self.reveal(reveal, window, cx);
+            }
         }
         match req.agent_tab {
             Some(tab) => self.open_agent_panel(tab, window, cx),
@@ -493,6 +550,8 @@ impl ViewerPane {
         self.status = LoadStatus::Empty;
         self.file_error = None;
         self.back_stack.clear();
+        self.list_hit = None;
+        self._hit_task = Task::ready(());
         if self.target.take().is_some() {
             self.header = None;
             self.agent_panel
@@ -889,6 +948,15 @@ impl ViewerPane {
                 .to_string(),
             "viewer.nav_active" => self.nav.is_active().to_string(),
             "viewer.search.mode" => format!("{:?}", self.search.mode()).to_lowercase(),
+            // The list's search hit (L-109): its query, and the line it is
+            // at (empty when there is none or it was not found).
+            "viewer.hit" => self
+                .hit_view
+                .as_ref()
+                .and(self.list_hit.as_ref())
+                .map(|hit| hit.query.clone())
+                .unwrap_or_default(),
+            "viewer.hit_line" => self.hit_line_text().unwrap_or_default(),
             "viewer.agent_panel" => self.agent_panel.read(cx).is_visible().to_string(),
             "viewer.find" => self.find_bar_text(),
             "viewer.status" => match &self.status {
@@ -1130,6 +1198,8 @@ impl ViewerPane {
         self.hovered_link = None;
         self.reveal = None;
         self.reveal_y.set(None);
+        self.hit_view = None;
+        self.hit_scroll = None;
         self.last_selection = None;
         self.last_selected_text = None;
         self.select_all = false;
@@ -1167,6 +1237,7 @@ impl ViewerPane {
                 path: target.path.clone(),
                 prefs: self.prefs,
                 history: crate::globals::env_history(cx),
+                hit: self.list_hit.clone(),
             },
             cx,
         );
@@ -1202,7 +1273,7 @@ impl ViewerPane {
                         .show(window, cx);
                 }
             }
-            Ok(built) => {
+            Ok(mut built) => {
                 // Built at a stale width (the pane was measured while it was
                 // building): rebuild at the measured one before showing it.
                 if matches!(pending.kind, PendingKind::Open { .. })
@@ -1211,7 +1282,11 @@ impl ViewerPane {
                     && built.cols != self.measured_cols
                 {
                     self.cols = self.measured_cols;
-                    let generation = self.submit(BuildJob::Rebuild { model: built.model }, cx);
+                    let job = BuildJob::Rebuild {
+                        model: built.model,
+                        hit: self.list_hit.clone(),
+                    };
+                    let generation = self.submit(job, cx);
                     self.pending = Some(PendingBuild {
                         generation,
                         kind: pending.kind,
@@ -1221,6 +1296,7 @@ impl ViewerPane {
                 }
                 self.perf.build_ms = built.build_ms;
                 let rem = window.rem_size();
+                let found = built.hit.take();
                 match pending.kind {
                     PendingKind::Open { reveal } => {
                         self.reset_view_state();
@@ -1240,12 +1316,17 @@ impl ViewerPane {
                         self.status = LoadStatus::Ready;
                         self.perf.open_to_content_ms =
                             pending.submitted.elapsed().as_secs_f64() * 1000.0;
+                        // Shown at the list's hit (L-109); a reveal wins.
+                        self.apply_found(found, reveal.is_none(), cx);
                         if let Some(reveal) = reveal {
                             self.apply_reveal(reveal, window, cx);
                         }
                     }
                     PendingKind::Rebuild { anchor, then } => {
                         self.install_rebuild(built, anchor, rem, cx);
+                        // The anchored rebuild keeps the viewport: only the
+                        // hit's highlights follow the new items.
+                        self.apply_found(found, false, cx);
                         self.after_rebuild(then, window, cx);
                     }
                 }
@@ -1357,6 +1438,7 @@ impl ViewerPane {
         self.search_index = None;
         self.hovered = None;
         self.reveal = None;
+        self.hit_scroll = None;
         self.status = LoadStatus::Ready;
     }
 
@@ -1426,7 +1508,8 @@ impl ViewerPane {
         };
         loaded.model.prefs = prefs;
         let model = loaded.model.clone();
-        let generation = self.submit(BuildJob::Rebuild { model }, cx);
+        let hit = self.list_hit.clone();
+        let generation = self.submit(BuildJob::Rebuild { model, hit }, cx);
         self.pending = Some(PendingBuild {
             generation,
             kind: PendingKind::Rebuild { anchor, then },
@@ -1633,6 +1716,199 @@ impl ViewerPane {
         cx.notify();
     }
 
+    // ----- list hit (§9.8a) ----------------------------------------------------------
+
+    /// The list's search hit the conversation is shown at (L-109).
+    pub fn list_hit(&self) -> Option<&ListHit> {
+        self.list_hit.as_ref()
+    }
+
+    /// Show the open conversation at `hit`, the list's new search hit in it
+    /// (its query changed while the list kept the row selected), or drop
+    /// the hit's highlights (`None`: the query was cleared). A new hit
+    /// replaces a `/` search; the viewport moves only when the hit's line
+    /// does.
+    pub fn set_list_hit(&mut self, hit: Option<ListHit>, cx: &mut Context<Self>) {
+        if hit == self.list_hit {
+            return;
+        }
+        if hit.is_none() {
+            self.forget_list_hit();
+            cx.notify();
+            return;
+        }
+        self.list_hit = hit;
+        if self.search.mode() != ViewSearchMode::Off {
+            self.search = ViewSearch::new();
+            self.find_open = false;
+            self.update_match_map();
+        }
+        // A build in flight carries the old hit; its install finds this one.
+        if self.pending.is_none() {
+            self.refind_hit(cx);
+        }
+        cx.notify();
+    }
+
+    /// Drop the list hit and its highlights (the viewport stays).
+    fn forget_list_hit(&mut self) {
+        self.list_hit = None;
+        self.hit_view = None;
+        self._hit_task = Task::ready(());
+        if self.hit_scroll.take().is_some() {
+            self.reveal = None;
+        }
+    }
+
+    /// The matches drawn: the `/` search's while it runs, else the list
+    /// hit's (never both, §9.8a).
+    fn shown_matches(&self) -> Rc<MatchesByItem> {
+        match &self.hit_view {
+            Some(view) if self.search.mode() == ViewSearchMode::Off => view.matches.clone(),
+            _ => self.matches_by_item.clone(),
+        }
+    }
+
+    /// Install what a build found for its hit; `place` shows it (an open).
+    /// A hit that changed while the build ran is found again.
+    fn apply_found(
+        &mut self,
+        found: Option<(ListHit, HitFound)>,
+        place: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.hit_view = None;
+        let Some(current) = self.list_hit.clone() else {
+            return;
+        };
+        match found {
+            Some((hit, found)) if hit == current => {
+                self.hit_view = Some(HitView {
+                    anchor: found.anchor,
+                    matches: Rc::new(found.matches),
+                });
+                if place {
+                    self.place_hit(cx);
+                }
+            }
+            _ => self.refind_hit(cx),
+        }
+    }
+
+    /// Find `list_hit` in the installed items in the background; the
+    /// highlights of the previous hit stay until it is found, and the hit is
+    /// shown when its line moved.
+    fn refind_hit(&mut self, cx: &mut Context<Self>) {
+        let (Some(loaded), Some(hit)) = (self.loaded.as_ref(), self.list_hit.clone()) else {
+            self._hit_task = Task::ready(());
+            return;
+        };
+        let previous = self.hit_view.as_ref().and_then(|view| view.anchor.clone());
+        let items = loaded.items.clone();
+        let info = loaded.info.clone();
+        self._hit_task = cx.spawn(async move |this, cx| {
+            let (items, hit, found) = cx
+                .background_spawn(async move {
+                    let found = hit::find(&items, &info, &hit);
+                    (items, hit, found)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                let current = this
+                    .loaded
+                    .as_ref()
+                    .is_some_and(|loaded| Arc::ptr_eq(&loaded.items, &items))
+                    && this.list_hit.as_ref() == Some(&hit);
+                if !current {
+                    return;
+                }
+                let moved = found.anchor.as_ref().map(|a| (a.item, a.segment, &a.line))
+                    != previous.as_ref().map(|a| (a.item, a.segment, &a.line));
+                this.hit_view = Some(HitView {
+                    anchor: found.anchor,
+                    matches: Rc::new(found.matches),
+                });
+                if moved {
+                    this.place_hit(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+    }
+
+    /// Scroll the hit into place and focus its message (upstream's preview
+    /// marks the line in its gutter): its message's first item goes to the
+    /// top, and the next frames move the hit a third of the way down when
+    /// it lies below the upper two thirds (`render_transcript`).
+    fn place_hit(&mut self, cx: &mut Context<Self>) {
+        let (Some(loaded), Some(anchor)) = (
+            self.loaded.as_ref(),
+            self.hit_view.as_ref().and_then(|view| view.anchor.clone()),
+        ) else {
+            return;
+        };
+        if anchor.item >= loaded.items.len() {
+            return;
+        }
+        let first = anchor
+            .position
+            .and_then(|position| nav::first_item_of(&loaded.info, position));
+        let (top, phase) = match first {
+            Some(first) => (first, HitPhase::MessageTop),
+            None => (anchor.item, HitPhase::Third),
+        };
+        if let Some(position) = anchor.position {
+            self.nav.focus(position);
+        }
+        self.list.scroll_to(ListOffset {
+            item_ix: top,
+            offset_in_item: px(0.),
+        });
+        // A position reported for an earlier target must not move this one.
+        self.reveal_y.set(None);
+        self.reveal = Some(RevealTarget {
+            item: anchor.item,
+            segment: anchor.segment,
+            byte: anchor.byte,
+        });
+        self.hit_scroll = Some(HitScroll {
+            phase,
+            shown: false,
+        });
+        cx.notify();
+    }
+
+    /// Where the list hit was found (tests, QA).
+    pub fn hit_anchor(&self) -> Option<&HitAnchor> {
+        self.hit_view.as_ref().and_then(|view| view.anchor.as_ref())
+    }
+
+    /// The list hit's highlights per item: `(segment, range, is_current)`
+    /// (tests).
+    pub fn hit_matches(&self) -> Option<Rc<MatchesByItem>> {
+        self.hit_view.as_ref().map(|view| view.matches.clone())
+    }
+
+    /// Whether the list hit is still being scrolled into place (tests).
+    pub fn hit_placing(&self) -> bool {
+        self.hit_scroll.is_some()
+    }
+
+    /// The text of the line the list hit is at (QA).
+    #[cfg(any(test, feature = "qa"))]
+    fn hit_line_text(&self) -> Option<String> {
+        let anchor = self.hit_anchor()?;
+        let segment = self
+            .loaded
+            .as_ref()?
+            .items
+            .get(anchor.item)?
+            .segments
+            .get(anchor.segment)?;
+        segment.text.get(anchor.line.clone()).map(str::to_string)
+    }
+
     // ----- search ------------------------------------------------------------------
 
     fn ensure_search_index(&mut self) {
@@ -1757,6 +2033,8 @@ impl ViewerPane {
         if self.loaded.is_none() {
             return;
         }
+        // The `/` search replaces the list hit's overlay (§9.8a).
+        self.forget_list_hit();
         self.search.start();
         self.update_match_map();
         self.find_open = true;
@@ -2803,18 +3081,53 @@ impl ViewerPane {
             self.theme_kind = Some(roles.kind);
         }
         // An exact reveal reported its y last frame: put the match a few
-        // lines from the top when it is outside the viewport (§9.8).
+        // lines from the top when it is outside the viewport (§9.8), the
+        // list hit by upstream's preview rule (§9.8a).
         if self.reveal.is_none() {
             self.reveal_y.set(None);
         }
         if let Some(position) = self.reveal_y.take() {
             let y = position.y;
             let viewport = self.list.viewport_bounds();
-            let line = Self::line_height(window);
-            if y < viewport.top() || y > viewport.bottom() - line {
-                self.list.scroll_by(y - viewport.top() - line * 3.);
+            if let Some(scroll) = self.hit_scroll.take() {
+                let below_top = y - viewport.top();
+                let height = viewport.size.height;
+                let keeps_message_start = scroll.phase == HitPhase::MessageTop
+                    && below_top >= px(0.)
+                    && below_top < height * (2. / 3.);
+                if !keeps_message_start {
+                    self.list.scroll_by(below_top - height / 3.);
+                }
+            } else {
+                let line = Self::line_height(window);
+                if y < viewport.top() || y > viewport.bottom() - line {
+                    self.list.scroll_by(y - viewport.top() - line * 3.);
+                }
             }
             self.reveal = None;
+        } else if let (Some(scroll), Some(reveal)) = (self.hit_scroll, self.reveal)
+            && scroll.shown
+        {
+            // The last frame painted no position for the hit: from its
+            // message's start it lies below the viewport. Start at its item
+            // and put it a third of the way down; give up when even that
+            // paints nothing.
+            if scroll.phase == HitPhase::MessageTop {
+                self.list.scroll_to(ListOffset {
+                    item_ix: reveal.item,
+                    offset_in_item: px(0.),
+                });
+                self.hit_scroll = Some(HitScroll {
+                    phase: HitPhase::Third,
+                    shown: false,
+                });
+            } else {
+                self.reveal = None;
+                self.hit_scroll = None;
+            }
+        }
+        if let Some(scroll) = self.hit_scroll.as_mut() {
+            scroll.shown = true;
         }
         // Evict selection handles far from the viewport.
         let top = self.list.logical_scroll_top().item_ix;
@@ -2845,7 +3158,7 @@ impl ViewerPane {
             show_timing: self.prefs.show_timing,
             focused_message: self.nav.highlighted(),
             hovered: self.hovered.clone(),
-            matches: self.matches_by_item.clone(),
+            matches: self.shown_matches(),
             handles: self.handles.clone(),
             tokens: self.tokens.clone(),
             reveal: self.reveal.map(|r| (r.item, r.segment, r.byte)),

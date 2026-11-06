@@ -1137,6 +1137,81 @@ mod pure {
         assert!(found("64").is_empty());
     }
 
+    /// L-109 (upstream 411e227 `list_preview_anchors_on_the_first_match`):
+    /// the list hit is the first line matching the query, its matches are
+    /// the current ones; the semantic evidence wins over the first match.
+    #[test]
+    fn l109_list_hit_anchors_on_the_first_match_or_the_evidence() {
+        use claude_history_core::browser::ListHit;
+
+        use crate::viewer::hit;
+
+        let lines = vec![
+            user("set up the tunnel"),
+            assistant("the tunnel is up"),
+            user("now rotate the token"),
+            assistant("rotated the token and restarted"),
+        ];
+        let (_dir, model) = model_for(&lines, prefs(ToolDisplayMode::Summary, false, false));
+        let doc = model.document();
+        let (items, info) = items::build_with_info(&doc, &model, 80, &|| false).unwrap();
+        let line_of = |anchor: &hit::HitAnchor| {
+            items[anchor.item].segments[anchor.segment].text[anchor.line.clone()].to_string()
+        };
+        let hit_of = |query: &str, evidence: Option<&str>| ListHit {
+            query: query.to_string(),
+            evidence: evidence.map(str::to_string),
+        };
+
+        let found = hit::find(&items, &info, &hit_of("token", None));
+        let anchor = found.anchor.clone().expect("a line matches");
+        assert_eq!(line_of(&anchor), "now rotate the token");
+        assert_eq!(anchor.position, Some(2));
+        let segment = &items[anchor.item].segments[anchor.segment].text;
+        assert_eq!(
+            anchor.byte,
+            segment.find("token").unwrap(),
+            "revealed at the match"
+        );
+        let all: Vec<(usize, usize, String, bool)> = found
+            .matches
+            .iter()
+            .flat_map(|(item, matches)| {
+                matches.iter().map(|(segment, range, current)| {
+                    let text = items[*item].segments[*segment].text[range.clone()].to_string();
+                    (*item, *segment, text, *current)
+                })
+            })
+            .collect();
+        assert_eq!(all.len(), 2, "{all:?}");
+        assert!(all.iter().all(|(_, _, text, _)| text == "token"), "{all:?}");
+        let current: Vec<usize> = all
+            .iter()
+            .filter(|(.., current)| *current)
+            .map(|(item, ..)| *item)
+            .collect();
+        assert_eq!(
+            current,
+            [anchor.item],
+            "only the anchor line's match is current"
+        );
+
+        // The semantic evidence names the passage the row shows.
+        let found = hit::find(
+            &items,
+            &info,
+            &hit_of("token", Some("…rotated the token and restarted…")),
+        );
+        let anchor = found.anchor.expect("the evidence's message");
+        assert_eq!(line_of(&anchor), "rotated the token and restarted");
+        assert_eq!(anchor.position, Some(3));
+
+        // Nothing matches: no anchor, nothing highlighted.
+        let found = hit::find(&items, &info, &hit_of("absent", None));
+        assert!(found.anchor.is_none());
+        assert!(found.matches.is_empty());
+    }
+
     #[test]
     fn v075_overlay_gives_the_current_match_its_own_style() {
         use gpui_kit::{FontWeight, HighlightStyle, hsla};

@@ -150,6 +150,7 @@ mod cards;
 mod corpus;
 mod family;
 mod index;
+mod list_preview;
 mod list_state;
 mod loader;
 mod mutations;
@@ -161,6 +162,7 @@ pub use corpus::{CorpusSnapshot, PreparedCorpus, PreparedSession};
 pub use family::{
     NO_CHILDREN_STATUS, NO_PARENT_STATUS, PARENT_GONE_STATUS, PARENT_NOT_FOUND_STATUS, ViewFamily,
 };
+pub use list_preview::ListHit;
 pub use loader::{
     DEFAULT_DRAIN_BUDGET, HistoryLoader, LoadEvent, LoaderOptions, LoaderPoll, REFRESHING_STATUS,
     RefreshPolicy,

@@ -11,6 +11,10 @@
 //! `ShowSemanticDetails`, `RowMenu`) while the list has focus, before
 //! `ListPane` handles it — so the viewer always shows what the action targets
 //! (PD2, §7.8, L-085). The fallback path flushes too (`ActivePane` = list).
+//! A preview carries the list's search hit in the row (`ListPane::
+//! list_hit_for`, L-109); a new hit for the conversation the viewer already
+//! shows (`ListPaneEvent::HitChanged`) waits the same debounce and is
+//! flushed the same way.
 //!
 //! Phase C (WP-I): the left pane makes room for the agent panel — its width
 //! shrinks down to the tab's minimum so the viewer keeps 32rem, and when even
@@ -25,9 +29,11 @@ pub mod title_bar;
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use claude_history_core::browser::ListHit;
 use gpui_kit::component::menu::AppMenuBar;
 use gpui_kit::component::tab::TabBar;
 use gpui_kit::component::{
@@ -211,6 +217,14 @@ impl FrameStats {
     }
 }
 
+/// A debounced preview of the list's selection (PD2): the conversation and
+/// the list's search hit in it (L-109).
+#[derive(Clone, Debug)]
+struct PendingPreview {
+    target: ConversationTarget,
+    hit: Option<ListHit>,
+}
+
 /// Drag payload of the main split divider.
 #[derive(Clone, Copy, Debug)]
 struct SplitDrag;
@@ -241,7 +255,11 @@ pub struct Workspace {
     list_width_rem: f32,
     deep_width_rem: f32,
     title: String,
-    pending_preview: Option<ConversationTarget>,
+    pending_preview: Option<PendingPreview>,
+    /// A debounced new search hit for the conversation the viewer shows
+    /// (the list's query changed, its selection did not; L-109).
+    pending_hit: Option<(PathBuf, Option<ListHit>)>,
+    /// Flushes `pending_preview` and `pending_hit` after the debounce.
     _preview_task: Task<()>,
     /// PD3 rule 3 (c) ran (once, after the first completed load).
     recorded_cwd_checked: bool,
@@ -334,6 +352,7 @@ impl Workspace {
             deep_width_rem: clamp_left_width(deep_width_rem, LeftTab::DeepSearch, None),
             title,
             pending_preview: None,
+            pending_hit: None,
             _preview_task: Task::ready(()),
             recorded_cwd_checked: false,
             frame_stats: Rc::new(FrameStats::default()),
@@ -477,14 +496,64 @@ impl Workspace {
     /// hook calls it for every list-target action while the list has focus.
     pub fn flush_pending_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self._preview_task = Task::ready(());
-        if let Some(target) = self.pending_preview.take() {
-            self.open_in_viewer(OpenRequest::new(target, false), window, cx);
+        if let Some(pending) = self.pending_preview.take() {
+            let req = OpenRequest::new(pending.target, false).with_list_hit(pending.hit);
+            self.open_in_viewer(req, window, cx);
+        }
+        if let Some((path, hit)) = self.pending_hit.take()
+            && self.viewer_shows(&path, cx)
+        {
+            self.viewer
+                .update(cx, |viewer, cx| viewer.set_list_hit(hit, cx));
         }
     }
 
     /// Whether a debounced preview is waiting.
     pub fn has_pending_preview(&self) -> bool {
         self.pending_preview.is_some()
+    }
+
+    /// Whether a debounced new search hit for the viewer's conversation is
+    /// waiting (L-109).
+    pub fn has_pending_hit(&self) -> bool {
+        self.pending_hit.is_some()
+    }
+
+    /// Whether the viewer shows `path`.
+    fn viewer_shows(&self, path: &std::path::Path, cx: &App) -> bool {
+        self.viewer
+            .read(cx)
+            .target()
+            .is_some_and(|current| same_path(&current.path, path))
+    }
+
+    /// Flush the pending preview and hit after the debounce (PD2).
+    fn start_preview_debounce(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self._preview_task = cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(PREVIEW_DEBOUNCE).await;
+            this.update_in(cx, |this, window, cx| {
+                this.flush_pending_preview(window, cx)
+            })
+            .ok();
+        });
+    }
+
+    /// Show the viewer's conversation at `hit` after the debounce, unless
+    /// it already is (L-109): the list's query changed while its selection,
+    /// the conversation shown, stayed.
+    fn schedule_hit(
+        &mut self,
+        path: PathBuf,
+        hit: Option<ListHit>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.viewer.read(cx).list_hit() == hit.as_ref() {
+            self.pending_hit = None;
+            return;
+        }
+        self.pending_hit = Some((path, hit));
+        self.start_preview_debounce(window, cx);
     }
 
     fn open_in_viewer(&mut self, req: OpenRequest, window: &mut Window, cx: &mut Context<Self>) {
@@ -515,6 +584,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.pending_preview = None;
+        self.pending_hit = None;
         self._preview_task = Task::ready(());
         let shown = self
             .viewer
@@ -557,6 +627,7 @@ impl Workspace {
                 if !self.list.read(cx).contains_focus(window, cx) {
                     return;
                 }
+                let hit = self.list.read(cx).list_hit_for(&target.path);
                 let shown = self
                     .viewer
                     .read(cx)
@@ -564,24 +635,45 @@ impl Workspace {
                     .is_some_and(|current| current.path == target.path);
                 if shown {
                     self.pending_preview = None;
+                    self.schedule_hit(target.path, hit, window, cx);
                     return;
                 }
-                self.pending_preview = Some(target);
-                self._preview_task = cx.spawn_in(window, async move |this, cx| {
-                    cx.background_executor().timer(PREVIEW_DEBOUNCE).await;
-                    this.update_in(cx, |this, window, cx| {
-                        this.flush_pending_preview(window, cx)
-                    })
-                    .ok();
-                });
+                self.pending_hit = None;
+                self.pending_preview = Some(PendingPreview { target, hit });
+                self.start_preview_debounce(window, cx);
+            }
+            ListPaneEvent::HitChanged { target, hit } => {
+                // Like a selection change: only while the list has focus (PD2).
+                if !self.list.read(cx).contains_focus(window, cx) {
+                    return;
+                }
+                if let Some(pending) = self
+                    .pending_preview
+                    .as_mut()
+                    .filter(|pending| same_path(&pending.target.path, &target.path))
+                {
+                    pending.hit = hit.clone();
+                } else if self.viewer_shows(&target.path, cx) {
+                    self.schedule_hit(target.path.clone(), hit.clone(), window, cx);
+                }
             }
             ListPaneEvent::OpenRequested {
                 target,
                 focus_viewer,
                 agent_tab,
             } => {
-                let req =
-                    OpenRequest::new(target.clone(), *focus_viewer).with_agent_tab(*agent_tab);
+                let hit = self.list.read(cx).list_hit_for(&target.path);
+                // For the conversation already shown the request's hit is
+                // authoritative, `None` included: a debounced hit still
+                // waiting (a cleared query) must not leave the old one.
+                if self.viewer_shows(&target.path, cx) {
+                    let hit = hit.clone();
+                    self.viewer
+                        .update(cx, |viewer, cx| viewer.set_list_hit(hit, cx));
+                }
+                let req = OpenRequest::new(target.clone(), *focus_viewer)
+                    .with_agent_tab(*agent_tab)
+                    .with_list_hit(hit);
                 self.open_request(req, false, window, cx);
             }
             ListPaneEvent::CorpusChanged => {
@@ -705,12 +797,19 @@ impl Workspace {
         crate::globals::sub_span(cx, "list.remove_paths", |cx| {
             list.update(cx, |list, cx| list.remove_paths(paths, cx))
         });
-        if self
-            .pending_preview
-            .as_ref()
-            .is_some_and(|pending| paths.iter().any(|path| same_path(path, &pending.path)))
-        {
+        if self.pending_preview.as_ref().is_some_and(|pending| {
+            paths
+                .iter()
+                .any(|path| same_path(path, &pending.target.path))
+        }) {
             self.pending_preview = None;
+        }
+        if self
+            .pending_hit
+            .as_ref()
+            .is_some_and(|(pending, _)| paths.iter().any(|path| same_path(path, pending)))
+        {
+            self.pending_hit = None;
         }
         let viewer_shows_deleted = self
             .viewer
@@ -945,7 +1044,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.pending_preview.is_some() && self.list.read(cx).contains_focus(window, cx) {
+        if (self.pending_preview.is_some() || self.pending_hit.is_some())
+            && self.list.read(cx).contains_focus(window, cx)
+        {
             self.flush_pending_preview(window, cx);
         }
     }

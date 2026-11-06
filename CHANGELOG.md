@@ -4,6 +4,10 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 ## Unreleased
 
+- While you search, the viewer shows the selected result at the match instead of at its start: scrolled to the
+  first line that matches the query (for a semantic result, the passage its row shows), with that message marked
+  and the query's matches highlighted. Typing more moves it to the new match; clearing the query or a search with
+  `/` in the viewer removes the highlights.
 - Tool results show screenshots and documents as `[image: image/png]` or `[document: application/pdf]` instead of
   pages of base64 data, also next to text (where the image used to be dropped), tool errors as `Error: ...` and
   one-line JSON results pretty-printed. Subagent results show their text instead of a quoted JSON string. Exports

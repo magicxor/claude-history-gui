@@ -3,13 +3,14 @@
 //!
 //! Core types are used directly (`ToolDisplayMode`, `ViewPrefs`,
 //! `ExportFormat`, `ExportOptions`, `PickerAction`, `ListSearchMode`,
-//! `TerminalCommand`, `LaunchSpec`, `UpdateStatus`); this module never mirrors
-//! them.
+//! `TerminalCommand`, `LaunchSpec`, `UpdateStatus`, `ListHit`); this module
+//! never mirrors them.
 
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Local};
 use claude_history_core::agent::AgentConversationInfo;
+use claude_history_core::browser::ListHit;
 use claude_history_core::display_format::{conversation_label, sanitize_preview};
 use claude_history_core::export::ExportFormat;
 use claude_history_core::history::actions::{Capabilities, capabilities_of, refusal};
@@ -358,6 +359,11 @@ pub struct OpenRequest {
     /// 3c2ffeb): the viewer keeps the conversations it came from; any other
     /// open forgets them.
     pub related: bool,
+    /// The list's search hit in this conversation (an open from the list
+    /// while it has a query, upstream 411e227 list preview): the viewer
+    /// shows the conversation scrolled to the hit, its message focused and
+    /// the query's matches highlighted (DESIGN §9.8a, L-109).
+    pub list_hit: Option<ListHit>,
 }
 
 impl OpenRequest {
@@ -369,7 +375,15 @@ impl OpenRequest {
             reveal: None,
             agent_tab: None,
             related: false,
+            list_hit: None,
         }
+    }
+
+    /// Show the conversation at the list's search hit (see
+    /// [`OpenRequest::list_hit`]).
+    pub fn with_list_hit(mut self, hit: Option<ListHit>) -> Self {
+        self.list_hit = hit;
+        self
     }
 
     /// A related open (see [`OpenRequest::related`]).

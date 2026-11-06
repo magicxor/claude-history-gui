@@ -17,6 +17,11 @@
 //!   `tui/app/view_state.rs`: in-view search, message navigation, re-render
 //!   anchoring and the Esc order.
 //!
+//! Besides them, [`preview`] finds where a list search result is in a
+//! conversation (upstream 411e227's list preview): the anchor line and the
+//! scroll offset that shows it, over any split of the conversation into
+//! lines.
+//!
 //! ## Typical flow (document renderer)
 //!
 //! 1. [`ViewerModel::open`] once, through the environment's
@@ -50,6 +55,7 @@
 
 pub mod document;
 pub mod ledger;
+pub mod preview;
 pub mod state;
 
 use std::collections::BTreeSet;
@@ -67,6 +73,7 @@ pub use ledger::{
     format_timestamp, open_conversation, render_conversation, render_parsed_conversation,
     renderable_entries,
 };
+pub use preview::PreviewDoc;
 pub use state::{
     DocSearchIndex, MessageNav, ScrollAnchor, SearchMatch, ViewEscape, ViewSearch, ViewSearchMode,
     ViewerModel, capture_anchor, capture_anchor_entry, escape, find_entry_or_prev,
