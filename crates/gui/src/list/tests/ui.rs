@@ -2,8 +2,6 @@
 //! picker banner and the row layout in a window (L-011…L-013, L-040,
 //! L-041, L-048, L-049, L-068, L-081, L-084, L-089, L-090).
 
-use std::sync::atomic::Ordering;
-
 use chrono::{Duration, Utc};
 use claude_history_core::config::{KeyBindings, parse_key_binding};
 use claude_history_core::export::ExportFormat;
@@ -700,10 +698,10 @@ fn the_workspace_picker_uses_cached_paths(cx: &mut TestAppContext) {
     f.wait_until(cx, "the cached paths", |list, _| {
         list.project_paths().len() == 2 && !list.recent_existing.is_empty()
     });
-    let calls = IS_DIR_CALLS.load(Ordering::SeqCst);
+    let calls = IS_DIR_CALLS.with(std::cell::Cell::get);
     let model = cx.read(|cx| f.list.read(cx).workspace_picker_model(cx));
     assert_eq!(
-        IS_DIR_CALLS.load(Ordering::SeqCst),
+        IS_DIR_CALLS.with(std::cell::Cell::get),
         calls,
         "building the menu makes no file-system call"
     );

@@ -25,15 +25,18 @@ use super::ListPane;
 /// Projects listed in the dropdown (PD3).
 pub const MAX_PROJECTS: usize = 30;
 
-/// Test counter of `is_dir` calls made by this module (the menu builder must
-/// not make any).
 #[cfg(test)]
-pub static IS_DIR_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    /// Test counter of `is_dir` calls made by the current thread (the menu
+    /// builder must not make any). Per thread, so concurrent tests and
+    /// background tasks do not disturb it.
+    pub static IS_DIR_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// `path.is_dir()`; the only file-system access of the workspace picker.
 pub fn path_is_dir(path: &Path) -> bool {
     #[cfg(test)]
-    IS_DIR_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    IS_DIR_CALLS.with(|calls| calls.set(calls.get() + 1));
     path.is_dir()
 }
 
