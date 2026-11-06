@@ -2406,8 +2406,13 @@ mod tests {
         assert!(in_workspace(&pi, root.path()));
         assert!(!in_workspace(&pi, &root.path().join("sub")));
         // Upstream 82b355a: a session of a folder below the workspace
-        // belongs to it too.
-        pi.project_path = Some(root.path().join("sub"));
+        // belongs to it too. The folder must exist: a project path is
+        // compared in its canonical spelling, and a temp dir's canonical
+        // spelling differs from `root.path()` on macOS (/var ->
+        // /private/var) and on Windows runners (8.3 names such as RUNNER~1).
+        let sub = root.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        pi.project_path = Some(sub);
         assert!(in_workspace(&pi, root.path()));
     }
 
