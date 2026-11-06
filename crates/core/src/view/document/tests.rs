@@ -931,7 +931,7 @@ fn tool_summary_uses_source_agent_label() {
     assert_eq!(collapsed.messages[0].label, "Pi");
     assert_eq!(
         collapsed.messages[0].blocks[0].plain_text(),
-        r#"bash: { "command": "pwd" }"#
+        "Ran 1 shell command"
     );
 
     let expanded = build_document(
@@ -997,7 +997,7 @@ fn hidden_pi_thinking_allows_clickable_grouped_tool_summary() {
     );
     assert_eq!(
         collapsed.messages[0].blocks[0].plain_text(),
-        "Called bash ×2"
+        "Ran 2 shell commands"
     );
 
     let expanded = build_document(

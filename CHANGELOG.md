@@ -13,6 +13,7 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 - Tool calls without a dedicated format (MCP tools and the like) now show as one line of JSON, for example
   `clock__sleep: { "duration_ms": 20000 }`, instead of a bare name with a pretty-printed body. In Summary mode a group
   of exactly one such call shows that line instead of "Called 1 tool".
+- Pi and OMP tool calls (`bash`, `read`, `edit`, `write`, `grep`, `find`) now read like Claude Code ones: `Bash: ls`, `Read: a.rs:5-15`, edit diffs, and "Ran 2 shell commands" in summary rows.
 - Summary rows now name tools without their own wording (`Read 1 file, called mcp__docs__search, clock__sleep ×2`)
   instead of counting them as "Called N tools".
 - Semantic search uses the snowflake-arctic-embed-xs model (about 90 MB), which ranks as well or better than the
