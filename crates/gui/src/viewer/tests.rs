@@ -539,6 +539,33 @@ mod pure {
     }
 
     #[test]
+    fn v051_single_unknown_call_summary_is_one_clipped_row() {
+        let long = "x".repeat(200);
+        let lines = vec![
+            user("q"),
+            assistant_blocks(
+                &format!(
+                    r#"[{{"type":"tool_use","id":"a","name":"clock__sleep","input":{{"note":"{long}"}}}}]"#
+                ),
+                1,
+            ),
+        ];
+        let items = items_for(&lines, prefs(ToolDisplayMode::Summary, false, false), 60);
+        let summary = items
+            .iter()
+            .find(|i| i.kind == ItemKind::ToolSummary)
+            .expect("summary item");
+        let text = items::item_text(summary);
+        assert!(text.starts_with("clock__sleep: { \"note\": "), "{text}");
+        assert!(text.ends_with('…'), "{text}");
+        assert!(
+            unicode_width::UnicodeWidthStr::width(text.as_str()) <= 60,
+            "{text}"
+        );
+        assert!(summary.cols_dependent);
+    }
+
+    #[test]
     fn v055_edit_call_body_lines_are_diff_colored() {
         let lines = vec![
             user("q"),

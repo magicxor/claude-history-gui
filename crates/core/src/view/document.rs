@@ -57,9 +57,10 @@ use super::ViewPrefs;
 use super::ledger::{
     RenderOptions, RenderableEntry, RowTiming, TRUNCATED_BODY_LINES, TRUNCATED_RESULT_LINES,
     TimingSlot, ToolActivitySummary, ToolDisplayMode, ToolOutputId, ToolOutputKind,
-    assistant_label, format_timestamp, format_tool_result_content, make_tool_output_id,
-    make_tool_summary_output_id, render_markdown_to_lines, subagent_label, summarize_tool_calls,
-    tool_only_assistant_summary, tool_result_display_text, user_entry_is_only_tool_results,
+    assistant_label, format_timestamp, format_tool_result_content, group_summary_line,
+    make_tool_output_id, make_tool_summary_output_id, render_markdown_to_lines, subagent_label,
+    summarize_tool_calls, summary_line, tool_only_assistant_summary, tool_result_display_text,
+    user_entry_is_only_tool_results,
 };
 use crate::commands::process_command_message;
 use crate::history::model::{Message, Part, Role};
@@ -1179,7 +1180,7 @@ impl Builder<'_> {
             timing: DocTiming::from_slot(slot),
             kind: DocBlockKind::ToolSummary {
                 id: None,
-                sentence: summary.sentence(),
+                sentence: summary_line(&summary, content.iter(), usize::MAX),
             },
         });
     }
@@ -1457,7 +1458,13 @@ impl Builder<'_> {
                 },
                 kind: DocBlockKind::ToolSummary {
                     id: Some(group.id.clone()),
-                    sentence: group.summary.sentence(),
+                    sentence: group_summary_line(
+                        entries,
+                        group.first_parsed_idx..=group.last_parsed_idx,
+                        group.parent_id.as_deref(),
+                        &group.summary,
+                        usize::MAX,
+                    ),
                 },
             }
         };

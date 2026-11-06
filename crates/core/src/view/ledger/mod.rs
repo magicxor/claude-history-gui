@@ -43,8 +43,8 @@ use summary::{PendingToolSummary, flush_tool_summary};
 pub(crate) use markdown::render_markdown_to_lines;
 pub(crate) use style::{assistant_label, subagent_label};
 pub(crate) use summary::{
-    ToolActivitySummary, summarize_tool_calls, tool_only_assistant_summary,
-    user_entry_is_only_tool_results,
+    ToolActivitySummary, group_summary_line, summarize_tool_calls, summary_line,
+    tool_only_assistant_summary, user_entry_is_only_tool_results,
 };
 pub(crate) use timing::{RowTiming, TimingSlot};
 pub(crate) use tools::{

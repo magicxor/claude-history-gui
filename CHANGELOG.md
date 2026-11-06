@@ -4,6 +4,9 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 ## Unreleased
 
+- Tool calls without a dedicated format (MCP tools and the like) now show as one line of JSON, for example
+  `clock__sleep: { "duration_ms": 20000 }`, instead of a bare name with a pretty-printed body. In Summary mode a group
+  of exactly one such call shows that line instead of "Called 1 tool".
 - Semantic search uses the snowflake-arctic-embed-xs model (about 90 MB), which ranks as well or better than the
   previous one at half the indexing cost. After the update the history is re-embedded in the background, ranking
   what is indexed so far meanwhile, and the old model download is removed once the new one loads.

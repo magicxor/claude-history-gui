@@ -742,7 +742,7 @@ fn tool_summary_uses_source_agent_label() {
     assert_eq!(collapsed.messages[0].label, "Pi");
     assert_eq!(
         collapsed.messages[0].blocks[0].plain_text(),
-        "Called 1 tool"
+        r#"bash: { "command": "pwd" }"#
     );
 
     let expanded = build_document(
@@ -758,6 +758,27 @@ fn tool_summary_uses_source_agent_label() {
     assert_eq!(id, &summary_id);
     assert_eq!(items.len(), 2);
     assert!(!doc_text(&expanded).contains("Claude"));
+}
+
+#[test]
+fn single_unknown_tool_call_summary_is_the_call_itself() {
+    let single = entry(
+        0,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"clock__sleep","input":{"duration_ms":20000}}]}}"#,
+    );
+    let doc = build(&[single], &prefs(ToolDisplayMode::Summary));
+    assert_eq!(
+        doc.messages[0].blocks[0].plain_text(),
+        r#"clock__sleep: { "duration_ms": 20000 }"#
+    );
+
+    // Two calls keep the counted sentence.
+    let two = entry(
+        0,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"a__b","input":{}},{"type":"tool_use","id":"toolu_2","name":"a__c","input":{}}]}}"#,
+    );
+    let doc = build(&[two], &prefs(ToolDisplayMode::Summary));
+    assert_eq!(doc.messages[0].blocks[0].plain_text(), "Called 2 tools");
 }
 
 #[test]

@@ -367,7 +367,11 @@ impl MessageCtx<'_> {
                 });
             }
             DocBlockKind::ToolSummary { id, sentence } => {
-                let segment = segments::styled_line(sentence, Style::TOOL | Style::DIMMED);
+                // A single unrecognized call reads as the call itself, which
+                // has no length limit in the document: keep one row.
+                let clipped = segments::clip_to_cols(sentence, self.cols);
+                let cols_dependent = clipped != *sentence;
+                let segment = segments::styled_line(&clipped, Style::TOOL | Style::DIMMED);
                 let key = match id {
                     Some(id) => ItemKey::Tool(id.clone()),
                     None => ItemKey::Text {
@@ -394,7 +398,7 @@ impl MessageCtx<'_> {
                     more: None,
                     group_toggle: None,
                     block: self.block_ref(block_index, None),
-                    cols_dependent: false,
+                    cols_dependent,
                 });
             }
             DocBlockKind::ToolSummaryDetails { id, items } => {
