@@ -728,13 +728,12 @@ fn summary_tool_mode_coalesces_tool_calls_across_records_that_show_nothing() {
     assert_eq!(doc.messages.len(), 1);
 }
 
-/// Upstream a60dfe9: calls mode groups like summary mode but lists each
-/// call on its own line, without results; every line carries the group's
-/// id, so a click on any of them expands the whole group.
+/// Upstream a60dfe9 and a1c88f8: calls mode groups like summary mode but
+/// lists each call on its own line, without results; every line carries its
+/// own row id, so a click expands just that call and its result.
 #[test]
 fn calls_tool_mode_lists_each_call_on_one_line_without_results() {
     let entries = tool_summary_entries();
-    let summary_id = make_tool_summary_output_id(0, None);
     let doc = assert_ledger_parity(&entries, &prefs(ToolDisplayMode::Calls), &BTreeSet::new());
 
     assert_eq!(doc.messages.len(), 1);
@@ -742,68 +741,142 @@ fn calls_tool_mode_lists_each_call_on_one_line_without_results() {
     assert_eq!(message.kind, DocMessageKind::ToolSummaryGroup);
     assert_eq!(message.label, "Claude");
     assert_eq!(message.label_role, LabelRole::AccentDim);
+    let row_id = |entry: usize, block: usize, call: &str| {
+        make_tool_output_id(entry, None, block, ToolOutputKind::CallRow, Some(call))
+    };
+    let row_ids = [
+        row_id(0, 0, "toolu_1"),
+        row_id(2, 0, "toolu_2"),
+        row_id(2, 1, "toolu_3"),
+    ];
+    assert_eq!(
+        row_ids[2].0,
+        "entry:2:parent:top:block:1:kind:row:id:toolu_3"
+    );
     let lines: Vec<&DocBlockKind> = message.blocks.iter().map(|block| &block.kind).collect();
-    let line = |header: &str| DocBlockKind::ToolCallLine {
-        id: Some(summary_id.clone()),
+    let line = |id: &ToolOutputId, header: &str| DocBlockKind::ToolCallLine {
+        id: Some(id.clone()),
         header: header.to_string(),
     };
     assert_eq!(
         lines,
         [
-            &line(r#"Grep: "one" in ."#),
-            &line("Read: src/main.rs"),
-            &line("Bash: cargo test"),
+            &line(&row_ids[0], r#"Grep: "one" in ."#),
+            &line(&row_ids[1], "Read: src/main.rs"),
+            &line(&row_ids[2], "Bash: cargo test"),
         ]
     );
-    assert!(
-        message
-            .blocks
-            .iter()
-            .all(|block| block.toggle_id() == Some(&summary_id))
-    );
+    let toggles: Vec<Option<&ToolOutputId>> =
+        message.blocks.iter().map(DocBlock::toggle_id).collect();
+    assert_eq!(toggles, row_ids.iter().map(Some).collect::<Vec<_>>());
     let text = doc_text(&doc);
     assert!(!text.contains("Result"), "{text}");
     assert!(!text.contains("grep result"), "{text}");
 
+    // The group's own id no longer expands anything in calls mode.
+    let summary_id = make_tool_summary_output_id(0, None);
+    assert_eq!(
+        build_document(
+            &renderable(&entries),
+            &prefs(ToolDisplayMode::Calls),
+            &BTreeSet::from([summary_id]),
+        ),
+        doc
+    );
+
+    // Expanding the Bash row shows its call and result; the other rows stay
+    // collapsed.
     let expanded = assert_ledger_parity(
         &entries,
         &prefs(ToolDisplayMode::Calls),
-        &BTreeSet::from([summary_id.clone()]),
+        &BTreeSet::from([row_ids[2].clone()]),
     );
-    assert!(doc_text(&expanded).contains("grep result"));
-    assert!(matches!(
-        &expanded.messages[0].blocks[..],
-        [DocBlock {
-            kind: DocBlockKind::ToolSummaryDetails { id, .. },
-            ..
-        }] if *id == summary_id
-    ));
+    let text = doc_text(&expanded);
+    assert!(text.contains("bash result"), "{text}");
+    assert!(!text.contains("grep result"), "{text}");
+    let blocks = &expanded.messages[0].blocks;
+    assert_eq!(blocks.len(), 3);
+    assert_eq!(blocks[0].kind, line(&row_ids[0], r#"Grep: "one" in ."#));
+    assert_eq!(blocks[1].kind, line(&row_ids[1], "Read: src/main.rs"));
+    let DocBlockKind::ToolSummaryDetails { id, items } = &blocks[2].kind else {
+        panic!("expanded row: {:?}", blocks[2]);
+    };
+    assert_eq!(id, &row_ids[2]);
+    assert_eq!(blocks[2].toggle_id(), Some(&row_ids[2]));
+    let item_ids: Vec<&str> = items
+        .iter()
+        .map(|item| item.tool_output_id().unwrap().0.as_str())
+        .collect();
+    assert_eq!(
+        item_ids,
+        [
+            "entry:2:parent:top:block:1:kind:call:id:toolu_3",
+            "entry:3:parent:top:block:0:kind:result:id:toolu_3",
+        ]
+    );
+    let DocBlockKind::ToolCall(call) = &items[0].kind else {
+        panic!("call: {:?}", items[0]);
+    };
+    assert!(call.dimmed);
+    assert_eq!(call.header, "Bash: cargo test");
+    let DocBlockKind::ToolResult(result) = &items[1].kind else {
+        panic!("result: {:?}", items[1]);
+    };
+    assert_eq!(result.text, "bash result");
+
+    // A call whose result is not in the group shows just the call.
+    let read = assert_ledger_parity(
+        &entries,
+        &prefs(ToolDisplayMode::Calls),
+        &BTreeSet::from([row_ids[1].clone()]),
+    );
+    let DocBlockKind::ToolSummaryDetails { items, .. } = &read.messages[0].blocks[1].kind else {
+        panic!("expanded row: {:?}", read.messages[0].blocks[1]);
+    };
+    assert!(
+        matches!(&items[..], [DocBlock { kind: DocBlockKind::ToolCall(call), .. }] if call.header == "Read: src/main.rs")
+    );
 }
 
 /// Calls mode: the first line of a group carries the stamp, later lines
-/// pad under it (the ledger's continuation rows); without timing every
-/// line has no column.
+/// pad under it (the ledger's continuation rows), an expanded row included;
+/// without timing every line has no column.
 #[test]
 fn calls_tool_mode_lines_after_the_first_pad_the_timing_column() {
     let timestamp = Local.with_ymd_and_hms(2026, 9, 4, 13, 59, 0).unwrap();
-    let entries = [entry(
-        0,
-        &format!(
-            r#"{{"type":"assistant","timestamp":"{}","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_1","name":"Bash","input":{{"command":"pwd"}}}},{{"type":"tool_use","id":"toolu_2","name":"Read","input":{{"file_path":"a.rs"}}}}]}}}}"#,
-            timestamp.to_rfc3339()
+    let entries = [
+        entry(
+            0,
+            &format!(
+                r#"{{"type":"assistant","timestamp":"{}","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_1","name":"Bash","input":{{"command":"pwd"}}}},{{"type":"tool_use","id":"toolu_2","name":"Read","input":{{"file_path":"a.rs"}}}}]}}}}"#,
+                timestamp.to_rfc3339()
+            ),
         ),
-    )];
+        entry(
+            1,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"/tmp"},{"type":"tool_result","tool_use_id":"toolu_2","content":"fn main() {}"}]}}"#,
+        ),
+    ];
     let mut prefs = prefs(ToolDisplayMode::Calls);
     prefs.show_timing = true;
     let doc = assert_ledger_parity(&entries, &prefs, &BTreeSet::new());
     let slots: Vec<&DocTiming> = doc.messages[0].blocks.iter().map(|b| &b.timing).collect();
-    assert_eq!(
-        slots,
-        [
-            &DocTiming::Stamp("Sep 04 13:59".to_string()),
-            &DocTiming::Pad
-        ]
-    );
+    let stamp = DocTiming::Stamp("Sep 04 13:59".to_string());
+    assert_eq!(slots, [&stamp, &DocTiming::Pad]);
+
+    // Expanded rows keep their row's slot; their result pads.
+    let ids = doc_toggle_ids(&doc);
+    let expanded = assert_ledger_parity(&entries, &prefs, &ids);
+    let blocks = &expanded.messages[0].blocks;
+    let slots: Vec<&DocTiming> = blocks.iter().map(|b| &b.timing).collect();
+    assert_eq!(slots, [&stamp, &DocTiming::Pad]);
+    for (block, first) in blocks.iter().zip([&stamp, &DocTiming::Pad]) {
+        let DocBlockKind::ToolSummaryDetails { items, .. } = &block.kind else {
+            panic!("expanded row: {block:?}");
+        };
+        let slots: Vec<&DocTiming> = items.iter().map(|item| &item.timing).collect();
+        assert_eq!(slots, [first, &DocTiming::Pad]);
+    }
 
     prefs.show_timing = false;
     let doc = assert_ledger_parity(&entries, &prefs, &BTreeSet::new());

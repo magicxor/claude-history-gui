@@ -2,7 +2,8 @@
 //! stable ids, lanes, ≈100-line chunks, visual-row truncation (K9). WP2.
 //!
 //! One item per ledger block (markdown text, thinking, tool summary, call
-//! line, tool call, tool result, subagent result, expanded summary detail);
+//! line, tool call, tool result, subagent result, detail of an expanded
+//! summary group or calls row);
 //! blocks longer than the chunk limits are split into chunk items with
 //! stable `(block, chunk)` ids. Gpui-free: the worker thread builds them.
 //!
@@ -46,9 +47,10 @@ pub enum TextKind {
     Thinking,
     /// The non-clickable tool summary sentence of a mixed message.
     Summary,
-    /// A tool call line (calls mode, upstream a60dfe9), by its position
-    /// among the message's call lines: the lines of a group all carry the
-    /// group's id, so the id cannot tell them apart.
+    /// A non-clickable tool call line of a mixed message (calls mode,
+    /// upstream a60dfe9), by its position among the message's id-less call
+    /// lines. A group's call lines have their own row ids (upstream a1c88f8)
+    /// and use [`ItemKey::Tool`].
     CallLine,
 }
 
@@ -62,7 +64,8 @@ pub enum ItemKey {
         kind: TextKind,
         ordinal: u32,
     },
-    /// A tool output (call, result, summary group) by its core id.
+    /// A tool output (call, result, summary group, calls row) by its core
+    /// id.
     Tool(ToolOutputId),
 }
 
@@ -416,10 +419,23 @@ impl MessageCtx<'_> {
                 // A narrower window could clip any line wider than the 8-column floor.
                 let cols_dependent = unicode_width::UnicodeWidthStr::width(header.as_str()) > 8;
                 let segment = segments::styled_line(&clipped, Style::TOOL | Style::DIMMED);
-                let ordinal = self.call_line_ordinal;
-                self.call_line_ordinal += 1;
+                // A group's row has its own id (upstream a1c88f8); the lines
+                // of a mixed message have none and go by position.
+                let key = match id {
+                    Some(id) => ItemKey::Tool(id.clone()),
+                    None => {
+                        let ordinal = self.call_line_ordinal;
+                        self.call_line_ordinal += 1;
+                        ItemKey::Text {
+                            entry: message.entry_index,
+                            kind: TextKind::CallLine,
+                            ordinal,
+                        }
+                    }
+                };
                 // A run of call lines reads as one block: the label (and the
                 // stamp, which only the first line carries) on its first line.
+                // An expanded row in between starts a new run.
                 let continues_run = block_index
                     .checked_sub(1)
                     .and_then(|previous| message.blocks.get(previous))
@@ -438,11 +454,7 @@ impl MessageCtx<'_> {
                     }
                 };
                 self.emit(Pending {
-                    key: ItemKey::Text {
-                        entry: message.entry_index,
-                        kind: TextKind::CallLine,
-                        ordinal,
-                    },
+                    key,
                     kind: ItemKind::CallLine,
                     lanes,
                     chunks: vec![vec![segment]],

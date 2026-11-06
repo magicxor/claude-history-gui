@@ -20,7 +20,9 @@
 //! - summary- and calls-mode grouping of consecutive tool-only assistant
 //!   entries with the same parent and speaker, absorbing tool-result-only
 //!   user entries, the summary sentence (`"Searched for 2 patterns, read 1
-//!   file"`) and the call lines (`"Bash: cargo test"`, upstream a60dfe9);
+//!   file"`) and the call lines (`"Bash: cargo test"`, upstream a60dfe9),
+//!   where an expanded summary group shows all its calls and results and an
+//!   expanded call line just that call and its result (upstream a1c88f8);
 //! - tool output ids ([`ToolOutputId`]), which are stable across re-renders
 //!   and shared with the ledger, so one expanded set drives both;
 //! - truncation and expansion ([`Fold`]), label text, roles and dimming;
@@ -58,10 +60,11 @@ use super::ViewPrefs;
 use super::ledger::{
     RenderOptions, RenderableEntry, RowTiming, TRUNCATED_BODY_LINES, TRUNCATED_RESULT_LINES,
     TimingSlot, ToolActivitySummary, ToolDisplayMode, ToolOutputId, ToolOutputKind,
-    assistant_label, entry_shows_nothing, format_timestamp, format_tool_result_content,
-    group_summary_rows, make_tool_output_id, make_tool_summary_output_id, render_markdown_to_lines,
-    subagent_label, summarize_tool_calls, summary_rows, tool_only_assistant_summary,
-    tool_result_display_text, user_entry_is_only_tool_results,
+    assistant_label, call_line, entry_shows_nothing, format_timestamp, format_tool_result_content,
+    group_call_result, group_messages, group_summary_line, make_tool_output_id,
+    make_tool_summary_output_id, render_markdown_to_lines, subagent_label, summarize_tool_calls,
+    summary_rows, tool_only_assistant_summary, tool_result_display_text,
+    user_entry_is_only_tool_results,
 };
 use crate::commands::process_command_message;
 use crate::history::model::{Message, Part, Role};
@@ -236,20 +239,24 @@ pub enum DocBlockKind {
     },
     /// One tool call on one line, without its result (calls mode, upstream
     /// a60dfe9): the call's header as formatted at width 0, whole (the
-    /// ledger cuts it to the content width with `…`). Each call of a
-    /// collapsed group is one block, and every block of the group carries
-    /// the group's `id`, so a click on any of them expands the whole group
-    /// (into [`DocBlockKind::ToolSummaryDetails`]); a mixed text + tools
-    /// assistant message gets non-clickable lines (`id: None`). Like the
-    /// summary sentence, later lines of a group take the continuation timing
-    /// slot.
+    /// ledger cuts it to the content width with `…`). Each call of a group
+    /// is one block with its own row id (`…:kind:row:…`, upstream a1c88f8),
+    /// so a click expands just that call (into a
+    /// [`DocBlockKind::ToolSummaryDetails`] with the call and its result)
+    /// while the other calls of the group stay on one line; a mixed text +
+    /// tools assistant message gets non-clickable lines (`id: None`). Like
+    /// the summary sentence, later lines of a group take the continuation
+    /// timing slot.
     ToolCallLine {
         id: Option<ToolOutputId>,
         header: String,
     },
-    /// An expanded summary group: every call and result of the group in
-    /// truncated mode, each individually expandable; a click on the group
-    /// (the ledger: its first row) collapses it again via `id`.
+    /// An expanded summary group or calls row. A summary group (summary
+    /// mode) shows every call and result of the group; a calls row (calls
+    /// mode, upstream a1c88f8) shows its call followed by the call's result
+    /// when the group holds it. The items are in truncated mode and each is
+    /// individually expandable; a click on the group or row (the ledger: its
+    /// first row) collapses it again via `id`.
     ToolSummaryDetails {
         id: ToolOutputId,
         items: Vec<DocBlock>,
@@ -1491,7 +1498,18 @@ impl Builder<'_> {
         } else {
             None
         };
-        let blocks = if self.expanded.contains(&group.id) {
+        let slot = match ts.as_deref() {
+            Some(ts) => TimingSlot::Stamp(ts),
+            None => TimingSlot::Disabled,
+        };
+        let blocks = if self.prefs.tool_display == ToolDisplayMode::Calls {
+            // Calls mode ignores the group's own id: each row expands alone.
+            let blocks = self.calls_group_blocks(entries, &group, slot);
+            if blocks.is_empty() {
+                return;
+            }
+            blocks
+        } else if self.expanded.contains(&group.id) {
             let items = self.summary_group_details(entries, &group);
             if items.is_empty() {
                 return;
@@ -1507,22 +1525,14 @@ impl Builder<'_> {
             if group.summary.is_empty() {
                 return;
             }
-            let slot = match ts.as_deref() {
-                Some(ts) => TimingSlot::Stamp(ts),
-                None => TimingSlot::Disabled,
-            };
-            let rows = group_summary_rows(
+            let line = group_summary_line(
                 entries,
                 group.first_parsed_idx..=group.last_parsed_idx,
                 group.parent_id.as_deref(),
                 &group.summary,
-                &self.options,
+                self.options.content_width,
             );
-            let blocks = self.summary_blocks(Some(&group.id), slot, rows);
-            if blocks.is_empty() {
-                return;
-            }
-            blocks
+            self.summary_blocks(Some(&group.id), slot, vec![line])
         };
 
         let is_subagent = group.parent_id.is_some();
@@ -1539,6 +1549,114 @@ impl Builder<'_> {
             navigable: true,
             blocks,
         });
+    }
+
+    /// The ledger's `render_calls_group` (upstream a1c88f8): each call of the
+    /// group as a [`DocBlockKind::ToolCallLine`] with its own row id, or,
+    /// when that row is expanded, as a [`DocBlockKind::ToolSummaryDetails`]
+    /// holding the call and its result. Rows after the first take the
+    /// continuation slot of `slot`.
+    fn calls_group_blocks(
+        &self,
+        entries: &[RenderableEntry<'_>],
+        group: &PendingGroup,
+        slot: TimingSlot<'_>,
+    ) -> Vec<DocBlock> {
+        let parent_id = group.parent_id.as_deref();
+        let range = group.first_parsed_idx..=group.last_parsed_idx;
+        let mut blocks = Vec::new();
+        for (entry_index, message) in group_messages(entries, range, parent_id, Role::Assistant) {
+            for (block_idx, part) in message.parts.iter().enumerate() {
+                let Part::ToolCall { id, name, input } = part else {
+                    continue;
+                };
+                let row_id = make_tool_output_id(
+                    entry_index,
+                    parent_id,
+                    block_idx,
+                    ToolOutputKind::CallRow,
+                    Some(id),
+                );
+                let row_slot = if blocks.is_empty() {
+                    slot
+                } else {
+                    slot.continuation()
+                };
+                let kind = if self.expanded.contains(&row_id) {
+                    DocBlockKind::ToolSummaryDetails {
+                        id: row_id,
+                        items: self.call_details(
+                            entries,
+                            group,
+                            (entry_index, block_idx, id, name, input),
+                            row_slot,
+                        ),
+                    }
+                } else {
+                    DocBlockKind::ToolCallLine {
+                        id: Some(row_id),
+                        header: call_line(name, input, self.options.content_width),
+                    }
+                };
+                blocks.push(DocBlock {
+                    timing: DocTiming::from_slot(row_slot),
+                    kind,
+                });
+            }
+        }
+        blocks
+    }
+
+    /// The ledger's `render_call_details`: one call of the group in
+    /// truncated mode, followed by its result when the group holds it.
+    fn call_details(
+        &self,
+        entries: &[RenderableEntry<'_>],
+        group: &PendingGroup,
+        (entry_index, block_idx, call_id, name, input): (
+            usize,
+            usize,
+            &str,
+            &str,
+            &serde_json::Value,
+        ),
+        slot: TimingSlot<'_>,
+    ) -> Vec<DocBlock> {
+        let parent_id = group.parent_id.as_deref();
+        let call_output_id = make_tool_output_id(
+            entry_index,
+            parent_id,
+            block_idx,
+            ToolOutputKind::ToolCall,
+            Some(call_id),
+        );
+        let mut items = vec![self.tool_call(
+            name,
+            input,
+            true,
+            ToolDisplayMode::Truncated,
+            call_output_id,
+            slot,
+        )];
+        let range = group.first_parsed_idx..=group.last_parsed_idx;
+        if let Some((entry_index, block_idx, output)) =
+            group_call_result(entries, range, parent_id, call_id)
+        {
+            let result_output_id = make_tool_output_id(
+                entry_index,
+                parent_id,
+                block_idx,
+                ToolOutputKind::ToolResult,
+                Some(call_id),
+            );
+            items.extend(self.tool_result(
+                result_output_id,
+                tool_result_display_text(output),
+                ToolDisplayMode::Truncated,
+                slot.continuation(),
+            ));
+        }
+        items
     }
 
     /// The ledger's `render_summary_group_details`: every call and result of

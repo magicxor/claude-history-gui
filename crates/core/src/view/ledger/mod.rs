@@ -8,9 +8,11 @@
 //! upstream, all mechanical: the palette comes from [`crate::theme::current`]
 //! instead of terminal detection (R3); `process_command_message` lives in
 //! [`crate::commands`]; a few items are re-exported `pub(crate)` for the
-//! layout-free [`crate::view::document`] builder (`group_summary_rows` takes
-//! the group's parsed range, parent and summary instead of the ledger's
-//! `PendingToolSummary`, so the builder can share it); the agent-progress
+//! layout-free [`crate::view::document`] builder (`group_messages` and
+//! `group_summary_line` take the group's parsed range and parent (and
+//! summary) instead of the ledger's `PendingToolSummary`, and the result
+//! lookup of upstream's `render_call_details` is `group_call_result`, so the
+//! builder can share them); the agent-progress
 //! label is sliced by characters instead of bytes (W18). Rendering output is
 //! unchanged.
 
@@ -46,8 +48,9 @@ use summary::{PendingToolSummary, flush_tool_summary};
 pub(crate) use markdown::render_markdown_to_lines;
 pub(crate) use style::{assistant_label, subagent_label};
 pub(crate) use summary::{
-    ToolActivitySummary, entry_shows_nothing, group_summary_rows, summarize_tool_calls,
-    summary_rows, tool_only_assistant_summary, user_entry_is_only_tool_results,
+    ToolActivitySummary, call_line, entry_shows_nothing, group_call_result, group_messages,
+    group_summary_line, summarize_tool_calls, summary_rows, tool_only_assistant_summary,
+    user_entry_is_only_tool_results,
 };
 pub(crate) use timing::{RowTiming, TimingSlot};
 pub(crate) use tools::{

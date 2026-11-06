@@ -6,8 +6,10 @@ Release notes are taken from the `## v<version>` section of this file by the rel
 
 - The viewer has a new **Calls** tool display between Summary and Truncated (toolbar, View > Tool display, and the
   `t` cycle: Off, Summary, Calls, Truncated, Full). It lists every tool call of a run on its own line, such as
-  `Bash: cargo test`, without the results; a click on any of these lines expands the run into its calls and
-  results, as a click on a Summary row does. The mode is remembered like the others.
+  `Bash: cargo test`, without the results; a click on one of these lines expands just that call and its result,
+  and the other calls of the run stay on one line. The mode is remembered like the others.
+- Expanding or collapsing a Summary row (or the first line of a run in Calls mode) keeps it in place instead of
+  scrolling its message to the top of the viewer.
 - Summary mode keeps a run of tool calls in one row even when records that show nothing (bookkeeping entries,
   thinking-only messages while thinking is hidden) sit between the calls, instead of one "Ran 1 shell command" row per call.
 - Tool calls without a dedicated format (MCP tools and the like) now show as one line of JSON, for example

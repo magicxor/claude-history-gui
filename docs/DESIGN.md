@@ -2046,7 +2046,7 @@ pub struct Lanes { pub timestamp: Option<SharedString>, pub label: Option<Shared
 pub enum ItemBody {
     Markdown { segments: Arc<Vec<Segment>>, thinking: bool },
     ToolSummary { sentence: SharedString, id: Option<ToolOutputId>, expanded: bool },
-    CallLine { header: SharedString, id: Option<ToolOutputId> },  // calls mode (a60dfe9): one row per call
+    CallLine { header: SharedString, id: Option<ToolOutputId> },  // calls mode (a60dfe9): one row per call, a group's row with its own id (a1c88f8)
     ToolCall { id: ToolOutputId, header: Option<SharedString>, lines: Arc<Segment> /* SegKind::ToolBody, this chunk */,
                more: Option<usize>, expandable: bool, expanded: bool },
     ToolResult { id: ToolOutputId, segments: Arc<Vec<Segment>>, more: Option<usize>, expandable: bool, expanded: bool },
@@ -2079,7 +2079,7 @@ pub fn build(doc: &ConversationDocument, model: &ViewerModel, cols: usize, cance
 | CallLine (calls mode) | message label on the first line of a run, none after | AccentDim | no | message dimmed | first line only |
 | ToolResult (top-level) | `↳ Result` | ToolText | no | no | first block only |
 | SubagentToolResult | `↳ Tool` (header `<Result>`) | AccentDim | no | yes | Pad |
-| ToolSummaryDetails items | group label on the first item | AccentDim | no | yes | Pad |
+| ToolSummaryDetails items (expanded summary group or calls row) | group label on the first item | AccentDim | no | yes | Pad (a calls row: the row's own slot, so the group's first row keeps the stamp) |
 
   Label text is fitted with core `view::fitted_name` (9 display cells, `Branch s…`, V-014). The timing lane is
   reserved whenever timing is on (quirks 1–2 fixed); `DocTiming::Disabled` blocks show an empty lane.
@@ -2132,8 +2132,10 @@ h_flex().w_full().items_start()                       // one ledger row per item
  └─ content     v_flex flex_1 min_w_0 gap per 9.3
        ├─ Markdown: one SelText per segment (Code: bg(muted) rounded p_2 mono; TableRow: mono row + bottom border)
        ├─ ToolSummary: SelText sentence (tool_text, dimmed); chevron ▸/▾ button when clickable
-       ├─ CallLine: like ToolSummary, the call header clipped to `cols` (one row per call; every row of a group
-       │            toggles the group, a mixed message's rows toggle nothing)
+       ├─ CallLine: like ToolSummary, the call header clipped to `cols` (one row per call, key `ItemKey::Tool(row id)`;
+       │            a group's row toggles just its call (a1c88f8), which then shows as ToolSummaryDetails items, the
+       │            call and its result under a `tool details` chevron; a mixed message's rows toggle nothing and are
+       │            keyed by position)
        ├─ ToolCall: header row on the first chunk (tool_text; chevron if expandable) + empty spacer + body chunk (mono)
        │            + "(N more lines…)" row on the last chunk (dimmed, cursor pointer, toggles) when truncated
        ├─ ToolResult: rows/segments + indicator row as above
@@ -2177,7 +2179,11 @@ row), taken from the handle LRU (§9.7).
   `items[top.item_ix].id`) and the anchor entry via core `capture_anchor_entry(nav_entries, focused, nav_active,
   first_at_or_below_top)`; rebuild in the worker; diff the old and new `(id, version)` lists into `ListState::splice`
   calls; resolve the anchor id in the new list (exact; else core `find_entry_or_prev` → that message's first item,
-  e.g. the message before a tool-only one that Off mode removed (d0aca95), else 0) and `scroll_to(ListOffset { item_ix, offset_in_item: same ? top.offset_in_item : 0 })`; then
+  e.g. the message before a tool-only one that Off mode removed (d0aca95), else 0) and `scroll_to(ListOffset { item_ix, offset_in_item: same ? top.offset_in_item : 0 })`.
+  When the focused message survives but its first item is replaced (an expanded or collapsed summary group or
+  calls row, a tool display mode change) the fallback finds that same message: its first row keeps its offset from
+  the viewport top, so the clicked row stays under the pointer. This applies only while that item's top was in view;
+  when it was scrolled above the viewport the message is top-aligned instead. Then
   `MessageNav::refocus(resolved)` (V-081, F9). `remeasure()` alone is never used for width changes (it re-anchors
   proportionally).
 * Opening a different conversation: `ListState::reset_with_uniform_height(n, rem * 3.0)` (keeps the size hint for a

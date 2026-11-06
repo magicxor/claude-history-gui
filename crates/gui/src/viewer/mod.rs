@@ -1306,12 +1306,22 @@ impl ViewerPane {
         let (item_ix, offset, exact) = match resolved_ix {
             Some(ix) => (ix, anchor.offset, true),
             None => {
-                let ix = anchor
+                let position = anchor
                     .entry
-                    .and_then(|entry| find_entry_or_prev(&built.info.nav_entries, entry))
+                    .and_then(|entry| find_entry_or_prev(&built.info.nav_entries, entry));
+                let ix = position
                     .and_then(|position| nav::first_item_of(&built.info, position))
                     .unwrap_or(0);
-                (ix, px(0.), false)
+                // The focused message is still there and only its first item
+                // was replaced (an expanded or collapsed summary group or
+                // calls row, a mode change): keep its top where it was, but
+                // only while that top was in view. A top scrolled above the
+                // viewport has no row to keep (the new first item may be
+                // much shorter than the offset).
+                let same_message = anchor.relative.is_some_and(|relative| relative >= px(0.))
+                    && position.and_then(|position| built.info.nav_entries.get(position))
+                        == anchor.entry.as_ref();
+                (ix, px(0.), same_message)
             }
         };
         if built.items.is_empty() {

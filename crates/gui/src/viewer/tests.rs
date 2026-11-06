@@ -538,11 +538,11 @@ mod pure {
         assert!(items::item_text(summary).contains("Read 1 file"));
     }
 
-    /// Calls mode (upstream a60dfe9): a group lists one clipped row per
-    /// call, every row toggling the group; the label sits on the first row
-    /// only and the keys stay unique although the rows share the group id.
+    /// Calls mode (upstream a60dfe9, a1c88f8): a group lists one clipped row
+    /// per call, each toggling its own call and keyed by its row id; the
+    /// label sits on the first row only.
     #[test]
-    fn calls_mode_lists_one_row_per_call_toggling_the_group() {
+    fn calls_mode_lists_one_row_per_call_each_with_its_own_toggle() {
         let long = "x".repeat(200);
         let lines = vec![
             user("q"),
@@ -563,9 +563,13 @@ mod pure {
         assert!(bash.ends_with('…'), "{bash}");
         assert!(unicode_width::UnicodeWidthStr::width(bash.as_str()) <= 60);
         assert!(rows[0].cols_dependent && rows[1].cols_dependent);
-        // One group: the same toggle on every row, distinct item ids.
-        let group = rows[0].toggle.clone().expect("a clickable row");
-        assert_eq!(rows[1].toggle.as_ref(), Some(&group));
+        // Each row toggles its own call and is keyed by that row id.
+        for row in &rows {
+            let toggle = row.toggle.clone().expect("a clickable row");
+            assert!(toggle.0.contains(":kind:row:"), "{toggle:?}");
+            assert_eq!(row.id.key, ItemKey::Tool(toggle));
+        }
+        assert_ne!(rows[0].toggle, rows[1].toggle);
         assert_ne!(rows[0].id, rows[1].id);
         assert!(rows[0].first_of_message && !rows[1].first_of_message);
         assert!(rows[0].lanes.label.is_some() && rows[1].lanes.label.is_none());
@@ -2045,20 +2049,25 @@ mod gui {
             .is_empty()));
     }
 
-    /// Calls mode (upstream a60dfe9): the chevron of any call row expands
-    /// the whole group into its truncated calls and results, and the group
-    /// chevron collapses it again.
+    /// Calls mode (upstream a1c88f8): the chevron of a call row expands just
+    /// that call and its result, the other rows stay on one line, and the
+    /// details chevron collapses it again. Expanding the group's first row
+    /// keeps that row where it was.
     #[gpui_kit::test]
-    fn calls_row_chevron_expands_the_group(cx: &mut TestAppContext) {
+    fn calls_row_chevron_expands_just_that_call(cx: &mut TestAppContext) {
         let world = TestWorld::new();
-        let lines = vec![
+        let mut lines = vec![
             user("q"),
             tool_call("g1", "Grep", r#"{"pattern":"one"}"#, 1),
             tool_result("g1", "grep result", 1),
             tool_call("r1", "Read", r#"{"file_path":"x.rs"}"#, 1),
             tool_result("r1", "read result", 1),
-            assistant_at("done", 2),
         ];
+        // Enough below the group to scroll it to the top.
+        for ix in 0..30 {
+            lines.push(assistant_at(&format!("answer {ix}"), 2));
+            lines.push(user_at(&format!("question {ix}"), 2));
+        }
         let (handle, viewer, _) = open_viewer(cx, &world, &lines, &[]);
         let all_text = |cx: &mut TestAppContext| {
             read(cx, &viewer, |v| {
@@ -2070,6 +2079,24 @@ mod gui {
                     .join("\n")
             })
         };
+        let call_rows = |cx: &mut TestAppContext| {
+            read(cx, &viewer, |v| {
+                v.items()
+                    .unwrap()
+                    .iter()
+                    .filter(|i| i.kind == ItemKind::CallLine)
+                    .map(|i| (i.key_hash, i.toggle.clone().unwrap()))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let click = |cx: &mut TestAppContext, name: &'static str, hash: u64| {
+            draw(cx, handle);
+            cx.update_window(handle, |_, window, cx| {
+                window.click(gpui_kit::ElementId::NamedInteger(name.into(), hash), cx)
+            })
+            .unwrap();
+            wait_viewer_ready(cx, handle, &viewer);
+        };
         cx.update_window(handle, |_, window, cx| {
             viewer.update(cx, |viewer, cx| {
                 viewer.handle_forwarded(&SetToolsCalls, window, cx)
@@ -2078,68 +2105,91 @@ mod gui {
         .unwrap();
         wait_viewer_ready(cx, handle, &viewer);
         assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Calls);
-        let rows = read(cx, &viewer, |v| {
-            v.items()
-                .unwrap()
-                .iter()
-                .filter(|i| i.kind == ItemKind::CallLine)
-                .count()
-        });
-        assert_eq!(rows, 2);
+        let rows = call_rows(cx);
+        assert_eq!(rows.len(), 2);
+        assert_ne!(rows[0].1, rows[1].1);
         assert!(!all_text(cx).contains("read result"));
-        // The second row's chevron.
-        let second = read(cx, &viewer, |v| {
-            v.items()
-                .unwrap()
-                .iter()
-                .filter(|i| i.kind == ItemKind::CallLine)
-                .nth(1)
-                .unwrap()
-                .key_hash
-        });
-        draw(cx, handle);
-        cx.update_window(handle, |_, window, cx| {
-            window.click(
-                gpui_kit::ElementId::NamedInteger("summary-chevron".into(), second),
-                cx,
-            )
-        })
-        .unwrap();
-        wait_viewer_ready(cx, handle, &viewer);
+
+        // The second row's chevron: its call and result, the first row stays.
+        click(cx, "summary-chevron", rows[1].0);
         let expanded = all_text(cx);
-        assert!(
-            expanded.contains("grep result") && expanded.contains("read result"),
-            "{expanded}"
-        );
-        assert!(read(cx, &viewer, |v| {
-            v.items()
-                .unwrap()
-                .iter()
-                .all(|i| i.kind != ItemKind::CallLine)
-        }));
-        // The group chevron collapses it again.
-        let group = item_index(cx, &viewer, |i| i.group_toggle.is_some());
-        let hash = read(cx, &viewer, |v| v.items().unwrap()[group].key_hash);
-        draw(cx, handle);
+        assert!(expanded.contains("read result"), "{expanded}");
+        assert!(!expanded.contains("grep result"), "{expanded}");
+        assert_eq!(call_rows(cx), rows[..1]);
+        let details = item_index(cx, &viewer, |i| i.group_toggle.is_some());
+        read(cx, &viewer, |v| {
+            let items = v.items().unwrap();
+            assert_eq!(items[details].group_toggle.as_ref(), Some(&rows[1].1));
+            assert_eq!(items[details].kind, ItemKind::ToolCall);
+            assert_eq!(items[details + 1].kind, ItemKind::ToolResult);
+        });
+        // The details chevron collapses it again.
+        let hash = read(cx, &viewer, |v| v.items().unwrap()[details].key_hash);
+        click(cx, "group-chevron", hash);
+        assert!(!all_text(cx).contains("read result"));
+        assert_eq!(call_rows(cx), rows);
+
+        // The first row's chevron: the row stays under the click.
+        let top_of = |cx: &mut TestAppContext, ix: usize| {
+            read(cx, &viewer, |v| {
+                let bounds = v.list_state().bounds_for_item(ix).expect("rendered");
+                f32::from(bounds.top() - v.list_state().viewport_bounds().top())
+            })
+        };
+        let first = item_index(cx, &viewer, |i| i.kind == ItemKind::CallLine);
+        let before = top_of(cx, first);
+        assert!(before > 0.0, "the user message sits above the group");
+        click(cx, "summary-chevron", rows[0].0);
+        assert!(all_text(cx).contains("grep result"));
+        let details = item_index(cx, &viewer, |i| i.group_toggle.is_some());
+        assert_eq!(details, first);
+        assert!((top_of(cx, details) - before).abs() < 0.5);
+    }
+
+    /// Mode change on a focused message whose first item (an expanded
+    /// group's first detail) is partly scrolled above the viewport: the
+    /// replacing row must not be scrolled into by the old offset.
+    #[gpui_kit::test]
+    fn mode_change_with_partly_scrolled_first_item_keeps_group_visible(cx: &mut TestAppContext) {
+        let world = TestWorld::new();
+        let mut lines = vec![
+            user("q"),
+            tool_call("g1", "Grep", r#"{"pattern":"one"}"#, 1),
+            tool_result("g1", &numbered_lines(12), 1),
+            tool_call("r1", "Read", r#"{"file_path":"x.rs"}"#, 1),
+            tool_result("r1", "content", 1),
+        ];
+        for ix in 0..30 {
+            lines.push(assistant_at(&format!("answer {ix}"), 2));
+            lines.push(user_at(&format!("question {ix}"), 2));
+        }
+        let (handle, viewer, _) = open_viewer(cx, &world, &lines, &[]);
+        let summary = item_index(cx, &viewer, |i| i.kind == ItemKind::ToolSummary);
+        let hash = read(cx, &viewer, |v| v.items().unwrap()[summary].key_hash);
         cx.update_window(handle, |_, window, cx| {
             window.click(
-                gpui_kit::ElementId::NamedInteger("group-chevron".into(), hash),
+                gpui_kit::ElementId::NamedInteger("summary-chevron".into(), hash),
                 cx,
             )
         })
         .unwrap();
         wait_viewer_ready(cx, handle, &viewer);
-        assert!(!all_text(cx).contains("read result"));
-        assert_eq!(
-            read(cx, &viewer, |v| {
-                v.items()
-                    .unwrap()
-                    .iter()
-                    .filter(|i| i.kind == ItemKind::CallLine)
-                    .count()
-            }),
-            2
-        );
+        let details = item_index(cx, &viewer, |i| i.group_toggle.is_some());
+        viewer.update(cx, |v, _| {
+            v.list_state().scroll_to(gpui_kit::ListOffset {
+                item_ix: details,
+                offset_in_item: px(40.),
+            })
+        });
+        draw(cx, handle);
+        keys(cx, handle, &viewer, "t");
+        assert_eq!(tool_display(cx, &viewer), ToolDisplayMode::Calls);
+        let first = item_index(cx, &viewer, |i| i.kind == ItemKind::CallLine);
+        let visible = read(cx, &viewer, |v| {
+            v.list_state().item_is_above_viewport(first) == Some(false)
+                && v.list_state().item_is_below_viewport(first) == Some(false)
+        });
+        assert!(visible, "the group's first row is visible");
     }
 
     /// V-052: summary group chevrons.
