@@ -1,8 +1,9 @@
 # Changelog
 
-Release notes are taken from the `## v<version>` section of this file by the release workflow.
+GitHub generates the release notes from the merged pull requests; a `## v<version>` section of this file, if there
+is one, is put above them by the release workflow.
 
-## Unreleased
+## v0.2.0
 
 Update notes: the history store is rebuilt once on the first start (the list footer shows its progress), and the
 semantic search model changed, so the history is re-embedded in the background after the update. The caches of

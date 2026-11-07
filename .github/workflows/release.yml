@@ -226,7 +226,9 @@ jobs:
             test -s "$artifact.sha256"
             sha256sum --check "$artifact.sha256"
           done
-      - name: Release notes from CHANGELOG.md
+      # GitHub generates the notes (merged pull requests since the previous release). A `## v<version>`
+      # section of CHANGELOG.md, if there is one, is put above them; it is optional.
+      - name: Optional release notes from CHANGELOG.md
         run: |
           set -euo pipefail
           awk -v v="v${VERSION}" '
@@ -234,12 +236,16 @@ jobs:
             found && /^## / { exit }
             found { print }
           ' CHANGELOG.md > release-notes.md
-          test -s release-notes.md || { echo "CHANGELOG.md has no '## v${VERSION}' section" >&2; exit 1; }
-          cat release-notes.md
+          if [[ -s release-notes.md ]]; then
+            cat release-notes.md
+          else
+            echo "CHANGELOG.md has no '## v${VERSION}' section: generated notes only"
+          fi
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ needs.version.outputs.version }}
           body_path: release-notes.md
+          generate_release_notes: true
           files: |
             artifacts/*.zip
             artifacts/*.tar.gz
