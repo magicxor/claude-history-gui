@@ -70,7 +70,8 @@
 
 use super::corpus::{CorpusSnapshot, SearchSnapshot};
 use super::{
-    Browser, ListSearchMode, PreparedSession, SemanticProgress, SemanticResultMetadata, UuidLookup,
+    Browser, ListSearchMode, ListSortOrder, PreparedSession, SemanticProgress,
+    SemanticResultMetadata, UuidLookup,
 };
 use crate::env::HistoryEnv;
 use crate::history::Conversation;
@@ -627,6 +628,7 @@ impl Browser {
         self.search_generation += 1;
         self.search_in_flight = false;
         self.search_page_shown = false;
+        self.rerank_pending = false;
         self.lexical_evidence.clear();
         self.clear_evidence_checked();
         self.semantic_search.pending_generation = None;
@@ -1209,6 +1211,7 @@ impl Browser {
         self.search_generation += 1;
         self.search_in_flight = true;
         self.search_page_shown = false;
+        self.rerank_pending = false;
         self.send_lexical_search(query, self.search_generation, self.list_search_mode);
     }
 
@@ -1397,6 +1400,19 @@ impl Browser {
                 && (response.mode == ListSearchMode::Lexical || semantic_fallback_pending)
                 && index_current
             {
+                if !response.complete
+                    && (self.effective_sort_order() != ListSortOrder::Relevance
+                        || self.selection_anchor.is_some()
+                        || self.rerank_pending)
+                {
+                    // Wait for every result: the best-ranked page sorted by
+                    // date would be reordered when they arrive, and a
+                    // session to keep selected (a toggle, a sort change)
+                    // may rank below the page, which would select its first
+                    // row instead.
+                    self.search_in_flight = true;
+                    continue;
+                }
                 let (filtered, evidence) = if response.index.is_some() {
                     let filtered = self.rows_of_docs(&response.filtered);
                     (filtered, self.evidence_of_docs(response.evidence))
@@ -1425,6 +1441,12 @@ impl Browser {
                     // keep what the user selected on it.
                     self.selection_anchor = self.selected_path();
                 }
+                if self.rerank_pending && self.selection_anchor.is_none() {
+                    // The user moved the selection over the rows of before
+                    // (which clears the anchor): keep that session.
+                    self.selection_anchor = self.selected_path();
+                }
+                self.rerank_pending &= !response.complete;
                 self.apply_filtered(filtered);
                 self.search_page_shown = !response.complete;
                 self.search_in_flight = !response.complete;
@@ -1854,6 +1876,57 @@ impl Browser {
         }
     }
 
+    /// Order the rows by relevance or by date (fork), keeping the query and
+    /// the selected session. The date orders apply in lexical mode only
+    /// ([`Browser::effective_sort_order`]); in semantic mode the order is
+    /// stored and applies once lexical mode is back. No-op when unchanged
+    /// and in single-file mode.
+    pub fn set_sort_order(&mut self, order: ListSortOrder) {
+        if self.single_file_mode || self.sort_order == order {
+            return;
+        }
+        let was = self.effective_sort_order();
+        self.sort_order = order;
+        if self.effective_sort_order() == was {
+            return;
+        }
+        match &self.uuid_lookup {
+            // The UUID jump shows its one session: nothing to order.
+            Some(UuidLookup::Found { .. }) => return,
+            // Pending or not found: the rows of before stay. A date order
+            // applies to them; they have no rank to bring back.
+            Some(_) => {
+                if order != ListSortOrder::Relevance {
+                    self.selection_anchor = self.selected_path();
+                    let rows = self.filtered.clone();
+                    self.apply_filtered(rows);
+                }
+                return;
+            }
+            None => {}
+        }
+        if self.selection_anchor.is_none() {
+            self.selection_anchor = self.selected_path();
+        }
+        if order == ListSortOrder::Relevance {
+            // Sorting again cannot bring the rank back: the query runs again
+            // (the browse list is rebuilt in corpus order).
+            self.invalidate_search_generation();
+            self.update_filter();
+            self.rerank_pending = self.search_in_flight;
+        } else {
+            // Every row is there: the date order is applied to them; a
+            // search still running answers in that order too, and keeps the
+            // selected session (its answer needs the anchor as well).
+            let anchor = self.selection_anchor.clone();
+            let rows = self.filtered.clone();
+            self.apply_filtered(rows);
+            if self.search_in_flight {
+                self.selection_anchor = anchor;
+            }
+        }
+    }
+
     /// Whether user-only search is on ([`Browser::toggle_user_only`]),
     /// whatever the search mode.
     pub fn user_only(&self) -> bool {
@@ -1919,6 +1992,14 @@ impl Browser {
             return;
         }
         if self.list_search_mode == ListSearchMode::Semantic && self.query.trim().is_empty() {
+            if self.sort_order != ListSortOrder::Relevance {
+                // The browse rows were in a date order; semantic mode shows
+                // them ranked (newest first), keeping the selected session.
+                if self.selection_anchor.is_none() {
+                    self.selection_anchor = self.selected_path();
+                }
+                self.apply_browse_filter();
+            }
             self.ensure_semantic_corpus();
             self.prewarm_semantic_cache();
         } else {

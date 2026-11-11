@@ -194,6 +194,9 @@ macro_rules! on_fallback_actions {
                 $crate::actions::SetModeSemantic,
                 $crate::actions::SetScopeAll,
                 $crate::actions::SetScopeWorkspace,
+                $crate::actions::SetSortRelevance,
+                $crate::actions::SetSortNewest,
+                $crate::actions::SetSortOldest,
                 $crate::actions::ToggleScope,
                 $crate::actions::ToggleSearchMode,
                 $crate::actions::ToggleAllKinds,
@@ -248,6 +251,9 @@ pub fn is_list_action(action: &dyn Action) -> bool {
         || a.is::<SetModeSemantic>()
         || a.is::<SetScopeAll>()
         || a.is::<SetScopeWorkspace>()
+        || a.is::<SetSortRelevance>()
+        || a.is::<SetSortNewest>()
+        || a.is::<SetSortOldest>()
         || a.is::<ToggleScope>()
         || a.is::<ToggleSearchMode>()
         || a.is::<ToggleAllKinds>()

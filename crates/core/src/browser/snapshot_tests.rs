@@ -1292,6 +1292,161 @@ fn the_complete_ranking_keeps_a_row_selected_on_the_first_page() {
     assert_eq!(app.filtered().len(), 120, "the rows kept for the query");
 }
 
+#[test]
+fn a_date_order_waits_for_every_result_and_sorts_them() {
+    let sandbox = Sandbox::new();
+    let root = publish(&many_needles(120));
+    let mut app = loading_app(&sandbox, None, vec![]);
+    show(&mut app, &root, TimeFilter::default());
+    assert!(app.open_search_index());
+    app.set_sort_order(ListSortOrder::Oldest);
+    let index = app.search_index.clone().unwrap();
+    let (tx, rx) = mpsc::channel();
+    app.search_rx = rx;
+    type_query(&mut app, "needle");
+    let generation = app.search_generation;
+    let ranking: Vec<usize> = (0..120).map(|doc| (doc * 7) % 120).collect();
+    let response = |filtered: Vec<usize>, complete: bool| SearchResponse {
+        filtered,
+        index: Some(index.clone()),
+        complete,
+        generation,
+        mode: ListSearchMode::Lexical,
+        user_only: false,
+        evidence: HashMap::new(),
+    };
+    let before = listed_paths(&app);
+
+    tx.send(response(ranking[..50].to_vec(), false)).unwrap();
+    app.poll();
+    assert_eq!(listed_paths(&app), before, "the first page is not shown");
+    assert!(app.has_search_work_in_flight(), "the rest is coming");
+
+    tx.send(response(ranking, true)).unwrap();
+    assert!(app.poll());
+    assert!(!app.has_search_work_in_flight());
+    let mut oldest_first: Vec<String> = (0..120)
+        .map(|i| format!("/p/-tmp-alpha/{i:03}.jsonl"))
+        .collect();
+    assert_eq!(listed_paths(&app), oldest_first);
+
+    app.set_sort_order(ListSortOrder::Newest);
+    oldest_first.reverse();
+    assert_eq!(listed_paths(&app), oldest_first);
+}
+
+/// Rows of an index query answered by hand: the app with its index, the
+/// sender of answers and the ranking of `many_needles(120)`.
+fn needles_answered_by_hand(
+    sandbox: &Sandbox,
+    root: &tempfile::TempDir,
+) -> (Browser, mpsc::Sender<SearchResponse>, Vec<usize>) {
+    let mut app = loading_app(sandbox, None, vec![]);
+    show(&mut app, root, TimeFilter::default());
+    assert!(app.open_search_index());
+    let (tx, rx) = mpsc::channel();
+    app.search_rx = rx;
+    let ranking = (0..120).map(|doc| (doc * 7) % 120).collect();
+    (app, tx, ranking)
+}
+
+fn index_answer(app: &Browser, filtered: Vec<usize>, complete: bool) -> SearchResponse {
+    SearchResponse {
+        filtered,
+        index: app.search_index.clone(),
+        complete,
+        generation: app.search_generation,
+        mode: ListSearchMode::Lexical,
+        user_only: false,
+        evidence: HashMap::new(),
+    }
+}
+
+#[test]
+fn back_to_relevance_keeps_a_session_ranked_below_the_first_page() {
+    let sandbox = Sandbox::new();
+    let root = publish(&many_needles(120));
+    let (mut app, tx, ranking) = needles_answered_by_hand(&sandbox, &root);
+    type_query(&mut app, "needle");
+    tx.send(index_answer(&app, ranking.clone(), true)).unwrap();
+    assert!(app.poll());
+    assert!(app.select(100), "ranked far below the first page");
+    let chosen = app.selected_path();
+
+    app.set_sort_order(ListSortOrder::Oldest);
+    assert_eq!(app.selected_path(), chosen);
+    app.set_sort_order(ListSortOrder::Relevance);
+    tx.send(index_answer(&app, ranking[..50].to_vec(), false))
+        .unwrap();
+    app.poll();
+    assert_eq!(app.selected_path(), chosen, "the first page waits");
+    tx.send(index_answer(&app, ranking.clone(), true)).unwrap();
+    assert!(app.poll());
+    assert_eq!(app.selected_path(), chosen);
+    assert_eq!(app.selected(), Some(100));
+}
+
+#[test]
+fn a_date_order_chosen_while_the_rank_is_coming_keeps_the_selection() {
+    let sandbox = Sandbox::new();
+    let root = publish(&many_needles(120));
+    let (mut app, tx, ranking) = needles_answered_by_hand(&sandbox, &root);
+    type_query(&mut app, "needle");
+    tx.send(index_answer(&app, ranking.clone(), true)).unwrap();
+    assert!(app.poll());
+    app.set_sort_order(ListSortOrder::Oldest);
+    assert!(app.select(30));
+    let chosen = app.selected_path();
+
+    // Relevance asks for the rank again; Newest is chosen before it comes.
+    app.set_sort_order(ListSortOrder::Relevance);
+    app.set_sort_order(ListSortOrder::Newest);
+    assert_eq!(app.selected_path(), chosen);
+    tx.send(index_answer(&app, ranking, true)).unwrap();
+    assert!(app.poll());
+    assert_eq!(
+        app.selected_path(),
+        chosen,
+        "the answer keeps the selection"
+    );
+    let mut newest_first: Vec<String> = (0..120)
+        .map(|i| format!("/p/-tmp-alpha/{i:03}.jsonl"))
+        .collect();
+    newest_first.reverse();
+    assert_eq!(listed_paths(&app), newest_first);
+}
+
+#[test]
+fn a_session_moved_to_while_the_rank_is_coming_stays_selected() {
+    let sandbox = Sandbox::new();
+    let root = publish(&many_needles(120));
+    let (mut app, tx, ranking) = needles_answered_by_hand(&sandbox, &root);
+    type_query(&mut app, "needle");
+    tx.send(index_answer(&app, ranking.clone(), true)).unwrap();
+    assert!(app.poll());
+    app.set_sort_order(ListSortOrder::Oldest);
+    assert!(app.select(70));
+
+    app.set_sort_order(ListSortOrder::Relevance);
+    // Down over the rows of before, while the rank is coming.
+    app.select_next();
+    let moved_to = app.selected_path();
+    tx.send(index_answer(&app, ranking[..50].to_vec(), false))
+        .unwrap();
+    app.poll();
+    assert_eq!(app.selected_path(), moved_to, "the first page waits");
+    tx.send(index_answer(&app, ranking, true)).unwrap();
+    assert!(app.poll());
+    assert_eq!(app.selected_path(), moved_to);
+
+    // A later query starts at its first row again.
+    app.select_next();
+    type_query(&mut app, " number");
+    tx.send(index_answer(&app, (0..5).collect(), true)).unwrap();
+    assert!(app.poll());
+    assert_eq!(app.selected(), Some(0));
+}
+
 // --- the loader in store mode (fork) ---
 
 /// Drive `loader` until it reports a load event.

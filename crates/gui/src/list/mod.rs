@@ -52,7 +52,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
 use claude_history_core::browser::{
-    Browser, BrowserOptions, HistoryLoader, ListHit, ListSearchMode, LoaderOptions,
+    Browser, BrowserOptions, HistoryLoader, ListHit, ListSearchMode, ListSortOrder, LoaderOptions,
     PreparedSession, RenameError, SemanticWorkerExit,
 };
 #[cfg(test)]
@@ -365,6 +365,15 @@ impl ListPane {
             )
         };
         let excluded_paths = app_state(cx).settings.exclude_paths.clone();
+        let sort_order = {
+            let state = app_state(cx);
+            state
+                .ui
+                .sort_order
+                .filter(|_| state.config.gui.restore_session())
+                .map(ListSortOrder::from)
+                .unwrap_or_default()
+        };
         let level = Some(crate::debug_sink::capture_level(cx));
 
         // The waker: worker threads post to a one-slot channel, the poll task
@@ -377,6 +386,7 @@ impl ListPane {
         let options = BrowserOptions::new(env.clone())
             .with_show_last(show_last)
             .with_default_mode(mode)
+            .with_sort_order(sort_order)
             .with_exclude_projects(excluded.clone())
             .with_exclude_paths(excluded_paths)
             .with_workspace(workspace.clone())
@@ -740,6 +750,23 @@ impl ListPane {
         self.browser.user_only()
     }
 
+    /// The order the user chose (core `Browser::sort_order`), whatever the
+    /// mode.
+    pub fn sort_order(&self) -> ListSortOrder {
+        self.browser.sort_order()
+    }
+
+    /// The order the rows are in: the chosen one in lexical mode, Relevance
+    /// in semantic mode (core `Browser::effective_sort_order`).
+    pub fn effective_sort_order(&self) -> ListSortOrder {
+        self.browser.effective_sort_order()
+    }
+
+    /// Whether the sort order can be chosen: lexical mode.
+    pub fn sort_order_applies(&self) -> bool {
+        self.browser.sort_order_applies()
+    }
+
     /// Whether the current query matches only the user's own messages: the
     /// toggle is on and the mode is lexical (semantic search ignores it).
     pub fn searches_user_only(&self) -> bool {
@@ -947,6 +974,12 @@ impl ListPane {
             self.set_scope_workspace(false, cx);
         } else if any.is::<SetScopeWorkspace>() {
             self.set_scope_workspace(true, cx);
+        } else if any.is::<SetSortRelevance>() {
+            self.set_sort_order(ListSortOrder::Relevance, cx);
+        } else if any.is::<SetSortNewest>() {
+            self.set_sort_order(ListSortOrder::Newest, cx);
+        } else if any.is::<SetSortOldest>() {
+            self.set_sort_order(ListSortOrder::Oldest, cx);
         } else if any.is::<ToggleScope>() {
             let next = !self.scope_is_workspace();
             self.set_scope_workspace(next, cx);
@@ -1015,6 +1048,22 @@ impl ListPane {
             return;
         }
         self.browser.set_user_only(user_only);
+        self.after_filter_change(cx);
+    }
+
+    /// Order the rows by relevance or by date (core
+    /// `Browser::set_sort_order`), keeping the query and the selected
+    /// conversation; remembered (state.json `sort_order`). In semantic mode,
+    /// which ranks its results, the order is not changed.
+    pub fn set_sort_order(&mut self, order: ListSortOrder, cx: &mut Context<Self>) {
+        if self.sort_order() == order || !self.sort_order_applies() {
+            return;
+        }
+        self.browser.set_sort_order(order);
+        update_app_state(cx, |state, _| state.ui.sort_order = Some(order.into()));
+        crate::persist::schedule_save(cx);
+        // The selected conversation stays selected but moves: keep it in view.
+        self.scroll_to_selection();
         self.after_filter_change(cx);
     }
 
@@ -1502,6 +1551,8 @@ impl ListPane {
             .to_string(),
             "list.all_kinds" => self.all_kinds().to_string(),
             "list.user_only" => self.user_only().to_string(),
+            // The order the rows are in: relevance, newest or oldest.
+            "list.sort" => format!("{:?}", self.effective_sort_order()).to_lowercase(),
             "list.time" => self
                 .time_label
                 .as_ref()
@@ -1664,6 +1715,15 @@ impl Render for ListPane {
                 this.handle_forwarded(a, w, cx);
             }))
             .on_action(cx.listener(|this, a: &ToggleAllKinds, w, cx| {
+                this.handle_forwarded(a, w, cx);
+            }))
+            .on_action(cx.listener(|this, a: &SetSortRelevance, w, cx| {
+                this.handle_forwarded(a, w, cx);
+            }))
+            .on_action(cx.listener(|this, a: &SetSortNewest, w, cx| {
+                this.handle_forwarded(a, w, cx);
+            }))
+            .on_action(cx.listener(|this, a: &SetSortOldest, w, cx| {
                 this.handle_forwarded(a, w, cx);
             }))
             .on_action(cx.listener(|this, a: &ToggleUserOnly, w, cx| {

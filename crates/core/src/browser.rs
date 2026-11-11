@@ -169,9 +169,9 @@ pub use loader::{
 };
 pub use search_state::SemanticWorkerExit;
 pub use types::{
-    DeleteError, DeletedSession, EscapeOutcome, IndexNotice, ListSearchMode, RENAMED_STATUS,
-    Readiness, ReconcileState, RenameError, SemanticProgress, SemanticResultMetadata, UuidLookup,
-    query_has_literals,
+    DeleteError, DeletedSession, EscapeOutcome, IndexNotice, ListSearchMode, ListSortOrder,
+    RENAMED_STATUS, Readiness, ReconcileState, RenameError, SemanticProgress,
+    SemanticResultMetadata, UuidLookup, query_has_literals,
 };
 
 use corpus::{CorpusEdits, SearchSnapshot};
@@ -198,6 +198,8 @@ pub struct BrowserOptions {
     pub show_last: bool,
     /// Initial search mode (`[search].mode` / `[tui].semantic_search`).
     pub default_mode: ListSearchMode,
+    /// Initial order of the rows ([`Browser::set_sort_order`]).
+    pub sort_order: ListSortOrder,
     /// Project names hidden from the list (`[tui].exclude_projects`).
     pub exclude_projects: Vec<String>,
     /// Working-directory prefixes hidden from the list (`[tui].exclude_paths`,
@@ -236,6 +238,7 @@ impl BrowserOptions {
             env,
             show_last: true,
             default_mode: ListSearchMode::Lexical,
+            sort_order: ListSortOrder::Relevance,
             exclude_projects: Vec::new(),
             exclude_paths: Vec::new(),
             workspace,
@@ -254,6 +257,11 @@ impl BrowserOptions {
 
     pub fn with_default_mode(mut self, mode: ListSearchMode) -> Self {
         self.default_mode = mode;
+        self
+    }
+
+    pub fn with_sort_order(mut self, order: ListSortOrder) -> Self {
+        self.sort_order = order;
         self
     }
 
@@ -304,6 +312,7 @@ impl std::fmt::Debug for BrowserOptions {
             .field("env", &self.env)
             .field("show_last", &self.show_last)
             .field("default_mode", &self.default_mode)
+            .field("sort_order", &self.sort_order)
             .field("exclude_projects", &self.exclude_projects)
             .field("exclude_paths", &self.exclude_paths)
             .field("workspace", &self.workspace)
@@ -400,8 +409,14 @@ pub struct Browser {
     /// Whether `filtered` is the first page of an index search still being
     /// completed
     search_page_shown: bool,
+    /// The lexical search in flight re-ranks the rows after a sort change
+    /// back to Relevance: its answer keeps the session selected then, also
+    /// one the user moved to meanwhile
+    rerank_pending: bool,
     /// Current list search mode
     list_search_mode: ListSearchMode,
+    /// Order of the rows chosen by the user (applied in lexical mode)
+    sort_order: ListSortOrder,
     /// Semantic search state
     semantic_search: SemanticSearchState,
     /// Cached lexical evidence produced outside the render path
@@ -538,7 +553,13 @@ impl Browser {
             search_generation: 0,
             search_in_flight: false,
             search_page_shown: false,
+            rerank_pending: false,
             list_search_mode,
+            sort_order: if parts.single_file_mode {
+                ListSortOrder::Relevance
+            } else {
+                opts.sort_order
+            },
             semantic_search: SemanticSearchState {
                 available: semantic_available,
                 ..Default::default()
@@ -569,7 +590,9 @@ impl Browser {
                 search_rx,
             },
         );
-        browser.filtered = browser.filter_indices(0..browser.conversations.len());
+        let mut filtered = browser.filter_indices(0..browser.conversations.len());
+        browser.order_rows(&mut filtered);
+        browser.filtered = filtered;
         browser.selected = if browser.filtered.is_empty() {
             None
         } else {
@@ -794,6 +817,28 @@ impl Browser {
         self.list_search_mode
     }
 
+    /// The order the user chose ([`Browser::set_sort_order`]), whatever the
+    /// search mode.
+    pub fn sort_order(&self) -> ListSortOrder {
+        self.sort_order
+    }
+
+    /// The order the rows are in: the chosen one in lexical mode,
+    /// [`ListSortOrder::Relevance`] in semantic mode (semantic search ranks
+    /// nearly every conversation, so a date order would lose its ranking).
+    pub fn effective_sort_order(&self) -> ListSortOrder {
+        match self.list_search_mode {
+            ListSearchMode::Lexical => self.sort_order,
+            ListSearchMode::Semantic => ListSortOrder::Relevance,
+        }
+    }
+
+    /// Whether the sort order applies ([`Browser::effective_sort_order`]):
+    /// lexical mode, outside single-file mode.
+    pub fn sort_order_applies(&self) -> bool {
+        !self.single_file_mode && self.list_search_mode == ListSearchMode::Lexical
+    }
+
     /// Whether semantic search can be used (always false in single-file mode).
     pub fn semantic_available(&self) -> bool {
         self.semantic_search.available
@@ -942,3 +987,6 @@ mod perf_tests;
 
 #[cfg(test)]
 mod snapshot_tests;
+
+#[cfg(test)]
+mod sort_tests;

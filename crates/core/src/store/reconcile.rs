@@ -922,11 +922,15 @@ mod tests {
         let fixture = Fixture::new();
         let a = fixture.claude("-tmp-work", "a.jsonl", "hello alpha");
         settle_all(fixture._dir.path());
+        // A minute ahead: the file stays inside the window of unknown
+        // fingerprints (`MTIME_SLACK`) for both passes however slow the
+        // machine is. With `now` a pass starting more than the slack later
+        // (a loaded CI runner) saw a settled file and published.
         fs::File::options()
             .write(true)
             .open(&a)
             .unwrap()
-            .set_modified(SystemTime::now())
+            .set_modified(SystemTime::now() + Duration::from_secs(60))
             .unwrap();
         fixture.run();
         let outcome = fixture.run();

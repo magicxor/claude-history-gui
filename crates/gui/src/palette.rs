@@ -29,7 +29,8 @@ pub struct PaletteEntry {
     pub path: SharedString,
     pub checked: bool,
     /// No handler for the action on the dispatch path of the focus the
-    /// palette returns to (§8.9): shown muted, never dispatched.
+    /// palette returns to (§8.9), or disabled in the menu tree itself (View
+    /// → Sort in semantic mode): shown muted, never dispatched.
     pub disabled: bool,
     /// The live shortcut of the action for the focus the palette returns to
     /// (`None`: unbound there).
@@ -75,12 +76,13 @@ fn collect(items: Vec<MenuItem>, path: &str, out: &mut Vec<PaletteEntry>) {
                 name,
                 action,
                 checked,
+                disabled,
                 ..
             } => out.push(PaletteEntry {
                 label: name,
                 path: path.to_string().into(),
                 checked,
-                disabled: false,
+                disabled,
                 shortcut: None,
                 action,
             }),
@@ -124,7 +126,7 @@ pub fn palette_groups_for(
 ) -> Vec<PaletteGroup> {
     let mut groups = palette_groups(cx);
     for entry in groups.iter_mut().flat_map(|group| group.entries.iter_mut()) {
-        entry.disabled = !match focus {
+        entry.disabled |= !match focus {
             Some(focus) => window.is_action_available_in(&*entry.action, focus),
             None => window.is_action_available(&*entry.action, cx),
         };

@@ -14,7 +14,8 @@ use crate::list::ListPaneEvent;
 use crate::list::context_menu::MenuEntry;
 use crate::list::footer::{ChipKind, FooterModel, chip_width_rem};
 use crate::list::toolbar::{
-    NO_WORKSPACE_TOOLTIP, USER_ONLY_SEMANTIC_TOOLTIP, USER_ONLY_TOOLTIP, WORKSPACE_TOOLTIP,
+    NO_WORKSPACE_TOOLTIP, SORT_SEMANTIC_TOOLTIP, SORT_TOOLTIP, USER_ONLY_SEMANTIC_TOOLTIP,
+    USER_ONLY_TOOLTIP, WORKSPACE_TOOLTIP,
 };
 use crate::list::workspace_picker::IS_DIR_CALLS;
 use crate::model::RowMenuItem;
@@ -621,6 +622,153 @@ fn alt_u_searches_only_your_own_messages(cx: &mut TestAppContext) {
     f.press(cx, "ctrl-t");
     f.wait_idle(cx);
     assert_eq!(f.paths(cx), [asked], "lexical again: only yours");
+}
+
+/// Three walrus sessions an hour apart: the oldest mentions it most, the
+/// middle one once. Returns (oldest, middle, newest).
+fn sorting_world() -> (TestWorld, [std::path::PathBuf; 3]) {
+    let world = TestWorld::new();
+    let start = Utc::now() - Duration::hours(5);
+    let oldest = SessionSpec::new("alpha", 1)
+        .messages(&[
+            ("user", "walrus walrus walrus walrus"),
+            ("assistant", "the walrus, the walrus, the walrus"),
+        ])
+        .start(start)
+        .write(&world);
+    let middle = SessionSpec::new("beta", 2)
+        .messages(&[("user", "one walrus"), ("assistant", "an answer")])
+        .start(start + Duration::hours(2))
+        .write(&world);
+    let newest = SessionSpec::new("gamma", 3)
+        .messages(&[("user", "walrus and walrus"), ("assistant", "two of them")])
+        .start(start + Duration::hours(4))
+        .write(&world);
+    (world, [oldest, middle, newest])
+}
+
+fn dispatch(f: &ListFixture, cx: &mut TestAppContext, action: Box<dyn gpui_kit::Action>) {
+    cx.update_window(f.handle, |_, window, cx| window.dispatch_action(action, cx))
+        .unwrap();
+    cx.run_until_parked();
+    f.wait_idle(cx);
+}
+
+/// L-110: the sort order orders lexical results and the browse list by
+/// date (last activity) and back by relevance, keeping the query and the
+/// selected conversation; the toolbar, the View menu and the probe follow,
+/// the order is remembered, and semantic mode keeps its ranking.
+fn sort_order_orders_the_rows(cx: &mut TestAppContext, memory: bool) {
+    use claude_history_core::browser::ListSortOrder::{Newest, Oldest, Relevance};
+    let (world, [oldest, middle, newest]) = sorting_world();
+    if memory {
+        crate::test_support::use_memory_list(cx, &world, &[]);
+    } else {
+        ListFixture::init_app(cx, &world, &[]);
+    }
+    let _control = crate::test_support::fixtures_list::install_fake_embedder(cx);
+    let f = ListFixture::open_loaded(cx, &world, &[]);
+    let probe = |cx: &TestAppContext| f.read(cx, |list, cx| list.qa_probe("list.sort", cx));
+    let toolbar = |cx: &TestAppContext| f.read(cx, |list, _| list.toolbar_model());
+    assert_eq!(probe(cx).as_deref(), Some("relevance"));
+    assert_eq!(toolbar(cx).sort_order, Relevance);
+    assert!(toolbar(cx).sort_enabled);
+    assert_eq!(toolbar(cx).sort_tooltip, SORT_TOOLTIP);
+    let browse = [newest.clone(), middle.clone(), oldest.clone()];
+    assert_eq!(f.paths(cx), browse);
+
+    f.type_text(cx, "walrus");
+    f.wait_idle(cx);
+    let ranked = f.paths(cx);
+    assert_eq!(ranked.len(), 3);
+    assert_eq!(ranked[0], oldest, "the most mentions rank first");
+    f.press(cx, "down");
+    let chosen = f.selected_path(cx);
+
+    dispatch(&f, cx, Box::new(crate::actions::SetSortOldest));
+    assert_eq!(probe(cx).as_deref(), Some("oldest"));
+    assert_eq!(
+        f.paths(cx),
+        [oldest.clone(), middle.clone(), newest.clone()]
+    );
+    assert_eq!(f.selected_path(cx), chosen, "the selection is kept");
+    assert_eq!(f.read(cx, |list, cx| list.query(cx).to_string()), "walrus");
+    assert_eq!(
+        cx.read(|cx| crate::menus::current_checks(cx).sort_order),
+        Oldest
+    );
+    assert_eq!(
+        cx.read(|cx| crate::globals::app_state(cx).ui.sort_order),
+        Some(crate::persist::RememberedSortOrder::Oldest)
+    );
+
+    dispatch(&f, cx, Box::new(crate::actions::SetSortNewest));
+    assert_eq!(f.paths(cx), browse);
+    assert_eq!(toolbar(cx).sort_order, Newest);
+
+    dispatch(&f, cx, Box::new(crate::actions::SetSortRelevance));
+    assert_eq!(f.paths(cx), ranked, "the rank comes back");
+    assert_eq!(f.selected_path(cx), chosen);
+
+    // Browse: the date orders apply too.
+    dispatch(&f, cx, Box::new(crate::actions::SetSortOldest));
+    f.press(cx, "escape");
+    f.wait_idle(cx);
+    assert_eq!(f.read(cx, |list, cx| list.query(cx).to_string()), "");
+    assert_eq!(
+        f.paths(cx),
+        [oldest.clone(), middle.clone(), newest.clone()]
+    );
+
+    // Semantic mode keeps its ranking: the control is disabled and the
+    // chosen order waits for lexical mode.
+    f.press(cx, "ctrl-t");
+    f.wait_idle(cx);
+    let model = toolbar(cx);
+    assert!(!model.sort_enabled);
+    assert_eq!(model.sort_order, Relevance);
+    assert_eq!(model.sort_tooltip, SORT_SEMANTIC_TOOLTIP);
+    assert_eq!(probe(cx).as_deref(), Some("relevance"));
+    let checks = cx.read(crate::menus::current_checks);
+    assert_eq!(checks.sort_order, Relevance);
+    dispatch(&f, cx, Box::new(crate::actions::SetSortNewest));
+    assert_eq!(
+        f.read(cx, |list, _| list.sort_order()),
+        Oldest,
+        "ignored in semantic mode"
+    );
+    f.press(cx, "ctrl-t");
+    f.wait_idle(cx);
+    assert_eq!(probe(cx).as_deref(), Some("oldest"));
+    assert_eq!(f.paths(cx), [oldest, middle, newest]);
+}
+
+#[gpui_kit::test]
+fn the_sort_order_orders_the_rows(cx: &mut TestAppContext) {
+    sort_order_orders_the_rows(cx, false);
+}
+
+#[gpui_kit::test]
+fn the_sort_order_orders_the_rows_in_memory(cx: &mut TestAppContext) {
+    sort_order_orders_the_rows(cx, true);
+}
+
+/// L-110, C-071: the remembered order applies when the list opens.
+#[gpui_kit::test]
+fn the_remembered_sort_order_applies_at_startup(cx: &mut TestAppContext) {
+    let (world, [oldest, middle, newest]) = sorting_world();
+    ListFixture::init_app(cx, &world, &[]);
+    cx.update(|cx| {
+        crate::globals::update_app_state(cx, |state, _| {
+            state.ui.sort_order = Some(crate::persist::RememberedSortOrder::Oldest)
+        })
+    });
+    let f = ListFixture::open_loaded(cx, &world, &[]);
+    assert_eq!(
+        f.read(cx, |list, _| list.sort_order()),
+        claude_history_core::browser::ListSortOrder::Oldest
+    );
+    assert_eq!(f.paths(cx), [oldest, middle, newest]);
 }
 
 /// C-070: upstream's default `[keys] user_only = "ctrl+v"` is paste in the

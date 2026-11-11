@@ -1,21 +1,22 @@
 //! The list toolbar (DESIGN §5.1): mode Lexical/Semantic, the `You only`
 //! toggle (upstream ae7ae39), scope All/Workspace, workspace picker, time
-//! filter, Refresh. WP1.
+//! filter, sort order (fork), Refresh. WP1.
 
 use claude_history_core::WorkspaceScope;
-use claude_history_core::browser::ListSearchMode;
+use claude_history_core::browser::{ListSearchMode, ListSortOrder};
 use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants as _};
-use gpui_kit::component::menu::DropdownMenu as _;
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{
     Disableable as _, IconName, Selectable as _, Sizable as _, h_flex, v_flex,
 };
 use gpui_kit::{
-    Context, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, Styled as _,
-    div,
+    Action, Anchor, Context, InteractiveElement as _, IntoElement, ParentElement as _,
+    SharedString, Styled as _, div,
 };
 
 use crate::actions::{
-    Refresh, SetModeLexical, SetModeSemantic, SetScopeAll, SetScopeWorkspace, ToggleUserOnly,
+    Refresh, SetModeLexical, SetModeSemantic, SetScopeAll, SetScopeWorkspace, SetSortNewest,
+    SetSortOldest, SetSortRelevance, ToggleUserOnly,
 };
 use crate::keymap::{CTX_LIST, CTX_LIST_TOOLBAR, CTX_WORKSPACE};
 use crate::widgets::time_range::{TimeRangeChoice, time_range_button};
@@ -33,6 +34,29 @@ pub const USER_ONLY_TOOLTIP: &str = crate::menus::USER_ONLY_LABEL;
 /// The user-only toggle's tooltip in semantic mode, which ignores it.
 pub const USER_ONLY_SEMANTIC_TOOLTIP: &str =
     "Search only your own messages (lexical search; semantic search ignores it)";
+/// The sort button's tooltip in lexical mode.
+pub const SORT_TOOLTIP: &str = "Sort the results";
+/// The sort button's tooltip in semantic mode, where it is disabled.
+pub const SORT_SEMANTIC_TOOLTIP: &str =
+    "Semantic results are ranked by similarity (sorting applies to lexical search)";
+
+/// The sort button's label: the order in a word.
+pub fn sort_button_label(order: ListSortOrder) -> &'static str {
+    match order {
+        ListSortOrder::Relevance => "Relevance",
+        ListSortOrder::Newest => "Newest",
+        ListSortOrder::Oldest => "Oldest",
+    }
+}
+
+/// The action choosing `order` (toolbar menu, View → Sort).
+pub fn sort_action(order: ListSortOrder) -> Box<dyn Action> {
+    match order {
+        ListSortOrder::Relevance => Box::new(SetSortRelevance),
+        ListSortOrder::Newest => Box::new(SetSortNewest),
+        ListSortOrder::Oldest => Box::new(SetSortOldest),
+    }
+}
 
 /// The workspace button label: the folder's short name, else "No workspace".
 pub fn workspace_label(workspace: Option<&WorkspaceScope>) -> String {
@@ -61,6 +85,11 @@ pub struct ToolbarModel {
     pub workspace_label: String,
     /// `Any time`, `Since 2d`, `Before 2026-07-20`
     pub time_label: SharedString,
+    /// The order the rows are in (Relevance in semantic mode).
+    pub sort_order: ListSortOrder,
+    /// The sort button is enabled (lexical mode).
+    pub sort_enabled: bool,
+    pub sort_tooltip: &'static str,
     pub refresh_loading: bool,
 }
 
@@ -85,6 +114,13 @@ impl ListPane {
             },
             workspace_label: workspace_label(self.browser.workspace()),
             time_label: self.time_label.clone().unwrap_or_else(|| "Any time".into()),
+            sort_order: self.effective_sort_order(),
+            sort_enabled: self.sort_order_applies(),
+            sort_tooltip: if self.sort_order_applies() {
+                SORT_TOOLTIP
+            } else {
+                SORT_SEMANTIC_TOOLTIP
+            },
             refresh_loading: self.is_refreshing() || self.is_loading(),
         }
     }
@@ -178,7 +214,11 @@ pub fn render_toolbar(list: &ListPane, cx: &mut Context<ListPane>) -> impl IntoE
         )
         .child(
             h_flex()
+                // A narrow pane wraps the dropdowns instead of clipping them
+                // (and pushing Refresh out of the pane).
+                .flex_wrap()
                 .gap_2()
+                .gap_y_1()
                 .child(
                     Button::new("workspace-picker")
                         .icon(IconName::FolderOpen)
@@ -203,6 +243,7 @@ pub fn render_toolbar(list: &ListPane, cx: &mut Context<ListPane>) -> impl IntoE
                             .ok();
                     },
                 ))
+                .child(sort_button(&model))
                 .child(div().flex_1())
                 .child(
                     Button::new("refresh")
@@ -215,4 +256,32 @@ pub fn render_toolbar(list: &ListPane, cx: &mut Context<ListPane>) -> impl IntoE
                         .on_click(|_, window, cx| window.dispatch_action(Box::new(Refresh), cx)),
                 ),
         )
+}
+
+/// The sort order dropdown: Relevance, Newest first, Oldest first (each a
+/// `SetSort*` action, so the View menu and the palette offer the same).
+fn sort_button(model: &ToolbarModel) -> impl IntoElement + use<> {
+    let current = model.sort_order;
+    Button::new("sort-order")
+        .icon(match current {
+            ListSortOrder::Oldest => IconName::SortAscending,
+            ListSortOrder::Relevance | ListSortOrder::Newest => IconName::SortDescending,
+        })
+        .label(sort_button_label(current))
+        .xsmall()
+        .outline()
+        .dropdown_caret(true)
+        .disabled(!model.sort_enabled)
+        .tooltip(model.sort_tooltip)
+        .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _window, _cx| {
+            ListSortOrder::ALL.into_iter().fold(menu, |menu, order| {
+                menu.item(
+                    PopupMenuItem::new(order.label())
+                        .checked(order == current)
+                        .on_click(move |_, window, cx| {
+                            window.dispatch_action(sort_action(order), cx)
+                        }),
+                )
+            })
+        })
 }

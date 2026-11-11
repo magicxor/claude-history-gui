@@ -348,8 +348,8 @@ explicitly.
 ### PD17 Persisted UI state
 `<home>/.local/state/claude-history-gui/state.json` (separate from gui.toml; never the CLI's files): window bounds per
 window kind, left-pane widths (conversations / deep search), agent-panel width/visibility/tab, focus-viewer mode,
-active left tab, workspace + recents, last search mode, last tool display, show thinking, show timing, last export
-dir. **Precedence** for the view defaults and the list mode: CLI flag > config key (gui.toml > config.toml) when set >
+active left tab, workspace + recents, last search mode, last sort order (fork), last tool display, show thinking,
+show timing, last export dir. **Precedence** for the view defaults and the list mode: CLI flag > config key (gui.toml > config.toml) when set >
 remembered value from state.json (only when `[gui] restore_session`) > built-in default **[FLAG: refined; a
 remembered value must never mask a config key]**. The time filter is **not** persisted (every launch starts
 unfiltered unless `--since/--after/--before` is given — upstream behavior). Theme is not here (PD9). Writes are
@@ -668,7 +668,11 @@ Should-close handler: `cx.quit()` (PD6).
   only your own messages (lexical search; semantic search ignores it)`); `ButtonGroup` **All | Workspace** (Workspace
   disabled without a workspace). Row 2: workspace dropdown button (icon `FolderOpen`, label = workspace short name
   or "No workspace"), time filter dropdown (`dropdown_menu_with_anchor(Anchor::TopRight)`; label "Any time" or the
-  active filter, e.g. "Since 2d" / "Before 2026-07-20"), spacer, Refresh ghost icon button (`RefreshCw`,
+  active filter, e.g. "Since 2d" / "Before 2026-07-20"), sort dropdown (fork; icon `SortDescending`, `SortAscending`
+  for Oldest; label `Relevance` / `Newest` / `Oldest`; tooltip `Sort the results`; disabled in semantic mode with the
+  tooltip `Semantic results are ranked by similarity (sorting applies to lexical search)`; §5.3, §11.4; row 2 wraps
+  in a narrow pane, so the dropdowns are never clipped and Refresh stays in the pane), spacer,
+  Refresh ghost icon button (`RefreshCw`,
   `tooltip_with_action("Refresh", &Refresh, Some("Workspace"))`, `.loading(true)` while a load runs).
 * Picker banner (picker mode only) between toolbar and list: info-colored strip with the PD5 text and a primary
   `Select` button.
@@ -721,7 +725,7 @@ disabled for targets with an unknown source, and each one the conversation's cap
 disabled too. While loading, Rename and Delete are disabled, and Resume and Fork until the rows are listed newest
 first (the first cards of the store's generation, AD6).
 
-### 5.3 Workspace picker and time filter dropdowns
+### 5.3 Workspace picker, time filter and sort dropdowns
 ```
 Workspace ▾                                   Time ▾
 ┌───────────────────────────────────────┐     ┌──────────────────────┐
@@ -737,6 +741,8 @@ Workspace ▾                                   Time ▾
                                               │ Custom range…        │
                                               └──────────────────────┘
 ```
+Sort ▾ (fork, anchored top right like Time ▾): `✓ Relevance`, `Newest first`, `Oldest first`; the items dispatch
+`SetSortRelevance` / `SetSortNewest` / `SetSortOldest`, the same as View → Sort ▸.
 The "Projects in conversations" entries come from ListPane's cached `project_paths` (computed off-thread after each
 load, PD3). "Custom range…" dialog (shared widget `widgets/time_range.rs`, also used by Deep search):
 ```
@@ -1752,7 +1758,7 @@ gpui_kit::actions!(history, [
   // list
   SelectPrev, SelectNext, SelectPageUp, SelectPageDown, SelectHalfPageDown, SelectFirst, SelectLast,
   ClearQuery, ToggleScope, ToggleSearchMode, ToggleAllKinds, ToggleUserOnly, SetModeLexical, SetModeSemantic,
-  SetScopeAll, SetScopeWorkspace, OpenRowContextMenu,
+  SetScopeAll, SetScopeWorkspace, SetSortRelevance, SetSortNewest, SetSortOldest, OpenRowContextMenu,
   // viewer
   ScrollLineDown, ScrollLineUp, NextMessage, PrevMessage, ScrollHalfPageDown, ScrollHalfPageUp,
   ScrollPageDown, ScrollPageUp, ScrollTop, ScrollBottom, StartSearch, NextMatch, PrevMatch, CommitSearch,
@@ -1810,6 +1816,7 @@ Columns: **Win/Linux** and **macOS** keystrokes (identical unless shown), **Cont
 | ToggleScope | `tab` | `tab` | `ConversationList && !ListToolbar` | ListPane; without a workspace → `cx.propagate()` (focus moves on) | View → Scope ▸ |
 | ToggleSearchMode | `ctrl-t` | `ctrl-t` | `ConversationList && !ListToolbar` | ListPane | **not registered** when `KeyBindings::conflicts_with_ctrl_t()` (C-029) |
 | SetModeLexical / SetModeSemantic / SetScopeAll / SetScopeWorkspace | — | — | — | ListPane (+ routing fallback) | View menu items + toolbar |
+| SetSortRelevance / SetSortNewest / SetSortOldest | — | — | — | ListPane (+ routing fallback); no-op in semantic mode | View → Sort ▸ + toolbar sort dropdown (fork) |
 | OpenRowContextMenu | `shift-f10`, `menu` | `shift-f10` | `ConversationList && !ListToolbar` | ListPane → NativeMenu at the selected row | |
 | ScrollLineDown | `j`, `down` | same | `Viewer && !Input` | ViewerPane | |
 | ScrollLineUp | `k`, `up` | same | `Viewer && !Input` | ViewerPane | |
@@ -2029,8 +2036,10 @@ activation (check marks reflect the active window's viewer, tracked in `ActivePa
 * **File**: Open JSONL file…, Show conversations, Choose workspace…, Clear workspace, Export…, Close window, Quit.
 * **Edit**: Copy, Find in conversation, Find in all conversations….
 * **View**: Conversations, Deep search, Viewer, Focus viewer, Tool display ▸ Off/Summary/Calls/Truncated/Full,
-  Show thinking, Show timestamps, Search mode ▸ Lexical/Semantic, Scope ▸ All/Workspace, Show automated and subagent
-  conversations (check mark, cb990e6), Theme ▸ System/Light/Dark, Refresh.
+  Show thinking, Show timestamps, Search mode ▸ Lexical/Semantic, Scope ▸ All/Workspace, Sort ▸ Relevance/Newest
+  first/Oldest first (fork; check mark on the order the rows are in, every item disabled in semantic mode: the tree
+  sets the flag, `mark_disabled` and the palette keep it), Show automated and subagent conversations (check mark, cb990e6),
+  Search only your own messages (check mark, ae7ae39), Theme ▸ System/Light/Dark, Refresh.
 * **Session**: Open, Resume, Fork, Rename…, Delete…, Export…, Copy to clipboard ▸ 4 formats, Copy message, Copy path,
   Copy session ID, Copy header session ID, Show file path, Reveal in file manager, Open parent conversation,
   Subagents and forks… (3c2ffeb), Search within conversation…, Outline, Read range…, Semantic result details, Print
@@ -2448,6 +2457,7 @@ recorded each frame (for the keyboard context menu position).
 | show timing | — | — | state.json `view.show_timing` | false |
 | show last (previews) | `--last` / `--first` | config `[display] last` set | — | true |
 | list mode | `--semantic` / `--lexical` | config `[search] mode` or `[tui] semantic_search` set (core `list_search_mode`) | state.json `search_mode` | Lexical |
+| sort order (fork) | — | — | state.json `sort_order` | Relevance |
 | time filter | `--since/--after/--before` | — | (never restored) | none |
 
    * keymap, menus, palette, theme, embedder.
@@ -2618,7 +2628,23 @@ recorded each frame (for the keyboard context menu position).
    (`SearchIndex::search(.., user_only)` on the `own-*` index segments, or the lexical worker's
    `search::user_only_view` of the corpus in memory, built once per corpus version); evidence comes from own text
    (the worker's, and `fill_visible_evidence`). In semantic mode it changes nothing until the mode is lexical again
-   (ae7ae39).
+   (ae7ae39). Sort order (fork; toolbar sort dropdown / View → Sort ▸ / palette; remembered in state.json
+   `sort_order`): `browser.set_sort_order(ListSortOrder::{Relevance, Newest, Oldest})` keeps the query and the
+   selected conversation. The date orders sort by `Conversation::timestamp`, the last activity the rows show (there
+   is no creation time); core applies them in one place, `Browser::apply_filtered` (a stable sort of the rows, never
+   of the shared scope or the corpus), so the browse list, lexical results, the scope-only rows while loading and the
+   first cards of a generation follow; under a date order, and while a session is to stay selected (a sort change or
+   another toggle keeping the selection: it may rank below the page), the index's best-ranked first page is not
+   shown, the complete answer is. Back to Relevance the query runs again (the rank cannot be recovered by sorting);
+   a date order chosen before that answer keeps the selected session for it, and so does that answer for a session
+   the user moved to meanwhile (`rerank_pending`). Semantic mode ranks nearly every
+   conversation, so it always shows its ranking (`effective_sort_order` = Relevance; switching to it rebuilds a
+   date-ordered browse list; the toolbar control and the menu items are disabled; the chosen order applies again in
+   lexical mode). A UUID jump's single row is not ordered; the rows a pending or unknown UUID keeps follow a date
+   order (they have no rank to bring back). While the in-memory loader streams, rows arrive unsorted
+   whatever the order (L-002); the load's end orders them. Known limits: lexical hit evidence exists for the 200 best-ranked rows, so a
+   date-sorted row further down shows its normal preview (in store mode `fill_visible_evidence` fills it); before
+   a generation opens only its newest `SNAPSHOT_ROWS` cards are listed (Oldest orders them until it opens).
 5. Footer activity = `semantic_activity_status_text()`, its progress bar from `semantic_activity_counts()`.
 
 ### 11.5 UUID jump (K2)
@@ -2968,6 +2994,7 @@ W warning, E error. Every error state offers a recovery action (DG §9.13).
 | Toast E | a failed reconcile pass that no load event reports (not a refresh's pass, and not a first pass that left nothing listed) | + [Show debug log]; replaces the refresh toasts | `Indexing failed: <message>` | `Indexing failed: <message>` (`IndexNotice::status_message`) |
 | Footer / View menu / rows | automated and subagent conversations listed (cb990e6) | chip (accent, while on) / check mark / line-2 tag | `Ctrl+G all kinds` / `Show automated and subagent conversations` / `auto`, `sub` | `^G·all kinds` / help `Show/hide automated and subagent sessions` / `Provenance::list_label` |
 | Toolbar / footer / View menu | search limited to the user's own messages (ae7ae39) | toggle button (selected while on) + tooltip / chip (accent, while on) / check mark | `You only`, tooltip `Search only your own messages` (semantic mode: `Search only your own messages (lexical search; semantic search ignores it)`) / `Alt+U you only`, in semantic mode `Alt+U you only: not in semantic` / `Search only your own messages` | `^V·you only` / `you only: not in semantic` / help `Search only your own messages (lexical)` |
+| Toolbar / View menu | sort order of the rows (fork) | dropdown button (disabled in semantic mode) / submenu with check marks (disabled in semantic mode) | `Relevance` / `Newest` / `Oldest`, tooltip `Sort the results` (semantic mode: `Semantic results are ranked by similarity (sorting applies to lexical search)`); items `Relevance`, `Newest first`, `Oldest first` | — |
 | Deep search options | `--user-only` (dcd3978) | checkbox + tooltip | `Only my messages`; tooltip `Search only your own messages; semantic and hybrid modes search lexically instead` | clap help (verbatim tooltip) |
 | Deep search options | `--all-kinds` (cb990e6) | checkbox + tooltip | `Include exec and subagent runs`; tooltip `Also search automated (Codex exec) and subagent conversations` | clap help (verbatim tooltip) |
 | Toast S | refresh done | replaces previous | `Refreshed conversations: <old> → <new>` | `Refreshed sessions: <old> -> <new>` |
@@ -3138,6 +3165,7 @@ Path: `<home>/.local/state/claude-history-gui/state.json` (the directory of `env
   "workspace": "C:\\git\\proj",
   "recent_workspaces": ["C:\\git\\proj", "C:\\git\\api"],
   "search_mode": "lexical",
+  "sort_order": "relevance",
   "view": { "tool_display": "summary", "show_thinking": false, "show_timing": false },
   "last_export_dir": "C:\\Users\\me\\Downloads"
 }
@@ -3146,7 +3174,8 @@ Restored values are clamped (window to current displays, widths to the ranges an
 false` → only `last_export_dir` and `recent_workspaces` are used. A version-1 file is read (its `time_filter_text` is
 ignored). `view.tool_display` is `off|summary|calls|truncated|full` (`off`: d0aca95, `calls`: a60dfe9); a value
 this build does not know reads as never remembered instead of making the file corrupt (a build before a60dfe9
-forgets a remembered `calls`).
+forgets a remembered `calls`). `sort_order` (fork) is `relevance|newest|oldest`, an unknown value likewise reads as
+never remembered.
 
 ### 13.4 Data locations (core `env.rs`)
 | What | Location |

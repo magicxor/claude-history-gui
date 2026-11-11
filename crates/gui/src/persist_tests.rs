@@ -58,6 +58,7 @@ fn full_state(base: &Path) -> UiState {
         workspace: Some(proj.clone()),
         recent_workspaces: vec![proj, api],
         search_mode: Some(RememberedSearchMode::Semantic),
+        sort_order: Some(RememberedSortOrder::Oldest),
         view: RememberedView {
             tool_display: Some(RememberedToolDisplay::Full),
             show_thinking: Some(true),
@@ -309,6 +310,7 @@ fn restore_session_off_keeps_only_export_dir_and_recents() {
     assert!(!loaded.list_collapsed);
     assert_eq!(loaded.view, RememberedView::default());
     assert_eq!(loaded.search_mode, None);
+    assert_eq!(loaded.sort_order, None);
 }
 
 /// `load` reads `[gui] restore_session` from gui.toml itself.
