@@ -100,6 +100,8 @@ struct ModelChange {
 struct UserMessage {
     content: Option<String>,
     source: Option<String>,
+    // Not `parentAgentTaskId`: newer CLI versions put it on the user's own
+    // prompts too, so it does not tell a subagent's prompt from them.
     parent_tool_call_id: Option<String>,
 }
 

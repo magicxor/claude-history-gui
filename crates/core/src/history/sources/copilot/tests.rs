@@ -415,9 +415,17 @@ fn subagent_records_are_attributed_to_their_agent() {
     );
 
     // The main agent's own dialogue, with the results of its task calls.
+    // The user's prompt names a parent task (`parentAgentTaskId`), as a
+    // newer CLI's prompts do: that does not make it a subagent's.
     let main = messages(&transcript, Visibility::Dialogue);
     assert_eq!(main.len(), 5);
-    assert_eq!(main[0].1, [text("Survey the lemur parser with subagents")]);
+    assert_eq!(
+        main[0],
+        (
+            Role::User,
+            &[text("Survey the lemur parser with subagents")][..]
+        )
+    );
     assert!(matches!(main[2].1, [Part::ToolResult { call_id, .. }] if call_id == "call_task1"));
 
     // Subagent text is found by agent search, not by the list's.
