@@ -13,6 +13,7 @@
 use crate::env::WorkspaceScope;
 use crate::history::model::SourceKind;
 use crate::history::path::project_is_excluded;
+use crate::history::sources::copilot;
 use crate::history::{Conversation, Workspace};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -27,11 +28,20 @@ use std::sync::Arc;
 /// are told apart by the comparison every lookup makes. Hashing only the
 /// file name is several times cheaper than hashing every component through
 /// `Path`'s `Hash` (about 1 µs per path on Windows).
+///
+/// Fork: every Copilot session's log is named `events.jsonl`, which would
+/// put them all under one key and make each lookup compare every one of
+/// them. Such a path is keyed by the name of its directory, the session's
+/// id; equal paths have equal directory names too.
 pub(super) fn path_key(path: &Path) -> u64 {
-    hash_bytes(
-        path.file_name()
-            .map_or(&[][..], |name| name.as_encoded_bytes()),
-    )
+    let name = path.file_name();
+    let name = match name {
+        Some(log) if log == copilot::EVENTS_FILE => {
+            path.parent().and_then(Path::file_name).or(name)
+        }
+        _ => name,
+    };
+    hash_bytes(name.map_or(&[][..], |name| name.as_encoded_bytes()))
 }
 
 /// The 64-bit key of a session id, ignoring ASCII case (the UUID jump
@@ -727,6 +737,19 @@ mod tests {
             assert_eq!(path_key(left), path_key(right));
         }
         assert_ne!(path_key(Path::new("a/b")), path_key(Path::new("a/c")));
+        // Copilot logs share their name: the session directory tells them
+        // apart, and equal paths still get equal keys.
+        let log = |dir: &str| Path::new(dir).join("events.jsonl");
+        let first = log("h/session-state/0c0a0000-0000-4000-8000-000000000001");
+        let second = log("h/session-state/0c0a0000-0000-4000-8000-000000000002");
+        assert_ne!(path_key(&first), path_key(&second));
+        let respelled = log("h//session-state/./0c0a0000-0000-4000-8000-000000000001/.");
+        assert_eq!(first, respelled);
+        assert_eq!(path_key(&first), path_key(&respelled));
+        assert_eq!(
+            path_key(Path::new("events.jsonl")),
+            path_key(Path::new("./events.jsonl"))
+        );
         assert_eq!(
             session_key("AAAAAAAA-1111-4111-8111-111111111111"),
             session_key("aaaaaaaa-1111-4111-8111-111111111111")
