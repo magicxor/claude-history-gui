@@ -515,7 +515,7 @@ client (the CLI, VS Code, JetBrains) are listed, `session-store.db` is not read.
   excludes cached tokens). Hook records and unknown event types are skipped silently; a
   malformed line and a torn last line (`incomplete last record, still being written`) are soft diagnostics. A user
   message the CLI injects itself (`source: system`) is not the user's dialogue. A log whose first record is not
-  `session.start` is not a session.
+  a Copilot event holds no conversation.
 * *Metadata:* the project is the cwd of `session.start` (else `workspace.yaml`'s `cwd`); later cwds
   (`session.context_changed`, `session.resume`) count for the Workspace scope like Codex's recorded cwds. In
   `workspace.yaml`, a `name` with `user_named: true` is the custom title, any other `name` or the older `summary` the
@@ -524,7 +524,9 @@ client (the CLI, VS Code, JetBrains) are listed, `session-store.db` is not read.
 * *Actions:* Resume only (§11.10). Fork, Rename and Delete are refused for the whole source by `capabilities_of` (§11.8,
   §11.9): the CLI has no fork flag and no delete command, and renaming is left out.
 * *Opened by path:* an `events.jsonl` whose first record is a Copilot event decodes as a Copilot session in a
-  single-file window and in exports (§11.12). Where an id or title came from the file stem, a Copilot log uses its
+  single-file window and in exports (§11.12). So does a copy of a log under another name, such as the raw JSONL export
+  (`conversation-<timestamp>.jsonl`), when it starts with a `session.start`; such a copy reads no `workspace.yaml` and
+  is keyed by its file name. Where an id or title came from the file stem, a Copilot log uses its
   session directory's name (`sources::session_stem`), so "Copy session ID" copies the uuid.
 * *Agent / Deep search:* Copilot sessions are discovered from the store's cards, narrowed by the workspace like Pi/OMP;
   a conversation's file name in refs is `<uuid>.jsonl`.
@@ -2841,9 +2843,10 @@ then validate (`File not
 found: <p>` / `Not a file: <p>` → window opens in an error state), open `SingleFileWindow` with
 `ViewerPane(SingleFile)`, header from `Browser::new_single_file` in the background
 (`history::process_conversation_file_in(env, path, mtime, None)`: a Codex rollout of the env's home honors
-`CODEX_SQLITE_HOME` like the viewer; a file named `events.jsonl` whose first record is a Copilot `session.start`
-decodes as a Copilot session (fork: `sources::copilot::view`, reading only itself and the sibling `workspace.yaml`,
-never listing `session-state`; its id and title are the session directory's name, `sources::session_stem`);
+`CODEX_SQLITE_HOME` like the viewer; a file named `events.jsonl` whose first record is a Copilot event, or a file
+of another name that starts with a Copilot `session.start` (a raw JSONL export), decodes as a Copilot session (fork:
+`sources::copilot::view`; only an `events.jsonl` also reads the sibling `workspace.yaml`, and nothing lists
+`session-state`; the id and title of an `events.jsonl` are the session directory's name, `sources::session_stem`);
 `Ok(None)` → stem-only header and the D1 error state
 `<file> contains no conversation messages`; `Err` → header stem
 + error), target `ConversationTarget::from_parsed_file`. The agent panel asks the agent worker for

@@ -13,7 +13,7 @@
 //! yields no event. Most of a log is such records (hooks, turn markers,
 //! tool starts), so `data` is only parsed for the types that are read.
 
-use super::WORKSPACE_FILE;
+use super::view::workspace_file_of;
 use super::workspace::Workspace;
 use crate::error::Result;
 use crate::history::ParseError;
@@ -180,19 +180,34 @@ impl TokenCounts {
     }
 }
 
-/// Whether `line`, a record of a file, is a Copilot event (a log normally
-/// starts with its `session.start`). `None` for a line that is no record:
-/// [`decode`] reports such a line and reads on, so the first record after it
-/// tells what the file is.
-pub(super) fn is_event(line: &[u8]) -> Option<bool> {
-    serde_json::from_slice::<Record<'_>>(line.trim_ascii())
-        .ok()
-        .map(|record| record.is_event())
+/// What the first record of a file is.
+pub(super) enum First {
+    /// The `session.start` a Copilot log starts with.
+    Start,
+    /// Another Copilot event: a log that lost its start.
+    Event,
+    /// A record of something else.
+    Other,
+}
+
+/// What `line`, a record of a file, is. `None` for a line that is no
+/// record: [`decode`] reports such a line and reads on, so the first record
+/// after it tells what the file is.
+pub(super) fn first_record(line: &[u8]) -> Option<First> {
+    let record: Record<'_> = serde_json::from_slice(line.trim_ascii()).ok()?;
+    Some(if !record.is_event() {
+        First::Other
+    } else if record.kind == "session.start" {
+        First::Start
+    } else {
+        First::Event
+    })
 }
 
 /// Decodes the event log `path`, read from `reader`, passing its events to
 /// `events`. `None` when its first record is not a Copilot event. The
-/// titles come from the `workspace.yaml` beside the log. The session was
+/// titles come from the `workspace.yaml` beside a session's own log (a copy
+/// under another name has none). The session was
 /// last active at its latest message, else at its last record, the time
 /// `workspace.yaml` names, or the log's mtime (`modified`).
 pub(super) fn decode(
@@ -261,10 +276,13 @@ pub(super) fn decode(
         return Ok(None);
     }
 
-    let workspace_path = path.with_file_name(WORKSPACE_FILE);
-    let workspace = Workspace::read(&workspace_path);
-    let workspace_modified = fs::metadata(&workspace_path)
-        .ok()
+    let workspace_path = workspace_file_of(path);
+    let workspace = workspace_path
+        .as_deref()
+        .map(Workspace::read)
+        .unwrap_or_default();
+    let workspace_modified = workspace_path
+        .and_then(|path| fs::metadata(path).ok())
         .and_then(|metadata| metadata.modified().ok());
     let mut cwds = std::mem::take(&mut decoder.cwds);
     if let Some(cwd) = workspace.cwd.as_deref().filter(|_| cwds.is_empty()) {

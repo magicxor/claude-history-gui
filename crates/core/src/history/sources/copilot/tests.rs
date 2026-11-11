@@ -673,6 +673,38 @@ fn logs_opened_by_path_decode_as_their_session() {
     );
 }
 
+/// The raw JSONL export copies a log under another name: it reopens as the
+/// Copilot session it is, without reading what lies beside it.
+#[test]
+fn an_exported_log_is_recognized_by_its_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let name = "conversation-2026-10-01-080000.jsonl";
+    let path = dir.path().join(name);
+    fs::copy(fixture_root().join(PLAIN).join(EVENTS_FILE), &path).unwrap();
+    fs::write(
+        dir.path().join(WORKSPACE_FILE),
+        "name: Another file of that name\nuser_named: true\n",
+    )
+    .unwrap();
+
+    let transcript = crate::history::sources::decode_path(&path, None, false).unwrap();
+    assert_eq!(transcript.source, SourceKind::Copilot);
+    assert_eq!(transcript.key.instance.root, dir.path());
+    assert_eq!(transcript.key.native_id, name);
+    assert_eq!(transcript.meta.session_id, PLAIN);
+    assert_eq!(transcript.meta.custom_title, None);
+    assert_eq!(transcript.events, decoded(PLAIN).events);
+    assert_eq!(view::workspace_file_of(&path), None);
+
+    // Under another name only a log's start tells a Copilot log: an event
+    // alone has a shape other tools' records can have.
+    let part = dir.path().join("part.jsonl");
+    let event = json!({ "type": "user.message", "id": "e2", "data": { "content": "hello" } });
+    fs::write(&part, format!("{event}\n")).unwrap();
+    let transcript = crate::history::sources::decode_path(&part, None, false).unwrap();
+    assert_eq!(transcript.source, SourceKind::Claude);
+}
+
 /// Decoding passes over a line that is no record, and so does telling
 /// whether a file opened by path is a Copilot log.
 #[test]
