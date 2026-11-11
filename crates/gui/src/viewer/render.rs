@@ -381,10 +381,14 @@ fn seg_part(
         Some(_) => (1u32 << 24) | ((segment_ix as u32) << 8) | cell_ix as u32,
         None => segment_ix as u32,
     };
-    let handle = ctx
-        .handles
-        .borrow_mut()
-        .get_or_create(&item.id, key, item_ix, shown, cx);
+    let handle = ctx.handles.borrow_mut().get_or_create(
+        &item.id,
+        key,
+        item_ix,
+        shown,
+        ctx.weak.entity_id(),
+        cx,
+    );
     let id = ElementId::NamedInteger(
         "seg".into(),
         item.key_hash
