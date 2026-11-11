@@ -21,12 +21,18 @@ env:
 
 jobs:
   check:
-    name: ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    # The job names are the required status checks of main's ruleset: keep them.
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
+        include:
+          - { name: windows-latest, runner: windows-latest }
+          - { name: macos-latest, runner: macos-latest }
+          # ubuntu-24.04, not ubuntu-latest: on the ubuntu-26.04 image the Ubuntu mirrors
+          # (*.ubuntu.com) did not resolve and apt-get failed (November 2026).
+          - { name: ubuntu-latest, runner: ubuntu-24.04 }
     steps:
       - uses: actions/checkout@v7
 

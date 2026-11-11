@@ -3641,7 +3641,9 @@ ctor.workspace = true
 
 ### 16.2 CI (`.github/workflows/ci.yml`, WP7)
 * Triggers: push to main, pull requests; also `workflow_call` (used by release.yml).
-* Matrix `os: [windows-latest, macos-latest, ubuntu-latest]`, `fail-fast: false`. Toolchain from
+* Matrix of jobs `windows-latest`, `macos-latest`, `ubuntu-latest` (the required checks of main's ruleset); the
+  `ubuntu-latest` job runs on `ubuntu-24.04` (the Ubuntu mirrors did not resolve on the ubuntu-26.04 image),
+  `fail-fast: false`. Toolchain from
   `rust-toolchain.toml`. Linux: `sudo apt-get install -y gcc g++ clang libfontconfig-dev libwayland-dev
   libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libvulkan1 mesa-vulkan-drivers xvfb xterm`.
   `Swatinem/rust-cache@v2` (`cache-on-failure: true`); cache the ORT download dir per OS.
