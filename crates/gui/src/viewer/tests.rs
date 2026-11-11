@@ -1571,7 +1571,7 @@ mod pure {
 }
 
 mod gui {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use std::time::Duration;
 
@@ -3429,6 +3429,77 @@ mod gui {
         assert_eq!(toast, PARTIAL_COPY_TOAST);
         let copied = recording(cx).clipboard().unwrap_or_default();
         assert!(copied.contains("Message 2"), "{copied:?}");
+    }
+
+    /// V-085: a drag selection shows while the button is still down: every
+    /// move that changes the selection asks the viewer for a frame (gpui
+    /// redraws on a plain mouse move only for an active drag).
+    #[gpui_kit::test]
+    fn v085_drag_selection_shows_before_mouse_up(cx: &mut TestAppContext) {
+        let world = TestWorld::new();
+        let (handle, viewer, _) = open_viewer(cx, &world, &long_conversation(10), &[]);
+        let start = text_position(cx, handle, &viewer, 0, 0, 0) + point(px(1.), px(4.));
+        let end = text_position(cx, handle, &viewer, 0, 0, 10) + point(px(1.), px(4.));
+        move_mouse(cx, handle, start);
+        cx.update_window(handle, |_, window, cx| {
+            window.dispatch_event(
+                MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: start,
+                    modifiers: Modifiers::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let notified = Rc::new(Cell::new(0usize));
+        let _observe = cx.update(|cx| {
+            let notified = notified.clone();
+            cx.observe(&viewer, move |_, _| notified.set(notified.get() + 1))
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: end,
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Modifiers::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(
+            notified.get() > 0,
+            "a selection change during the drag asks for a frame"
+        );
+        draw(cx, handle);
+        let selected = cx
+            .update_window(handle, |_, window, cx| {
+                gpui_kit::base::TextSelection::selected_text(window, cx)
+            })
+            .unwrap();
+        assert!(!selected.is_empty(), "selected before the mouse up");
+        cx.update_window(handle, |_, window, cx| {
+            window.dispatch_event(
+                MouseUpEvent {
+                    button: MouseButton::Left,
+                    position: end,
+                    modifiers: Modifiers::default(),
+                    click_count: 1,
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
     }
 
     /// V-088: Ctrl+A selects the whole transcript (also what is not painted)

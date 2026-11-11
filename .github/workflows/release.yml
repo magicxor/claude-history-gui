@@ -155,10 +155,19 @@ jobs:
       - uses: actions/checkout@v7
       - name: Toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
+      # As in ci.yml: public resolvers before the runner's own (they once failed on *.ubuntu.com).
+      - name: DNS fallback
+        run: |
+          iface=$(ip route show default | awk '{print $5; exit}')
+          current=$(resolvectl dns "$iface" | cut -d: -f2-)
+          sudo resolvectl dns "$iface" 1.1.1.1 8.8.8.8 $current
+          sudo resolvectl flush-caches
+          resolvectl dns "$iface"
+          resolvectl query archive.ubuntu.com || true
       - name: Linux dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc g++ clang libfontconfig-dev libwayland-dev \
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y gcc g++ clang libfontconfig-dev libwayland-dev \
             libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libvulkan1 mesa-vulkan-drivers
       - uses: Swatinem/rust-cache@v2
         with:
