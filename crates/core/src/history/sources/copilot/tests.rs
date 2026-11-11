@@ -318,7 +318,8 @@ fn the_session_is_described_by_its_start_and_workspace_yaml() {
         ["/work/demo", "/work/other", "/work/third"].map(PathBuf::from)
     );
     assert_eq!(moved.cwd.as_deref(), Some(Path::new("/work/demo")));
-    assert_eq!(moved.model.as_deref(), Some("gpt-5.2"));
+    // The model it was resumed with.
+    assert_eq!(moved.model.as_deref(), Some("gpt-5.4"));
     assert_eq!(moved.custom_title, None);
     assert_eq!(
         moved.summary.as_deref(),

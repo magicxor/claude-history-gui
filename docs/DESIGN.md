@@ -510,8 +510,9 @@ client (the CLI, VS Code, JetBrains) are listed, `session-store.db` is not read.
 * *Decoding:* user and assistant messages, reasoning (shown as thinking), tool calls and their results. Subagent traffic
   that Copilot records inline in the parent's log becomes subagent messages (`↳ <agent name>`): hidden until subagents
   are shown, found by agent and Deep search, and kept out of the list's full text and previews. Compaction summaries,
-  model changes and token usage are recorded as non-shown notes: the model becomes the card's model, the token counts the
-  card's tokens (the input count excludes cached tokens). Hook records and unknown event types are skipped silently; a
+  model changes and token usage are recorded as non-shown notes: the model becomes the card's model (as does the model a
+  session is resumed with, `session.resume` `selectedModel`), the token counts the card's tokens (the input count
+  excludes cached tokens). Hook records and unknown event types are skipped silently; a
   malformed line and a torn last line (`incomplete last record, still being written`) are soft diagnostics. A user
   message the CLI injects itself (`source: system`) is not the user's dialogue. A log whose first record is not
   `session.start` is not a session.

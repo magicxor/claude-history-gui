@@ -81,12 +81,13 @@ struct Context {
 }
 
 /// `session.context_changed` names the directory itself, `session.resume`
-/// in its `context`.
+/// in its `context`, with the model the session goes on with.
 #[derive(Default, Deserialize)]
-#[serde(default)]
+#[serde(default, rename_all = "camelCase")]
 struct Moved {
     cwd: Option<String>,
     context: Context,
+    selected_model: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -336,7 +337,8 @@ struct Decoder<'a> {
     diagnostics: Vec<ParseError>,
     records: usize,
     session_id: Option<String>,
-    /// The model the session started with, then the one it last changed to.
+    /// The model the session started with, then the one it was last resumed
+    /// with or changed to.
     model: Option<String>,
     /// Distinct working directories, in order of first appearance.
     cwds: Vec<PathBuf>,
@@ -379,6 +381,10 @@ impl Decoder<'_> {
             }
             "session.resume" | "session.context_changed" => {
                 let moved: Moved = record.data();
+                // A resume can pick another model than the session had.
+                if let Some(model) = moved.selected_model.filter(|model| !model.is_empty()) {
+                    self.model = Some(model);
+                }
                 self.moved_to(moved.cwd.or(moved.context.cwd));
                 None
             }
