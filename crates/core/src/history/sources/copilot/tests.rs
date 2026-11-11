@@ -439,6 +439,44 @@ fn subagent_records_are_attributed_to_their_agent() {
 }
 
 #[test]
+fn what_the_cli_tells_a_subagent_is_not_its_dialogue_either() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join(SESSION_STATE_DIR);
+    session(
+        &root,
+        PLAIN,
+        &[
+            start(PLAIN),
+            json!({ "type": "user.message", "id": "e2", "data": { "content": "Ask the okapi" } }),
+            json!({ "type": "user.message", "id": "e3", "agentId": "a1",
+                    "data": { "content": "A capybara notice", "source": "system" } }),
+            json!({ "type": "assistant.message", "id": "e4", "agentId": "a1",
+                    "data": { "content": "Okapi here" } }),
+        ],
+        None,
+    );
+    let transcript = decoded_in(&CopilotAdapter::new(root), PLAIN);
+    let subagents: Vec<(Visibility, Role)> = transcript
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::Subagent { message, .. } => Some((event.visibility, message.role)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        subagents,
+        [
+            (Visibility::Injected, Role::User),
+            (Visibility::Dialogue, Role::Assistant)
+        ]
+    );
+    let conversation = index::index(&transcript).unwrap();
+    assert!(conversation.agent_search_text.contains("Okapi here"));
+    assert!(!conversation.agent_search_text.contains("capybara"));
+}
+
+#[test]
 fn a_subagent_without_a_recorded_start_is_still_a_subagent() {
     let home = tempfile::tempdir().unwrap();
     let root = home.path().join(SESSION_STATE_DIR);

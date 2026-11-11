@@ -512,6 +512,8 @@ impl Decoder<'_> {
 
     /// `message` as the main agent's, or as a subagent's when the record
     /// names one: by its own agent id or by the tool call that started it.
+    /// Either way it keeps its visibility: what the CLI tells a subagent is
+    /// no more part of the dialogue than what it tells the main agent.
     fn attribute(
         &self,
         record: &Record<'_>,
@@ -529,10 +531,7 @@ impl Decoder<'_> {
             .find_map(|id| self.agents.get(*id))
             .map_or(UNNAMED_AGENT, String::as_str)
             .to_owned();
-        (
-            Visibility::Dialogue,
-            EventKind::Subagent { agent_id, message },
-        )
+        (visibility, EventKind::Subagent { agent_id, message })
     }
 }
 
