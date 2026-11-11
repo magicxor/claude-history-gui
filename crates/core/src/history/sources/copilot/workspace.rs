@@ -134,15 +134,55 @@ fn unquote(value: &str) -> Option<String> {
             unescaped.push(next);
             continue;
         }
-        match chars.next() {
-            Some('n') => unescaped.push('\n'),
-            Some('t') => unescaped.push('\t'),
-            Some('r') => unescaped.push('\r'),
-            Some(other) => unescaped.push(other),
-            None => unescaped.push('\\'),
+        let Some(escape) = chars.next() else {
+            unescaped.push('\\');
+            break;
+        };
+        let digits = match escape {
+            'x' => 2,
+            'u' => 4,
+            'U' => 8,
+            _ => {
+                unescaped.push(escaped(escape));
+                continue;
+            }
+        };
+        let hex: String = chars.clone().take(digits).collect();
+        let code = (hex.len() == digits && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .then(|| u32::from_str_radix(&hex, 16).ok())
+            .flatten()
+            .and_then(char::from_u32);
+        match code {
+            Some(code) => {
+                unescaped.push(code);
+                chars.nth(digits - 1);
+            }
+            // Not a code point: kept as it is written.
+            None => unescaped.extend(['\\', escape]),
         }
     }
     Some(unescaped)
+}
+
+/// The character a one-letter escape of a double-quoted scalar stands for;
+/// a letter that is no escape stands for itself.
+fn escaped(escape: char) -> char {
+    match escape {
+        '0' => '\0',
+        'a' => '\u{7}',
+        'b' => '\u{8}',
+        't' => '\t',
+        'n' => '\n',
+        'v' => '\u{b}',
+        'f' => '\u{c}',
+        'r' => '\r',
+        'e' => '\u{1b}',
+        'N' => '\u{85}',
+        '_' => '\u{a0}',
+        'L' => '\u{2028}',
+        'P' => '\u{2029}',
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -202,6 +242,29 @@ mod tests {
         let wrapped = Workspace::parse("name: Survey the\n  lemur parser\nuser_named: true\n");
         assert_eq!(wrapped.name.as_deref(), Some("Survey the lemur parser"));
         assert!(wrapped.user_named);
+    }
+
+    #[test]
+    fn double_quoted_scalars_decode_their_code_point_escapes() {
+        let name = |yaml: &str| Workspace::parse(yaml).name;
+        assert_eq!(
+            name("name: \"Fix \\u00e9 handling \\x41\\U0001F600\"\n").as_deref(),
+            Some("Fix \u{e9} handling A\u{1f600}")
+        );
+        assert_eq!(
+            name("name: \"tab\\there\\_non-breaking\\e\"\n").as_deref(),
+            Some("tab\there\u{a0}non-breaking\u{1b}")
+        );
+        // What is no code point stays as it is written.
+        assert_eq!(
+            name("name: \"short \\u12 surrogate \\uD83D end \\x\"\n").as_deref(),
+            Some("short \\u12 surrogate \\uD83D end \\x")
+        );
+        // Single quotes have no escapes but their own.
+        assert_eq!(
+            name("name: 'kept \\u00e9'\n").as_deref(),
+            Some("kept \\u00e9")
+        );
     }
 
     #[test]
