@@ -202,6 +202,8 @@ impl Element for SelText {
             ],
             cx,
         );
+        // Catches a change made by this paint; a change made by the mouse
+        // notifies the viewer through the handle's subscription (`lru.rs`).
         if before != TextSelection::selected_text(window, cx) {
             window.refresh();
         }

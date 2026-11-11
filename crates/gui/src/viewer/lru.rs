@@ -5,7 +5,9 @@
 //!   by `(ItemId, segment)`, capped by **handle count** ([`HANDLE_CAP`]);
 //!   after each scroll the handles of the items farthest from the top of the
 //!   viewport are evicted (live selection handles make every frame slower,
-//!   spike-viewer §3.2).
+//!   spike-viewer §3.2). Each handle asks its owner (the viewer) for a
+//!   frame when its selection changes, so a drag selection shows while the
+//!   button is still down.
 //! * [`TokenCache`]: syntect tokens per `(ItemId, segment, ThemeKind)`,
 //!   capped at [`TOKEN_CAP`] segments, least recently used evicted.
 //! * Search texts live with the installed items (`search.rs`), built on the
@@ -17,8 +19,8 @@ use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
 use claude_history_core::theme::ThemeKind;
-use gpui_kit::base::TextSelectionHandle;
-use gpui_kit::{App, EntityId};
+use gpui_kit::base::{TextSelectionEvent, TextSelectionHandle};
+use gpui_kit::{App, EntityId, Subscription};
 
 use super::code::Tokens;
 use super::items::ItemId;
@@ -134,6 +136,8 @@ struct HandleEntry {
     handle: TextSelectionHandle,
     /// The item's index when the handle was last used.
     item_ix: usize,
+    /// Notifies the owner on a selection change (dropped with the entry).
+    _on_change: Subscription,
 }
 
 /// Selection handles per rendered segment, capped by count.
@@ -157,21 +161,35 @@ impl HandleCache {
     }
 
     /// The handle of segment `segment` of item `id` (created on first use).
+    /// A new handle notifies `owner`, the entity that paints the segment,
+    /// whenever its selection changes: gpui redraws on a mouse move only for
+    /// an active drag, and a drag selection would otherwise show only after
+    /// the mouse up.
     pub fn get_or_create(
         &mut self,
         id: &ItemId,
         segment: u32,
         item_ix: usize,
         text: &str,
+        owner: EntityId,
         cx: &mut App,
     ) -> TextSelectionHandle {
-        let entry = self
-            .map
-            .entry((id.clone(), segment))
-            .or_insert_with(|| HandleEntry {
-                handle: TextSelectionHandle::new(text.to_string(), cx),
+        let entry = self.map.entry((id.clone(), segment)).or_insert_with(|| {
+            let handle = TextSelectionHandle::new(text.to_string(), cx);
+            let on_change = handle.subscribe(
+                move |event, cx| {
+                    if matches!(event, TextSelectionEvent::SelectionChanged(_)) {
+                        cx.notify(owner);
+                    }
+                },
+                cx,
+            );
+            HandleEntry {
+                handle,
                 item_ix,
-            });
+                _on_change: on_change,
+            }
+        });
         entry.item_ix = item_ix;
         entry.handle.clone()
     }
