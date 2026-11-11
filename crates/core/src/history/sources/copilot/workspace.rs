@@ -69,19 +69,24 @@ impl Workspace {
 }
 
 /// The value of a key: `first` is the rest of the key's line, `continuation`
-/// the indented lines after it. `None` for an empty or null value.
+/// the indented lines after it. `None` for an empty or null value; only a
+/// plain scalar can be null, a quoted or block `null` is that text.
 fn scalar(first: &str, continuation: &[&str]) -> Option<String> {
-    let value = if first.starts_with(['|', '>']) {
-        block(first.starts_with('|'), continuation)
+    let (value, plain) = if first.starts_with(['|', '>']) {
+        (block(first.starts_with('|'), continuation), false)
     } else {
         let folded = std::iter::once(first)
             .chain(continuation.iter().map(|line| line.trim()))
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>()
             .join(" ");
-        unquote(&folded)
+        match unquote(&folded) {
+            Some(text) => (text, false),
+            None => (folded, true),
+        }
     };
-    (!value.is_empty() && value != "null" && value != "~").then_some(value)
+    let null = plain && matches!(value.as_str(), "null" | "Null" | "NULL" | "~");
+    (!value.is_empty() && !null).then_some(value)
 }
 
 /// A block scalar's lines without their common indentation: kept as lines
@@ -110,8 +115,8 @@ fn block(literal: bool, lines: &[&str]) -> String {
     joined.trim().to_owned()
 }
 
-/// A flow scalar without its quotes and escapes; a plain one as it is.
-fn unquote(value: &str) -> String {
+/// A quoted scalar without its quotes and escapes; `None` for a plain one.
+fn unquote(value: &str) -> Option<String> {
     let inner = |quote: char| {
         value
             .strip_prefix(quote)
@@ -119,11 +124,9 @@ fn unquote(value: &str) -> String {
             .filter(|_| value.len() >= 2)
     };
     if let Some(inner) = inner('\'') {
-        return inner.replace("''", "'");
+        return Some(inner.replace("''", "'"));
     }
-    let Some(inner) = inner('"') else {
-        return value.to_owned();
-    };
+    let inner = inner('"')?;
     let mut unescaped = String::with_capacity(inner.len());
     let mut chars = inner.chars();
     while let Some(next) = chars.next() {
@@ -139,7 +142,7 @@ fn unquote(value: &str) -> String {
             None => unescaped.push('\\'),
         }
     }
-    unescaped
+    Some(unescaped)
 }
 
 #[cfg(test)]
@@ -202,6 +205,16 @@ mod tests {
     }
 
     #[test]
+    fn only_a_plain_scalar_is_null() {
+        let quoted = Workspace::parse("name: \"null\"\nsummary: '~'\n");
+        assert_eq!(quoted.name.as_deref(), Some("null"));
+        assert_eq!(quoted.summary.as_deref(), Some("~"));
+        let block = Workspace::parse("name: |-\n  null\nsummary: >-\n  ~\n");
+        assert_eq!(block.name.as_deref(), Some("null"));
+        assert_eq!(block.summary.as_deref(), Some("~"));
+    }
+
+    #[test]
     fn anything_else_reads_as_nothing() {
         assert_eq!(Workspace::parse(""), Workspace::default());
         assert_eq!(
@@ -210,6 +223,7 @@ mod tests {
         );
         let empty = Workspace::parse("name:\nsummary: null\ncwd: ~\nupdated_at: ''\n");
         assert_eq!(empty, Workspace::default());
+        assert_eq!(Workspace::parse("name: NULL\n"), Workspace::default());
         assert_eq!(
             Workspace::read(Path::new("no-such-dir/workspace.yaml")),
             Workspace::default()
