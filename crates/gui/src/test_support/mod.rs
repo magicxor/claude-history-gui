@@ -6,7 +6,7 @@
 //!
 //! Isolation layers:
 //! * a `#[ctor]` runs before any test thread exists and points `HOME`,
-//!   `USERPROFILE`, `CLAUDE_CONFIG_DIR`, the Pi/OMP and XDG variables into a
+//!   `USERPROFILE`, `CLAUDE_CONFIG_DIR`, the Pi/OMP, Codex, Copilot and XDG variables into a
 //!   per-process temp root, and removes `OMP_PROFILE`, `PI_PROFILE`,
 //!   `TERMINAL`, `CLAUDE_HISTORY_CLIPBOARD` — even a stray
 //!   process-environment read in GUI code cannot reach the user's data. The
@@ -54,7 +54,7 @@ use crate::workspace::Workspace;
 static REDIRECT_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 /// Variables the redirect points into the temp root (relative to its `home`).
-pub const REDIRECTED_VARS: [(&str, &str); 12] = [
+pub const REDIRECTED_VARS: [(&str, &str); 13] = [
     ("HOME", ""),
     ("USERPROFILE", ""),
     ("CLAUDE_CONFIG_DIR", ".claude"),
@@ -63,6 +63,7 @@ pub const REDIRECTED_VARS: [(&str, &str); 12] = [
     ("PI_CONFIG_DIR", ".omp"),
     ("CODEX_HOME", ".codex"),
     ("CODEX_SQLITE_HOME", ".codex"),
+    ("COPILOT_HOME", ".copilot"),
     ("XDG_DATA_HOME", ".local/share"),
     ("XDG_CONFIG_HOME", ".config"),
     ("XDG_CACHE_HOME", ".cache"),

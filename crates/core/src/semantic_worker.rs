@@ -1046,10 +1046,8 @@ fn exact_literal_metadata(
             chunk: SemanticChunkIdentity {
                 conversation_index: conversation.index,
                 source: crate::semantic::types::SemanticChunkSource::VisibleDialogue,
-                session: conversation
-                    .path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
+                session: crate::history::sources::session_stem(&conversation.path)
+                    .as_deref()
                     .unwrap_or("?")
                     .to_string(),
                 chunk_index: 0,

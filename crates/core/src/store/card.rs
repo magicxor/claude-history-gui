@@ -242,6 +242,7 @@ pub fn source_to_u8(source: crate::history::model::SourceKind) -> u8 {
         crate::history::model::SourceKind::Pi => 1,
         crate::history::model::SourceKind::Omp => 2,
         crate::history::model::SourceKind::Codex => 3,
+        crate::history::model::SourceKind::Copilot => 4,
     }
 }
 
@@ -251,6 +252,7 @@ pub fn source_from_u8(value: u8) -> Option<crate::history::model::SourceKind> {
         1 => Some(crate::history::model::SourceKind::Pi),
         2 => Some(crate::history::model::SourceKind::Omp),
         3 => Some(crate::history::model::SourceKind::Codex),
+        4 => Some(crate::history::model::SourceKind::Copilot),
         _ => None,
     }
 }

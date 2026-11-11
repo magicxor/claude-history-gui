@@ -110,10 +110,14 @@ impl SingleFileWindow {
             this.update_in(cx, |this, _, cx| this.apply_probe(probe, cx))
                 .ok();
         });
-        let file_name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
+        // Fork: a Copilot log is always `events.jsonl`, so its session id.
+        let file_name = match claude_history_core::history::sources::copilot::session_of(&path) {
+            Some((_, id)) => id,
+            None => path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+        };
         let title = single_file_title(&file_name);
         window.set_window_title(&title);
         let bus = CorpusBus::entity(cx);

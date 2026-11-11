@@ -18,17 +18,22 @@ pub struct FormattedToolCall {
 /// The `max_width` parameter controls line wrapping for tools with long content (e.g., Bash commands).
 /// Claude Code tool names and Pi's lowercase ones (`bash`, `read`, ...)
 /// share formatters; Pi names files with `path` where Claude uses `file_path`.
+/// Fork: GitHub Copilot CLI's tools (`powershell`, `view`, `create`, `rg`,
+/// `glob`, `task`, `web_fetch`) use them too, with Copilot's argument names
+/// (`view_range`, `old_str`/`new_str`, `paths`, `agent_type`).
 pub fn format_tool_call(name: &str, input: &Value, max_width: usize) -> FormattedToolCall {
     match name {
         "Task" => format_task(input),
-        "Bash" | "bash" => format_bash(input, max_width),
-        "Read" | "read" => format_read(input),
-        "Grep" | "grep" => format_grep(input),
-        "Glob" => format_glob("Glob", input),
+        "task" if str_field(input, "agent_type").is_some() => format_task(input),
+        "Bash" | "bash" => format_shell("Bash: ", input, max_width),
+        "powershell" => format_shell("PowerShell: ", input, max_width),
+        "Read" | "read" | "view" => format_read(input),
+        "Grep" | "grep" | "rg" => format_grep(input),
+        "Glob" | "glob" => format_glob("Glob", input),
         "find" => format_glob("Find", input),
         "Edit" | "edit" => format_edit(input),
-        "Write" | "write" => format_write(input),
-        "WebFetch" | "fetch_content" => format_web_fetch(input),
+        "Write" | "write" | "create" => format_write(input),
+        "WebFetch" | "fetch_content" | "web_fetch" => format_web_fetch(input),
         "WebSearch" | "web_search" => format_web_search(input),
         "codemode" => wrap_after_prefix("Codemode: ", str_or_empty(input, "code"), max_width),
         "ls" => FormattedToolCall {
@@ -50,9 +55,9 @@ pub fn format_tool_call(name: &str, input: &Value, max_width: usize) -> Formatte
 }
 
 fn format_task(input: &Value) -> FormattedToolCall {
-    let subagent_type = input
-        .get("subagent_type")
-        .and_then(|v| v.as_str())
+    // Copilot names the subagent's kind `agent_type`.
+    let subagent_type = str_field(input, "subagent_type")
+        .or_else(|| str_field(input, "agent_type"))
         .unwrap_or("agent");
     let description = input
         .get("description")
@@ -66,9 +71,9 @@ fn format_task(input: &Value) -> FormattedToolCall {
     }
 }
 
-fn format_bash(input: &Value, max_width: usize) -> FormattedToolCall {
+fn format_shell(prefix: &str, input: &Value, max_width: usize) -> FormattedToolCall {
     let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-    wrap_after_prefix("Bash: ", command, max_width)
+    wrap_after_prefix(prefix, command, max_width)
 }
 
 /// Lay out `prefix` + `text` as a header line, wrapping the text to
@@ -133,18 +138,37 @@ fn format_read(input: &Value) -> FormattedToolCall {
     let offset = input.get("offset").and_then(|v| v.as_u64());
     let limit = input.get("limit").and_then(|v| v.as_u64());
 
-    let header = match (offset, limit) {
-        (Some(o), Some(l)) => format!("Read: {}:{}-{}", file_path, o, o + l),
-        (Some(o), None) => format!("Read: {}:{}", file_path, o),
+    // Copilot's `view` names the lines `[first, last]`, the last one -1 for
+    // the end of the file.
+    let range = input
+        .get("view_range")
+        .and_then(|v| v.as_array())
+        .map(|range| {
+            let line = |index: usize| range.get(index).and_then(Value::as_i64);
+            (line(0), line(1))
+        });
+
+    let header = match (offset, limit, range) {
+        (Some(o), Some(l), _) => format!("Read: {}:{}-{}", file_path, o, o + l),
+        (Some(o), None, _) => format!("Read: {}:{}", file_path, o),
+        (None, _, Some((Some(first), Some(last)))) if last >= first => {
+            format!("Read: {}:{}-{}", file_path, first, last)
+        }
+        (None, _, Some((Some(first), _))) => format!("Read: {}:{}", file_path, first),
         _ => format!("Read: {}", file_path),
     };
 
     FormattedToolCall { header, body: None }
 }
 
+/// Where a search looks: `path`, or Copilot's `paths`.
+fn search_path(input: &Value) -> Option<&str> {
+    str_field(input, "path").or_else(|| str_field(input, "paths"))
+}
+
 fn format_grep(input: &Value) -> FormattedToolCall {
     let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-    let path = input.get("path").and_then(|v| v.as_str());
+    let path = search_path(input);
     let glob = input.get("glob").and_then(|v| v.as_str());
 
     let location = match (path, glob) {
@@ -162,7 +186,7 @@ fn format_grep(input: &Value) -> FormattedToolCall {
 
 fn format_glob(label: &str, input: &Value) -> FormattedToolCall {
     let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-    let path = input.get("path").and_then(|v| v.as_str());
+    let path = search_path(input);
 
     let header = match path {
         Some(p) => format!("{}: {} in {}", label, pattern, p),
@@ -179,7 +203,8 @@ fn str_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 fn format_edit(input: &Value) -> FormattedToolCall {
     let file_path = file_path(input);
 
-    // Claude edits one span; Pi passes a list of `edits`.
+    // Claude edits one span (Copilot too, as `old_str`/`new_str`); Pi passes
+    // a list of `edits`.
     let replacements: Vec<(&str, &str)> = match input.get("edits").and_then(|v| v.as_array()) {
         Some(edits) => edits
             .iter()
@@ -187,6 +212,7 @@ fn format_edit(input: &Value) -> FormattedToolCall {
             .collect(),
         None => str_field(input, "old_string")
             .zip(str_field(input, "new_string"))
+            .or_else(|| str_field(input, "old_str").zip(str_field(input, "new_str")))
             .into_iter()
             .collect(),
     };
@@ -558,6 +584,67 @@ mod tests {
         );
         assert_eq!(edit.header, "Edit: a.rs");
         assert_eq!(edit.body, Some("- a\n+ b\n- c\n+ d".to_string()));
+    }
+
+    #[test]
+    fn test_format_copilot_tools() {
+        let header = |name: &str, input: Value| format_tool_call(name, &input, 80).header;
+        assert_eq!(
+            header(
+                "powershell",
+                json!({ "command": "cargo test", "description": "Run the tests" })
+            ),
+            "PowerShell: cargo test"
+        );
+        assert_eq!(
+            header("view", json!({ "path": "a.rs", "view_range": [5, 40] })),
+            "Read: a.rs:5-40"
+        );
+        assert_eq!(
+            header("view", json!({ "path": "a.rs", "view_range": [5, -1] })),
+            "Read: a.rs:5"
+        );
+        assert_eq!(header("view", json!({ "path": "src" })), "Read: src");
+        assert_eq!(
+            header(
+                "create",
+                json!({ "path": "a.rs", "file_text": "fn a() {}" })
+            ),
+            "Write: a.rs"
+        );
+        assert_eq!(
+            header("rg", json!({ "pattern": "fn a", "paths": "src" })),
+            "Grep: \"fn a\" in src"
+        );
+        assert_eq!(
+            header("glob", json!({ "pattern": "*.rs", "paths": "src" })),
+            "Glob: *.rs in src"
+        );
+        assert_eq!(
+            header("web_fetch", json!({ "url": "https://example.com" })),
+            "Fetch: https://example.com"
+        );
+
+        let edit = format_tool_call(
+            "edit",
+            &json!({ "path": "a.rs", "old_str": "a", "new_str": "b" }),
+            80,
+        );
+        assert_eq!(edit.header, "Edit: a.rs");
+        assert_eq!(edit.body, Some("- a\n+ b".to_string()));
+
+        let task = format_tool_call(
+            "task",
+            &json!({ "agent_type": "explore", "description": "Survey", "prompt": "List them" }),
+            80,
+        );
+        assert_eq!(task.header, "Task (explore): Survey");
+        assert_eq!(task.body, Some("List them".to_string()));
+        // Another agent's `task` tool keeps the generic rendering.
+        assert_eq!(
+            header("task", json!({ "title": "Ship it" })),
+            "task: { \"title\": \"Ship it\" }"
+        );
     }
 
     #[test]

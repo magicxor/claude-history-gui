@@ -265,6 +265,7 @@ pub fn config_table(source: SourceKind) -> &'static str {
         SourceKind::Pi => "[resume.pi]",
         SourceKind::Omp => "[resume.omp]",
         SourceKind::Codex => "[resume.codex]",
+        SourceKind::Copilot => "[resume.copilot]",
     }
 }
 
@@ -350,6 +351,7 @@ mod tests {
             (SourceKind::Pi, "pi"),
             (SourceKind::Omp, "omp"),
             (SourceKind::Codex, "codex"),
+            (SourceKind::Copilot, "copilot"),
         ] {
             let launcher = Launcher::default_for(source);
             assert_eq!(launcher.program, Path::new(program));
@@ -497,10 +499,23 @@ mod tests {
             SourceKind::Pi,
             SourceKind::Omp,
             SourceKind::Codex,
+            SourceKind::Copilot,
         ] {
             let adapter = registry.for_source(source);
             assert_eq!(adapter.instance().kind, source);
             let capabilities = adapter.capabilities();
+            if source == SourceKind::Copilot {
+                assert_eq!(
+                    capabilities,
+                    Capabilities {
+                        resume: true,
+                        fork: false,
+                        delete: false,
+                        rename: false,
+                    }
+                );
+                continue;
+            }
             assert_eq!(capabilities.rename, source != SourceKind::Codex);
             assert!(capabilities.resume && capabilities.fork && capabilities.delete);
         }
@@ -576,6 +591,15 @@ mod tests {
             refusal(SourceKind::Codex, plain, "Renaming"),
             "Renaming CX sessions is not supported"
         );
+        for (doing, text) in [
+            ("Forking", "Forking CP sessions is not supported"),
+            ("Renaming", "Renaming CP sessions is not supported"),
+            ("Deleting", "Deleting CP sessions is not supported"),
+        ] {
+            assert_eq!(refusal(SourceKind::Copilot, plain, doing), text);
+        }
+        let allowed = capabilities_of(SourceKind::Copilot, plain);
+        assert!(allowed.resume && !allowed.fork && !allowed.delete && !allowed.rename);
         let orphaned = Provenance {
             orphaned: true,
             ..plain

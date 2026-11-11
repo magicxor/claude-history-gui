@@ -3,6 +3,7 @@
 //! One module per action family; the helpers every module shares live here.
 
 mod codex_tests;
+mod copilot_tests;
 mod copy_tests;
 mod delete_tests;
 mod export_tests;

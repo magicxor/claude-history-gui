@@ -1,0 +1,5 @@
+{"type":"session.start","data":{"sessionId":"0c0a0000-0000-4000-8000-000000000005","version":1,"producer":"copilot-agent","copilotVersion":"1.0.105","startTime":1791187200000,"selectedModel":"gpt-5.4","context":{"cwd":"/work/demo"}},"id":"e0000005-0000-4000-8000-000000000001","timestamp":"2026-10-05T08:00:00.000Z","parentId":null}
+{"type":"user.message","data":{"content":"Count the ibis nests","attachments":[]},"id":"e0000005-0000-4000-8000-000000000002","timestamp":"2026-10-05T08:00:05.000Z","parentId":"e0000005-0000-4000-8000-000000000001"}
+this line is not json
+{"type":"assistant.message","data":{"messageId":"m0000005-0000-4000-8000-000000000001","content":"There are three ibis nests.","toolRequests":[]},"id":"e0000005-0000-4000-8000-000000000004","timestamp":"2026-10-05T08:00:10.000Z","parentId":"e0000005-0000-4000-8000-000000000002"}
+{"type":"assistant.message","data":{"messageId":"m0000005-0000-4000-8000-000000000002","content":"And a fou

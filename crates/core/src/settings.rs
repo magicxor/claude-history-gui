@@ -109,17 +109,21 @@ pub struct EffectiveSettings {
     pub resume_default_args: Vec<String>,
     /// `[resume.codex].default_args` (Codex only, upstream eea6d37).
     pub resume_codex_default_args: Vec<String>,
+    /// Fork: `[resume.copilot].default_args` (Copilot only, GUI-only table).
+    pub resume_copilot_default_args: Vec<String>,
 }
 
 impl EffectiveSettings {
     /// The configured arguments for resuming a conversation of `source`
     /// (upstream `ResumeConfig::default_args`): `[resume].default_args` for
-    /// Claude, `[resume.codex].default_args` for Codex, none for Pi and OMP.
+    /// Claude, `[resume.codex].default_args` for Codex,
+    /// `[resume.copilot].default_args` for Copilot, none for Pi and OMP.
     pub fn resume_default_args_for(&self, source: crate::history::model::SourceKind) -> &[String] {
         use crate::history::model::SourceKind;
         match source {
             SourceKind::Claude => &self.resume_default_args,
             SourceKind::Codex => &self.resume_codex_default_args,
+            SourceKind::Copilot => &self.resume_copilot_default_args,
             SourceKind::Pi | SourceKind::Omp => &[],
         }
     }
@@ -210,6 +214,15 @@ pub fn effective_settings(
                     .to_vec()
             })
             .unwrap_or_default(),
+        resume_copilot_default_args: config
+            .resume
+            .as_ref()
+            .map(|resume| {
+                resume
+                    .default_args(crate::history::model::SourceKind::Copilot)
+                    .to_vec()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -245,8 +258,12 @@ pub fn picker_output(action: PickerAction, conversation: &Conversation) -> Resul
     }
 }
 
-/// Upstream's `--show-id` fallback: the file stem.
+/// Upstream's `--show-id` fallback: the file stem (fork: for a Copilot event
+/// log the session id).
 pub fn session_id_from_path(path: &Path) -> Result<String> {
+    if let Some((_, id)) = crate::history::sources::copilot::session_of(path) {
+        return Ok(id);
+    }
     path.file_stem()
         .and_then(|stem| stem.to_str())
         .map(str::to_string)
@@ -567,7 +584,7 @@ impl GuiLaunchArgs {
 /// not listed, as upstream.
 pub fn help_text(program: &str) -> String {
     format!(
-        "Browse Claude Code, Codex, Pi and OMP conversation history
+        "Browse Claude Code, Codex, Copilot, Pi and OMP conversation history
 
 Usage: {program} [OPTIONS] [FILE]
        {program} delete-empty [--local|--all] [--yes]
@@ -1117,6 +1134,7 @@ mod tests {
                 semantic_toggle_enabled: true,
                 resume_default_args: Vec::new(),
                 resume_codex_default_args: Vec::new(),
+                resume_copilot_default_args: Vec::new(),
             }
         );
     }
@@ -1233,6 +1251,10 @@ mod tests {
                     default_args: Some(vec!["--yolo".into()]),
                     ..Default::default()
                 }),
+                copilot: Some(crate::config::AgentResumeConfig {
+                    default_args: Some(vec!["--allow-all".into()]),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             tui: Some(TuiConfig {
@@ -1251,6 +1273,11 @@ mod tests {
         assert!(settings.show_thinking);
         assert_eq!(settings.resume_default_args, vec!["--model", "opus"]);
         assert_eq!(settings.resume_codex_default_args, vec!["--yolo"]);
+        assert_eq!(settings.resume_copilot_default_args, vec!["--allow-all"]);
+        assert_eq!(
+            settings.resume_default_args_for(crate::history::model::SourceKind::Copilot),
+            ["--allow-all"]
+        );
         assert_eq!(
             settings.resume_default_args_for(crate::history::model::SourceKind::Codex),
             ["--yolo"]
@@ -1464,7 +1491,7 @@ mod tests {
         assert_eq!(parse_launch_args(["-V"]), Ok(LaunchCommand::Version));
         let help = help_text("claude-history-gui");
         assert!(help.contains("Usage: claude-history-gui [OPTIONS] [FILE]"));
-        assert!(help.starts_with("Browse Claude Code, Codex, Pi and OMP"));
+        assert!(help.starts_with("Browse Claude Code, Codex, Copilot, Pi and OMP"));
         for option in [
             "--local",
             "--all-kinds",

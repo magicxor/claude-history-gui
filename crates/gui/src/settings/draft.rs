@@ -32,6 +32,7 @@ pub enum Field {
     PiPath,
     OmpPath,
     CodexPath,
+    CopilotPath,
     DefaultWorkspace,
     RestoreSession,
     PreviewLast,
@@ -49,6 +50,8 @@ pub enum Field {
     OmpCommand,
     CodexCommand,
     CodexResumeArgs,
+    CopilotCommand,
+    CopilotResumeArgs,
     AgentScope,
     AgentMode,
     AgentOutputChars,
@@ -84,13 +87,14 @@ impl Field {
     }
 
     /// Every field, page by page, in display order.
-    pub const ALL: [Field; 39] = [
+    pub const ALL: [Field; 42] = [
         Field::Theme,
         Field::Terminal,
         Field::ClaudePath,
         Field::PiPath,
         Field::OmpPath,
         Field::CodexPath,
+        Field::CopilotPath,
         Field::DefaultWorkspace,
         Field::RestoreSession,
         Field::PreviewLast,
@@ -113,6 +117,8 @@ impl Field {
         Field::OmpCommand,
         Field::CodexCommand,
         Field::CodexResumeArgs,
+        Field::CopilotCommand,
+        Field::CopilotResumeArgs,
         Field::AgentScope,
         Field::AgentMode,
         Field::AgentOutputChars,
@@ -135,6 +141,7 @@ impl Field {
             | Field::PiPath
             | Field::OmpPath
             | Field::CodexPath
+            | Field::CopilotPath
             | Field::DefaultWorkspace
             | Field::RestoreSession => SettingsPage::General,
             Field::PreviewLast | Field::ToolDisplay | Field::ShowThinking | Field::Plain => {
@@ -149,7 +156,9 @@ impl Field {
             | Field::PiCommand
             | Field::OmpCommand
             | Field::CodexCommand
-            | Field::CodexResumeArgs => SettingsPage::Resume,
+            | Field::CodexResumeArgs
+            | Field::CopilotCommand
+            | Field::CopilotResumeArgs => SettingsPage::Resume,
             _ => SettingsPage::Agent,
         }
     }
@@ -163,6 +172,7 @@ impl Field {
             Field::PiPath => "pi program",
             Field::OmpPath => "omp program",
             Field::CodexPath => "codex program",
+            Field::CopilotPath => "copilot program",
             Field::DefaultWorkspace => "Default workspace",
             Field::RestoreSession => "Restore last session",
             Field::PreviewLast => "Preview shows",
@@ -179,6 +189,8 @@ impl Field {
             Field::OmpCommand => "OMP command",
             Field::CodexCommand => "Codex command",
             Field::CodexResumeArgs => "Codex default arguments",
+            Field::CopilotCommand => "Copilot command",
+            Field::CopilotResumeArgs => "Copilot default arguments",
             Field::AgentScope => "Scope",
             Field::AgentMode => "Mode",
             Field::AgentOutputChars => "Output budget (chars)",
@@ -202,6 +214,7 @@ impl Field {
             Field::PiPath => "[gui] pi_path",
             Field::OmpPath => "[gui] omp_path",
             Field::CodexPath => "[gui] codex_path",
+            Field::CopilotPath => "[gui] copilot_path",
             Field::DefaultWorkspace => "[gui] default_workspace",
             Field::RestoreSession => "[gui] restore_session",
             Field::PreviewLast => "[display] last",
@@ -224,6 +237,8 @@ impl Field {
             Field::OmpCommand => "[resume.omp] command",
             Field::CodexCommand => "[resume.codex] command",
             Field::CodexResumeArgs => "[resume.codex] default_args",
+            Field::CopilotCommand => "[resume.copilot] command",
+            Field::CopilotResumeArgs => "[resume.copilot] default_args",
             Field::AgentScope => "[agent] scope",
             Field::AgentMode => "[agent] mode",
             Field::AgentOutputChars => "[agent] output_chars",
@@ -261,12 +276,15 @@ impl Field {
             | Field::PiPath
             | Field::OmpPath
             | Field::CodexPath
+            | Field::CopilotPath
             | Field::ClaudeCommand
             | Field::ResumeArgs
             | Field::PiCommand
             | Field::OmpCommand
             | Field::CodexCommand
-            | Field::CodexResumeArgs => "Applies to the next resume",
+            | Field::CodexResumeArgs
+            | Field::CopilotCommand
+            | Field::CopilotResumeArgs => "Applies to the next resume",
             Field::DefaultWorkspace | Field::RestoreSession => "Applies at the next start",
             Field::PreviewLast => "Applies when the list refreshes",
             Field::ToolDisplay | Field::ShowThinking => {
@@ -291,6 +309,7 @@ impl Field {
             Field::PiCommand => Some(AgentKind::Pi),
             Field::OmpCommand => Some(AgentKind::Omp),
             Field::CodexCommand => Some(AgentKind::Codex),
+            Field::CopilotCommand => Some(AgentKind::Copilot),
             _ => None,
         }
     }
@@ -302,6 +321,7 @@ impl Field {
             AgentKind::Pi => Field::PiCommand,
             AgentKind::Omp => Field::OmpCommand,
             AgentKind::Codex => Field::CodexCommand,
+            AgentKind::Copilot => Field::CopilotCommand,
         }
     }
 }
@@ -379,6 +399,7 @@ pub fn get(field: Field, gui: &GuiConfigFile) -> Value {
         Field::PiPath => some_text(&settings.pi_path),
         Field::OmpPath => some_text(&settings.omp_path),
         Field::CodexPath => some_text(&settings.codex_path),
+        Field::CopilotPath => some_text(&settings.copilot_path),
         Field::DefaultWorkspace => some_text(&settings.default_workspace),
         Field::RestoreSession => opt(settings.restore_session, Value::Bool),
         Field::PreviewLast => opt(display.last, Value::Bool),
@@ -414,7 +435,18 @@ pub fn get(field: Field, gui: &GuiConfigFile) -> Value {
                 .and_then(|codex| codex.default_args.clone()),
             Value::List,
         ),
-        Field::ClaudeCommand | Field::PiCommand | Field::OmpCommand | Field::CodexCommand => {
+        Field::CopilotResumeArgs => opt(
+            gui.resume
+                .as_ref()
+                .and_then(|r| r.copilot.as_ref())
+                .and_then(|copilot| copilot.default_args.clone()),
+            Value::List,
+        ),
+        Field::ClaudeCommand
+        | Field::PiCommand
+        | Field::OmpCommand
+        | Field::CodexCommand
+        | Field::CopilotCommand => {
             resume_command(gui.resume.as_ref(), field.command_agent().unwrap())
         }
         Field::AgentScope => opt(agent.scope, Value::Scope),
@@ -499,6 +531,7 @@ pub fn set(field: Field, gui: &mut GuiConfigFile, value: Value) {
         Field::PiPath => gui_table(gui).pi_path = path(&value),
         Field::OmpPath => gui_table(gui).omp_path = path(&value),
         Field::CodexPath => gui_table(gui).codex_path = path(&value),
+        Field::CopilotPath => gui_table(gui).copilot_path = path(&value),
         Field::DefaultWorkspace => gui_table(gui).default_workspace = path(&value),
         Field::PreviewLast => display(gui).last = flag(&value),
         Field::ToolDisplay => {
@@ -543,6 +576,13 @@ pub fn set(field: Field, gui: &mut GuiConfigFile, value: Value) {
                 .get_or_insert_with(AgentResumeConfig::default)
                 .default_args = list(&value)
         }
+        Field::CopilotResumeArgs => {
+            gui.resume
+                .get_or_insert_with(ResumeConfig::default)
+                .copilot
+                .get_or_insert_with(AgentResumeConfig::default)
+                .default_args = list(&value)
+        }
         // A list that names no program (empty, blank first word) removes
         // the key, as config files refuse it.
         Field::ClaudeCommand => {
@@ -567,6 +607,13 @@ pub fn set(field: Field, gui: &mut GuiConfigFile, value: Value) {
             gui.resume
                 .get_or_insert_with(ResumeConfig::default)
                 .codex
+                .get_or_insert_with(AgentResumeConfig::default)
+                .command = list(&value).and_then(AgentCommand::new)
+        }
+        Field::CopilotCommand => {
+            gui.resume
+                .get_or_insert_with(ResumeConfig::default)
+                .copilot
                 .get_or_insert_with(AgentResumeConfig::default)
                 .command = list(&value).and_then(AgentCommand::new)
         }
@@ -638,7 +685,18 @@ pub fn cli_value(field: Field, cli: &ConfigFile) -> Value {
                 .and_then(|codex| codex.default_args.clone()),
             Value::List,
         ),
-        Field::ClaudeCommand | Field::PiCommand | Field::OmpCommand | Field::CodexCommand => {
+        Field::CopilotResumeArgs => opt(
+            cli.resume
+                .as_ref()
+                .and_then(|r| r.copilot.as_ref())
+                .and_then(|copilot| copilot.default_args.clone()),
+            Value::List,
+        ),
+        Field::ClaudeCommand
+        | Field::PiCommand
+        | Field::OmpCommand
+        | Field::CodexCommand
+        | Field::CopilotCommand => {
             resume_command(cli.resume.as_ref(), field.command_agent().unwrap())
         }
         Field::AgentScope => opt(agent.scope, Value::Scope),
@@ -684,7 +742,11 @@ pub fn default_value(field: Field) -> Value {
         | Field::AgentSubagents => Value::Bool(false),
         Field::Terminal => Value::Text("auto".to_string()),
         // The agent's own binary (upstream 8a99ccc's defaults).
-        Field::ClaudeCommand | Field::PiCommand | Field::OmpCommand | Field::CodexCommand => {
+        Field::ClaudeCommand
+        | Field::PiCommand
+        | Field::OmpCommand
+        | Field::CodexCommand
+        | Field::CopilotCommand => {
             Value::List(vec![field.command_agent().unwrap().label().to_string()])
         }
         _ => Value::Unset,
@@ -695,9 +757,11 @@ pub fn default_value(field: Field) -> Value {
 pub fn describe(field: Field, value: &Value) -> String {
     match value {
         Value::Unset => match field {
-            Field::ClaudePath | Field::PiPath | Field::OmpPath | Field::CodexPath => {
-                "resolved from PATH".into()
-            }
+            Field::ClaudePath
+            | Field::PiPath
+            | Field::OmpPath
+            | Field::CodexPath
+            | Field::CopilotPath => "resolved from PATH".into(),
             Field::AgentMode => "from [search] mode, else automatic".into(),
             _ => "not set".into(),
         },

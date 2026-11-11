@@ -13,13 +13,13 @@
 //!    (it fails closed);
 //! 3. each of `CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR`,
 //!    `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`, `CODEX_HOME`,
-//!    `CODEX_SQLITE_HOME`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`,
+//!    `CODEX_SQLITE_HOME`, `COPILOT_HOME`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`,
 //!    `XDG_CACHE_HOME`, `XDG_STATE_HOME` is unset or (canonically) inside the
 //!    home — set but empty, it counts as unset only where the app reads it so
 //!    ([`EMPTY_MEANS_UNSET`]); the app reads an empty `PI_CODING_AGENT_DIR`,
 //!    `PI_CODING_AGENT_SESSION_DIR` or `PI_CONFIG_DIR` as a relative path, so
 //!    it is refused — and the default data locations used while they are unset
-//!    (`<home>/.claude`, `.claude.json`, `.pi`, `.omp`, `.codex`, `.config`,
+//!    (`<home>/.claude`, `.claude.json`, `.pi`, `.omp`, `.codex`, `.copilot`, `.config`,
 //!    `.cache`, `.local` and their data subfolders) canonically
 //!    stay inside the home when they exist — a junction or symlink to real
 //!    data is refused;
@@ -31,7 +31,8 @@
 //!    with its `sessions` and `archived_sessions` directories and its state
 //!    database directory (the `sqlite_home` of the Codex home's
 //!    `config.toml`, else `CODEX_SQLITE_HOME`, else the Codex home: core
-//!    `sources::codex::state_db_dir`), the store and semantic cache
+//!    `sources::codex::state_db_dir`), the Copilot home with its
+//!    `session-state` directory, the store and semantic cache
 //!    directories (`cache_base_dir`, `semantic_cache_dir`), the `sessionDir`
 //!    of Pi's `settings.json` in the agent directory (core
 //!    `pi_loader::session_dir_settings`; a relative value resolves against
@@ -58,7 +59,10 @@
 //!    directory decoding the rollout opens (that home's `config.toml`
 //!    `sqlite_home`, else the home: core
 //!    `sources::codex::view::state_db_dir_of`) must canonically stay inside
-//!    the sandbox home. At startup a refusal exits 3 like the gate; File →
+//!    the sandbox home; a Copilot event log (`events.jsonl`) also reads the
+//!    `workspace.yaml` beside it, which, when it exists, must canonically
+//!    be inside the sandbox home (a link out of it is refused). At startup a
+//!    refusal exits 3 like the gate; File →
 //!    Open JSONL file… shows an error toast and does not open that file.
 //!
 //! Debug builds skip the gate, rules 6 and 7 included, only with
@@ -73,6 +77,7 @@ use std::path::{Component, Path, PathBuf};
 
 use claude_history_core::HistoryEnv;
 use claude_history_core::history::sources::codex::{self, discover};
+use claude_history_core::history::sources::copilot;
 use claude_history_core::history::{omp_loader, pi_loader};
 
 /// The marker file a sandbox home must contain.
@@ -80,13 +85,14 @@ pub const SANDBOX_MARKER: &str = ".qa-sandbox";
 /// The variable that lets a debug build use the real home.
 pub const ALLOW_REAL_HOME_VAR: &str = "CHG_ALLOW_REAL_HOME";
 /// Path variables that must stay inside the sandbox home.
-pub const PATH_VARS: [&str; 10] = [
+pub const PATH_VARS: [&str; 11] = [
     "CLAUDE_CONFIG_DIR",
     "PI_CODING_AGENT_DIR",
     "PI_CODING_AGENT_SESSION_DIR",
     "PI_CONFIG_DIR",
     "CODEX_HOME",
     "CODEX_SQLITE_HOME",
+    "COPILOT_HOME",
     "XDG_DATA_HOME",
     "XDG_CONFIG_HOME",
     "XDG_CACHE_HOME",
@@ -97,10 +103,11 @@ pub const PATH_VARS: [&str; 10] = [
 /// the `XDG_*` directories by the XDG spec). Any other path variable that is set but
 /// empty is refused: the app reads an empty `PI_*` value as a relative path
 /// (an empty `PI_CODING_AGENT_SESSION_DIR` is the launch directory).
-pub const EMPTY_MEANS_UNSET: [&str; 7] = [
+pub const EMPTY_MEANS_UNSET: [&str; 8] = [
     "CLAUDE_CONFIG_DIR",
     "CODEX_HOME",
     "CODEX_SQLITE_HOME",
+    "COPILOT_HOME",
     "XDG_DATA_HOME",
     "XDG_CONFIG_HOME",
     "XDG_CACHE_HOME",
@@ -110,7 +117,7 @@ pub const EMPTY_MEANS_UNSET: [&str; 7] = [
 pub const NAME_VARS: [&str; 2] = ["OMP_PROFILE", "PI_PROFILE"];
 /// Default data locations under the home (relative), checked when present:
 /// each must canonically stay inside the home.
-pub const DEFAULT_DATA_PATHS: [&str; 19] = [
+pub const DEFAULT_DATA_PATHS: [&str; 21] = [
     ".claude",
     ".claude/projects",
     ".claude.json",
@@ -121,6 +128,8 @@ pub const DEFAULT_DATA_PATHS: [&str; 19] = [
     ".codex",
     ".codex/sessions",
     ".codex/archived_sessions",
+    ".copilot",
+    ".copilot/session-state",
     ".config",
     ".config/claude-history",
     ".cache",
@@ -284,12 +293,22 @@ pub fn check_workspace(env: &HistoryEnv, workspace: Option<&Path>) -> Result<(),
 /// home holding it (listed and its session index read) and the state
 /// database directory decoding it opens, in `env` (a
 /// single-file window) and without it (`--render`, the history service's
-/// loose files). Any other file adds nothing. `Err` is the reason: a startup
+/// loose files); for a Copilot event log, the `workspace.yaml` beside it
+/// when it exists. Any other file adds nothing. `Err` is the reason: a startup
 /// caller words it with [`refusal_message`] and exits 3, a runtime caller
 /// does not open the file. Callers check only when the process [`enforced`]
 /// the gate. The Codex home is checked by path alone before any of its files
 /// (config.toml) is read.
 pub fn check_opened_file(env: &HistoryEnv, file: &Path) -> Result<(), String> {
+    // A Copilot event log also reads the workspace.yaml beside it (an absent
+    // one is not read).
+    if let Some(sibling) = copilot::view::workspace_file_of(file)
+        && std::fs::symlink_metadata(&sibling).is_ok()
+    {
+        let home = canonical(sandbox_home(env)?);
+        let what = format!("the Copilot workspace.yaml beside {}", file.display());
+        check_inside(&[(what, sibling)], &home)?;
+    }
     // Path-only checks first: nothing in a Codex home outside the sandbox
     // (its config.toml included) is read before it is refused.
     let Some(codex_home) = discover::home_of(file) else {
@@ -335,6 +354,13 @@ fn data_locations(env: &HistoryEnv) -> Vec<(String, PathBuf)> {
     if let Some(home) = env.codex_home() {
         let db_dir = codex::state_db_dir(&home, env.codex_sqlite_home().as_deref());
         paths.extend(codex_locations(&home, &[db_dir], ""));
+    }
+    if let Some(home) = env.copilot_home() {
+        paths.push(("the Copilot home".to_string(), home.clone()));
+        paths.push((
+            "the Copilot session-state directory".to_string(),
+            home.join(copilot::SESSION_STATE_DIR),
+        ));
     }
     if let Some(dir) = env.cache_base_dir() {
         paths.push(("the store directory".to_string(), dir));
@@ -564,6 +590,7 @@ mod tests {
             "PI_CONFIG_DIR" => &mut env.pi_config_dir,
             "CODEX_HOME" => &mut env.codex_home,
             "CODEX_SQLITE_HOME" => &mut env.codex_sqlite_home,
+            "COPILOT_HOME" => &mut env.copilot_home,
             "XDG_DATA_HOME" => &mut env.xdg_data_home,
             // Read by the gate only.
             _ => return gate,
@@ -608,10 +635,11 @@ mod tests {
             Some(outside.path().join(".claude").into_os_string()),
         )];
         assert!(check(&gate).unwrap_err().contains("CLAUDE_CONFIG_DIR"));
-        // The Codex home and its state database directory are checked too.
-        for name in ["CODEX_HOME", "CODEX_SQLITE_HOME"] {
+        // The Codex and Copilot homes and the Codex state database directory
+        // are checked too.
+        for name in ["CODEX_HOME", "CODEX_SQLITE_HOME", "COPILOT_HOME"] {
             assert!(PATH_VARS.contains(&name), "{name} is gathered");
-            gate.path_vars = vec![(name, Some(outside.path().join(".codex").into_os_string()))];
+            gate.path_vars = vec![(name, Some(outside.path().join(".agent").into_os_string()))];
             assert!(check(&gate).unwrap_err().contains(name));
         }
         gate.path_vars = vec![("XDG_DATA_HOME", Some(OsString::from("relative/dir")))];
@@ -942,6 +970,12 @@ mod tests {
         gate.env.env_path_base = Some(outside.path().to_path_buf());
         let error = check(&gate).unwrap_err();
         assert!(error.starts_with("the Codex home ("), "{error}");
+        // So does a relative COPILOT_HOME.
+        let mut gate = inputs(home.path());
+        gate.env.copilot_home = Some(PathBuf::from("copilot"));
+        gate.env.env_path_base = Some(outside.path().to_path_buf());
+        let error = check(&gate).unwrap_err();
+        assert!(error.starts_with("the Copilot home ("), "{error}");
     }
 
     /// Rule 5 checks the Claude projects folder, the Codex session folders
@@ -953,10 +987,15 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         let claude = home.path().join("claude-moved");
         let codex = home.path().join("codex-moved");
+        let copilot = home.path().join("copilot-moved");
         let gate = with_var(
-            with_var(inputs(home.path()), "CLAUDE_CONFIG_DIR", claude.clone()),
-            "CODEX_HOME",
-            codex.clone(),
+            with_var(
+                with_var(inputs(home.path()), "CLAUDE_CONFIG_DIR", claude.clone()),
+                "CODEX_HOME",
+                codex.clone(),
+            ),
+            "COPILOT_HOME",
+            copilot.clone(),
         );
         let store = gate.env.cache_base_dir().unwrap();
         assert!(store.starts_with(home.path().join(".cache").join("claude-history-gui")));
@@ -968,6 +1007,10 @@ mod tests {
             (
                 codex.join("archived_sessions"),
                 "the archived Codex sessions directory",
+            ),
+            (
+                copilot.join("session-state"),
+                "the Copilot session-state directory",
             ),
             (store, "the store directory"),
         ] {
@@ -1060,5 +1103,67 @@ mod tests {
         let error =
             check_opened_file(&moved, &rollout_in(&home.path().join(".codex"))).unwrap_err();
         assert!(error.starts_with("CODEX_SQLITE_HOME ("), "{error}");
+    }
+
+    /// A file symlink (skipped like the directory links without the privilege).
+    fn make_file_link(target: &Path, link: &Path) -> bool {
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link).is_ok()
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            let _ = (target, link);
+            false
+        }
+    }
+
+    /// Rule 7: a Copilot event log also reads the workspace.yaml beside it,
+    /// which must be inside the home when it exists.
+    #[test]
+    fn a_copilot_log_reads_only_a_workspace_file_inside_the_home() {
+        let home = sandbox();
+        let outside = tempfile::tempdir().unwrap();
+        let env = HistoryEnv::sandbox(home.path());
+        let session = "0c0a0000-0000-4000-8000-0000000000aa";
+        let log_in = |root: &Path| root.join(session).join("events.jsonl");
+
+        let inside = log_in(&home.path().join("copilot"));
+        write(&inside, "");
+        write(
+            &inside.with_file_name("workspace.yaml"),
+            "cwd: /work/demo\n",
+        );
+        assert_eq!(check_opened_file(&env, &inside), Ok(()));
+
+        // Without a sibling there is nothing else to read.
+        let loose = log_in(outside.path());
+        write(&loose, "");
+        assert_eq!(check_opened_file(&env, &loose), Ok(()));
+
+        // A sibling outside the home is refused, the opened file itself is not.
+        write(&loose.with_file_name("workspace.yaml"), "cwd: /work/demo\n");
+        let error = check_opened_file(&env, &loose).unwrap_err();
+        assert!(
+            error.starts_with("the Copilot workspace.yaml beside "),
+            "{error}"
+        );
+        assert!(error.ends_with("is outside the sandbox home"), "{error}");
+
+        // A sibling inside the home that links outside is refused too.
+        let linked = log_in(&home.path().join("linked"));
+        write(&linked, "");
+        let target = outside.path().join("target.yaml");
+        write(&target, "cwd: /work/demo\n");
+        if make_file_link(&target, &linked.with_file_name("workspace.yaml")) {
+            let error = check_opened_file(&env, &linked).unwrap_err();
+            assert!(error.contains("workspace.yaml"), "{error}");
+        } else {
+            eprintln!("skipped the file link case: cannot create a file link here");
+        }
     }
 }

@@ -16,6 +16,7 @@
 //! Scrolling, hit-testing and drawing stay with the GUI; functions that
 //! upstream computed from the viewport take the viewport facts as arguments.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -158,9 +159,11 @@ impl ViewerModel {
     }
 
     /// What upstream's `I` copied: the file stem (the session UUID for
-    /// Claude; for Pi/OMP the file name, not the header id).
-    pub fn session_id(&self) -> Option<&str> {
-        self.path.file_stem().and_then(|stem| stem.to_str())
+    /// Claude; for Pi/OMP the file name, not the header id; fork: for
+    /// Copilot the session directory's name, see
+    /// [`crate::history::sources::session_stem`]).
+    pub fn session_id(&self) -> Option<Cow<'_, str>> {
+        crate::history::sources::session_stem(&self.path)
     }
 
     /// The clipboard text of the message at `entry_index` (upstream `y` in

@@ -16,11 +16,12 @@ use super::pages::{program_status_for, terminal_preview_for};
 /// The program path fields (General) and the agent each one starts; every
 /// agent's `command` field (Resume, upstream 8a99ccc) shows the same probe
 /// (`Field::command_of`).
-pub const PROGRAM_FIELDS: [(Field, SourceKind); 4] = [
+pub const PROGRAM_FIELDS: [(Field, SourceKind); 5] = [
     (Field::ClaudePath, SourceKind::Claude),
     (Field::PiPath, SourceKind::Pi),
     (Field::OmpPath, SourceKind::Omp),
     (Field::CodexPath, SourceKind::Codex),
+    (Field::CopilotPath, SourceKind::Copilot),
 ];
 
 /// The agent whose program a program path or `command` field sets.

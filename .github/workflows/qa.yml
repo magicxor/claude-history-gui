@@ -65,6 +65,8 @@ jobs:
             'cross-pane'        = @{ Prepare = 'synth'; Args = ''; Timeout = 1200 }
             # eea6d37: a Codex thread in the sandbox's Codex home (new-sandbox -WithCodex).
             'codex'             = @{ Prepare = 'codex'; Args = '' }
+            # A Copilot CLI session in the sandbox's Copilot home (new-sandbox -WithCopilot).
+            'copilot'           = @{ Prepare = 'copilot'; Args = '' }
           }
           foreach ($scenario in Get-ChildItem crates/gui/qa/scenarios -Filter *.qa) {
             if ($scenario.Name -like 'semantic-*') { Write-Output "skip $($scenario.Name) (needs a model)"; continue }
@@ -74,6 +76,7 @@ jobs:
             $sbx = @{ Source = 'crates/gui/tests/fixtures/qa-home'; Dest = $sandbox; Force = $true }
             if ($step -and $step.Prepare -eq 'workspace') { $sbx.WithWorkspace = $true }
             if ($step -and $step.Prepare -eq 'codex') { $sbx.WithCodex = $true }
+            if ($step -and $step.Prepare -eq 'copilot') { $sbx.WithCopilot = $true }
             ./tools/qa/new-sandbox.ps1 @sbx | Out-Null
             $argsLine = ''
             if ($step) {

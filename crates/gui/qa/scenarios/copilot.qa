@@ -1,0 +1,38 @@
+# copilot.qa: a GitHub Copilot CLI session is listed and opens in the viewer, refuses
+# Rename, Fork and Delete before any dialog (the Copilot CLI has no command for them),
+# and resumes through the (recorded) terminal with COPILOT_HOME. Terminals and program
+# runs are only recorded.
+#
+# Run on a FRESH COPY of the sandbox with the Copilot session added:
+#   tools/qa/new-sandbox.ps1 -Source crates/gui/tests/fixtures/qa-home -Dest <sandbox> -WithCopilot
+#   tools/qa/run-gui.ps1 -Sandbox <sandbox> -Exe <qa build> -Scenario crates/gui/qa/scenarios/copilot.qa -Out <dir> [-Shots]
+wait-loaded 30s
+expect dialog == none
+type "ocelot"
+wait-for list.selected_title contains "Ocelot cache eviction" 10s
+shot copilot-row
+
+# Rename, Fork and Delete are refused before a dialog opens, with core's text.
+key f2
+wait-for toast.last contains "Renaming CP sessions is not supported" 5s
+expect dialog == none
+action history::Fork
+wait-for toast.last contains "Forking CP sessions is not supported" 5s
+expect dialog == none
+action history::Delete
+wait-for toast.last contains "Deleting CP sessions is not supported" 5s
+expect dialog == none
+
+# The viewer shows the session.
+key enter
+wait-for viewer.items > 0 10s
+shot copilot-viewer
+
+# Resume: the Copilot CLI with the session's id and COPILOT_HOME.
+expect calls.terminal.count == 0
+key ctrl-r
+wait-for calls.terminal.count == 1 10s
+expect calls.terminal.last contains "--resume=0c0a0000-0000-4000-8000-000000000001"
+expect calls.terminal.last contains "COPILOT_HOME"
+expect calls.run.count == 0
+quit 0

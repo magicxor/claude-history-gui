@@ -18,6 +18,8 @@ pub enum SourceKind {
     Pi,
     Omp,
     Codex,
+    /// Fork-only source.
+    Copilot,
 }
 
 impl SourceKind {
@@ -27,6 +29,7 @@ impl SourceKind {
             Self::Pi => "pi",
             Self::Omp => "omp",
             Self::Codex => "codex",
+            Self::Copilot => "copilot",
         }
     }
 
@@ -37,6 +40,7 @@ impl SourceKind {
             Self::Pi => "Pi",
             Self::Omp => "OMP",
             Self::Codex => "Codex",
+            Self::Copilot => "Copilot",
         }
     }
 
@@ -46,6 +50,7 @@ impl SourceKind {
             Self::Pi => "Pi",
             Self::Omp => "OMP",
             Self::Codex => "CX",
+            Self::Copilot => "CP",
         }
     }
 }

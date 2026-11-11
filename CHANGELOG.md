@@ -3,6 +3,17 @@
 GitHub generates the release notes from the merged pull requests; a `## v<version>` section of this file, if there
 is one, is put above them by the release workflow.
 
+## Unreleased
+
+### New
+
+- GitHub Copilot CLI sessions are listed and searchable next to the other sources (marked `CP`), read from
+  `~/.copilot` or `COPILOT_HOME` (`session-state/<session-id>/events.jsonl` and its `workspace.yaml`, whichever client
+  wrote them). They open in the viewer, single-file windows, exports and copies; Deep Search and the agent panel
+  find, read and outline them. Resume runs `copilot --resume=<session-id>` in a new terminal; Fork, Rename and Delete
+  are not available for Copilot sessions. gui.toml only: `[gui] copilot_path` and `[resume.copilot]` (`command`,
+  `default_args`, for example `["--allow-all-tools"]`); `[resume.copilot]` in `config.toml` is rejected.
+
 ## v0.2.0
 
 Update notes: the history store is rebuilt once on the first start (the list footer shows its progress), and the

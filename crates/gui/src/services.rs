@@ -83,7 +83,7 @@ pub trait PlatformServices: Send + Sync + 'static {
     fn exec_in_current_terminal(&self, spec: &LaunchSpec) -> Result<(), String>;
     /// Blocking (until the program exits); call from a background task. Run
     /// an agent's CLI without a terminal (Codex: `codex delete --force <id>`,
-    /// upstream eea6d37). Real: core `terminal::run_to_completion` after the
+    /// upstream eea6d37; Copilot has no such command). Real: core `terminal::run_to_completion` after the
     /// debug-build launch guard. `Err` = could not run it.
     fn run_program(&self, spec: &LaunchSpec) -> Result<RunOutput, String>;
     /// `Redirected | Terminal | None` (after `AttachConsole` on Windows).
@@ -666,16 +666,16 @@ impl RealServices {
 const REFUSED_IN_TESTS: &str = "RealServices is refused in test builds";
 
 /// The variable that lets a debug build start a real `claude`/`pi`/`omp`/
-/// `codex`.
+/// `codex`/`copilot`.
 pub const ALLOW_REAL_LAUNCH_VAR: &str = "CHG_ALLOW_REAL_LAUNCH";
 
 /// Programs a debug build never starts for real without an override (§15.4).
-const GUARDED_PROGRAMS: [&str; 4] = ["claude", "pi", "omp", "codex"];
+const GUARDED_PROGRAMS: [&str; 5] = ["claude", "pi", "omp", "codex", "copilot"];
 
 /// The debug-build launch guard (§15.4, X-037) on the text of a launch
 /// (a terminal command line, a launch script, an exec line, a program run): a
-/// word whose file stem is `claude`, `pi`, `omp` or `codex` and that is not an
-/// existing directory is a guarded program. It is allowed only when `allow_real` is set
+/// word whose file stem is `claude`, `pi`, `omp`, `codex` or `copilot` and that is
+/// not an existing directory is a guarded program. It is allowed only when `allow_real` is set
 /// (`CHG_ALLOW_REAL_LAUNCH=1`) or the word is a path inside the sandbox home
 /// (a `[gui] <prog>_path` override pointing at a harmless recorder).
 pub fn launch_guard(
@@ -1038,6 +1038,8 @@ mod tests {
             "omp.exe",
             "codex",
             "codex.cmd",
+            "copilot",
+            "copilot.cmd",
         ] {
             let line = format!("xterm -e {program} --session x");
             assert!(launch_guard(&line, false, None).is_err(), "{line}");

@@ -34,13 +34,14 @@ use crate::workspace::startup::register_dialog;
 /// The QA / probe id of the dialog.
 pub const DIALOG_ID: &str = "delete";
 
-/// `Claude Code`, `Pi`, `OMP` or `Codex`.
+/// `Claude Code`, `Pi`, `OMP`, `Codex` or `Copilot`.
 pub fn source_label(source: SourceKind) -> &'static str {
     match source {
         SourceKind::Claude => "Claude Code",
         SourceKind::Pi => "Pi",
         SourceKind::Omp => "OMP",
         SourceKind::Codex => "Codex",
+        SourceKind::Copilot => "Copilot",
     }
 }
 

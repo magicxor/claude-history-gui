@@ -210,7 +210,7 @@ impl KeyIndex {
 
 /// How many conversations of each source the corpus holds.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct SourceCounts([usize; 4]);
+pub(super) struct SourceCounts([usize; 5]);
 
 impl SourceCounts {
     fn slot(source: SourceKind) -> usize {
@@ -219,6 +219,7 @@ impl SourceCounts {
             SourceKind::Pi => 1,
             SourceKind::Omp => 2,
             SourceKind::Codex => 3,
+            SourceKind::Copilot => 4,
         }
     }
 
@@ -841,6 +842,10 @@ mod tests {
         counts.add(SourceKind::Pi);
         assert!(counts.mixed());
         counts.remove(SourceKind::Pi);
+        assert!(!counts.mixed());
+        counts.add(SourceKind::Copilot);
+        assert!(counts.mixed());
+        counts.remove(SourceKind::Copilot);
         assert!(!counts.mixed());
     }
 }

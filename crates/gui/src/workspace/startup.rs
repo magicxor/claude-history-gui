@@ -934,7 +934,7 @@ fn cli_workspace(
 /// 5. the last used workspace of state.json when `[gui] restore_session`;
 /// 6. none.
 ///
-/// Rule 3 (c), a directory recorded by Pi/OMP/Codex sessions, needs the loaded
+/// Rule 3 (c), a directory recorded by Pi/OMP/Codex/Copilot sessions, needs the loaded
 /// corpus: [`workspace_from_recorded_cwd`] applies it after the first batch.
 pub fn resolve_workspace(
     launch: &LaunchContext,
@@ -1043,7 +1043,7 @@ pub fn opened_file_refusal(state: &AppState, file: &Path) -> Option<String> {
 
 /// PD3 rule 3 (c): after the first load batch, when no workspace was chosen
 /// by rules 1–5 and the launch directory is not excluded (root, home, the
-/// executable's directory) and equals the cwd recorded by at least one Pi/OMP/Codex
+/// executable's directory) and equals the cwd recorded by at least one Pi/OMP/Codex/Copilot
 /// session, that directory becomes the workspace.
 pub fn workspace_from_recorded_cwd<'a>(
     launch_cwd: Option<&Path>,
@@ -1087,7 +1087,7 @@ pub fn workspace_from_recorded_cwd_with<'a>(
 }
 
 /// The app-level entry for PD3 rule 3 (c): the list calls this once after its
-/// first load batch with the cwds the batch's Pi/OMP/Codex sessions recorded. When
+/// first load batch with the cwds the batch's Pi/OMP/Codex/Copilot sessions recorded. When
 /// the rule picks a workspace, `AppState` takes it and `Ok(true)` is returned (the
 /// caller then re-scopes and reloads its list); otherwise nothing changes. When
 /// the sandbox gate refuses the workspace (§15.4 rule 6, [`workspace_refusal`])

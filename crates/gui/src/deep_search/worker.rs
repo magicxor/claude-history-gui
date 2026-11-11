@@ -390,9 +390,11 @@ fn full_ref_candidates(response: &mut AgentResponse, env: &HistoryEnv, cancelled
         // The discovery is blocking and not cancellable: skip it for a job
         // that was cancelled or replaced (the handles stay).
         let keys = if !cancelled && error.detail.contains(" source=") {
-            // Cards are only needed for Codex keys.
+            // Cards are only needed for Codex and Copilot keys.
             let no_cards: &[claude_history_core::history::Conversation] = &[];
-            let listed = (!error.detail.contains(" source=codex ")).then_some(no_cards);
+            let listed = (!error.detail.contains(" source=codex ")
+                && !error.detail.contains(" source=copilot "))
+            .then_some(no_cards);
             // Hidden (exec and subagent) threads too: refs resolve them by
             // identity (upstream cb990e6).
             claude_history_core::agent::service::discover_agent_keys(env, None, listed, true)

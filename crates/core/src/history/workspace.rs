@@ -203,7 +203,12 @@ mod tests {
     #[test]
     fn non_claude_sessions_match_by_cwd_below_workspace() {
         let ws = workspace("/nonexistent/group");
-        for source in [SourceKind::Pi, SourceKind::Omp, SourceKind::Codex] {
+        for source in [
+            SourceKind::Pi,
+            SourceKind::Omp,
+            SourceKind::Codex,
+            SourceKind::Copilot,
+        ] {
             let inside = conversation(source, "ignored", &["/nonexistent/group/repo-a"]);
             assert!(ws.contains(&inside), "{source:?}");
             let outside = conversation(source, "ignored", &["/nonexistent/groupie"]);

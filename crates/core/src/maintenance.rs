@@ -628,7 +628,18 @@ pub fn plan_session_delete(
                 kept: Vec::new(),
             })
         }
+        // Fork: refused by the capability check above, kept consistent here.
+        SourceKind::Copilot => Err(copilot_delete_refused()),
     }
+}
+
+/// Fork: the refusal of deleting a Copilot session.
+fn copilot_delete_refused() -> AppError {
+    AppError::Unsupported(history::actions::refusal(
+        SourceKind::Copilot,
+        history::Provenance::default(),
+        "Deleting",
+    ))
 }
 
 fn plan_session_id(header_id: Option<String>, path: &Path) -> String {
@@ -887,6 +898,7 @@ fn validate_delete_plan(env: &HistoryEnv, plan: &DeletePlan) -> Result<()> {
                 return refuse();
             }
         }
+        SourceKind::Copilot => return Err(copilot_delete_refused()),
     }
     Ok(())
 }
@@ -1090,10 +1102,8 @@ pub fn debug_search_report(
                     .project_name
                     .clone()
                     .unwrap_or_else(|| "(none)".to_string()),
-                session: conversation
-                    .path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
+                session: crate::history::sources::session_stem(&conversation.path)
+                    .as_deref()
                     .unwrap_or("?")
                     .to_string(),
                 age_label: format_debug_age(age),
@@ -2065,6 +2075,36 @@ mod tests {
         let plan = plan_session_delete(&sandbox.env, &other, SourceKind::Codex).unwrap();
         assert!(execute_session_delete(&sandbox.env, &plan).is_err());
         assert!(other.is_file());
+    }
+
+    /// Fork: the CLI has no delete command, so a Copilot session is refused
+    /// whether planned or validated.
+    #[test]
+    fn copilot_sessions_cannot_be_deleted() {
+        let sandbox = Sandbox::new();
+        let dir = sandbox
+            .root
+            .path()
+            .join(".copilot/session-state/0f8e7d6c-5b4a-4932-8170-a1b2c3d4e5f6");
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("events.jsonl");
+        std::fs::write(&log, "{}\n").unwrap();
+        let error = plan_session_delete(&sandbox.env, &log, SourceKind::Copilot).unwrap_err();
+        assert!(matches!(error, AppError::Unsupported(_)), "{error:?}");
+        assert_eq!(error.to_string(), "Deleting CP sessions is not supported");
+
+        let plan = DeletePlan {
+            source: SourceKind::Copilot,
+            path: log.clone(),
+            session_id: "x".to_owned(),
+            files: vec![log.clone()],
+            dirs: Vec::new(),
+            metadata: Vec::new(),
+            kept: Vec::new(),
+        };
+        let error = validate_delete_plan(&sandbox.env, &plan).unwrap_err();
+        assert!(matches!(error, AppError::Unsupported(_)), "{error:?}");
+        assert!(log.is_file());
     }
 
     #[test]

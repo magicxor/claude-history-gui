@@ -572,10 +572,8 @@ fn conversation_title(conversation: &Conversation) -> String {
 }
 
 fn session_stem(conversation: &Conversation) -> String {
-    conversation
-        .path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
+    crate::history::sources::session_stem(&conversation.path)
+        .as_deref()
         .unwrap_or("?")
         .to_string()
 }

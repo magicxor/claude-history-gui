@@ -789,17 +789,18 @@ impl AgentService {
 
 /// Discover every Claude session and Pi/OMP transcript key (public so a GUI
 /// can turn the candidates of an ambiguous-ref error into durable full refs),
-/// and the keys of the listed Codex threads and Claude sidecars (subagents
-/// and `/btw` forks, upstream 3c2ffeb) among `listed`, else among the store's
-/// cards; automated and child conversations only with `all_kinds`. Codex keys
-/// need the thread's working directory and sidecar keys their metadata, which
-/// only decoding reveals, so they come from the cards the store keeps. With a
-/// `workspace`, only the workspace's Claude project directories
-/// (worktree-aware), the sidecars it contains and the Pi/OMP sessions whose
-/// working directory or project is the workspace or a folder below it are
-/// returned (upstream 82b355a); Codex keys are not narrowed (as upstream),
-/// search scopes its conversations itself and keys the ones a recorded cwd
-/// puts in the workspace.
+/// and the keys of the listed Codex threads, Copilot sessions (fork) and
+/// Claude sidecars (subagents and `/btw` forks, upstream 3c2ffeb) among
+/// `listed`, else among the store's cards; automated and child conversations
+/// only with `all_kinds`. Codex keys need the thread's working directory and
+/// sidecar keys their metadata, which only decoding reveals, so they come
+/// from the cards the store keeps; so do Copilot's. With a `workspace`, only
+/// the workspace's Claude project directories (worktree-aware), the sidecars
+/// and Copilot sessions it contains and the Pi/OMP sessions whose working
+/// directory or project is the workspace or a folder below it are returned
+/// (upstream 82b355a); Codex keys are not narrowed (as upstream), search
+/// scopes its conversations itself and keys the ones a recorded cwd puts in
+/// the workspace.
 pub fn discover_agent_keys(
     env: &HistoryEnv,
     workspace: Option<&history::Workspace>,
@@ -977,6 +978,10 @@ pub fn discover_agent_keys(
                         history::sources::claude::sidecar(&conversation.path).is_some()
                             && workspace.is_none_or(|workspace| workspace.contains(conversation))
                     }
+                    // Fork: narrowed like Pi/OMP.
+                    history::model::SourceKind::Copilot => {
+                        workspace.is_none_or(|workspace| workspace.contains(conversation))
+                    }
                     _ => false,
                 };
                 from_cards && (all_kinds || !conversation.provenance.hidden_by_default())
@@ -989,7 +994,7 @@ pub fn discover_agent_keys(
     if keys.is_empty() && !root.exists() {
         return Err(AgentError::io(
             Some(&root.to_string_lossy()),
-            "no Claude, Pi, OMP, or Codex history storage is available",
+            "no Claude, Pi, OMP, Codex, or Copilot history storage is available",
         )
         .into());
     }
@@ -1093,12 +1098,10 @@ fn conversation_from_agent_transcript(
     let semantic_route_text = history::semantic_route_text(&full_text, "");
     history::Conversation {
         source,
-        session_id: transcript
-            .path
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_owned(),
+        // Fork: a Copilot log is `events.jsonl`; its session directory names it.
+        session_id: history::sources::session_stem(&transcript.path)
+            .map(std::borrow::Cow::into_owned)
+            .unwrap_or_default(),
         path: transcript.path.clone(),
         index: 0,
         timestamp,
@@ -2345,6 +2348,49 @@ mode = "hybrid"
 
         let (global, _) = discover_agent_keys(&env, None, None, false).unwrap();
         assert_eq!(global, local);
+    }
+
+    #[test]
+    fn key_discovery_finds_copilot_sessions_and_narrows_them_by_workspace() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = home.path().join("workspace");
+        let elsewhere = home.path().join("elsewhere");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let root =
+            crate::history::sources::copilot::tests::root_copy(&home.path().join(".copilot"));
+        // The fixtures' working directory `/work/demo` is no real folder:
+        // move the first session into the workspace.
+        let plain = "0c0a0000-0000-4000-8000-000000000001";
+        let log = root.join(plain).join("events.jsonl");
+        let cwd = serde_json::to_string(&workspace.to_string_lossy()).unwrap();
+        let text = std::fs::read_to_string(&log)
+            .unwrap()
+            .replace("\"/work/demo\"", &cwd);
+        std::fs::write(&log, text).unwrap();
+        let env = HistoryEnv::sandbox(home.path());
+        // Without a Claude projects root an empty key set is an error.
+        std::fs::create_dir_all(env.claude_projects_root().unwrap()).unwrap();
+
+        let copilot = |keys: &[agent::refs::AgentConversationKey]| {
+            let mut ids: Vec<String> = keys
+                .iter()
+                .filter(|key| key.source == history::model::SourceKind::Copilot)
+                .map(|key| key.session_id.clone())
+                .collect();
+            ids.sort();
+            ids
+        };
+        let (all, _) = discover_agent_keys(&env, None, None, false).unwrap();
+        assert_eq!(copilot(&all).len(), 4, "{all:?}");
+
+        let at = |dir: &Path| {
+            history::Workspace::new(&crate::env::WorkspaceScope::new(dir).unwrap(), None)
+        };
+        let (inside, _) = discover_agent_keys(&env, Some(&at(&workspace)), None, false).unwrap();
+        assert_eq!(copilot(&inside), [plain]);
+        let (outside, _) = discover_agent_keys(&env, Some(&at(&elsewhere)), None, false).unwrap();
+        assert!(copilot(&outside).is_empty(), "{outside:?}");
     }
 
     #[test]

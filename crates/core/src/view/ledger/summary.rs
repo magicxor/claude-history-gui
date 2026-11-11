@@ -42,14 +42,15 @@ pub(crate) struct ToolActivitySummary {
 impl ToolActivitySummary {
     fn add_call(&mut self, name: &str) {
         match name {
-            "Bash" | "bash" => self.shell_commands += 1,
-            "Read" | "read" => self.read_files += 1,
-            "Grep" | "grep" => self.searched_patterns += 1,
-            "Glob" | "find" => self.searched_file_patterns += 1,
+            // Fork: with GitHub Copilot CLI's names (`powershell`, `view`, ...).
+            "Bash" | "bash" | "powershell" => self.shell_commands += 1,
+            "Read" | "read" | "view" => self.read_files += 1,
+            "Grep" | "grep" | "rg" => self.searched_patterns += 1,
+            "Glob" | "find" | "glob" => self.searched_file_patterns += 1,
             "Edit" | "edit" => self.edited_files += 1,
-            "Write" | "write" => self.wrote_files += 1,
-            "Task" => self.agents += 1,
-            "WebFetch" | "fetch_content" => self.fetched_urls += 1,
+            "Write" | "write" | "create" => self.wrote_files += 1,
+            "Task" | "task" => self.agents += 1,
+            "WebFetch" | "fetch_content" | "web_fetch" => self.fetched_urls += 1,
             "WebSearch" | "web_search" => self.web_searches += 1,
             _ => self.add_other_tool(name, 1),
         }
