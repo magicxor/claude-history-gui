@@ -192,3 +192,35 @@ fn semantic_mode_shows_the_browse_list_ranked() {
     assert_eq!(names(&app), ["d", "b", "c", "a"], "as the control says");
     assert_eq!(app.selected_path(), chosen);
 }
+
+#[test]
+fn rows_kept_by_a_pending_or_unknown_uuid_follow_the_date_order() {
+    let sandbox = Sandbox::new();
+    let mut app = Browser::new(corpus(), sandbox.options());
+    let uuid = "cccccccc-3333-4333-8333-333333333333";
+    app.set_query(uuid);
+    assert!(matches!(
+        app.uuid_lookup(),
+        Some(UuidLookup::Pending { .. })
+    ));
+    assert_eq!(names(&app), ["d", "b", "c", "a"], "the rows of before stay");
+
+    app.set_sort_order(ListSortOrder::Oldest);
+    assert_eq!(names(&app), ["a", "c", "b", "d"]);
+    assert!(matches!(
+        app.uuid_lookup(),
+        Some(UuidLookup::Pending { .. })
+    ));
+
+    app.resolve_uuid_lookup(uuid, None);
+    assert!(matches!(
+        app.uuid_lookup(),
+        Some(UuidLookup::NotFound { .. })
+    ));
+    app.set_sort_order(ListSortOrder::Newest);
+    assert_eq!(names(&app), ["d", "b", "c", "a"]);
+    assert!(matches!(
+        app.uuid_lookup(),
+        Some(UuidLookup::NotFound { .. })
+    ));
+}

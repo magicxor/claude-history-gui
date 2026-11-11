@@ -2038,7 +2038,7 @@ activation (check marks reflect the active window's viewer, tracked in `ActivePa
 * **View**: Conversations, Deep search, Viewer, Focus viewer, Tool display ▸ Off/Summary/Calls/Truncated/Full,
   Show thinking, Show timestamps, Search mode ▸ Lexical/Semantic, Scope ▸ All/Workspace, Sort ▸ Relevance/Newest
   first/Oldest first (fork; check mark on the order the rows are in, every item disabled in semantic mode: the tree
-  sets the flag and `mark_disabled` keeps it), Show automated and subagent conversations (check mark, cb990e6),
+  sets the flag, `mark_disabled` and the palette keep it), Show automated and subagent conversations (check mark, cb990e6),
   Search only your own messages (check mark, ae7ae39), Theme ▸ System/Light/Dark, Refresh.
 * **Session**: Open, Resume, Fork, Rename…, Delete…, Export…, Copy to clipboard ▸ 4 formats, Copy message, Copy path,
   Copy session ID, Copy header session ID, Show file path, Reveal in file manager, Open parent conversation,
@@ -2636,10 +2636,12 @@ recorded each frame (for the keyboard context menu position).
    first cards of a generation follow; under a date order, and while a session is to stay selected (a sort change or
    another toggle keeping the selection: it may rank below the page), the index's best-ranked first page is not
    shown, the complete answer is. Back to Relevance the query runs again (the rank cannot be recovered by sorting);
-   a date order chosen before that answer keeps the selected session for it. Semantic mode ranks nearly every
+   a date order chosen before that answer keeps the selected session for it, and so does that answer for a session
+   the user moved to meanwhile (`rerank_pending`). Semantic mode ranks nearly every
    conversation, so it always shows its ranking (`effective_sort_order` = Relevance; switching to it rebuilds a
    date-ordered browse list; the toolbar control and the menu items are disabled; the chosen order applies again in
-   lexical mode). A UUID jump's single row is not ordered. While the in-memory loader streams, rows arrive unsorted
+   lexical mode). A UUID jump's single row is not ordered; the rows a pending or unknown UUID keeps follow a date
+   order (they have no rank to bring back). While the in-memory loader streams, rows arrive unsorted
    whatever the order (L-002); the load's end orders them. Known limits: lexical hit evidence exists for the 200 best-ranked rows, so a
    date-sorted row further down shows its normal preview (in store mode `fill_visible_evidence` fills it); before
    a generation opens only its newest `SNAPSHOT_ROWS` cards are listed (Oldest orders them until it opens).

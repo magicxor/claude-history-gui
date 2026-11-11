@@ -409,6 +409,10 @@ pub struct Browser {
     /// Whether `filtered` is the first page of an index search still being
     /// completed
     search_page_shown: bool,
+    /// The lexical search in flight re-ranks the rows after a sort change
+    /// back to Relevance: its answer keeps the session selected then, also
+    /// one the user moved to meanwhile
+    rerank_pending: bool,
     /// Current list search mode
     list_search_mode: ListSearchMode,
     /// Order of the rows chosen by the user (applied in lexical mode)
@@ -549,6 +553,7 @@ impl Browser {
             search_generation: 0,
             search_in_flight: false,
             search_page_shown: false,
+            rerank_pending: false,
             list_search_mode,
             sort_order: if parts.single_file_mode {
                 ListSortOrder::Relevance

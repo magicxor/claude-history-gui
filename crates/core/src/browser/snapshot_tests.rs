@@ -1416,6 +1416,37 @@ fn a_date_order_chosen_while_the_rank_is_coming_keeps_the_selection() {
     assert_eq!(listed_paths(&app), newest_first);
 }
 
+#[test]
+fn a_session_moved_to_while_the_rank_is_coming_stays_selected() {
+    let sandbox = Sandbox::new();
+    let root = publish(&many_needles(120));
+    let (mut app, tx, ranking) = needles_answered_by_hand(&sandbox, &root);
+    type_query(&mut app, "needle");
+    tx.send(index_answer(&app, ranking.clone(), true)).unwrap();
+    assert!(app.poll());
+    app.set_sort_order(ListSortOrder::Oldest);
+    assert!(app.select(70));
+
+    app.set_sort_order(ListSortOrder::Relevance);
+    // Down over the rows of before, while the rank is coming.
+    app.select_next();
+    let moved_to = app.selected_path();
+    tx.send(index_answer(&app, ranking[..50].to_vec(), false))
+        .unwrap();
+    app.poll();
+    assert_eq!(app.selected_path(), moved_to, "the first page waits");
+    tx.send(index_answer(&app, ranking, true)).unwrap();
+    assert!(app.poll());
+    assert_eq!(app.selected_path(), moved_to);
+
+    // A later query starts at its first row again.
+    app.select_next();
+    type_query(&mut app, " number");
+    tx.send(index_answer(&app, (0..5).collect(), true)).unwrap();
+    assert!(app.poll());
+    assert_eq!(app.selected(), Some(0));
+}
+
 // --- the loader in store mode (fork) ---
 
 /// Drive `loader` until it reports a load event.

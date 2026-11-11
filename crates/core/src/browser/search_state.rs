@@ -628,6 +628,7 @@ impl Browser {
         self.search_generation += 1;
         self.search_in_flight = false;
         self.search_page_shown = false;
+        self.rerank_pending = false;
         self.lexical_evidence.clear();
         self.clear_evidence_checked();
         self.semantic_search.pending_generation = None;
@@ -1210,6 +1211,7 @@ impl Browser {
         self.search_generation += 1;
         self.search_in_flight = true;
         self.search_page_shown = false;
+        self.rerank_pending = false;
         self.send_lexical_search(query, self.search_generation, self.list_search_mode);
     }
 
@@ -1400,7 +1402,8 @@ impl Browser {
             {
                 if !response.complete
                     && (self.effective_sort_order() != ListSortOrder::Relevance
-                        || self.selection_anchor.is_some())
+                        || self.selection_anchor.is_some()
+                        || self.rerank_pending)
                 {
                     // Wait for every result: the best-ranked page sorted by
                     // date would be reordered when they arrive, and a
@@ -1438,6 +1441,12 @@ impl Browser {
                     // keep what the user selected on it.
                     self.selection_anchor = self.selected_path();
                 }
+                if self.rerank_pending && self.selection_anchor.is_none() {
+                    // The user moved the selection over the rows of before
+                    // (which clears the anchor): keep that session.
+                    self.selection_anchor = self.selected_path();
+                }
+                self.rerank_pending &= !response.complete;
                 self.apply_filtered(filtered);
                 self.search_page_shown = !response.complete;
                 self.search_in_flight = !response.complete;
@@ -1881,9 +1890,20 @@ impl Browser {
         if self.effective_sort_order() == was {
             return;
         }
-        if self.uuid_lookup.is_some() {
-            // The UUID jump shows one session (or none yet): nothing to order.
-            return;
+        match &self.uuid_lookup {
+            // The UUID jump shows its one session: nothing to order.
+            Some(UuidLookup::Found { .. }) => return,
+            // Pending or not found: the rows of before stay. A date order
+            // applies to them; they have no rank to bring back.
+            Some(_) => {
+                if order != ListSortOrder::Relevance {
+                    self.selection_anchor = self.selected_path();
+                    let rows = self.filtered.clone();
+                    self.apply_filtered(rows);
+                }
+                return;
+            }
+            None => {}
         }
         if self.selection_anchor.is_none() {
             self.selection_anchor = self.selected_path();
@@ -1893,6 +1913,7 @@ impl Browser {
             // (the browse list is rebuilt in corpus order).
             self.invalidate_search_generation();
             self.update_filter();
+            self.rerank_pending = self.search_in_flight;
         } else {
             // Every row is there: the date order is applied to them; a
             // search still running answers in that order too, and keeps the

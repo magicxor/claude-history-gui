@@ -653,6 +653,26 @@ mod tests {
             .collect()
     }
 
+    /// L-110: the palette lists View → Sort disabled in semantic mode too
+    /// (it keeps the menu tree's own disabled flag).
+    #[test]
+    fn the_palette_keeps_the_sort_items_disabled_in_semantic_mode() {
+        let sort_entries = |checks: &MenuChecks| {
+            crate::palette::groups_from_menus(build_tree(checks))
+                .into_iter()
+                .flat_map(|group| group.entries)
+                .filter(|entry| entry.path.as_ref() == "View › Sort")
+                .map(|entry| entry.disabled)
+                .collect::<Vec<_>>()
+        };
+        let semantic = MenuChecks {
+            semantic_mode: true,
+            ..MenuChecks::default()
+        };
+        assert_eq!(sort_entries(&semantic), [true, true, true]);
+        assert_eq!(sort_entries(&MenuChecks::default()), [false, false, false]);
+    }
+
     /// L-110: View → Sort checks the order the rows are in; in semantic mode
     /// its items are disabled (and stay so through `mark_disabled`).
     #[test]
