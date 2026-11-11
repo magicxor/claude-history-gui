@@ -34,11 +34,24 @@ jobs:
         shell: bash
         run: rustup show active-toolchain || rustup toolchain install
 
+      # The runners' resolver failed to resolve *.ubuntu.com (other names resolved) and apt-get
+      # could not fetch (November 2026): public resolvers go first, the runner's own stay behind
+      # them as the fallback. The query only reports; a failure is left to apt-get.
+      - name: DNS fallback
+        if: runner.os == 'Linux'
+        run: |
+          iface=$(ip route show default | awk '{print $5; exit}')
+          current=$(resolvectl dns "$iface" | cut -d: -f2-)
+          sudo resolvectl dns "$iface" 1.1.1.1 8.8.8.8 $current
+          sudo resolvectl flush-caches
+          resolvectl dns "$iface"
+          resolvectl query archive.ubuntu.com || true
+
       - name: Linux dependencies
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc g++ clang libfontconfig-dev libwayland-dev \
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y gcc g++ clang libfontconfig-dev libwayland-dev \
             libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libvulkan1 \
             mesa-vulkan-drivers xvfb xterm
 
