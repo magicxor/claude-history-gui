@@ -531,7 +531,9 @@ client (the CLI, VS Code, JetBrains) are listed, `session-store.db` is not read.
   with `view_range`), `create` (as Write), `edit` (`old_str` / `new_str`), `rg` / `grep`, `glob`, `task` (`agent_type`)
   and `web_fetch` use the existing formatters and count in the summary; other Copilot tools use the one-line JSON
   fallback.
-* *Store:* no card version change; Copilot is source byte 4 (`store::card`).
+* *Store:* no card version change; Copilot is source byte 4 (`store::card`). A Copilot home that `COPILOT_HOME` moves away from
+  the default is part of the store root's hash (`store::default_root`), so two homes never share a store; the default
+  home leaves the hash as it was.
 
 Duplicates the GUI must **not** write (each was planned in revision 1): its own loader bridge and refresh buffer
 (use `HistoryLoader`), viewer navigation/search state machines (use `MessageNav`, `ViewSearch<M>`, `escape`,

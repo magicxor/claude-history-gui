@@ -256,7 +256,19 @@ impl HistoryEnv {
     /// unset.
     pub fn copilot_home(&self) -> Option<PathBuf> {
         self.env_value_path(self.copilot_home.as_deref())
-            .or_else(|| self.home_dir.as_ref().map(|home| home.join(".copilot")))
+            .or_else(|| self.default_copilot_home())
+    }
+
+    /// The Copilot home `COPILOT_HOME` selects when it is not the default
+    /// one (fork): such a home has a store of its own
+    /// ([`crate::store::default_root`]).
+    pub fn selected_copilot_home(&self) -> Option<PathBuf> {
+        self.env_value_path(self.copilot_home.as_deref())
+            .filter(|home| Some(home) != self.default_copilot_home().as_ref())
+    }
+
+    fn default_copilot_home(&self) -> Option<PathBuf> {
+        self.home_dir.as_ref().map(|home| home.join(".copilot"))
     }
 
     /// An environment-variable path: as is when absolute, else against

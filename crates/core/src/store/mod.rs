@@ -13,7 +13,8 @@
 //!   (the fork's own cache root, `~/.cache/claude-history-gui`, namespaced by
 //!   `CLAUDE_CONFIG_DIR` like upstream) and the Pi/OMP session roots resolved
 //!   from the same env (the Pi root also follows the workspace's
-//!   `.pi/settings.json`). Upstream returned `None` under
+//!   `.pi/settings.json`), and from a Copilot home other than the default
+//!   one ([`HistoryEnv::selected_copilot_home`]). Upstream returned `None` under
 //!   `cfg(test)`; here tests are kept off the user's cache by
 //!   [`HistoryEnv::sandbox`] and temporary roots instead.
 //! * **Time filter at runtime.** [`Snapshot::with_time_filter`] gives a
@@ -119,36 +120,46 @@ use std::sync::{Arc, OnceLock};
 /// Store root: `v3/roots-<hash>/` beside the other caches. The cache dir is
 /// namespaced by `CLAUDE_CONFIG_DIR` ([`HistoryEnv::cache_base_dir`]),
 /// and the hash covers the Pi and OMP session roots resolved from `env`, so a
-/// snapshot is only read by runs that load the same sources. `None` without a
-/// cache root.
+/// snapshot is only read by runs that load the same sources. Fork: it also
+/// covers a Copilot home that `COPILOT_HOME` moves away from the default, so
+/// the sessions of two homes never share a snapshot. `None` without a cache
+/// root.
 pub fn default_root(env: &HistoryEnv) -> Option<PathBuf> {
     let pi = crate::history::pi_loader::session_root(env).ok();
     let omp = crate::history::omp_loader::session_root(env).ok();
+    let copilot = env.selected_copilot_home();
     let namespace = source_roots_namespace(
         pi.as_ref().map(|root| root.path.as_path()),
         omp.as_ref().map(|root| root.path.as_path()),
+        copilot.as_deref(),
     );
     env.cache_base_dir()
         .map(|base| base.join("v3").join(namespace))
 }
 
 /// Directory name identifying the Pi and OMP session roots, canonicalized
-/// when they exist.
-fn source_roots_namespace(pi: Option<&Path>, omp: Option<&Path>) -> String {
+/// when they exist, and (fork) `copilot`, a Copilot home other than the
+/// default one. The default home adds nothing, so the name is the one stores
+/// had before the Copilot source existed.
+fn source_roots_namespace(pi: Option<&Path>, omp: Option<&Path>, copilot: Option<&Path>) -> String {
+    fn add(hasher: &mut blake3::Hasher, tag: u8, path: &Path) {
+        let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let bytes = resolved.as_os_str().as_encoded_bytes();
+        hasher.update(&[tag]);
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
     let mut hasher = blake3::Hasher::new();
     for root in [pi, omp] {
         match root {
-            Some(path) => {
-                let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-                let bytes = resolved.as_os_str().as_encoded_bytes();
-                hasher.update(&[1]);
-                hasher.update(&(bytes.len() as u64).to_le_bytes());
-                hasher.update(bytes);
-            }
+            Some(path) => add(&mut hasher, 1, path),
             None => {
                 hasher.update(&[0]);
             }
         }
+    }
+    if let Some(home) = copilot {
+        add(&mut hasher, 2, home);
     }
     format!("roots-{}", &hasher.finalize().to_hex()[..16])
 }
@@ -967,18 +978,48 @@ mod tests {
         let other_pi = Path::new("/tmp/claude-history-test/other-pi-sessions");
         let omp = Path::new("/tmp/claude-history-test/omp-sessions");
 
-        let base = source_roots_namespace(Some(pi), Some(omp));
+        let base = source_roots_namespace(Some(pi), Some(omp), None);
         assert!(base.starts_with("roots-"));
-        assert_eq!(base, source_roots_namespace(Some(pi), Some(omp)));
+        assert_eq!(base, source_roots_namespace(Some(pi), Some(omp), None));
         for other in [
-            source_roots_namespace(Some(other_pi), Some(omp)),
-            source_roots_namespace(Some(pi), Some(other_pi)),
-            source_roots_namespace(Some(omp), Some(pi)),
-            source_roots_namespace(None, Some(omp)),
-            source_roots_namespace(Some(pi), None),
+            source_roots_namespace(Some(other_pi), Some(omp), None),
+            source_roots_namespace(Some(pi), Some(other_pi), None),
+            source_roots_namespace(Some(omp), Some(pi), None),
+            source_roots_namespace(None, Some(omp), None),
+            source_roots_namespace(Some(pi), None, None),
         ] {
             assert_ne!(base, other);
         }
+    }
+
+    /// Fork: sessions of two Copilot homes never share a snapshot, and the
+    /// default home keeps the store that existed before the source did.
+    #[test]
+    fn a_copilot_home_other_than_the_default_has_its_own_store() {
+        let home = tempfile::tempdir().unwrap();
+        let env = HistoryEnv::sandbox(home.path());
+        let base = default_root(&env).unwrap();
+        assert_eq!(env.selected_copilot_home(), None);
+
+        let spelled_out = env.clone().with_copilot_home(home.path().join(".copilot"));
+        assert_eq!(spelled_out.selected_copilot_home(), None);
+        assert_eq!(default_root(&spelled_out).unwrap(), base);
+
+        let work = env
+            .clone()
+            .with_copilot_home(home.path().join("work-copilot"));
+        let other = env
+            .clone()
+            .with_copilot_home(home.path().join("other-copilot"));
+        assert_eq!(
+            work.selected_copilot_home(),
+            Some(home.path().join("work-copilot"))
+        );
+        let (work, other) = (default_root(&work).unwrap(), default_root(&other).unwrap());
+        assert_ne!(work, base);
+        assert_ne!(other, base);
+        assert_ne!(work, other);
+        assert_eq!(work.parent(), base.parent());
     }
 
     #[test]
