@@ -3,7 +3,7 @@
 GitHub generates the release notes from the merged pull requests; a `## v<version>` section of this file, if there
 is one, is put above them by the release workflow.
 
-## Unreleased
+## v0.3.0
 
 ### New
 
