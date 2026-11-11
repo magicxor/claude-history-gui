@@ -2633,11 +2633,14 @@ recorded each frame (for the keyboard context menu position).
    selected conversation. The date orders sort by `Conversation::timestamp`, the last activity the rows show (there
    is no creation time); core applies them in one place, `Browser::apply_filtered` (a stable sort of the rows, never
    of the shared scope or the corpus), so the browse list, lexical results, the scope-only rows while loading and the
-   first cards of a generation follow; under a date order the index's best-ranked first page is not shown, the
-   complete answer is. Back to Relevance the query runs again (the rank cannot be recovered by sorting). Semantic
-   mode ranks nearly every conversation, so it always shows its ranking (`effective_sort_order` = Relevance; the
-   toolbar control and the menu items are disabled; the chosen order applies again in lexical mode). A UUID jump's
-   single row is not ordered. Known limits: lexical hit evidence exists for the 200 best-ranked rows, so a
+   first cards of a generation follow; under a date order, and while a session is to stay selected (a sort change or
+   another toggle keeping the selection: it may rank below the page), the index's best-ranked first page is not
+   shown, the complete answer is. Back to Relevance the query runs again (the rank cannot be recovered by sorting);
+   a date order chosen before that answer keeps the selected session for it. Semantic mode ranks nearly every
+   conversation, so it always shows its ranking (`effective_sort_order` = Relevance; switching to it rebuilds a
+   date-ordered browse list; the toolbar control and the menu items are disabled; the chosen order applies again in
+   lexical mode). A UUID jump's single row is not ordered. While the in-memory loader streams, rows arrive unsorted
+   whatever the order (L-002); the load's end orders them. Known limits: lexical hit evidence exists for the 200 best-ranked rows, so a
    date-sorted row further down shows its normal preview (in store mode `fill_visible_evidence` fills it); before
    a generation opens only its newest `SNAPSHOT_ROWS` cards are listed (Oldest orders them until it opens).
 5. Footer activity = `semantic_activity_status_text()`, its progress bar from `semantic_activity_counts()`.

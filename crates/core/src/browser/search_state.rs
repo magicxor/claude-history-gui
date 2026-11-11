@@ -1398,9 +1398,15 @@ impl Browser {
                 && (response.mode == ListSearchMode::Lexical || semantic_fallback_pending)
                 && index_current
             {
-                if !response.complete && self.effective_sort_order() != ListSortOrder::Relevance {
-                    // The best-ranked page sorted by date would be reordered
-                    // when every result arrives: wait for them.
+                if !response.complete
+                    && (self.effective_sort_order() != ListSortOrder::Relevance
+                        || self.selection_anchor.is_some())
+                {
+                    // Wait for every result: the best-ranked page sorted by
+                    // date would be reordered when they arrive, and a
+                    // session to keep selected (a toggle, a sort change)
+                    // may rank below the page, which would select its first
+                    // row instead.
                     self.search_in_flight = true;
                     continue;
                 }
@@ -1889,9 +1895,14 @@ impl Browser {
             self.update_filter();
         } else {
             // Every row is there: the date order is applied to them; a
-            // search still running answers in that order too.
+            // search still running answers in that order too, and keeps the
+            // selected session (its answer needs the anchor as well).
+            let anchor = self.selection_anchor.clone();
             let rows = self.filtered.clone();
             self.apply_filtered(rows);
+            if self.search_in_flight {
+                self.selection_anchor = anchor;
+            }
         }
     }
 
@@ -1960,6 +1971,14 @@ impl Browser {
             return;
         }
         if self.list_search_mode == ListSearchMode::Semantic && self.query.trim().is_empty() {
+            if self.sort_order != ListSortOrder::Relevance {
+                // The browse rows were in a date order; semantic mode shows
+                // them ranked (newest first), keeping the selected session.
+                if self.selection_anchor.is_none() {
+                    self.selection_anchor = self.selected_path();
+                }
+                self.apply_browse_filter();
+            }
             self.ensure_semantic_corpus();
             self.prewarm_semantic_cache();
         } else {

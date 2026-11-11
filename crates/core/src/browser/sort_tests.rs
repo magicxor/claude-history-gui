@@ -177,3 +177,18 @@ fn a_uuid_jump_shows_its_one_row_whatever_the_order() {
         })
     ));
 }
+
+#[test]
+fn semantic_mode_shows_the_browse_list_ranked() {
+    let sandbox = Sandbox::new();
+    let mut app = Browser::new(corpus(), sandbox.options());
+    app.set_sort_order(ListSortOrder::Oldest);
+    assert_eq!(names(&app), ["a", "c", "b", "d"]);
+    assert!(app.select(1));
+    let chosen = app.selected_path();
+
+    app.set_list_search_mode(ListSearchMode::Semantic);
+    assert_eq!(app.effective_sort_order(), ListSortOrder::Relevance);
+    assert_eq!(names(&app), ["d", "b", "c", "a"], "as the control says");
+    assert_eq!(app.selected_path(), chosen);
+}

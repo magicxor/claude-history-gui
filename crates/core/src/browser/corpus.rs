@@ -402,7 +402,10 @@ impl Browser {
         // the sorted one: a query (below) leaves them visible until its
         // results arrive, so stale indices would show (and select) the
         // wrong, possibly excluded, conversations. Upstream kept them.
-        self.filtered = self.scope_rows();
+        let mut rows = self.scope_rows();
+        // In the chosen order, also while a query typed meanwhile runs.
+        self.order_rows(&mut rows);
+        self.filtered = rows;
         // The first row is selected (L-003).
         self.selected = (!self.filtered.is_empty()).then_some(0);
         self.readiness = Readiness::ready();
