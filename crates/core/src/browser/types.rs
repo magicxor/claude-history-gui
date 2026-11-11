@@ -38,6 +38,41 @@ impl ListSearchMode {
     }
 }
 
+/// Order of the conversation list's rows (fork: the TUI has only the rank).
+///
+/// The date orders sort by [`crate::history::Conversation::timestamp`], the
+/// conversation's last activity, which the rows show. They apply to the
+/// browse list and to lexical results; semantic results are always ranked
+/// ([`super::Browser::effective_sort_order`]).
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum ListSortOrder {
+    /// The search's rank (newest first without a query).
+    #[default]
+    Relevance,
+    /// Most recently active first.
+    Newest,
+    /// Least recently active first.
+    Oldest,
+}
+
+impl ListSortOrder {
+    /// Every order, in menu order.
+    pub const ALL: [ListSortOrder; 3] = [
+        ListSortOrder::Relevance,
+        ListSortOrder::Newest,
+        ListSortOrder::Oldest,
+    ];
+
+    /// Label of the order: `Relevance`, `Newest first`, `Oldest first`.
+    pub fn label(self) -> &'static str {
+        match self {
+            ListSortOrder::Relevance => "Relevance",
+            ListSortOrder::Newest => "Newest first",
+            ListSortOrder::Oldest => "Oldest first",
+        }
+    }
+}
+
 impl From<TuiSearchMode> for ListSearchMode {
     fn from(mode: TuiSearchMode) -> Self {
         match mode {

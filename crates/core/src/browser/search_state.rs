@@ -70,7 +70,8 @@
 
 use super::corpus::{CorpusSnapshot, SearchSnapshot};
 use super::{
-    Browser, ListSearchMode, PreparedSession, SemanticProgress, SemanticResultMetadata, UuidLookup,
+    Browser, ListSearchMode, ListSortOrder, PreparedSession, SemanticProgress,
+    SemanticResultMetadata, UuidLookup,
 };
 use crate::env::HistoryEnv;
 use crate::history::Conversation;
@@ -1397,6 +1398,12 @@ impl Browser {
                 && (response.mode == ListSearchMode::Lexical || semantic_fallback_pending)
                 && index_current
             {
+                if !response.complete && self.effective_sort_order() != ListSortOrder::Relevance {
+                    // The best-ranked page sorted by date would be reordered
+                    // when every result arrives: wait for them.
+                    self.search_in_flight = true;
+                    continue;
+                }
                 let (filtered, evidence) = if response.index.is_some() {
                     let filtered = self.rows_of_docs(&response.filtered);
                     (filtered, self.evidence_of_docs(response.evidence))
@@ -1851,6 +1858,40 @@ impl Browser {
             self.update_filter();
         } else {
             self.dispatch_search();
+        }
+    }
+
+    /// Order the rows by relevance or by date (fork), keeping the query and
+    /// the selected session. The date orders apply in lexical mode only
+    /// ([`Browser::effective_sort_order`]); in semantic mode the order is
+    /// stored and applies once lexical mode is back. No-op when unchanged
+    /// and in single-file mode.
+    pub fn set_sort_order(&mut self, order: ListSortOrder) {
+        if self.single_file_mode || self.sort_order == order {
+            return;
+        }
+        let was = self.effective_sort_order();
+        self.sort_order = order;
+        if self.effective_sort_order() == was {
+            return;
+        }
+        if self.uuid_lookup.is_some() {
+            // The UUID jump shows one session (or none yet): nothing to order.
+            return;
+        }
+        if self.selection_anchor.is_none() {
+            self.selection_anchor = self.selected_path();
+        }
+        if order == ListSortOrder::Relevance {
+            // Sorting again cannot bring the rank back: the query runs again
+            // (the browse list is rebuilt in corpus order).
+            self.invalidate_search_generation();
+            self.update_filter();
+        } else {
+            // Every row is there: the date order is applied to them; a
+            // search still running answers in that order too.
+            let rows = self.filtered.clone();
+            self.apply_filtered(rows);
         }
     }
 

@@ -1292,6 +1292,49 @@ fn the_complete_ranking_keeps_a_row_selected_on_the_first_page() {
     assert_eq!(app.filtered().len(), 120, "the rows kept for the query");
 }
 
+#[test]
+fn a_date_order_waits_for_every_result_and_sorts_them() {
+    let sandbox = Sandbox::new();
+    let root = publish(&many_needles(120));
+    let mut app = loading_app(&sandbox, None, vec![]);
+    show(&mut app, &root, TimeFilter::default());
+    assert!(app.open_search_index());
+    app.set_sort_order(ListSortOrder::Oldest);
+    let index = app.search_index.clone().unwrap();
+    let (tx, rx) = mpsc::channel();
+    app.search_rx = rx;
+    type_query(&mut app, "needle");
+    let generation = app.search_generation;
+    let ranking: Vec<usize> = (0..120).map(|doc| (doc * 7) % 120).collect();
+    let response = |filtered: Vec<usize>, complete: bool| SearchResponse {
+        filtered,
+        index: Some(index.clone()),
+        complete,
+        generation,
+        mode: ListSearchMode::Lexical,
+        user_only: false,
+        evidence: HashMap::new(),
+    };
+    let before = listed_paths(&app);
+
+    tx.send(response(ranking[..50].to_vec(), false)).unwrap();
+    app.poll();
+    assert_eq!(listed_paths(&app), before, "the first page is not shown");
+    assert!(app.has_search_work_in_flight(), "the rest is coming");
+
+    tx.send(response(ranking, true)).unwrap();
+    assert!(app.poll());
+    assert!(!app.has_search_work_in_flight());
+    let mut oldest_first: Vec<String> = (0..120)
+        .map(|i| format!("/p/-tmp-alpha/{i:03}.jsonl"))
+        .collect();
+    assert_eq!(listed_paths(&app), oldest_first);
+
+    app.set_sort_order(ListSortOrder::Newest);
+    oldest_first.reverse();
+    assert_eq!(listed_paths(&app), oldest_first);
+}
+
 // --- the loader in store mode (fork) ---
 
 /// Drive `loader` until it reports a load event.

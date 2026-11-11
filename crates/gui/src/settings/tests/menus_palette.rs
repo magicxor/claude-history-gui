@@ -218,6 +218,7 @@ fn the_tree_marks_each_state() {
         workspace_scope: true,
         all_kinds: true,
         user_only: true,
+        sort_order: claude_history_core::browser::ListSortOrder::Oldest,
         picker: false,
         header_session_id: false,
     });
@@ -232,6 +233,7 @@ fn the_tree_marks_each_state() {
         ("View › Scope", "Workspace"),
         ("View", menus::ALL_KINDS_LABEL),
         ("View", menus::USER_ONLY_LABEL),
+        ("View › Sort", "Oldest first"),
     ] {
         assert!(checked(&leaves, path, name), "{path} / {name}");
     }
@@ -242,6 +244,8 @@ fn the_tree_marks_each_state() {
         ("View › Tool display", "Calls"),
         ("View › Search mode", "Lexical"),
         ("View › Scope", "All"),
+        ("View › Sort", "Relevance"),
+        ("View › Sort", "Newest first"),
     ] {
         assert!(!checked(&leaves, path, name), "{path} / {name}");
     }

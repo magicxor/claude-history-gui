@@ -9,7 +9,7 @@
 //! WP6 adds the remaining check marks (viewer toggles, list mode/scope, focus
 //! viewer mode) from the active window.
 
-use claude_history_core::browser::ListSearchMode;
+use claude_history_core::browser::{ListSearchMode, ListSortOrder};
 use claude_history_core::export::ExportFormat;
 use claude_history_core::theme::ThemePreference;
 use claude_history_core::view::ToolDisplayMode;
@@ -54,6 +54,9 @@ pub struct MenuChecks {
     pub all_kinds: bool,
     /// List search matches only the user's own messages (upstream ae7ae39).
     pub user_only: bool,
+    /// The order the list's rows are in (Relevance in semantic mode, where
+    /// the Sort items are disabled).
+    pub sort_order: ListSortOrder,
     pub picker: bool,
     /// The active conversation's header session ID differs from its file
     /// stem (Pi/OMP): Session → Copy header session ID is listed (A-042;
@@ -86,6 +89,7 @@ pub fn current_checks(cx: &App) -> MenuChecks {
         checks.workspace_scope = list.scope_is_workspace();
         checks.all_kinds = list.all_kinds();
         checks.user_only = list.user_only();
+        checks.sort_order = list.effective_sort_order();
     }
     checks
 }
@@ -244,6 +248,18 @@ fn item<A: gpui_kit::Action>(name: &str, action: A) -> MenuItem {
     MenuItem::action(name.to_string(), action)
 }
 
+/// View → Sort → `order`: checked when the rows are in that order, disabled
+/// in semantic mode (its results stay ranked).
+fn sort_item<A: gpui_kit::Action>(
+    order: ListSortOrder,
+    action: A,
+    checks: &MenuChecks,
+) -> MenuItem {
+    item(order.label(), action)
+        .checked(checks.sort_order == order)
+        .disabled(checks.semantic_mode)
+}
+
 /// The six menus of every window (File, Edit, View, Session, Tools, Help).
 /// On macOS, Settings… and Quit live in the app menu ([`app_menu`]) instead.
 pub fn menu_tree(cx: &App) -> Vec<Menu> {
@@ -326,6 +342,11 @@ pub fn build_tree_with(checks: &MenuChecks, app_menu_items: bool) -> Vec<Menu> {
         MenuItem::submenu(Menu::new("Scope").items([
             item("All", SetScopeAll).checked(!checks.workspace_scope),
             item("Workspace", SetScopeWorkspace).checked(checks.workspace_scope),
+        ])),
+        MenuItem::submenu(Menu::new("Sort").items([
+            sort_item(ListSortOrder::Relevance, SetSortRelevance, checks),
+            sort_item(ListSortOrder::Newest, SetSortNewest, checks),
+            sort_item(ListSortOrder::Oldest, SetSortOldest, checks),
         ])),
         item(ALL_KINDS_LABEL, ToggleAllKinds).checked(checks.all_kinds),
         item(USER_ONLY_LABEL, ToggleUserOnly).checked(checks.user_only),
@@ -510,8 +531,14 @@ pub fn mark_disabled(mut menu: Menu, disabled: &std::collections::BTreeSet<&'sta
         .items
         .into_iter()
         .map(|entry| match entry {
-            MenuItem::Action { ref action, .. } => {
-                let off = disabled.contains(action.name());
+            MenuItem::Action {
+                ref action,
+                disabled: already,
+                ..
+            } => {
+                // An item the tree disabled itself (View → Sort in semantic
+                // mode) stays disabled.
+                let off = already || disabled.contains(action.name());
                 entry.disabled(off)
             }
             MenuItem::Submenu(sub) => MenuItem::Submenu(mark_disabled(sub, disabled)),
@@ -596,6 +623,62 @@ impl Global for RebuildStats {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// View → Sort's items: (name, checked, disabled), after `mark_disabled`.
+    fn sort_items(checks: &MenuChecks) -> Vec<(String, bool, bool)> {
+        let view = build_tree(checks)
+            .into_iter()
+            .find(|menu| menu.name.as_ref() == "View")
+            .unwrap();
+        let view = mark_disabled(view, &Default::default());
+        let sort = view
+            .items
+            .into_iter()
+            .find_map(|item| match item {
+                MenuItem::Submenu(menu) if menu.name.as_ref() == "Sort" => Some(menu),
+                _ => None,
+            })
+            .expect("View → Sort");
+        sort.items
+            .into_iter()
+            .filter_map(|item| match item {
+                MenuItem::Action {
+                    name,
+                    checked,
+                    disabled,
+                    ..
+                } => Some((name.to_string(), checked, disabled)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// L-110: View → Sort checks the order the rows are in; in semantic mode
+    /// its items are disabled (and stay so through `mark_disabled`).
+    #[test]
+    fn the_sort_submenu_follows_the_order_and_the_mode() {
+        let lexical = MenuChecks {
+            sort_order: ListSortOrder::Newest,
+            ..MenuChecks::default()
+        };
+        assert_eq!(
+            sort_items(&lexical),
+            [
+                ("Relevance".to_string(), false, false),
+                ("Newest first".to_string(), true, false),
+                ("Oldest first".to_string(), false, false),
+            ]
+        );
+        let semantic = MenuChecks {
+            semantic_mode: true,
+            ..MenuChecks::default()
+        };
+        assert!(
+            sort_items(&semantic)
+                .iter()
+                .all(|(_, _, disabled)| *disabled)
+        );
+    }
 
     #[test]
     fn tree_has_the_six_menus_in_order() {

@@ -1,7 +1,7 @@
 //! Filtering and selection (upstream `tui/app/list_state.rs`).
 
-use super::Browser;
 use super::index::{ScopeFilter, ScopeIndex, ScopeSettings};
+use super::{Browser, ListSortOrder};
 use crate::env::WorkspaceScope;
 use crate::history::Conversation;
 use crate::history::model::SourceKind;
@@ -97,7 +97,31 @@ impl Browser {
         }
     }
 
-    pub(super) fn apply_filtered(&mut self, filtered: Vec<usize>) {
+    /// Sorts `rows` by date when a date order is in effect
+    /// ([`Browser::effective_sort_order`]); the rank otherwise stays. Stable:
+    /// rows of equal timestamps keep their order. The browse list is already
+    /// newest first (corpus order): one O(n) check then, no sort.
+    pub(super) fn order_rows(&self, rows: &mut [usize]) {
+        let conversations = &self.conversations;
+        let at = |index: &usize| conversations[*index].timestamp;
+        let newest_first = |rows: &[usize]| rows.is_sorted_by(|a, b| at(a) >= at(b));
+        match self.effective_sort_order() {
+            ListSortOrder::Relevance => {}
+            ListSortOrder::Newest => {
+                if !newest_first(rows) {
+                    rows.sort_by_key(|index| std::cmp::Reverse(at(index)));
+                }
+            }
+            ListSortOrder::Oldest => {
+                if !rows.is_sorted_by_key(at) {
+                    rows.sort_by_key(at);
+                }
+            }
+        }
+    }
+
+    pub(super) fn apply_filtered(&mut self, mut filtered: Vec<usize>) {
+        self.order_rows(&mut filtered);
         self.filtered = filtered;
         self.selected = self
             .selection_anchor

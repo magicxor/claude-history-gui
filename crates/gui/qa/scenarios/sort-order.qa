@@ -1,0 +1,30 @@
+# sort-order.qa (fork): the list's sort order (toolbar dropdown, View → Sort)
+# orders lexical results by date and back by relevance, keeping the query
+# (FEATURES L-110, C-071; semantic mode, which keeps its ranking, is covered
+# by the GUI tests: it needs the model). In the qa-home corpus "refresh"
+# matches two sessions.
+wait-loaded 30s
+expect list.sort == "relevance"
+type "refresh"
+wait 50ms
+wait-for list.searching == false 10s
+expect list.count == 2
+action history::SetSortOldest
+wait 50ms
+wait-for list.searching == false 10s
+expect list.sort == "oldest"
+expect list.query == "refresh"
+expect list.count == 2
+shot list-sort-oldest
+action history::SetSortNewest
+wait 50ms
+wait-for list.searching == false 10s
+expect list.sort == "newest"
+expect list.count == 2
+action history::SetSortRelevance
+wait 50ms
+wait-for list.searching == false 10s
+expect list.sort == "relevance"
+expect list.query == "refresh"
+expect list.count == 2
+quit 0

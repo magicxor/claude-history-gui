@@ -27,6 +27,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use claude_history_core::HistoryEnv;
+use claude_history_core::browser::ListSortOrder;
 use claude_history_core::config::load_gui_config_from;
 use claude_history_core::debug::DebugLevel;
 use claude_history_core::view::ToolDisplayMode;
@@ -73,6 +74,13 @@ pub struct UiState {
     /// Last list search mode; used at startup only when no config key is set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub search_mode: Option<RememberedSearchMode>,
+    /// Last order of the list's rows (fork). An order this build does not
+    /// know (written by a newer one) reads as `None`.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "known_or_none"
+    )]
+    pub sort_order: Option<RememberedSortOrder>,
     pub view: RememberedView,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_export_dir: Option<PathBuf>,
@@ -92,6 +100,7 @@ impl Default for UiState {
             workspace: None,
             recent_workspaces: Vec::new(),
             search_mode: None,
+            sort_order: None,
             view: RememberedView::default(),
             last_export_dir: None,
         }
@@ -265,6 +274,34 @@ pub struct AgentPanelState {
 pub enum RememberedSearchMode {
     Lexical,
     Semantic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RememberedSortOrder {
+    Relevance,
+    Newest,
+    Oldest,
+}
+
+impl From<ListSortOrder> for RememberedSortOrder {
+    fn from(order: ListSortOrder) -> Self {
+        match order {
+            ListSortOrder::Relevance => Self::Relevance,
+            ListSortOrder::Newest => Self::Newest,
+            ListSortOrder::Oldest => Self::Oldest,
+        }
+    }
+}
+
+impl From<RememberedSortOrder> for ListSortOrder {
+    fn from(remembered: RememberedSortOrder) -> Self {
+        match remembered {
+            RememberedSortOrder::Relevance => Self::Relevance,
+            RememberedSortOrder::Newest => Self::Newest,
+            RememberedSortOrder::Oldest => Self::Oldest,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -872,6 +909,32 @@ pub fn remember_deep_options(open: bool, cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sort order is remembered as a word; an order of a newer build is
+    /// forgotten and the rest of the file stays.
+    #[test]
+    fn the_sort_order_is_remembered() {
+        let state = parse(r#"{ "sort_order": "newest" }"#).unwrap();
+        assert_eq!(state.sort_order, Some(RememberedSortOrder::Newest));
+        let state = parse(r#"{ "sort_order": "longest", "list_collapsed": true }"#).unwrap();
+        assert_eq!(state.sort_order, None);
+        assert!(state.list_collapsed);
+        assert_eq!(parse("{}").unwrap().sort_order, None);
+        for order in ListSortOrder::ALL {
+            assert_eq!(ListSortOrder::from(RememberedSortOrder::from(order)), order);
+        }
+        let json = serde_json::to_string(&UiState {
+            sort_order: Some(RememberedSortOrder::Oldest),
+            ..UiState::default()
+        })
+        .unwrap();
+        assert!(json.contains(r#""sort_order":"oldest""#), "{json}");
+        assert!(
+            !serde_json::to_string(&UiState::default())
+                .unwrap()
+                .contains("sort_order")
+        );
+    }
 
     /// Upstream d0aca95: the off mode is remembered as `"off"`, upstream
     /// a60dfe9's calls mode as `"calls"`, and every remembered value maps
