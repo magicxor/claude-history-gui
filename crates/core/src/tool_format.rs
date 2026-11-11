@@ -24,7 +24,7 @@ pub struct FormattedToolCall {
 pub fn format_tool_call(name: &str, input: &Value, max_width: usize) -> FormattedToolCall {
     match name {
         "Task" => format_task(input),
-        "task" if str_field(input, "agent_type").is_some() => format_task(input),
+        "task" if starts_copilot_agent(input) => format_task(input),
         "Bash" | "bash" => format_shell("Bash: ", input, max_width),
         "powershell" => format_shell("PowerShell: ", input, max_width),
         "Read" | "read" | "view" => format_read(input),
@@ -52,6 +52,13 @@ pub fn format_tool_call(name: &str, input: &Value, max_width: usize) -> Formatte
         "Skill" if str_field(input, "skill").is_some() => format_skill(input, max_width),
         _ => format_fallback(name, input, max_width),
     }
+}
+
+/// Whether a call of a tool named `task` is Copilot's, which starts a
+/// subagent and names its kind (fork). Another agent's tool of that name is
+/// a tool like any other.
+pub(crate) fn starts_copilot_agent(input: &Value) -> bool {
+    str_field(input, "agent_type").is_some()
 }
 
 fn format_task(input: &Value) -> FormattedToolCall {
