@@ -13,8 +13,8 @@ use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// More than a first record takes; a longer first line is not looked at.
-const MAX_FIRST_RECORD: u64 = 1 << 20;
+/// More than a log's first record takes; what follows is not looked at.
+const MAX_PROBED: u64 = 1 << 20;
 
 /// The `workspace.yaml` that decoding the event log `file` also reads,
 /// `None` when `file` is not named like an event log (fork, public: the
@@ -25,7 +25,8 @@ pub fn workspace_file_of(file: &Path) -> Option<PathBuf> {
 
 /// Decodes `path` as a Copilot event log, passing its events to `events`.
 /// `None` when it is not one: a file of another name, or one whose first
-/// record is not a Copilot event. `modified` dates a log without one
+/// record is not a Copilot event (as decoding finds it: lines that are no
+/// record are passed over). `modified` dates a log without one
 /// timestamp; `cancelled` stops the decode at its next read.
 pub(crate) fn decode_path_into(
     path: &Path,
@@ -40,18 +41,23 @@ pub(crate) fn decode_path_into(
     Some(decode_log(path, modified, events, cancelled))
 }
 
+/// Whether the first record of `path` is a Copilot event, by the decoder's
+/// own rule, so a log decodes the same by path as through its adapter.
 fn starts_event_log(path: &Path) -> bool {
     let Ok(file) = File::open(path) else {
         return false;
     };
-    let mut reader = BufReader::new(file.take(MAX_FIRST_RECORD));
+    let mut reader = BufReader::new(file.take(MAX_PROBED));
     let mut line = Vec::new();
     loop {
         line.clear();
         match reader.read_until(b'\n', &mut line) {
             Ok(0) | Err(_) => return false,
-            Ok(_) if line.trim_ascii().is_empty() => {}
-            Ok(_) => return decode::starts_event_log(&line),
+            Ok(_) => {
+                if let Some(event) = decode::is_event(&line) {
+                    return event;
+                }
+            }
         }
     }
 }

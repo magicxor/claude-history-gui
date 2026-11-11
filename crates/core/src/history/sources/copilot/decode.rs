@@ -53,6 +53,11 @@ struct Record<'a> {
 }
 
 impl Record<'_> {
+    /// Whether the record is a Copilot event: each has an id and data.
+    fn is_event(&self) -> bool {
+        self.id.is_some() && self.data.is_some()
+    }
+
     /// The record's data in the shape `T`, else `T`'s default.
     fn data<'de, T: Deserialize<'de> + Default>(&'de self) -> T {
         self.data
@@ -172,12 +177,14 @@ impl TokenCounts {
     }
 }
 
-/// Whether `line`, the first record of a file, is a Copilot event: a typed
-/// record with an id and data (as every event has; a log normally starts
-/// with its `session.start`).
-pub(super) fn starts_event_log(line: &[u8]) -> bool {
+/// Whether `line`, a record of a file, is a Copilot event (a log normally
+/// starts with its `session.start`). `None` for a line that is no record:
+/// [`decode`] reports such a line and reads on, so the first record after it
+/// tells what the file is.
+pub(super) fn is_event(line: &[u8]) -> Option<bool> {
     serde_json::from_slice::<Record<'_>>(line.trim_ascii())
-        .is_ok_and(|record| record.id.is_some() && record.data.is_some())
+        .ok()
+        .map(|record| record.is_event())
 }
 
 /// Decodes the event log `path`, read from `reader`, passing its events to
@@ -240,7 +247,7 @@ pub(super) fn decode(
             }
         };
         if !started {
-            if record.id.is_none() || record.data.is_none() {
+            if !record.is_event() {
                 return Ok(None);
             }
             started = true;

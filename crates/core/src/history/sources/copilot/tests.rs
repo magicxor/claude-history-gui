@@ -664,6 +664,43 @@ fn logs_opened_by_path_decode_as_their_session() {
     );
 }
 
+/// Decoding passes over a line that is no record, and so does telling
+/// whether a file opened by path is a Copilot log.
+#[test]
+fn a_log_is_recognized_past_a_malformed_first_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join(SESSION_STATE_DIR);
+    let session_dir = root.join(PLAIN);
+    fs::create_dir_all(&session_dir).unwrap();
+    let path = session_dir.join(EVENTS_FILE);
+    let question =
+        json!({ "type": "user.message", "id": "e2", "data": { "content": "Ask the quokka" } });
+    fs::write(&path, format!("not json\n\n{}\n{question}\n", start(PLAIN))).unwrap();
+
+    let by_path = crate::history::sources::decode_path(&path, None, false).unwrap();
+    assert_eq!(by_path.source, SourceKind::Copilot);
+    assert_eq!(by_path.diagnostics.len(), 1);
+    assert_eq!(
+        messages(&by_path, Visibility::Dialogue),
+        [(Role::User, &[text("Ask the quokka")][..])]
+    );
+    let through_adapter = decoded_in(&CopilotAdapter::new(root), PLAIN);
+    assert_eq!(by_path.key, through_adapter.key);
+    assert_eq!(by_path.events, through_adapter.events);
+
+    // Another tool's records after such a line are still not a Copilot log.
+    let other = dir.path().join("other");
+    fs::create_dir_all(&other).unwrap();
+    let path = other.join(EVENTS_FILE);
+    fs::write(
+        &path,
+        "not json\n{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n",
+    )
+    .unwrap();
+    let transcript = crate::history::sources::decode_path(&path, None, false).unwrap();
+    assert_eq!(transcript.source, SourceKind::Claude);
+}
+
 #[test]
 fn a_copied_log_decodes_without_its_session_directory() {
     let dir = tempfile::tempdir().unwrap();
