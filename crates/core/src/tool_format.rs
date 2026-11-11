@@ -161,21 +161,33 @@ fn format_read(input: &Value) -> FormattedToolCall {
     FormattedToolCall { header, body: None }
 }
 
-/// Where a search looks: `path`, or Copilot's `paths`.
-fn search_path(input: &Value) -> Option<&str> {
-    str_field(input, "path").or_else(|| str_field(input, "paths"))
+/// Where a search looks: `path`, or Copilot's `paths`, which is one path or
+/// a list of them.
+fn search_paths(input: &Value) -> Vec<&str> {
+    if let Some(path) = str_field(input, "path") {
+        return vec![path];
+    }
+    match input.get("paths") {
+        Some(Value::String(path)) => vec![path],
+        Some(Value::Array(paths)) => strings(paths),
+        _ => Vec::new(),
+    }
 }
 
 fn format_grep(input: &Value) -> FormattedToolCall {
     let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-    let path = search_path(input);
+    let paths = search_paths(input);
     let glob = input.get("glob").and_then(|v| v.as_str());
 
-    let location = match (path, glob) {
-        (Some(p), Some(g)) => format!("{}/{}", p, g),
-        (Some(p), None) => p.to_string(),
-        (None, Some(g)) => g.to_string(),
-        (None, None) => ".".to_string(),
+    let location = match (paths.is_empty(), glob) {
+        (false, Some(g)) => paths
+            .iter()
+            .map(|p| format!("{}/{}", p, g))
+            .collect::<Vec<_>>()
+            .join(", "),
+        (false, None) => paths.join(", "),
+        (true, Some(g)) => g.to_string(),
+        (true, None) => ".".to_string(),
     };
 
     FormattedToolCall {
@@ -186,11 +198,12 @@ fn format_grep(input: &Value) -> FormattedToolCall {
 
 fn format_glob(label: &str, input: &Value) -> FormattedToolCall {
     let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-    let path = search_path(input);
+    let paths = search_paths(input);
 
-    let header = match path {
-        Some(p) => format!("{}: {} in {}", label, pattern, p),
-        None => format!("{}: {}", label, pattern),
+    let header = if paths.is_empty() {
+        format!("{}: {}", label, pattern)
+    } else {
+        format!("{}: {} in {}", label, pattern, paths.join(", "))
     };
 
     FormattedToolCall { header, body: None }
@@ -619,6 +632,32 @@ mod tests {
         assert_eq!(
             header("glob", json!({ "pattern": "*.rs", "paths": "src" })),
             "Glob: *.rs in src"
+        );
+        // `paths` is also a list.
+        assert_eq!(
+            header(
+                "rg",
+                json!({ "pattern": "fn a", "paths": ["src", "tests"] })
+            ),
+            "Grep: \"fn a\" in src, tests"
+        );
+        assert_eq!(
+            header(
+                "grep",
+                json!({ "pattern": "fn a", "paths": ["src", "tests"], "glob": "*.rs" })
+            ),
+            "Grep: \"fn a\" in src/*.rs, tests/*.rs"
+        );
+        assert_eq!(
+            header(
+                "glob",
+                json!({ "pattern": "*.rs", "paths": ["src", "tests"] })
+            ),
+            "Glob: *.rs in src, tests"
+        );
+        assert_eq!(
+            header("glob", json!({ "pattern": "*.rs", "paths": [] })),
+            "Glob: *.rs"
         );
         assert_eq!(
             header("web_fetch", json!({ "url": "https://example.com" })),
