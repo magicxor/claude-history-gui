@@ -59,7 +59,7 @@ use crate::keymap::CTX_AGENT;
 use crate::model::{AgentTab, ConversationTarget, PaneFocus, RevealRequest};
 
 /// The panel body of a file outside the history roots (D-035).
-pub const OUT_OF_ROOT_TEXT: &str = "Outline, Within and Read work only for conversations inside the Claude, Pi or OMP history folders.";
+pub const OUT_OF_ROOT_TEXT: &str = "Outline, Within and Read work only for conversations inside the Claude, Codex, Copilot, Pi or OMP history folders.";
 
 /// Events of the agent panel (§7.2).
 #[derive(Clone, Debug, PartialEq)]

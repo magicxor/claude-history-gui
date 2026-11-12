@@ -21,7 +21,8 @@
 //! `actions::refusal` texts), takes the adapter of the target's source
 //! (`history::sources::Registry::for_source`) and has it plan: the Claude
 //! adapter with `plan_claude`, the Pi adapter (Pi and OMP) with
-//! `plan_native`, the Codex adapter with `plan_codex`. Unlike upstream, whose
+//! `plan_native`, the Codex adapter with `plan_codex`, the Copilot adapter
+//! (fork) with `plan_copilot`. Unlike upstream, whose
 //! command builders moved into the adapters, the planners stay here with the
 //! plan types and their tests.
 //!
@@ -73,10 +74,18 @@
 //! ([`ResumePlan::env`]), which every terminal launcher passes on
 //! ([`terminal`], "Environment variables").
 //!
+//! # Copilot (fork)
+//!
+//! `copilot [[resume.copilot] default_args] --resume=<session id>` runs in
+//! the session's project directory, else the workspace with a warning, as for
+//! Codex. The CLI has no fork flag, so a fork is refused. The plan sets
+//! `COPILOT_HOME` to the home whose `session-state` holds the session; a
+//! session outside one gets no variable and a warning.
+//!
 //! # The program (upstream 8a99ccc)
 //!
 //! Every plan carries a [`Launcher`]: the agent's own binary, or the user's
-//! `command` (`[resume] command`, `[resume.pi|omp|codex] command`, a
+//! `command` (`[resume] command`, `[resume.pi|omp|codex] command`, fork: `[resume.copilot] command`, a
 //! wrapper such as `["mise", "exec", "--", "claude"]`) or `[gui]` program
 //! path, chosen by `config::agent_launcher`. Its arguments come before the
 //! agent's ([`ResumePlan::launch_spec`], [`ResumePlan::display_command`]),
@@ -90,7 +99,7 @@ use crate::env::{HistoryEnv, WorkspaceScope};
 use crate::error::{AppError, Result};
 use crate::history::actions::{self, Launch, Launcher, Target};
 use crate::history::model::SourceKind;
-use crate::history::sources::Registry;
+use crate::history::sources::{Registry, copilot};
 use crate::history::{Conversation, Provenance};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -190,7 +199,7 @@ pub enum ResumeStrategy {
     /// Claude: copy the session into the workspace's projects directory,
     /// then resume the copy there (never with `--fork-session`).
     CopyToWorkspace,
-    /// Pi / OMP / Codex: the agent's native resume or fork command.
+    /// Pi / OMP / Codex / Copilot: the agent's native resume or fork command.
     Native,
 }
 
@@ -274,7 +283,7 @@ pub struct ResumePlan {
     /// The session transcript.
     pub session_path: PathBuf,
     /// What starts the agent: its own binary (`claude`, `pi`, `omp`,
-    /// `codex`), a `[gui]` program path or the user's `command` with the
+    /// `codex`, `copilot`), a `[gui]` program path or the user's `command` with the
     /// arguments that precede the agent's (upstream 8a99ccc; the precedence
     /// is `config::agent_launcher`'s).
     pub launcher: Launcher,
@@ -286,7 +295,7 @@ pub struct ResumePlan {
     pub copy: Option<CopyPlan>,
     /// Non-fatal notes for the user (fallback directories, overwrites).
     pub warnings: Vec<String>,
-    /// Environment variables the program runs with (Codex: `CODEX_HOME`).
+    /// Environment variables the program runs with (Codex: `CODEX_HOME`, Copilot: `COPILOT_HOME`).
     pub env: Vec<(OsString, OsString)>,
 }
 
@@ -602,6 +611,64 @@ pub(crate) fn plan_codex(
         copy: None,
         warnings,
         env: crate::history::sources::codex::codex_env(target.path, home),
+    })
+}
+
+/// Fork: the Copilot adapter's resume plan, `copilot [default_args]
+/// --resume=<session id>` (the CLI has no fork flag, so a fork is refused
+/// here as a backstop to the capability check). It runs in the session's
+/// project directory, else the workspace with a warning. `COPILOT_HOME` is
+/// set to the home that holds the session's `session-state` directory.
+pub(crate) fn plan_copilot(
+    target: Target<'_>,
+    workspace: Option<&WorkspaceScope>,
+    kind: ResumeKind,
+    launch: &Launch,
+) -> Result<ResumePlan> {
+    let (root, session_id) = copilot::session_of(target.path).ok_or_else(|| {
+        AppError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("not a Copilot session log: {}", target.path.display()),
+        ))
+    })?;
+    if kind.is_fork() {
+        return Err(AppError::ClaudeExecutionError(actions::refusal(
+            SourceKind::Copilot,
+            Provenance::default(),
+            "Forking",
+        )));
+    }
+    let mut warnings = Vec::new();
+    let cwd = project_or_workspace(target, workspace, &mut warnings);
+    let mut args: Vec<OsString> = launch.default_args.iter().map(OsString::from).collect();
+    args.push(OsString::from(format!("--resume={session_id}")));
+    let home = root
+        .file_name()
+        .is_some_and(|name| name == copilot::SESSION_STATE_DIR)
+        .then(|| root.parent())
+        .flatten()
+        .filter(|home| !home.as_os_str().is_empty());
+    let env = match home {
+        Some(home) => vec![(
+            OsString::from("COPILOT_HOME"),
+            home.as_os_str().to_os_string(),
+        )],
+        None => {
+            warnings.push("Session is outside a Copilot home; COPILOT_HOME is not set".to_owned());
+            Vec::new()
+        }
+    };
+    Ok(ResumePlan {
+        source: SourceKind::Copilot,
+        kind,
+        strategy: ResumeStrategy::Native,
+        session_path: target.path.to_path_buf(),
+        launcher: launch.launcher.clone(),
+        args,
+        cwd,
+        copy: None,
+        warnings,
+        env,
     })
 }
 
@@ -1133,6 +1200,101 @@ mod tests {
         };
         let error = sandbox.plan(&stray, None, false, &[]).unwrap_err();
         assert!(error.to_string().contains("not a Codex rollout"), "{error}");
+    }
+
+    /// Fork: `copilot [[resume.copilot] default_args] --resume=<id>` in the
+    /// session's project, with `COPILOT_HOME` set to the home of its
+    /// `session-state`.
+    #[test]
+    fn copilot_sessions_resume_through_the_copilot_cli() {
+        const SESSION: &str = "0f8e7d6c-5b4a-4932-8170-a1b2c3d4e5f6";
+        let sandbox = Sandbox::new();
+        let home = sandbox.root.path().join("copilot home");
+        let dir = home.join("session-state").join(SESSION);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("events.jsonl");
+        std::fs::write(&log, "{}\n").unwrap();
+        let project = sandbox.dir("project");
+        let workspace = sandbox.dir("workspace");
+        let target = ResumeTarget {
+            source: SourceKind::Copilot,
+            path: log.clone(),
+            project_path: Some(project.clone()),
+            provenance: Provenance::default(),
+        };
+        let copilot_home = vec![(
+            OsString::from("COPILOT_HOME"),
+            home.clone().into_os_string(),
+        )];
+
+        let resume = sandbox
+            .plan(&target, Some(&workspace), false, &["--yolo".to_string()])
+            .unwrap();
+        assert_eq!(resume.launcher.program, Path::new("copilot"));
+        assert_eq!(resume.args, os(&["--yolo", &format!("--resume={SESSION}")]));
+        assert_eq!(resume.cwd, Some(project));
+        assert_eq!(resume.strategy, ResumeStrategy::Native);
+        assert_eq!(resume.source, SourceKind::Copilot);
+        assert_eq!(resume.env, copilot_home);
+        assert!(resume.copy.is_none() && resume.warnings.is_empty());
+        assert_eq!(
+            resume.display_command(),
+            format!("copilot --yolo --resume={SESSION}")
+        );
+
+        // A project that is gone: the workspace, with a warning.
+        let gone = sandbox.root.path().join("gone");
+        let moved = ResumeTarget {
+            project_path: Some(gone.clone()),
+            ..target.clone()
+        };
+        let plan = sandbox.plan(&moved, Some(&workspace), false, &[]).unwrap();
+        assert_eq!(plan.cwd, Some(workspace.clone()));
+        assert_eq!(plan.warnings.len(), 1);
+        assert!(plan.warnings[0].contains(&gone.display().to_string()));
+        assert!(plan.warnings[0].contains("does not exist"));
+
+        // A log outside a `session-state` directory: no home to name.
+        let loose_dir = sandbox.dir("loose").join(SESSION);
+        std::fs::create_dir_all(&loose_dir).unwrap();
+        let loose = ResumeTarget {
+            path: loose_dir.join("events.jsonl"),
+            ..target.clone()
+        };
+        let plan = sandbox.plan(&loose, None, false, &[]).unwrap();
+        assert!(plan.env.is_empty());
+        assert_eq!(plan.args, os(&[&format!("--resume={SESSION}")]));
+        assert_eq!(plan.warnings.len(), 1);
+        assert!(plan.warnings[0].contains("COPILOT_HOME"));
+
+        // Fork is refused by the capabilities, and by the planner itself.
+        let error = sandbox.plan(&target, None, true, &[]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Failed to run Claude CLI: Forking CP sessions is not supported"
+        );
+        let launch = Launch {
+            launcher: Launcher::default_for(SourceKind::Copilot),
+            default_args: Vec::new(),
+        };
+        let error = plan_copilot(target.target(), None, ResumeKind::Fork, &launch).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Forking CP sessions is not supported"),
+            "{error}"
+        );
+
+        // A file that is not a session log.
+        let stray = ResumeTarget {
+            path: dir.join("workspace.yaml"),
+            ..target
+        };
+        let error = sandbox.plan(&stray, None, false, &[]).unwrap_err();
+        assert!(
+            error.to_string().contains("not a Copilot session log"),
+            "{error}"
+        );
     }
 
     // --- GUI semantics for Claude. ---

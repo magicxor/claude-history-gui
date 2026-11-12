@@ -141,8 +141,8 @@ Resolution at startup, first match wins:
 3. the launch cwd if it is *meaningful*: it is not a filesystem root, not the home directory, not the directory of
    the executable (or of the `.app` bundle), and (a) maps to an existing Claude projects dir
    (`env.claude_projects_dir_for(cwd).is_dir()`), or (b) has a `.git` entry (dir or file), or (c) is the recorded
-   cwd of at least one listed (not automated or child) Pi, OMP or Codex session (any non-Claude source; 7f5c443, 8f60c5f) (checked after the first load batch; if it matches and no workspace was
-   chosen yet, the workspace is set then and a refresh is not needed because Pi/OMP/Codex roots do not depend on it);
+   cwd of at least one listed (not automated or child) Pi, OMP, Codex or Copilot session (any non-Claude source; 7f5c443, 8f60c5f) (checked after the first load batch; if it matches and no workspace was
+   chosen yet, the workspace is set then and a refresh is not needed because Pi/OMP/Codex/Copilot roots do not depend on it);
 4. `[gui] default_workspace` from gui.toml if it exists **[FLAG: added; an explicit config value beats remembered
    state]**;
 5. the last used workspace from `state.json` if `[gui] restore_session` (default true) and it exists;
@@ -151,15 +151,16 @@ Resolution at startup, first match wins:
 The workspace sets `HistoryEnv::workspace_dir` (core uses it for the Workspace scope filter, Pi's
 `<workspace>/.pi/settings.json`, delete-empty Local scope, show-dir, resume/fork launch dir, agent Local scope).
 **Relative paths inside `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`, `XDG_DATA_HOME`,
-`CODEX_HOME`, `CODEX_SQLITE_HOME` resolve against the launch cwd** (`HistoryEnv::env_path_base`, core gap K16), never against a workspace chosen
+`CODEX_HOME`, `CODEX_SQLITE_HOME`, `COPILOT_HOME` resolve against the launch cwd** (`HistoryEnv::env_path_base`, core gap K16), never against a workspace chosen
 later, so a variable set by the launching shell keeps its meaning. Changing the workspace at runtime triggers a
 background reload (§11.20) and re-filters.
 
 **What the Workspace scope matches** (upstream 82b355a, core `history::Workspace::contains`): a conversation
 belongs to the workspace when its project is the workspace (Claude: the project directory name, worktree-aware;
-Pi, OMP, Codex: the resolved project path is the workspace or a folder below it) or when any working directory it
+Pi, OMP, Codex, Copilot: the resolved project path is the workspace or a folder below it) or when any working directory it
 recorded (`Conversation::cwds`: every distinct cwd in order, at most 16, the first being `cwd`; Claude from each user
-record, Codex from `session_meta` and each `turn_context`, Pi/OMP from the header) is the workspace or a folder below
+record, Codex from `session_meta` and each `turn_context`, Copilot from `session.start`, `session.context_changed` and
+`session.resume`, Pi/OMP from the header) is the workspace or a folder below
 it. Paths match on whole components (`…/repo` does not take in `…/repo-old`), ignore letter case on Windows, are
 compared against the workspace and its resolved path, and Windows' `\\?\` prefix is ignored (W1). So a session
 started in `~/code` that moved into `~/code/repo` is in `~/code/repo`'s scope, and a workspace at `~/code` takes in
@@ -175,7 +176,7 @@ cached on ListPane, never inside the menu builder), then "Choose folder…" (nat
 `Choose a workspace to filter by project` when there is no workspace.
 
 ### PD4 Resume / Fork (core owns planning and terminal command construction)
-* Launch `claude` / `pi` / `omp` in a **new terminal window**; the GUI stays open. A toast names the conversation
+* Launch `claude` / `pi` / `omp` / `codex` / `copilot` (Copilot: Resume only) in a **new terminal window**; the GUI stays open. A toast names the conversation
   and the command: `Opened "Fix login bug" in Windows Terminal` + muted second line `claude --resume 3f2a…`.
   Errors are toasts with recovery actions (§12).
 * **Planning** = `core::resume::plan_resume(env, conv, workspace, fork, &Launch)` (landed; `Launch` = the agent's
@@ -199,8 +200,9 @@ cached on ListPane, never inside the menu builder), then "Choose folder…" (nat
 * Terminal configurable in gui.toml `[gui] terminal` with **core's syntax** (`auto`, `wt`, `cmd`/`console`,
   `terminal`, `osascript`, a Linux emulator name, or a template) (§13.2). **What starts an agent** (upstream
   8a99ccc) is a `history::actions::Launcher` (program + arguments that precede the agent's own), chosen by
-  `config::agent_launcher` (`LayeredConfig::launcher`): gui.toml `[resume] command` / `[resume.pi|omp|codex] command`
-  > `[gui] claude_path|pi_path|omp_path|codex_path` > config.toml's `command` > the agent's name on `PATH`
+  `config::agent_launcher` (`LayeredConfig::launcher`): gui.toml `[resume] command` / `[resume.pi|omp|codex|copilot] command`
+  > `[gui] claude_path|pi_path|omp_path|codex_path|copilot_path` (`copilot_path` and `[resume.copilot]` are fork
+  additions; Copilot has no config.toml `command`, §13.2) > config.toml's `command` > the agent's name on `PATH`
   (decision 17: GUI settings beat the CLI's shared file, whose wrapper may be a shell script the GUI's platform
   cannot run; a `[gui]` path is the GUI spelling of a one-program command). A `command` is a string (one program,
   never split) or an array (program + leading arguments); `~/` is the home and a relative path resolves against the
@@ -324,7 +326,7 @@ File → "Open JSONL file…" opens an additional viewer window (not in picker m
 unavailable there (TUI parity; their hints are hidden — fix of V quirk 9). Esc/`q` close the window (the app quits
 when it was the last window and no main window exists). Semantic search is off. Header from
 `core::history::process_conversation_file_in` in the app's env (a Codex rollout of the env's home finds its state
-database as the viewer does). Unreadable/empty files show an error state with the reason
+database as the viewer does; a Copilot `events.jsonl` decodes as its session, §11.12). Unreadable/empty files show an error state with the reason
 (`core::browser::Browser::single_file_error` semantics, ADD D1). The agent panel works only for files inside the
 history roots (D-035).
 
@@ -484,20 +486,57 @@ truth.
 
 | Module | Items the GUI uses |
 |---|---|
-| `env` | `HistoryEnv { home_dir, claude_config_dir, pi_coding_agent_dir, pi_coding_agent_session_dir, pi_config_dir, omp_profile, pi_profile, codex_home, codex_sqlite_home, xdg_data_home, path_var, pathext, workspace_dir, cache_root, config_file, gui_config_file, debug_log_file }` (+ `env_path_base`, K16: `with_env_path_base`, `launch_base_dir()`, `env_value_base_dir()`; `main` sets it to the launch cwd), `from_process_env()` (main only), `sandbox(root)`, `with_workspace`, `claude_dir()`, `claude_projects_root()`, `claude_projects_dir_for(dir)`, `codex_home()` (`CODEX_HOME`, else `<home>/.codex`) + `codex_sqlite_home()` + `with_codex_home` (upstream 7f5c443), `cache_root()`, `cache_base_dir()` (`cache_root` or its `config-<hash>`, upstream `store::cache_base_dir`), `cli_cache_root()` + `is_in_cli_cache(path)` (the installed CLI's cache root, never deleted from), `semantic_cache_dir()`, `embedding_cache_file()`, `semantic_model_dir()`, `config_file()`, `gui_config_file()`, `debug_log_file()`, `workspace()`; `WorkspaceScope { dir, project_dir_name }`, `WorkspaceScope::new`; `STATE_DIR_NAME`, `CACHE_DIR_NAME`, `CLI_CACHE_DIR_NAME`, `is_within(path, dir)` |
-| `config` | `ConfigFile`, `GuiConfigFile`, `GuiSettings { theme, terminal, claude_path, pi_path, omp_path, codex_path, default_workspace, restore_session }`, `ResumeConfig { command, default_args, pi, omp: Option<LauncherConfig { command }>, codex: Option<AgentResumeConfig { command, default_args }> }` + `default_args(source)` (`[resume]` for Claude, `[resume.codex]` for Codex, eea6d37) + `command(source)` (`AgentCommand`: a string or an array naming a program, `new(words)`, `words()`; serializes a one-word command as a string; 8a99ccc), `agent_launcher(env, cli, gui, source) -> Launcher` and `LayeredConfig::{launcher, launch}(env, source)` (gui.toml `command` > `[gui] <agent>_path` > config.toml `command` > the agent's binary; 8a99ccc, decision 17), `GuiSettings::{program_path(source), program_path_key(source)}`, `TuiConfig { exclude_projects, exclude_paths, semantic_search }` / `TuiOverrides` (gui.toml; `Option` lists, so `[]` overrides; `exclude_paths` = `[tui] exclude_paths`, 982aea9), `LayeredConfig { cli, gui_file, effective, gui }`, `load_config_from(path)`, `load_gui_config_from(path)` (loaded **independently**, §11.1), `ConfigFile::overlaid_with(&GuiConfigFile)`, `save_gui_config_changes` (K12), `KeyChord::{short_label, help_label, gpui_keystroke, config_string}`, `parse_key_binding`, `KeyBindings { resume, fork, rename, delete, refresh, all_kinds, user_only }` + `from_config`, `conflicts_with_ctrl_t` (`all_kinds`: `[keys] all_kinds`, default `ctrl+g`, cb990e6; `user_only`: `[keys] user_only`, ae7ae39, default **[dev]** `alt+u` (upstream `ctrl+v`, reserved here, §8.5); both count for the Ctrl+T rule), `AgentScopeConfig`, `AgentConfig` |
-| `settings` | `parse_launch_args(args) -> Result<LaunchCommand, LaunchArgsError>` (`LaunchCommand::{Run(GuiLaunchArgs), Help, Version, DeleteEmpty { local, all, yes }, Update, Agent(AgentCli), SubcommandHelp(String)}`; K14/K15, `SubcommandHelp` added by WP-C: `update --help`, `delete-empty -h`, `help <subcommand>` → print the text, exit 0), `GuiLaunchArgs` (+`display_flags`, `search_mode_override`, `picker`, `time_filter`, `settings`, `validate`; `all_kinds` = `--all-kinds`, cb990e6), `help_text(program)`, `effective_settings(config, flags, mode_override) -> EffectiveSettings { show_last, show_tools, tool_display, show_thinking, search_mode, list_search_mode, exclude_projects, exclude_paths, keys, semantic_toggle_enabled, resume_default_args, resume_codex_default_args }`, `EffectiveSettings::initial_view_prefs()`, `EffectiveSettings::resume_default_args_for(source)` (eea6d37), `initial_tool_display`, `PickerAction::{ShowPath, ShowId, Resume{fork}}`, `picker_output(action, conv)`, `session_id_from_path(path)` |
+| `env` | `HistoryEnv { home_dir, claude_config_dir, pi_coding_agent_dir, pi_coding_agent_session_dir, pi_config_dir, omp_profile, pi_profile, codex_home, codex_sqlite_home, copilot_home, xdg_data_home, path_var, pathext, workspace_dir, cache_root, config_file, gui_config_file, debug_log_file }` (+ `env_path_base`, K16: `with_env_path_base`, `launch_base_dir()`, `env_value_base_dir()`; `main` sets it to the launch cwd), `from_process_env()` (main only), `sandbox(root)`, `with_workspace`, `claude_dir()`, `claude_projects_root()`, `claude_projects_dir_for(dir)`, `codex_home()` (`CODEX_HOME`, else `<home>/.codex`) + `codex_sqlite_home()` + `with_codex_home` (upstream 7f5c443), `copilot_home()` (`COPILOT_HOME`, an empty value counts as unset, else `<home>/.copilot`) + `with_copilot_home` (fork), `cache_root()`, `cache_base_dir()` (`cache_root` or its `config-<hash>`, upstream `store::cache_base_dir`), `cli_cache_root()` + `is_in_cli_cache(path)` (the installed CLI's cache root, never deleted from), `semantic_cache_dir()`, `embedding_cache_file()`, `semantic_model_dir()`, `config_file()`, `gui_config_file()`, `debug_log_file()`, `workspace()`; `WorkspaceScope { dir, project_dir_name }`, `WorkspaceScope::new`; `STATE_DIR_NAME`, `CACHE_DIR_NAME`, `CLI_CACHE_DIR_NAME`, `is_within(path, dir)` |
+| `config` | `ConfigFile`, `GuiConfigFile`, `GuiSettings { theme, terminal, claude_path, pi_path, omp_path, codex_path, copilot_path, default_workspace, restore_session }`, `ResumeConfig { command, default_args, pi, omp: Option<LauncherConfig { command }>, codex: Option<AgentResumeConfig { command, default_args }>, copilot: Option<AgentResumeConfig { command, default_args }> }` (fork: `copilot` and `copilot_path` exist in gui.toml only, `load_config_from` rejects `[resume.copilot]` in config.toml, §13.2) + `default_args(source)` (`[resume]` for Claude, `[resume.codex]` for Codex, eea6d37; `[resume.copilot]` for Copilot, fork) + `command(source)` (`AgentCommand`: a string or an array naming a program, `new(words)`, `words()`; serializes a one-word command as a string; 8a99ccc), `agent_launcher(env, cli, gui, source) -> Launcher` and `LayeredConfig::{launcher, launch}(env, source)` (gui.toml `command` > `[gui] <agent>_path` > config.toml `command` > the agent's binary; 8a99ccc, decision 17), `GuiSettings::{program_path(source), program_path_key(source)}`, `TuiConfig { exclude_projects, exclude_paths, semantic_search }` / `TuiOverrides` (gui.toml; `Option` lists, so `[]` overrides; `exclude_paths` = `[tui] exclude_paths`, 982aea9), `LayeredConfig { cli, gui_file, effective, gui }`, `load_config_from(path)`, `load_gui_config_from(path)` (loaded **independently**, §11.1), `ConfigFile::overlaid_with(&GuiConfigFile)`, `save_gui_config_changes` (K12), `KeyChord::{short_label, help_label, gpui_keystroke, config_string}`, `parse_key_binding`, `KeyBindings { resume, fork, rename, delete, refresh, all_kinds, user_only }` + `from_config`, `conflicts_with_ctrl_t` (`all_kinds`: `[keys] all_kinds`, default `ctrl+g`, cb990e6; `user_only`: `[keys] user_only`, ae7ae39, default **[dev]** `alt+u` (upstream `ctrl+v`, reserved here, §8.5); both count for the Ctrl+T rule), `AgentScopeConfig`, `AgentConfig` |
+| `settings` | `parse_launch_args(args) -> Result<LaunchCommand, LaunchArgsError>` (`LaunchCommand::{Run(GuiLaunchArgs), Help, Version, DeleteEmpty { local, all, yes }, Update, Agent(AgentCli), SubcommandHelp(String)}`; K14/K15, `SubcommandHelp` added by WP-C: `update --help`, `delete-empty -h`, `help <subcommand>` → print the text, exit 0), `GuiLaunchArgs` (+`display_flags`, `search_mode_override`, `picker`, `time_filter`, `settings`, `validate`; `all_kinds` = `--all-kinds`, cb990e6), `help_text(program)`, `effective_settings(config, flags, mode_override) -> EffectiveSettings { show_last, show_tools, tool_display, show_thinking, search_mode, list_search_mode, exclude_projects, exclude_paths, keys, semantic_toggle_enabled, resume_default_args, resume_codex_default_args, resume_copilot_default_args }`, `EffectiveSettings::initial_view_prefs()`, `EffectiveSettings::resume_default_args_for(source)` (eea6d37), `initial_tool_display`, `PickerAction::{ShowPath, ShowId, Resume{fork}}`, `picker_output(action, conv)`, `session_id_from_path(path)` |
 | `browser` | `Browser` (`family_of(path) -> ViewFamily { parent, children }` (a conversation's parent and its subagents and forks, oldest first, over every card; upstream 3c2ffeb), `new_loading`, `append_conversations`, `set_query`, `escape -> EscapeOutcome`, `toggle_workspace_filter`, `set_workspace_filter`, `set_workspace`, `workspace_display` (the workspace with `~` for the home, the prompt's folder, 82b355a), `set_excluded_projects`, `set_excluded_paths` + `excluded_paths` (`[tui] exclude_paths`: literal prefixes of the recorded cwd (case-sensitive; case-insensitive on Windows, 59417d1), applied by `ScopeFilter` in memory and by `Snapshot::head` / `scope(all_kinds, excluded_paths, workspace, ..)` for cards, 982aea9; the workspace test of both is `history::Workspace::contains`, the cards' by project key and the cwds a card stores, 82b355a), `all_kinds`, `toggle_all_kinds`, `set_all_kinds` (automated and child conversations in the list and its lexical search, keeping the query and the selected session, cb990e6), `user_only`, `toggle_user_only`, `set_user_only`, `searches_user_only` (lexical search over `Conversation::own_text` only, keeping the query and the selected session; `searches_user_only` is false in semantic mode, which ignores the toggle; ae7ae39), `toggle_list_search_mode`, `set_list_search_mode`, `poll`, `has_search_work_in_flight`, `filtered`, `row`, `selected`, `select*`, `select_half_page_down(viewport_rows)`, `selected_path`, `selected_conversation`, `has_multiple_sources`, `conversation_by_path`, `count_text`, `search_status_text`, `semantic_status_text`, `semantic_activity_status_text`, `semantic_activity_counts` (the `(done, total)` chunks the activity shows, for its progress bar; fork), `semantic_indexing -> Option<SemanticIndexing { completed, total }>` (the semantic worker's background indexing, upstream c6d0421), `semantic_error`, `semantic_progress`, `semantic_result_metadata[_for_selection]`, `list_hit() -> Option<ListHit { query, evidence }>` and `list_preview_wanted` (the selected result's search hit for the viewer: a non-blank query and a selection, the evidence the semantic row shows; upstream 411e227), `lexical_evidence`, `row_preview_input`, `row_header_input`, `uuid_lookup`, `rename_prefill`, `workspace`, `has_project_context`, `list_search_mode`, `is_loading` (`!readiness.list`, 358becb), `readiness() -> Readiness { list, lexical, reconcile: ReconcileState::{Running, Done}, semantic }`; generation mode (358becb): `show_snapshot(store::Snapshot)` (the first `SNAPSHOT_ROWS` cards), `shows_snapshot`, `generation_open`, `generation_len`, `generation_name`, `generation_is_empty`, `history_is_empty`, `is_hidden(index)`, `time_filter`, `set_time_filter(TimeFilter)`, `open_search_index` and `swap_generation(store::Snapshot)` (synchronous; the loader installs a generation opened off the UI thread), `search_index_generation`, `take_reconcile_request`, `set_reconciling`, `set_index_progress(Option<store::progress::Indexing>, running)`, `index_failed(message)`, `indexing_status_text`, `index_progress`, `take_index_notice -> Option<IndexNotice::{Indexed { total }, Failed(message)}>` (+`status_message`; the status messages of a pass shown as indexing or a failed one, 04c714b), `fill_visible_evidence(Range)`, `conversation_at`; upstream 3708bb6 replaced `loading_state`), `SNAPSHOT_ROWS`, `BrowserOptions` (+ builders incl. `with_exclude_paths`, `embedder_factory`, `waker`, `semantic_available`, `all_kinds`), `HistoryLoader` (`new`, `reconfigure` (store mode: moves to the store root of the new env), `start_initial_load` (store mode: a reconcile pass), `start_refresh` (store mode: a pass, then `Refreshed` from the generation sizes), `set_time_filter` (store mode: re-scopes the cards at the next poll), `is_running`, `is_refreshing`, `uses_store`, `open_snapshot` (`&mut self`: enters store mode; every card and the index are opened on `generation-open` and installed by a later `poll`), `finish_snapshot_write` (waits for the running pass and the ones asked for after it, returns the last `store::generation::Publish`, e905169), `poll(&mut Browser) -> LoaderPoll` incl. `pending`, `swapped`; `BUSY_RETRY`, `GENERATION_POLL`), `LoaderOptions` (incl. `drain_budget`, default `DEFAULT_DRAIN_BUDGET` = 8 ms, upstream 93e17a5; `snapshot` = store mode, default off, 3708bb6, 358becb), `LoadEvent::{Loaded, NoHistory, LoadFailed, Refreshed, RefreshIncomplete, RefreshFailed, RefreshInterrupted}` (+`status_message`), `ListSearchMode`, `SemanticProgress`, `SemanticResultMetadata`, `UuidLookup`, `SemanticIndexing`, `PreparedSession` (`Send`; `PreparedSession::new(Conversation)` normalizes the lexical body of a re-parsed session, the O(text) step for a background task; consumed by `Browser::apply_renamed_session` and `Browser::resolve_uuid_lookup_session`, 503fe42), `RenameError`, `DeleteError` (both with `Unsupported(Source)`: the source's adapter cannot rename or delete, 9799550), `Waker`, `SemanticEmbedderFactory`, `query_has_literals`; K1–K4, K6, K18 additions |
 | `display_format` | `conversation_label(&Conversation)` (title, else summary, else first message, else session id; upstream 3c2ffeb), `build_row_header(&RowHeaderInput) -> RowHeader { project, custom_title, summary, prompt_count, semantic_score, duration, timestamp, recency, .. }` (`prompt_count`: `1 prompt` / `N prompts`, e930cac) (`RowHeaderInput::show_kind_label`: the `auto`/`sub` tag of a listed automated or child conversation, cb990e6; the GUI draws it as its own run), `build_row_preview(&RowPreviewInput) -> RowPreview { preview, source, context }`, `HighlightQuery` (`parse`, `needs_literal_context`, `match_ranges`), `ViewSearchQuery` (`parse`, `is_empty`, `has_match`, `covers_all_terms` (a match holds every word and literal, 949ec4e), `match_ranges_in(text, &text_match::NormalizedForm)`: the viewer find, d2c0f07; `NormalizedForm` is the fork's owned normalized form of a text), `HighlightedText`, `Recency`, `format_model_name`, `format_tokens`, `format_tokens_long`, `count_label`, `format_header_counts` / `header_count_parts` / `header_counts` (`N prompts · M tool calls`, e930cac; `header_count_parts` is fork-only), `format_duration_minutes`, `group_digits` (`7,185`, 04c714b), `format_header_timestamp`, `semantic_row_metadata`, `semantic_rationale_label`, `sanitize_preview` |
 | `view` | `ViewerModel { path, transcript: Arc<Transcript>, prefs, expanded }` (`open(history, path, prefs)` and `open_cancellable(…, cancelled)` through the environment's `history::service::HistoryService`, `from_transcript`, `entries()` (the transcript's `history::view::entries`, numbered; 9597669), `cycle_tool_display`, `toggle_thinking`, `toggle_timing`, `toggle_expanded`, `document`, `export_options`, `session_id`, `message_text`, `plain_display`), `ViewPrefs`, `call_line_suffix` (the ` (N more lines)` suffix of a calls row, 9d4e9cc), `ToolDisplayMode` (`Off` (d0aca95) / `Summary` (was `Hidden`) / `Calls` (a60dfe9) / `Truncated` / `Full`; +`next`, `groups_tools` (was `is_summary`), `status_label`), `ConversationDocument` (`navigable_indices`, `navigable_entry_indices`, `nav_position`, `message_at_nav_position`), `DocMessage`, `DocMessageKind`, `DocBlock` (`toggle_id`, `tool_output_id`, `plain_text`), `DocBlockKind`, `DocTiming`, `Fold`, `DocToolCall`, `DocToolResult`, `DocSubagentToolResult`, `ToolBodyLine`, `BodyLineKind`, `LabelRole` (+`color`), `ToolOutputId`, `fitted_name`, `NAME_WIDTH`, `TRUNCATED_BODY_LINES`, `TRUNCATED_RESULT_LINES`, `MessageNav`, `ViewSearch<M>` (`commit` returns `No matches for /<query>` for a query with text and no matches, d2c0f07), `ViewSearchMode`, `escape -> ViewEscape`, `capture_anchor_entry`, `find_entry_or_prev`, `preview::{PreviewDoc<T: AsRef<str>> { texts, messages } (+`scroll_offset`, `message_at`, `from_rendered`), anchor(doc, query, evidence), match_ranges(doc, lines, anchor, query) -> per line (start, end, MatchEmphasis { Hit, Secondary }), widen_to_words}` (the line a list search hit is at: a line matching the query, lines holding every query word before lines holding only some (f374dc8) (the evidence's message among them, else the first; only without a match the evidence alone, 59195df); upstream 411e227 with 917758a's matcher; the hit's matches of the whole query emphasized and every match widened to whole words, 949ec4e); K5, K9 additions |
 | `export` | `ExportFormat::{ALL, from_index, index, label, extension}`, `ExportOptions`, `generate_export(&Transcript, format, options)`, `export_to_path(&Transcript, …) -> Result<(), ExportError>`, `default_export_file_name`, `plain_display(&Transcript, options)` (every generator renders `history::view::entries`; the caller decodes first with `view::open_conversation(history, path)`, whose error is `ExportError::Read`, 9597669), `exported_status`, constants `COPIED_TO_CLIPBOARD`, `MESSAGE_COPIED_TO_CLIPBOARD`, `NO_TEXT_CONTENT`, `MESSAGE_NOT_FOUND`, `PATH_COPIED_TO_CLIPBOARD`, `SESSION_ID_COPIED_TO_CLIPBOARD`; K11 |
-| `resume` | `plan_resume(env, conv, workspace, fork, &Launch) -> Result<ResumePlan>`, `plan_resume_target(…, &ResumeTarget, …)` (planned by the adapter of the target's source, `Adapter::resume`, 9799550; an action the conversation does not support, `history::actions::capabilities_of(source, provenance)`, is refused with `Failed to run Claude CLI: Resuming <source> sessions is not supported` / `Forking …`, or `… is unavailable: <source> no longer has this conversation's current history` for an orphaned one, eea6d37), `ResumeTarget { source, path, project_path, provenance }` (+`target()`), `ResumePlan { source, kind, strategy, session_path, launcher, args, cwd, copy, warnings, env }` (+`launch_spec(env)`: the launcher's program resolved (`AppError::AgentLaunch` when missing) and its arguments before `args`, `execute_copy()`, `display_command()` (`mise exec -- claude --resume …`); `env`: Codex's `CODEX_HOME`, eea6d37; `launcher`: 8a99ccc), `CopyPlan { files, dirs, existing_targets, target_dir, … }`, `CopyItem`, `CopyReport`, `ResumeStrategy`, `WORKSPACE_REQUIRED_RESUME`, `WORKSPACE_REQUIRED_FORK`; `terminal::{TerminalLauncher::from_setting, detect_launcher, prepare_terminal_command, build_terminal_command, prepare_launcher_command, LaunchOptions, LaunchSpec { program, args, cwd, env }, TerminalCommand (+display; `env` set on the launcher process), Platform, run_to_completion(spec) -> RunOutput { success, status, stderr }}` (the environment reaches the program through every launcher: `env NAME=value` in the POSIX line, `set "NAME=value" &&` in the `cmd.exe` line; `run_to_completion` runs a CLI without a terminal, refused under `cfg(test)`/`hermetic`, eea6d37); K17. **Forbidden in the GUI**: `resume::launch` (copies without confirmation) and direct `terminal::spawn_terminal` outside `services.rs` |
+| `resume` | `plan_resume(env, conv, workspace, fork, &Launch) -> Result<ResumePlan>`, `plan_resume_target(…, &ResumeTarget, …)` (planned by the adapter of the target's source, `Adapter::resume`, 9799550; an action the conversation does not support, `history::actions::capabilities_of(source, provenance)`, is refused with `Failed to run Claude CLI: Resuming <source> sessions is not supported` / `Forking …`, or `… is unavailable: <source> no longer has this conversation's current history` for an orphaned one, eea6d37), `ResumeTarget { source, path, project_path, provenance }` (+`target()`), `ResumePlan { source, kind, strategy, session_path, launcher, args, cwd, copy, warnings, env }` (+`launch_spec(env)`: the launcher's program resolved (`AppError::AgentLaunch` when missing) and its arguments before `args`, `execute_copy()`, `display_command()` (`mise exec -- claude --resume …`); `env`: Codex's `CODEX_HOME`, eea6d37, and Copilot's `COPILOT_HOME` (fork); `launcher`: 8a99ccc), `CopyPlan { files, dirs, existing_targets, target_dir, … }`, `CopyItem`, `CopyReport`, `ResumeStrategy`, `WORKSPACE_REQUIRED_RESUME`, `WORKSPACE_REQUIRED_FORK`; `terminal::{TerminalLauncher::from_setting, detect_launcher, prepare_terminal_command, build_terminal_command, prepare_launcher_command, LaunchOptions, LaunchSpec { program, args, cwd, env }, TerminalCommand (+display; `env` set on the launcher process), Platform, run_to_completion(spec) -> RunOutput { success, status, stderr }}` (the environment reaches the program through every launcher: `env NAME=value` in the POSIX line, `set "NAME=value" &&` in the `cmd.exe` line; `run_to_completion` runs a CLI without a terminal, refused under `cfg(test)`/`hermetic`, eea6d37); K17. **Forbidden in the GUI**: `resume::launch` (copies without confirmation) and direct `terminal::spawn_terminal` outside `services.rs` |
 | `maintenance` | `find_empty_candidates(env, &DeleteEmptyScope) -> Vec<EmptyCandidate>` (+`modified_within`, `cli_lines`), `delete_empty_candidates(&[EmptyCandidate]) -> DeleteEmptyOutcome { deleted, skipped, failure }`, `delete_empty_summary_line`, `format_delete_empty_report`, `find_session_copies(env, uuid) -> Vec<SessionCopyFiles>`, `delete_session_by_uuid(env, uuid) -> DeleteByUuidReport`, `delete_by_uuid_message`, `show_dir(env, workspace)`, `WORKSPACE_REQUIRED_SHOW_DIR`, `load_sorted_conversations(env, show_last, debug, &time_filter)`, `debug_search_report(convs, query, now, workspace) -> DebugSearchReport` (+`to_text`), `DEBUG_SEARCH_TOP`, `parse_error_report(conv)`, `log_parse_errors(env, conv)`; K4 (`plan_session_delete` (a source whose adapter cannot delete is refused with `AppError::Unsupported`: `Deleting <source> sessions is not supported`, 9799550), `execute_session_delete`, `execute_session_delete_with(env, plan, codex_launcher, run)` (a Codex plan, every rollout of the thread, runs `codex delete --force <thread id>` with `CODEX_HOME` through `run`: the GUI passes `PlatformServices::run_program`, eea6d37; started by the Codex `Launcher` with its leading arguments, a missing program fails before anything runs, 8a99ccc), `DeletePlan { source, path, session_id, files, dirs, metadata, kept }` (`metadata`: a sidecar's `.meta.json`; `kept`: a session's `/btw` forks, which stay; 3c2ffeb), `DeleteReport`, `SessionDeleteFailure { error, partial }`) |
 | `semantic_ops` | `generate_semantic_cache(env, convs, workspace, &time_filter, embedder, progress, &cancel) -> GenerateReport`, `GenerateProgress`, `GenerateOutcome`, `clear_semantic_cache(env) -> ClearReport` (K6 as built: empties `<cache root>/semantic` but keeps the directory and its `embeddings.lock`), `semantic_search_report(env, query, convs, top, workspace, embedder)`, `semantic_debug_report(env, query, convs, workspace, embedder)`, `semantic_status(env, convs, workspace)` (`CacheFileState::{Missing, Unreadable, Incompatible, Ready, Legacy}`: 8919a76 made `Incompatible` field-less, the matrix keeps only a model hash, and added `Legacy` for an unconverted `embeddings-v1.bin`), `clear_embedding_cache(env)` (the matrix and an unconverted v1 file), `EmbedderFactory<'a>`, `fastembed_factory(env)` (every core, `EmbedPriority::Foreground`), `no_conversations_message`; `semantic::fastembed::{FastembedEmbedder::new_in(model_dir, show_download_progress, EmbedPriority), EmbedPriority::{Foreground, Background}}` (the shared embedder, §7.6; upstream 8322afe) |
 | `agent` | `AgentRequest::{Search, Within, Read, Outline}`, `args::{AgentSearchArgs, AgentWithinArgs, AgentReadArgs, AgentOutlineArgs, AgentOutputFlags, AgentSearchModeArgs, TimeRangeArgs, DEFAULT_READ_CONTEXT}` (+`validate`), `AgentService::{new, with_embedder_factory, with_notice_sink, with_cancellation, respond}`, `agent::execute(env, config, request) -> AgentResponse` (headless `agent …`), `cli::{AgentCli::{Request, Help}, parse_agent_args}`, `AgentResponse { stdout, stderr, exit_code, result, warnings, error, notices }` (+`text`, `error_text`, `is_success`), `AgentResult::{Search, Within, Read, Outline}`, `AgentSearchResult { output, conversations }` (+`hits`, `conversation(ref)`), `AgentReadResult`, `AgentOutlineResult`, `AgentConversationInfo { reference, full_ref, uuid, project_id, source, session_id, session_filename, path }`, `AgentNotice::{SemanticProgress, UncachedPassages}`, `agent::service::{EmbedderFactory, discover_agent_keys(env, workspace, listed, all_kinds)}` (`AgentSearchArgs::all_kinds` = `--all-kinds`; `user_only` = `--user-only` (dcd3978: hits only from the authored text of top-level, non-note user messages, `AgentTranscript::notes` holding the Pi/OMP note ordinals; conversations ranked over `search::user_only_view`; semantic and hybrid fall back to lexical with a `semantic-unavailable` warning; `forces_lexical()`: the Deep search worker's semantic gate does not refuse such a search); read, outline, within and the GUI's ref lookups pass `all_kinds = true`, cb990e6); agent search leaves out the conversations under a `[tui] exclude_paths` prefix of its config (before reading their text) and drops their discovered keys, so they are not reported as skipped, and likewise conversations of a `[tui] exclude_projects` project (by name, 525e93f); results come in the list's keyword-search rank order; read, outline and within still open them (982aea9), `refs::{AgentConversationKey::from_conversation_in(conversation, &Registry), conversation_ref, full_ref, full_ref_for_candidate}`, `diagnostic::{AgentError, AgentWarning}`, `protocol::{ReadMessage, OutlineItem, ProtocolOptions, MessageLineRange}`; K5, K7, K8, K15 |
 | `update` | `check_latest_release(current) -> UpdateStatus` (services only), `update_status_from_response`, `UpdateStatus::{UpToDate, Available, Newer, NoRelease}`, `ReleaseInfo { tag, version, name, url, notes, … }` (+`asset_for(os, arch)`), `RELEASES_PAGE_URL`, `REPOSITORY` |
-| `history` | `Workspace` (`new(&WorkspaceScope, home)`, `of_env(env)`, `contains(conversation)`, `contains_project_key(key, key_is_path)`, `contains_cwd(path)`, `display()`: which conversations belong to the workspace, upstream 82b355a with no process cwd or home read; `path::{path_is_within, tilde_path}`), `Conversation` (+`cwds`: every distinct recorded cwd, at most `model::MAX_CWDS` = 16, `model::push_cwd`, 82b355a; +`provenance: Provenance` with `hidden_by_default`, `list_label` = `auto`/`sub`/`fork` (`Provenance::branch`: a `/btw` fork, 3c2ffeb), 8f60c5f, cb990e6; +`parent`: the session id a Claude subagent or fork belongs to, 3c2ffeb, with `history::is_parent_of(parent, child)`; +`own_text`: the authored text parts of top-level user messages, `messages::authored_text`, empty for a child conversation, ae7ae39), `model::SourceKind` (`Claude`, `Pi`, `Omp`, `Codex` (list label `CX`, 7f5c443); +`label`, `list_label`, `assistant_name`; the `history::Source` alias is gone since 9597669), `model` (normalized transcript model: `Transcript`, `Event`, `Revision`, `ConversationKey`), `adapter` (`Adapter`, `Stamp`, `Located` (+`native`: the adapter's own resolution), `Completeness`, `Discovery`, `Adapter::native_id_of`; an adapter also declares the actions its tool supports, `capabilities` (+`capabilities_for(provenance)`: a Claude subagent or fork can only be resumed, 3c2ffeb), and resumes, deletes and renames its conversations, 9799550), `actions` (`Capabilities` (+`ALL`, `NONE`), `capabilities_of(source, provenance)` (none for an orphaned conversation), `refusal(source, provenance, doing)`, `Target`; eea6d37; `Launcher { program, args, configured_at }` (+`default_for(source)`, `configured(env, command, at)`, `program_path(env, path, at)`, `resolve(env, source) -> ResolvedProgram`, `check(env, source)`, `words()`), `ConfiguredAt::{Config, Gui, GuiPath}` (names key and file in the error), `Launch { launcher, default_args }`, `config_table(source)`; 8a99ccc; `Adapter::resume` takes the `Launch`, `Adapter::delete` the `Launcher`) and `sources::Registry::from_env(env)` (+`for_source(kind)`: the adapter that acts on a source's conversations, 9799550) (one adapter per configured root, the Codex home included: `sources::codex::CodexAdapter::from_env(env)` lists the rollouts of `<codex home>/sessions` and `archived_sessions`, picks each thread's head with Codex's read-only state database and decodes its rollout chain, 7f5c443; it resumes and forks through the Codex CLI (`resume::plan_codex`, `CODEX_HOME`), deletes through `codex delete --force` (`sources::codex::{delete_spec, delete_outcome, thread_rollouts}`) and cannot rename, eea6d37; `sources::codex::view::decode_path` decodes a rollout opened by path as its thread (`process_conversation_file` shows such Codex threads); fork: single-file windows parse in their env (`Browser::new_single_file` through `process_conversation_file_in(env, …)` and `sources::decode_path_in(env, …)`), so a rollout of the env's own Codex home decodes through `CodexAdapter::from_env` with the env's `CODEX_SQLITE_HOME`, as the viewer's `HistoryService` does, and one of another home through that home's `config.toml` `sqlite_home`, else the home; the store's reconcile pass discovers through it, 8daac4c, and decodes each changed file through `Adapter::decode_into` (`decode` collects the events into a `Transcript`), feeding the events into `index::Indexer` (`push` per event, `finish` with the transcript metadata) to build the card's `Conversation`, fd27225, 350314d), `view::{entries, Entry, EntryKind}` (what a reader is shown of a transcript, in order: messages with the source's speaker, subagent reports, searchable notes, hidden records, and a `Fork` note where a forked thread's own records begin; the viewer, exports, copy-message and `--plain`/`--render` render from it, 9597669; fork: `entries_with_events` names each entry's event), `process_conversation_file(path, mtime, debug)` (`sources::decode_path_into` feeding `index::Indexer`, 350314d; fork: the list loaders stream through `decode_path_into` too; `process_conversation_file_in(env, path, mtime, debug)` parses a file opened in `env`, see above), `service::HistoryService` (`from_env(env)`, `open(key)`, `open_path(path)`; reuses the decoded `Arc<Transcript>` while the stamp is unchanged and keeps the 8 opened last, 9597669; the agent commands load transcripts through it, 59b9565; fork: one per environment, not upstream's process-wide `shared()` (the GUI's `globals::EnvHistory`), and `open_cancellable`/`open_path_cancellable` give a decode up when a flag is set, checked at each read of a Claude, Pi or OMP session file, `adapter::is_cancelled`; `decodes()` counts the decodes it ran, so the GUI's tests check one decode per viewer open), `sources::Registry::for_path(source, path)` (the instance whose root holds the file acts on it: resume, fork, rename, delete, 9597669), `DeleteEmptyScope::{All, Local(WorkspaceScope)}`, `pi_loader::session_root`, `omp_loader::session_root`; fork: `pi_loader::session_dir_settings(env)` (every Pi settings file naming a `sessionDir`, with the directory resolved as `session_root` resolves it) and `sources::codex::{state_db_dir(home, env_sqlite_home), configured_sqlite_home(home)}` (the adapter's own state database resolution) and `sources::codex::view::state_db_dir_of(env, path)` (the state database directory that decoding a rollout opened by path opens) for the sandbox gate (§15.4); K2 |
+| `history` | `Workspace` (`new(&WorkspaceScope, home)`, `of_env(env)`, `contains(conversation)`, `contains_project_key(key, key_is_path)`, `contains_cwd(path)`, `display()`: which conversations belong to the workspace, upstream 82b355a with no process cwd or home read; `path::{path_is_within, tilde_path}`), `Conversation` (+`cwds`: every distinct recorded cwd, at most `model::MAX_CWDS` = 16, `model::push_cwd`, 82b355a; +`provenance: Provenance` with `hidden_by_default`, `list_label` = `auto`/`sub`/`fork` (`Provenance::branch`: a `/btw` fork, 3c2ffeb), 8f60c5f, cb990e6; +`parent`: the session id a Claude subagent or fork belongs to, 3c2ffeb, with `history::is_parent_of(parent, child)`; +`own_text`: the authored text parts of top-level user messages, `messages::authored_text`, empty for a child conversation, ae7ae39), `model::SourceKind` (`Claude`, `Pi`, `Omp`, `Codex` (list label `CX`, 7f5c443), `Copilot` (fork: label `copilot`, assistant `Copilot`, list label `CP`); +`label`, `list_label`, `assistant_name`; the `history::Source` alias is gone since 9597669), `model` (normalized transcript model: `Transcript`, `Event`, `Revision`, `ConversationKey`), `adapter` (`Adapter`, `Stamp`, `Located` (+`native`: the adapter's own resolution), `Completeness`, `Discovery`, `Adapter::native_id_of`; an adapter also declares the actions its tool supports, `capabilities` (+`capabilities_for(provenance)`: a Claude subagent or fork can only be resumed, 3c2ffeb), and resumes, deletes and renames its conversations, 9799550), `actions` (`Capabilities` (+`ALL`, `NONE`), `capabilities_of(source, provenance)` (none for an orphaned conversation), `refusal(source, provenance, doing)`, `Target`; eea6d37; `Launcher { program, args, configured_at }` (+`default_for(source)`, `configured(env, command, at)`, `program_path(env, path, at)`, `resolve(env, source) -> ResolvedProgram`, `check(env, source)`, `words()`), `ConfiguredAt::{Config, Gui, GuiPath}` (names key and file in the error), `Launch { launcher, default_args }`, `config_table(source)`; 8a99ccc; `Adapter::resume` takes the `Launch`, `Adapter::delete` the `Launcher`) and `sources::Registry::from_env(env)` (+`for_source(kind)`: the adapter that acts on a source's conversations, 9799550) (one adapter per configured root, the Codex home included: `sources::codex::CodexAdapter::from_env(env)` lists the rollouts of `<codex home>/sessions` and `archived_sessions`, picks each thread's head with Codex's read-only state database and decodes its rollout chain, 7f5c443; it resumes and forks through the Codex CLI (`resume::plan_codex`, `CODEX_HOME`), deletes through `codex delete --force` (`sources::codex::{delete_spec, delete_outcome, thread_rollouts}`) and cannot rename, eea6d37; `sources::codex::view::decode_path` decodes a rollout opened by path as its thread (`process_conversation_file` shows such Codex threads); fork: single-file windows parse in their env (`Browser::new_single_file` through `process_conversation_file_in(env, …)` and `sources::decode_path_in(env, …)`), so a rollout of the env's own Codex home decodes through `CodexAdapter::from_env` with the env's `CODEX_SQLITE_HOME`, as the viewer's `HistoryService` does, and one of another home through that home's `config.toml` `sqlite_home`, else the home; the store's reconcile pass discovers through it, 8daac4c, and decodes each changed file through `Adapter::decode_into` (`decode` collects the events into a `Transcript`), feeding the events into `index::Indexer` (`push` per event, `finish` with the transcript metadata) to build the card's `Conversation`, fd27225, 350314d), `view::{entries, Entry, EntryKind}` (what a reader is shown of a transcript, in order: messages with the source's speaker, subagent reports, searchable notes, hidden records, and a `Fork` note where a forked thread's own records begin; the viewer, exports, copy-message and `--plain`/`--render` render from it, 9597669; fork: `entries_with_events` names each entry's event), `process_conversation_file(path, mtime, debug)` (`sources::decode_path_into` feeding `index::Indexer`, 350314d; fork: the list loaders stream through `decode_path_into` too; `process_conversation_file_in(env, path, mtime, debug)` parses a file opened in `env`, see above), `service::HistoryService` (`from_env(env)`, `open(key)`, `open_path(path)`; reuses the decoded `Arc<Transcript>` while the stamp is unchanged and keeps the 8 opened last, 9597669; the agent commands load transcripts through it, 59b9565; fork: one per environment, not upstream's process-wide `shared()` (the GUI's `globals::EnvHistory`), and `open_cancellable`/`open_path_cancellable` give a decode up when a flag is set, checked at each read of a Claude, Pi or OMP session file, `adapter::is_cancelled`; `decodes()` counts the decodes it ran, so the GUI's tests check one decode per viewer open), `sources::Registry::for_path(source, path)` (the instance whose root holds the file acts on it: resume, fork, rename, delete, 9597669), `DeleteEmptyScope::{All, Local(WorkspaceScope)}`, `pi_loader::session_root`, `omp_loader::session_root`; fork: `pi_loader::session_dir_settings(env)` (every Pi settings file naming a `sessionDir`, with the directory resolved as `session_root` resolves it) and `sources::codex::{state_db_dir(home, env_sqlite_home), configured_sqlite_home(home)}` (the adapter's own state database resolution) and `sources::codex::view::state_db_dir_of(env, path)` (the state database directory that decoding a rollout opened by path opens) for the sandbox gate (§15.4); K2 |
 | `theme`, `syntax`, `bench`, `debug`, `debug_log`, `markdown`, `time_filter`, `error` | `theme::{set_theme, kind, current, theme_for, ThemeKind, ThemePreference (+resolve), Theme, Rgb}`; `syntax::highlight_code(code, lang)`; `bench::{start(sink), enabled, mark, mark_peak_rss}` (upstream 40fa627 timing marks; explicit sink, no env read, no `--bench-startup`); `debug::{set_sink, reset_sink, DebugLevel (+tag), log, info, warn, error, should_log}`; `debug_log::{log_debug, log_display_error}`; `markdown::expand_tabs` (K10); `time_filter::{TimePoint, TimeFilter (+resolve, matches, is_active), TimeFilterError}`; `AppError`, `Result` |
+
+**The Copilot source (fork-only; core `history::sources::copilot`, `SourceKind::Copilot`; upstream has no Copilot
+support).** The GitHub Copilot CLI keeps one directory per session, `<COPILOT_HOME>/session-state/<session uuid>/`, with
+an append-only event log `events.jsonl` and a `workspace.yaml` beside it. The app only reads them; sessions written by any
+client (the CLI, VS Code, JetBrains) are listed, `session-store.db` is not read.
+* *Discovery:* only directories named by a UUID that hold an `events.jsonl` are sessions; the native id is the directory
+  name, the store key the log's path. A card's stamp folds the log and `workspace.yaml` (a title change alone re-parses it).
+* *Decoding:* user and assistant messages, reasoning (shown as thinking), tool calls and their results. Subagent traffic
+  that Copilot records inline in the parent's log becomes subagent messages (`↳ <agent name>`): hidden until subagents
+  are shown, found by agent and Deep search, and kept out of the list's full text and previews. Compaction summaries,
+  model changes and token usage are recorded as non-shown notes: the model becomes the card's model (as does the model a
+  session is resumed with, `session.resume` `selectedModel`), the token counts the card's tokens (the input count
+  excludes cached tokens). Hook records and unknown event types are skipped silently; a
+  malformed line and a torn last line (`incomplete last record, still being written`) are soft diagnostics. A user
+  message the CLI injects itself (`source: system`) is not the user's dialogue. A log whose first record is not
+  a Copilot event holds no conversation.
+* *Metadata:* the project is the cwd of `session.start` (else `workspace.yaml`'s `cwd`); later cwds
+  (`session.context_changed`, `session.resume`) count for the Workspace scope like Codex's recorded cwds. In
+  `workspace.yaml`, a `name` with `user_named: true` is the custom title, any other `name` or the older `summary` the
+  summary. A session was last active at its newest message, else its last record, else `updated_at` of
+  `workspace.yaml`, else the log's mtime.
+* *Actions:* Resume only (§11.10). Fork, Rename and Delete are refused for the whole source by `capabilities_of` (§11.8,
+  §11.9): the CLI has no fork flag and no delete command, and renaming is left out.
+* *Opened by path:* an `events.jsonl` whose first record is a Copilot event decodes as a Copilot session in a
+  single-file window and in exports (§11.12). So does a copy of a log under another name, such as the raw JSONL export
+  (`conversation-<timestamp>.jsonl`), when it starts with a `session.start`; such a copy reads no `workspace.yaml` and
+  is keyed by its file name. Where an id or title came from the file stem, a Copilot log uses its
+  session directory's name (`sources::session_stem`), so "Copy session ID" copies the uuid.
+* *Agent / Deep search:* Copilot sessions are discovered from the store's cards, narrowed by the workspace like Pi/OMP;
+  a conversation's file name in refs is `<uuid>.jsonl`.
+* *Tool rendering* (`tool_format`, the tool summary): Copilot's `powershell` (`PowerShell: <command>`), `view` (as Read,
+  with `view_range`), `create` (as Write), `edit` (`old_str` / `new_str`), `rg` / `grep`, `glob`, `task` (`agent_type`)
+  and `web_fetch` use the existing formatters and count in the summary; other Copilot tools use the one-line JSON
+  fallback.
+* *Store:* no card version change; Copilot is source byte 4 (`store::card`). A Copilot home that `COPILOT_HOME` moves away from
+  the default is part of the store root's hash (`store::default_root`), so two homes never share a store; the default
+  home leaves the hash as it was.
 
 Duplicates the GUI must **not** write (each was planned in revision 1): its own loader bridge and refresh buffer
 (use `HistoryLoader`), viewer navigation/search state machines (use `MessageNav`, `ViewSearch<M>`, `escape`,
@@ -721,8 +760,8 @@ selection (A1). Right-click also selects and previews the row (the list keeps fo
 ```
 Shortcut labels come from the live keymap. Items that need a known source (Resume, Fork, Rename, Delete) are
 disabled for targets with an unknown source, and each one the conversation's capabilities refuse (core
-`history::actions::capabilities_of`, eea6d37: Rename of a Codex thread, all four for an orphaned thread) is
-disabled too. While loading, Rename and Delete are disabled, and Resume and Fork until the rows are listed newest
+`history::actions::capabilities_of`, eea6d37: Rename of a Codex thread, all four for an orphaned thread; fork: Fork,
+Rename and Delete of every Copilot session) is disabled too. While loading, Rename and Delete are disabled, and Resume and Fork until the rows are listed newest
 first (the first cards of the store's generation, AD6).
 
 ### 5.3 Workspace picker, time filter and sort dropdowns
@@ -819,7 +858,7 @@ Read tab: Refs [ch_…:m10..m14  ch_…] (one or more, separated by spaces or co
   messages (single-ref reads only;
   multi-ref reads show the `continue read` line with "Copy read command").
 Out-of-root file (single-file window on an export or attachment): panel body "Outline, Within and Read work only for
-  conversations inside the Claude, Pi or OMP history folders." (D-035).
+  conversations inside the Claude, Codex, Copilot, Pi or OMP history folders." (D-035).
 ```
 
 ### 5.5 Single-file viewer window
@@ -1026,6 +1065,7 @@ Find = `maintenance::find_session_copies` (errors: `Session not found: <id>`). D
 │ Keys    │ pi program       [                     ] [Browse…] not found on PATH │
 │ Resume  │ omp program      [                     ] [Browse…]                   │
 │ Agent   │ codex program    [                     ] [Browse…]                   │
+│         │ copilot program  [                     ] [Browse…]                   │
 │         │ Default workspace[                     ] [Browse…]                   │
 │         │ ☑ Restore last session (window, workspace, view options)            │
 │         │ Display page: Default tool display (Off|Summary|Full)               │
@@ -1058,7 +1098,7 @@ Rows and labels: §8.7. Opens scrolled to the section of the region that had foc
 ```
 ┌ About Claude History GUI ─────────────────────────────────────┐
 │ Claude History GUI 0.1.0 (core 0.1.76)                        │
-│ A desktop browser for Claude Code, Codex, Pi and OMP history. │
+│ A desktop browser for Claude Code, Codex, Copilot, Pi and OMP history. │
 │ License: Unlicense. Core derived from claude-history          │
 │ (MIT, © 2024 Raine).                                          │
 │ Data: C:\Users\me\.claude                                     │
@@ -1487,7 +1527,7 @@ touches the real clipboard whatever has focus. gpui-kit components that perform 
 an `href`, `PopupMenu::link`, a `TextView` without a link handler, the `Clipboard` copy button) must not be used
 without routing them through `Services`. `RealServices` refuses every side effect in `cfg(test)` builds.
 Debug builds of `RealServices` refuse `spawn_terminal`/`exec_in_current_terminal`/`run_program` for
-`claude`/`pi`/`omp`/`codex` unless a program override is configured or `CHG_ALLOW_REAL_LAUNCH=1` (§15.4).
+`claude`/`pi`/`omp`/`codex`/`copilot` unless a program override is configured or `CHG_ALLOW_REAL_LAUNCH=1` (§15.4).
 
 ### 7.5 Background work model
 
@@ -2114,8 +2154,8 @@ pub fn build(doc: &ConversationDocument, model: &ViewerModel, cols: usize, cance
 | DocBlock (message kind) | label | role | bold | dimmed | timestamp lane |
 |---|---|---|---|---|---|
 | Markdown, top-level user | `You` | TextPrimary | yes (skill: no) | skill: yes | `DocTiming::Stamp` when timing on |
-| Markdown, assistant (label repeated per text block) | agent or `Claude`/`Pi`/`OMP` | Accent | yes | no | first block only (core `DocTiming`) |
-| Markdown, subagent / agent progress | `↳…` (core label) | TextPrimary / Accent | no | yes | Pad |
+| Markdown, assistant (label repeated per text block) | agent or `Claude`/`Pi`/`OMP`/`Copilot` | Accent | yes | no | first block only (core `DocTiming`) |
+| Markdown, subagent / agent progress (Copilot subagent traffic: `↳ <agent name>`) | `↳…` (core label) | TextPrimary / Accent | no | yes | Pad |
 | Markdown, note (Pi/OMP custom message, Codex `Fork`) | core label | TextSecondary | no | yes | Pad |
 | Thinking | `Thinking` | AccentDim | no | no (italic + thinking role) | first block only |
 | ToolSummary / ToolCall | message label | AccentDim | no | message dimmed | first block only |
@@ -2361,8 +2401,10 @@ row), taken from the handle LRU (§9.7).
   clipboard ▸, Copy message, Copy path, Copy session ID, Copy header session ID, Show file path, Reveal in file
   manager, Rename…, Search within conversation…, Read range…, Delete…). Single-file: no Resume/Fork/Rename/Delete;
   unknown-source targets: those items disabled with tooltip `Unknown conversation type`; items the conversation's
-  capabilities refuse (Rename of a Codex thread, all four for an orphaned thread; eea6d37) disabled, the Resume
-  and Fork buttons with core's refusal as tooltip.
+  capabilities refuse (Rename of a Codex thread, all four for an orphaned thread; eea6d37; fork: Fork, Rename and
+  Delete of a Copilot session) disabled, the Resume and Fork buttons with core's refusal as tooltip (the `⋯`
+  items Rename… and Delete… of a Copilot session are disabled too; the Fork button's tooltip is
+  `Forking CP sessions is not supported`).
 * Status bar (status.rs): `[i/N]` (mono), `tools·off|sum|cal|trn|all  think·on|off  info·on|off` (`ToolDisplayMode::
   status_label`; key letter accent, rest muted — clickable), `│`, hints (§8.7, focus-dependent, priority-trimmed).
 
@@ -2374,7 +2416,7 @@ row), taken from the handle LRU (§9.7).
 ```rust
 pub struct RowModel {                 // built per visible row each frame (cheap; no Vec clones)
     pub id: SharedString,             // path string (domain id; QA id "row:<file stem>")
-    pub source_label: Option<&'static str>,      // "CC" | "Pi" | "OMP" | "CX" when Browser::has_multiple_sources()
+    pub source_label: Option<&'static str>,      // "CC" | "Pi" | "OMP" | "CX" | "CP" when Browser::has_multiple_sources()
     pub kind_label: Option<&'static str>,        // "auto" | "sub": Provenance::list_label (listed on request, cb990e6)
     pub header: RowHeader,                       // core display_format::build_row_header(width = usize::MAX / 4)
     pub preview: RowPreview,                     // core display_format::build_row_preview(max_width = preview chars)
@@ -2500,12 +2542,14 @@ recorded each frame (for the keyboard context menu position).
      (an older generation) every card is listed and queries browse until a generation has them.
    * **Reconcile passes (upstream e905169, 358becb).** `start_initial_load` starts a reconcile pass on a
      `store-reconcile` thread (upstream ran a detached `--reconcile` process at launch). The pass takes `LOCK`
-     without waiting, stats every Claude, Pi, OMP and Codex session file (Codex rollouts, with the read-only state database for thread metadata) of the env's sources and compares size and mtime
+     without waiting, stats every Claude, Pi, OMP, Codex and Copilot session file (Codex rollouts, with the read-only state database for thread metadata; a Copilot session's `events.jsonl` together with its `workspace.yaml`, so a title change alone is a change; fork) of the env's sources and compares size and mtime
      with the fingerprints in `CURRENT`; only new or changed files are parsed (as the history loader parses them) and
      published as delta generations (newest 200 files first, then every 2 s of parsing; unchanged text, semantic and index
      segments hard-linked from the previous generation, deltas merged past the thresholds); files that hold no
      conversation are remembered as ignored; a source or directory that cannot be listed keeps its cards; nothing is
-     written when no file changed. A pass that published then removes the per-project and Pi/OMP caches of v0.1.1
+     written when no file changed. The first pass after an update that adds the Copilot source parses the Copilot
+     logs in the background (the store's card format and directory are unchanged; Copilot is source byte 4, fork).
+     A pass that published then removes the per-project and Pi/OMP caches of v0.1.1
      and earlier from the cache dir, still holding `LOCK` (`store::legacy`, upstream 75df2d4; §13.4 "GUI caches").
      When another instance holds the lock the pass tries again every second
      (`BUSY_RETRY`) until it gets it. While it runs, its `store-watch` thread reads `CURRENT` every 200 ms and wakes
@@ -2569,7 +2613,7 @@ recorded each frame (for the keyboard context menu position).
    batch): a batch left over is held for the next poll (`p.pending`) and core calls the waker for it. After each poll
    the task yields once to the executor, so a frame can be drawn before the next wake is handled. Core loads Claude
    projects (parallel, one batch per project) concurrently with every other instance (Pi, OMP and, since
-   9597669, Codex) parsed together through the registry (`store::reconcile::parse_everything`) and sent newest
+   9597669, Codex; fork: Copilot) parsed together through the registry (`store::reconcile::parse_everything`) and sent newest
    first in batches of 32 once that parse ends; the registry scan removes duplicates, and a root that cannot be
    listed is skipped without a message; batches arrive interleaved.
 3. On `p.event`:
@@ -2685,8 +2729,10 @@ the worker (§9.6); Active search `refresh`ed. Clicking an expandable control al
 ### 11.8 Rename (F2, menus, palette, row menu; list or viewer; K3)
 1. The pane handler captures `target` (§7.8); while loading, unknown source or single-file → no-op (menu item
    disabled). A conversation whose capabilities refuse it (`ConversationTarget::refusal`, core
-   `capabilities_of`: a Codex thread, an orphaned one, eea6d37; a Claude subagent or `/btw` fork, 3c2ffeb) →
-   warning toast with core's refusal (`Renaming CX sessions is not supported`, `Renaming CC subagents and forks is
+   `capabilities_of`: a Codex thread, an orphaned one, eea6d37; a Claude subagent or `/btw` fork, 3c2ffeb; any Copilot
+   session, fork) →
+   warning toast with core's refusal (`Renaming CX sessions is not supported`, `Renaming CP sessions is not
+   supported`, `Renaming CC subagents and forks is
    not supported`) before any dialog opens (`routing::run_session_action`); the row
    menu and the viewer's ⋯ menu show Rename… disabled.
 2. `ops::rename::open_rename_dialog(target, window, cx)`: `InputState` prefilled with `target.custom_title` (caret at
@@ -2694,13 +2740,14 @@ the worker (§9.6); Active search `refresh`ed. Clicking an expandable control al
 3. Save/Enter → buttons show a spinner; background `history::rename_session(env, path, source, input, show_last).map(PreparedSession::new)` →
    UI: `list.apply_renamed(path, prepared)` → `browser.apply_renamed_session` (K3). Ok → close dialog; row/header update via `CorpusChanged` (no toast).
    `Err(RenameError)` → inline error (`Failed to rename: conversation became empty` / `Failed to rename: <e>` /
-   `Renaming <source> sessions is not supported` when the source's adapter cannot rename (9799550; Codex is
+   `Renaming <source> sessions is not supported` when the source's adapter cannot rename (9799550; Codex and Copilot are
    refused up front, step 1); dialog stays open, input kept). `NoTarget` (the conversation left the list meanwhile) → inline `This conversation
    is no longer in the list`.
 
 ### 11.9 Delete (Ctrl+X, menus, palette, row menu; list or viewer; K4)
 1. Capture `target`; while loading, unknown source or single-file → no-op; refused by its capabilities (an orphaned
-   Codex thread, eea6d37) → warning toast with core's refusal (§11.8 step 1), checked again with the live corpus
+   Codex thread, eea6d37; any Copilot session, fork: `Deleting CP sessions is not supported`, the CLI has no delete
+   command) → warning toast with core's refusal (§11.8 step 1), checked again with the live corpus
    entry's provenance after planning (an agent hit does not know it).
 2. Background `maintenance::plan_session_delete(env, &target.path, source)`. Error (e.g. `Session not found: <id>`, or
    `Deleting <source> sessions is not supported` when the source's adapter cannot delete: 9799550) → error
@@ -2726,13 +2773,14 @@ the worker (§9.6); Active search `refresh`ed. Clicking an expandable control al
 
 ### 11.10 Resume / Fork
 1. Capture `target`; loading before the rows are listed (`list_ready`), unknown source or single-file → no-op;
-   refused by its capabilities (an orphaned Codex thread, eea6d37) → warning toast with core's refusal (§11.8
+   refused by its capabilities (an orphaned Codex thread, eea6d37; Fork of a Copilot session, fork:
+   `Forking CP sessions is not supported`) → warning toast with core's refusal (§11.8
    step 1), checked again with the live corpus entry's provenance once the plan is made.
 2. `conv` = `list.conversation(&target.path)` (live `project_path`) or, when not in the corpus, a background
    `process_conversation_file` → `ResumeTarget`.
 3. `launch = Launch { launcher: config.launcher(&env, source), default_args:
    settings.resume_default_args_for(source) }` (`[resume] default_args` for Claude, `[resume.codex] default_args` for
-   Codex, none for Pi/OMP; eea6d37); in the background, after the login-shell `PATH` probe (≤ 3 s, step 4),
+   Codex, `[resume.copilot] default_args` for Copilot, none for Pi/OMP; eea6d37); in the background, after the login-shell `PATH` probe (≤ 3 s, step 4),
    `launch.launcher.check(&env, source)`: `Err(AgentLaunch)` → error toast with core's text (upstream 8a99ccc:
    ``Cannot start agent: `<program>` was not found on PATH; …`` naming the key to check, or suggesting `command`)
    + action "Open Settings" (Resume page for a `command` or when nothing is set, General for a `[gui]` program path), before any copy confirmation; then
@@ -2747,6 +2795,14 @@ the worker (§9.6); Active search `refresh`ed. Clicking an expandable control al
      workspace with the `Session directory … does not exist` warning; `plan.env` = `CODEX_HOME` of the rollout's
      home, which every launcher passes on (`env 'CODEX_HOME=…'` in the POSIX line, `set "CODEX_HOME=…" &&` in the
      `cmd.exe` line, and on the launcher process).
+   * Copilot (fork-only source; Resume only): `copilot [default_args] --resume=<session id>` (`core::resume::plan_copilot`;
+     the session id is the log's directory name, a UUID) in the session's project directory (the `session.start`
+     cwd), else the workspace with the same `Session directory … does not exist` warning; strategy Native, no copy;
+     `plan.env` = `COPILOT_HOME` of the log's home (the parent of its `session-state` directory), passed on by every
+     launcher like `CODEX_HOME`; a log outside a `session-state` directory sets no `COPILOT_HOME` and adds the
+     warning `Session is outside a Copilot home; COPILOT_HOME is not set`. Fork is refused by the capability check
+     (the CLI has no fork flag; `plan_copilot` refuses it too as a backstop). A session written by VS Code or JetBrains
+     is resumed the same way.
    * `Err(AppError::WorkspaceRequired(msg))` → toast `msg` + action "Choose workspace…"; other errors → toast with the
      error text.
    * `plan.warnings` → warning toast(s) (e.g. `Session directory <dir> does not exist`).
@@ -2774,19 +2830,24 @@ the worker (§9.6); Active search `refresh`ed. Clicking an expandable control al
   `Copied to clipboard`.
 * Copy message (`y` with nav): `ViewerModel::message_text(entry)` → non-empty → clipboard + `Message copied to
   clipboard`; empty → `No text content in this message`; Err → `Message not found`.
-* Copy path → `Path copied to clipboard`; copy session ID (file stem) → `Session ID copied to clipboard`; copy header
+* Copy path → `Path copied to clipboard`; copy session ID (file stem; a Copilot log's session directory name, the
+  session UUID, fork: `core::history::sources::session_stem`) → `Session ID copied to clipboard`; copy header
   ID → `Session ID copied to clipboard`; show path → toast with the full path and Copy/Reveal buttons.
 
 ### 11.12 Single-file
 `claude-history-gui FILE`, `--render FILE` without redirection, or File → Open JSONL file…: (debug and QA builds) the
 sandbox gate's rule for files opened by path (§15.4 rule 7): a Codex rollout whose Codex home or state database
-lies outside the sandbox home is refused — at startup `Refusing to run: …`, exit 3 (`startup::dispatch`); from the
+lies outside the sandbox home, or a Copilot `events.jsonl` whose sibling `workspace.yaml` does, is refused — at startup `Refusing to run: …`, exit 3 (`startup::dispatch`); from the
 dialog an error toast `Couldn't open <p>: <reason>` and that file is not opened (`startup::opened_file_refusal`) —
 then validate (`File not
 found: <p>` / `Not a file: <p>` → window opens in an error state), open `SingleFileWindow` with
 `ViewerPane(SingleFile)`, header from `Browser::new_single_file` in the background
 (`history::process_conversation_file_in(env, path, mtime, None)`: a Codex rollout of the env's home honors
-`CODEX_SQLITE_HOME` like the viewer; `Ok(None)` → stem-only header and the D1 error state
+`CODEX_SQLITE_HOME` like the viewer; a file named `events.jsonl` whose first record is a Copilot event, or a file
+of another name that starts with a Copilot `session.start` (a raw JSONL export), decodes as a Copilot session (fork:
+`sources::copilot::view`; only an `events.jsonl` also reads the sibling `workspace.yaml`, and nothing lists
+`session-state`; the id and title of an `events.jsonl` are the session directory's name, `sources::session_stem`);
+`Ok(None)` → stem-only header and the D1 error state
 `<file> contains no conversation messages`; `Err` → header stem
 + error), target `ConversationTarget::from_parsed_file`. The agent panel asks the agent worker for
 `conversation_key_for_path` (K8) and is disabled with the D-035 text when `None`. Esc/q → `window.remove_window()`;
@@ -2958,7 +3019,7 @@ the launch time filter (Generate: none, AD9). The fresh load reads the store (up
 the store's `LOCK` (the list's `store-reconcile` pass, a second instance), it waits for the lock and runs the pass
 once more. Then it reads every card with its text frame and semantic data, parse errors included. Without a cache
 root, or when the store cannot be read, it parses the session files of every instance through the registry
-(`store::load_in_memory`, Codex included since 9597669). Deep
+(`store::load_in_memory`, Codex included since 9597669; Copilot too, fork). Deep
 search's `agent search` loads its corpus the same way, through `store::load_conversations_cancellable`: a cancelled
 job (K7) stops waiting for the lock at once (it asks for it every 100 ms), so the `agent-worker` thread is free for the
 next job. The keys-less fallback of `resolve_agent_read_args`/`resolve_agent_conversation_arg` reads cards only (`Contents::Cards`), as upstream; `agent read`/`outline`/`within`, and so the agent panel, resolve refs from `discover_agent_keys`, never through that fallback.
@@ -3002,8 +3063,8 @@ W warning, E error. Every error state offers a recovery action (DG §9.13).
 | Toast E | refresh fatal / interrupted | + [Retry] | `Refresh failed: <err>` / `Refresh failed; keeping the current list` | `Refresh failed: <err>` / `Refresh failed; keeping existing sessions` |
 | Toast W | load/reload with project errors | + [Show debug log] | `N project(s) could not be loaded. See Tools → Debug log.` | (ignored by TUI) |
 | Toast E | UUID not found | | `Session not found: <uuid>` | `UuidLookup::status_message` |
-| Rename dialog | errors (inline) | | `Failed to rename: conversation became empty` / `Failed to rename: <err>` / `This conversation is no longer in the list` / `Renaming <source> sessions is not supported` (Codex is refused before the dialog, next row) | `RenameError` Display (9799550: the TUI's refusal status) |
-| Toast W | an action the conversation's capabilities refuse (eea6d37) | | `Renaming CX sessions is not supported` / `<Resuming\|Forking\|Renaming\|Deleting> is unavailable: CX no longer has this conversation's current history` / `<Forking\|Renaming> CC subagents and forks is not supported` (3c2ffeb) | core `history::actions::refusal` (upstream status line, verbatim) |
+| Rename dialog | errors (inline) | | `Failed to rename: conversation became empty` / `Failed to rename: <err>` / `This conversation is no longer in the list` / `Renaming <source> sessions is not supported` (Codex and Copilot are refused before the dialog, next row) | `RenameError` Display (9799550: the TUI's refusal status) |
+| Toast W | an action the conversation's capabilities refuse (eea6d37) | | `Renaming CX sessions is not supported` / `Forking CP sessions is not supported` / `Renaming CP sessions is not supported` / `Deleting CP sessions is not supported` (fork: Copilot supports Resume only) / `<Resuming\|Forking\|Renaming\|Deleting> is unavailable: CX no longer has this conversation's current history` / `<Forking\|Renaming> CC subagents and forks is not supported` (3c2ffeb) | core `history::actions::refusal` (upstream status line, verbatim) |
 | Viewer header | family line (3c2ffeb) | muted line, link, button | `↳ fork of <label>` / `↳ subagent of <label>` / `↳ subagent of session <id> (not found)` / `1 subagent, 2 forks`; tooltips `Open the parent conversation (Shift+P)` / `Subagents and forks (s)` | `↳ fork of <label>  P open` / `N subagents, M forks  s list` |
 | Dialog | subagents and forks picker (3c2ffeb) | | title `Subagents and forks`; rows `sub` / `fork` + label + `<n> · %m-%d %H:%M`; `[Esc] Cancel` | ` Subagents and forks ` / `[Enter] Open  [Esc] Cancel` |
 | Toast I | `s` / `P` with nothing to open (3c2ffeb) | | `No subagents or forks in this conversation` / `This conversation has no parent` / `Parent conversation not found` | core `browser::{NO_CHILDREN_STATUS, NO_PARENT_STATUS, PARENT_NOT_FOUND_STATUS}` (`… in this session`, `This session has no parent`, `Parent session not found`) |
@@ -3108,6 +3169,10 @@ Subcommands cannot be combined with top-level flags.
   `[resume] command`, `[resume.pi] command`, `[resume.omp] command` and `[resume.codex] command` (upstream 8a99ccc):
   the program that starts each agent, a string (never split) or an array (program + leading arguments); an empty
   command or one with a blank program is a parse error (`command must …`).
+* **`[resume.copilot]` is GUI-only (fork).** The Copilot source is not in upstream's schema, and the installed upstream
+  CLI aborts on a key it does not know, so `load_config_from` rejects `[resume.copilot]` in `config.toml` like an
+  unknown key (`unknown field `copilot` in [resume], expected one of …; `[resume.copilot]` belongs in gui.toml`,
+  shown by the §5.20 dialog); only gui.toml accepts it (`command`, `default_args`), and so does `[gui] copilot_path`.
 * `config.toml`'s `[semantic]` table (`daemon`, `pause_on_battery`; upstream 939c20b) is part of the accepted schema but
   ignored by the GUI (no background daemon); `gui.toml` has no `[semantic]` table.
 * `gui.toml` (`~/.config/claude-history/gui.toml`, core `GuiConfigFile`): may override `[display]`, `[resume]`,
@@ -3123,7 +3188,7 @@ when no config key is set and restore_session is on) or `Default: <value>`; "App
 |---|---|---|---|---|---|
 | General | Theme | `[gui] theme` | Segmented | system / light / dark | immediately |
 | General | Terminal | `[gui] terminal` | Select + custom text | core syntax: `auto` (default), `wt`, `cmd` (`console`), `terminal`, `osascript`, a Linux emulator name (`gnome-terminal`, `ptyxis`, `kgx`, `konsole`, `xfce4-terminal`, `tilix`, `alacritty`, `kitty`, `wezterm`, `xterm`, `x-terminal-emulator`), or a template with `{cwd}`, `{args}`, `{cmd}`; the field previews the command for a sample resume (`build_terminal_command`) | next launch |
-| General | claude / pi / omp / codex program | `[gui] claude_path` / `pi_path` / `omp_path` / `codex_path` (codex: eea6d37; also the Codex delete) | path input + Browse… | must exist when set; shows what starts the agent (`resolved: <path>` / `not found on PATH` / `not an executable file`, after `runs …; from <key> in <file> · ` when a `command` decides; gui.toml's `command` beats it, config.toml's does not, 8a99ccc) | next launch |
+| General | claude / pi / omp / codex / copilot program | `[gui] claude_path` / `pi_path` / `omp_path` / `codex_path` / `copilot_path` (codex: eea6d37; also the Codex delete; copilot: fork, gui.toml only) | path input + Browse… | must exist when set; shows what starts the agent (`resolved: <path>` / `not found on PATH` / `not an executable file`, after `runs …; from <key> in <file> · ` when a `command` decides; gui.toml's `command` beats it, config.toml's does not, 8a99ccc) | next launch |
 | General | Default workspace | `[gui] default_workspace` | folder input + Browse… | existing dir | next start |
 | General | Restore last session | `[gui] restore_session` | Switch | default on | next start |
 | Display | Preview shows | `[display] last` | Segmented Last / First | | list refresh |
@@ -3139,6 +3204,8 @@ when no config key is set and restore_session is on) or `Default: <value>`; "App
 | Resume | Default arguments | `[resume] default_args` | list editor | Claude only, after the command's arguments | next resume |
 | Resume | Pi / OMP / Codex command | `[resume.pi]` / `[resume.omp]` / `[resume.codex] command` (8a99ccc) | list editor | as the Claude Code command; Codex's also runs `codex delete` | next resume |
 | Resume | Codex default arguments | `[resume.codex] default_args` (eea6d37) | list editor | Codex only, after the command, before `resume`/`fork` | next resume |
+| Resume | Copilot command | `[resume.copilot] command` (fork, gui.toml only) | list editor | as the Claude Code command; precedence `[resume.copilot] command` > `[gui] copilot_path` > `copilot` on `PATH` | next resume |
+| Resume | Copilot default arguments | `[resume.copilot] default_args` (fork, gui.toml only) | list editor | Copilot only, before `--resume=<id>`; page note `One argument per line; passed to copilot before --resume, for example --allow-all-tools.` | next resume |
 | Agent | Scope | `[agent] scope` | global / local | | next run |
 | Agent | Mode | `[agent] mode` | lexical/semantic/exact/hybrid | | next run |
 | Agent | Output budget (chars) | `[agent] output_chars` | NumberInput ≥ 1 | 6000 default | next run |
@@ -3183,6 +3250,7 @@ never remembered.
 | Claude data | `$CLAUDE_CONFIG_DIR` or `<home>/.claude` (read; written by rename/delete/fork-copy/delete-empty) |
 | Pi / OMP sessions | per core loaders (`PI_*`, `OMP_PROFILE`, `XDG_DATA_HOME`, relative values against the launch cwd (K16), workspace `.pi/settings.json`) |
 | Codex home (read-only) | `$CODEX_HOME` or `~/.codex`; its state database in the home's `config.toml` `sqlite_home`, else `$CODEX_SQLITE_HOME`, else the home (relative values resolve like the `PI_*` paths) |
+| Copilot home (read-only; fork) | `$COPILOT_HOME` (an empty value counts as unset; a relative value resolves against the launch cwd like `CODEX_HOME`) or `~/.copilot`; the sessions are `<home>/session-state/<session uuid>/events.jsonl` (+ `workspace.yaml` beside it), written by the Copilot CLI, VS Code or JetBrains; only directories named by a UUID that hold an `events.jsonl` are sessions; `session-store.db` is not read |
 | GUI caches | `<home>/.cache/claude-history-gui/{semantic,launch}` and the list snapshot below; the per-project and Pi/OMP caches of v0.1.1 and earlier (`projects/*.bin` and `config-<hash>/projects/*.bin` tagged `CLHIST01`, `pi/root-<hash>/sessions.bin` tagged `PIHIST01` and `omp/root-<hash>/sessions.bin` tagged `OMHIST01`, `.tmp*` files older than an hour beside them, then the dirs this empties) are removed by `store::legacy` after a reconcile pass that published, while it holds `LOCK`; never in the installed CLI's `<home>/.cache/claude-history` (`history::sources::Registry::cli_cache`; 75df2d4) |
 | List snapshot (store) | `<home>/.cache/claude-history-gui[/config-<hash>]/v3/roots-<hash>/` (`store::default_root`; `roots-<hash>` covers the resolved Pi and OMP session roots, so another workspace `.pi/settings.json` or `PI_*` value reads and writes its own generations): `LOCK`, `CURRENT`, `PROGRESS` (while a pass that parses at least 50 files runs: `indexing <pid> <parsed> <to parse>`, written through `PROGRESS.tmp`; after a failed pass `failed <message>` until the next pass; 04c714b), `gNNNNNN/manifest` (cards newest first with their file fingerprints, index locations, own-text locations, the index segment table and the ignored files; a card keeps the cwds recorded after the first as one NUL-separated heap string, 82b355a, and the session id of its parent, 3c2ffeb, and its prompt and tool call counts, e930cac; manifest version 14, ae7ae39, b9497ce, 1aa8eeb, a76d5df, 5896b9e, 82b355a, 3c2ffeb, e930cac), `gNNNNNN/text-NNNN.zst` (each conversation's text as one checksummed zstd frame), `gNNNNNN/sem-NNNN.zst` (each conversation's semantic turns, message ranges, route text, agent text and parse errors as one zstd frame of bincode, none when it has no such data; e61a999, 16cc49c), `gNNNNNN/own-NNNN.zst` (what the person typed, `Conversation::own_text`, one frame per conversation that has some; ae7ae39), `gNNNNNN/base.fst`, `base.post`, `base.short` (word-start suffix index segment 0) and `delta-NNNN.fst/post/short` (further index segments), each with an `own-` twin over the own text (same doc ids; ae7ae39); segments a generation shares with the previous one are hard links (copies where links fail), one generation is kept behind `CURRENT`; in store mode the list's rows and its search index (358becb), updated by the reconcile passes at start, on refresh and after a rename or delete, §11.2, and read in full by the one-shot tools and Deep search after a pass of their own, §11.24; upstream's format (e905169) |
 | Embedding cache | `<home>/.cache/claude-history-gui/semantic/embeddings-v2.bin`: upstream's memory-mapped matrix (8919a76; header with the model, schema and chunk settings, sorted 16-byte blake3 keys, last-use and protection columns, 64-byte aligned `f32` rows), written whole and renamed into place under `embeddings.lock` (K6); an `embeddings-v1.bin` from earlier versions is converted once and removed |
@@ -3206,7 +3274,7 @@ never remembered.
   then x-terminal-emulator, gnome-terminal (`--`), ptyxis, kgx, konsole, xfce4-terminal, tilix, alacritty, kitty,
   wezterm, xterm). A spawn error moves to the next candidate; an early non-zero exit within 3 s is reported (e.g.
   `open -a` failing); children are reaped by core.
-* Debug builds refuse to spawn `claude`/`pi`/`omp` without an override or `CHG_ALLOW_REAL_LAUNCH=1` (§15.4).
+* Debug builds refuse to spawn `claude`/`pi`/`omp`/`codex`/`copilot` without an override or `CHG_ALLOW_REAL_LAUNCH=1` (§15.4).
 * Never kill terminal processes (they may host the user's other tabs).
 
 ### 14.2 Program resolution and PATH
@@ -3268,9 +3336,9 @@ line).
 
 Absolute rules:
 * No OS input injection (no SendKeys, no synthetic OS mouse) and no real-desktop automation.
-* No test, QA run or agent dev run reads or writes the real `~/.claude`, `~/.pi`, `~/.omp`, `~/.codex`,
+* No test, QA run or agent dev run reads or writes the real `~/.claude`, `~/.pi`, `~/.omp`, `~/.codex`, `~/.copilot`,
   `~/.config/claude-history`, `~/.cache/claude-history*`, `~/.local/state/claude-history*`, the real clipboard, or
-  launches `claude`/`pi`/`omp`, URLs, file managers or native file dialogs. This is **enforced**, not only stated:
+  launches `claude`/`pi`/`omp`/`codex`/`copilot`, URLs, file managers or native file dialogs. This is **enforced**, not only stated:
   core `hermetic` guards in every GUI test build (K13), the env redirect in the test binary, `PlatformServices` for
   every side effect, the CI safety lint, the QA/debug-build sandbox gate (§15.4).
 
@@ -3293,7 +3361,7 @@ Absolute rules:
   reconcile pool do not lower their threads' priority there.
 * A `#[ctor::ctor]` in `test_support` runs before any test: it creates a per-process temp root and sets (unsafe
   `set_var`, before threads exist) `HOME`, `USERPROFILE`, `CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR`,
-  `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`, `CODEX_HOME`, `CODEX_SQLITE_HOME`, `XDG_DATA_HOME`,
+  `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`, `CODEX_HOME`, `CODEX_SQLITE_HOME`, `COPILOT_HOME`, `XDG_DATA_HOME`,
   `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` inside it and removes `OMP_PROFILE`, `PI_PROFILE`, `TERMINAL`, `CLAUDE_HISTORY_CLIPBOARD`.
 * `app::init_for_test` installs `RecordingServices`, a refusing embedder (`embedder::install_fake` to opt in),
   disables state.json writes, and uses an empty config unless the test writes one into its `TestWorld`. The list's
@@ -3408,7 +3476,9 @@ quit 0
   `tools.qa`; WP6
   `settings-keys.qa`, `theme.qa`, `palette.qa`; WP-I `cross-pane.qa`; the eea6d37 backport `codex.qa` (a Codex
   thread added by `new-sandbox.ps1 -WithCodex`: viewer, refused Rename, Resume with `CODEX_HOME`, the recorded
-  `codex delete`).
+  `codex delete`); the Copilot source (fork) `copilot.qa` (a Copilot session added by `new-sandbox.ps1
+  -WithCopilot`: listed with lane `CP`, Rename, Fork and Delete refused with core's toast and no dialog, viewer,
+  Resume recording `--resume=<id>` and `COPILOT_HOME`).
 
 ### 15.4 Sandbox gate, sandbox procedure (dev runs and QA)
 * **Gate** (`qa/gate.rs`, runs in `main` for `--features qa` builds **and every debug build**, on the `HistoryEnv`
@@ -3419,9 +3489,9 @@ quit 0
   OS profile directory of the current user, obtained from the OS, not from variables (Windows
   `SHGetKnownFolderPath(FOLDERID_Profile)`, Unix `getpwuid_r(getuid())` → `pw_dir`); (3) each of
   `CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`, `CODEX_HOME`,
-  `CODEX_SQLITE_HOME`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` is unset or
+  `CODEX_SQLITE_HOME`, `COPILOT_HOME`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` is unset or
   (canonically) inside the home; set but empty, a variable counts as unset only where the app reads it so
-  (`qa::gate::EMPTY_MEANS_UNSET`): the app reads an empty `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR` or
+  (`qa::gate::EMPTY_MEANS_UNSET`, which includes `COPILOT_HOME`): the app reads an empty `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR` or
   `PI_CONFIG_DIR` as a relative path (an empty `PI_CODING_AGENT_SESSION_DIR` is the launch directory), so it is
   refused; (4) `OMP_PROFILE`
   and `PI_PROFILE` are unset or plain names; (5) the data locations the app reads, derived from exactly that env
@@ -3429,7 +3499,8 @@ quit 0
   directories (`HistoryEnv::claude_dir`, `claude_projects_root`), the Codex home (`CODEX_HOME`, else
   `<home>/.codex`) with its `sessions` and `archived_sessions` directories and its state database directory (its
   `config.toml` `sqlite_home`, absolute or relative to the Codex home, else `CODEX_SQLITE_HOME`, else the Codex
-  home: core `sources::codex::state_db_dir`), the store and semantic cache directories (`cache_base_dir`, which
+  home: core `sources::codex::state_db_dir`), the Copilot home (`COPILOT_HOME`, else `<home>/.copilot`; checked as
+  "the Copilot home") with its `session-state` directory ("the Copilot session-state directory"), the store and semantic cache directories (`cache_base_dir`, which
   `CLAUDE_CONFIG_DIR` moves into `config-<hash>`, `semantic_cache_dir`), the `sessionDir` of Pi's `settings.json`
   in the agent directory (`PI_CODING_AGENT_DIR`, else `<home>/.pi/agent`; core `pi_loader::session_dir_settings`),
   and the Pi and OMP session roots (`pi_loader::session_root`, `omp_loader::session_root`; OMP reads no settings
@@ -3445,7 +3516,10 @@ quit 0
   through the Codex home holding it, which may be another home than the env's: that home, its `sessions` and
   `archived_sessions` directories and the state database directory decoding the rollout opens (that home's
   `config.toml` `sqlite_home`, else the home; core `sources::codex::view::state_db_dir_of`) must canonically stay
-  inside the sandbox home. `main` passes `qa::gate::enforced()` on (`ProcessInfo::sandbox_gate` →
+  inside the sandbox home. A Copilot `events.jsonl` decodes together with its sibling `workspace.yaml`, so that
+  file, when it exists, must canonically stay inside the sandbox home as well (core
+  `sources::copilot::view::workspace_file_of`; the check runs before the early return for files that are not Codex
+  rollouts). `main` passes `qa::gate::enforced()` on (`ProcessInfo::sandbox_gate` →
   `LaunchContext::sandbox_gate`); the GUI's startup workspace (`startup::startup_workspace`), the launch
   directory of the headless `agent` commands and the files of `[FILE]` and `--render FILE` (`startup::dispatch`)
   are refused like the gate (exit 3); a runtime workspace change (workspace picker, PD3 rule 3 (c);
@@ -3453,20 +3527,22 @@ quit 0
   File → Open JSONL file… (`startup::opened_file_refusal`) with an error toast and the file is not opened
   (§11.12). As built (WP0): when
   the OS cannot tell the profile directory the gate refuses (fails closed), and the default data locations used while the variables are unset (`<home>/.claude`,
-  `.claude.json`, `.pi`, `.omp`, `.codex`, `.config`, `.cache`, `.local` and their data subfolders,
+  `.claude.json`, `.pi`, `.omp`, `.codex`, `.copilot`, `.copilot/session-state`, `.config`, `.cache`, `.local` and their data subfolders,
   `qa::gate::DEFAULT_DATA_PATHS`) must canonically stay inside the home when they exist — a junction or symlink to
   real data is refused. Debug builds skip the gate (rules 6 and 7 included) only with `CHG_ALLOW_REAL_HOME=1` (the
   user's own choice); `--features qa` builds never skip it.
-* Debug builds of `RealServices` also refuse to spawn a terminal whose program is a resolved `claude`/`pi`/`omp`
+* Debug builds of `RealServices` also refuse to spawn a terminal whose program is a resolved `claude`/`pi`/`omp`/`codex`/`copilot`
   unless `[gui] <prog>_path` is set to a harmless program inside the sandbox or `CHG_ALLOW_REAL_LAUNCH=1`.
 * Procedure:
   1. `tools/qa/new-sandbox.ps1 -Source <scratchpad>/sandbox/home -Dest $env:TEMP\chg-sbx-<n>`: copies the corpus
      (never use the source in place), creates `<dest>\.qa-sandbox`, `<dest>\.config\claude-history\`,
-     `<dest>\.local\state\`, and a `gui.toml` with `claude_path`/`pi_path`/`omp_path`/`codex_path` pointing at a
-     harmless recorder script in the sandbox.
+     `<dest>\.local\state\`, and a `gui.toml` with `claude_path`/`pi_path`/`omp_path`/`codex_path`/`copilot_path` pointing at a
+     harmless recorder script in the sandbox; `-WithCopilot` copies one fixture session into
+     `<dest>\.copilot\session-state` (the dot matters: the launch guard reads a path word whose last component is
+     `copilot` as the program).
   2. `tools/qa/run-gui.ps1 -Sandbox <dest> -Exe <path> [-Scenario x.qa -Out <dir>] [-Shots]` sets, for the child
      process only: `USERPROFILE`, `HOME` = `<dest>`; `CLAUDE_CONFIG_DIR` = `<dest>\.claude`; `PI_CODING_AGENT_DIR` =
-     `<dest>\.pi\agent`; `CODEX_HOME` = `<dest>\.codex`; `XDG_*` under `<dest>`; removes
+     `<dest>\.pi\agent`; `CODEX_HOME` = `<dest>\.codex`; `COPILOT_HOME` = `<dest>\.copilot`; `XDG_*` under `<dest>`; removes
      `PI_CODING_AGENT_SESSION_DIR`, `PI_CONFIG_DIR`, `CODEX_SQLITE_HOME`, `OMP_PROFILE`, `PI_PROFILE`; starts the watcher when `-Shots`; waits; prints the report.
   3. Semantic QA: the model downloads into the sandbox cache on first use unless `--qa-model-dir
      <scratchpad>\qa-model-cache` points at a pre-downloaded copy (feature `qa` only). That copy must hold the
@@ -4212,7 +4288,7 @@ changes below (commits `integrator: …` on master). Contract changes a Phase-B 
   reconcile pass, `ListPane::is_reconciling()` false: a fresh store first lists only its newest delta generation) the
   main window calls
   `startup::apply_recorded_cwd_workspace(cx, ListPane::recorded_agent_cwds())` once (new `ListPane` method: the
-  distinct cwds of the listed Pi/OMP/Codex conversations, i.e. every non-Claude source except automated and child ones); on a match `AppState.workspace` is set and the list re-scopes
+  distinct cwds of the listed Pi/OMP/Codex/Copilot conversations, i.e. every non-Claude source except automated and child ones); on a match `AppState.workspace` is set and the list re-scopes
   through `ListPane::set_workspace` (a background reload).
 * **Keymap (WP6)**: `keymap::install_all` also binds `help::shortcuts::bindings()` (context `ShortcutsDialog`); code
   that clears and rebuilds the keymap keeps them (`install_user_bindings` does). Status-bar hints look bindings up with

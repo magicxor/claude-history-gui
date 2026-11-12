@@ -205,7 +205,7 @@ fn message_text_session_id_and_plain_display_use_the_cache() {
     let dir = tempfile::tempdir().unwrap();
     let path = write(dir.path(), "abc-123.jsonl", &conversation_lines());
     let mut model = ViewerModel::open(&history(), &path, ViewPrefs::default()).unwrap();
-    assert_eq!(model.session_id(), Some("abc-123"));
+    assert_eq!(model.session_id().as_deref(), Some("abc-123"));
 
     assert_eq!(model.message_text(0).unwrap(), "Find the Bug please");
     assert_eq!(model.message_text(1).unwrap(), "Looking for the bug.");

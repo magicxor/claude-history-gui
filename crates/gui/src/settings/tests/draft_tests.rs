@@ -160,6 +160,7 @@ fn sample(field: Field) -> Value {
         | Field::PiPath
         | Field::OmpPath
         | Field::CodexPath
+        | Field::CopilotPath
         | Field::DefaultWorkspace => {
             Value::Text(std::env::temp_dir().join("somewhere").display().to_string())
         }
@@ -171,10 +172,11 @@ fn sample(field: Field) -> Value {
         | Field::ExcludePaths
         | Field::ResumeArgs
         | Field::CodexResumeArgs
+        | Field::CopilotResumeArgs
         | Field::AgentExclude => Value::List(vec!["a".into(), "b c".into()]),
         // A program alone is written as a string, with arguments as an array.
         Field::ClaudeCommand | Field::OmpCommand => Value::List(vec!["my agent".into()]),
-        Field::PiCommand | Field::CodexCommand => {
+        Field::PiCommand | Field::CodexCommand | Field::CopilotCommand => {
             Value::List(vec!["mise".into(), "exec".into(), "--".into()])
         }
         Field::Key(_) => Value::Key(parse_key_binding("alt+z").unwrap()),
@@ -192,7 +194,7 @@ fn sample(field: Field) -> Value {
 /// Every field round-trips through the gui.toml model and Reset removes it.
 #[test]
 fn every_field_sets_gets_and_resets() {
-    assert_eq!(Field::ALL.len(), 39);
+    assert_eq!(Field::ALL.len(), 42);
     for field in Field::ALL {
         let mut gui = GuiConfigFile::default();
         assert!(get(field, &gui).is_unset(), "{field:?} starts unset");
@@ -274,6 +276,23 @@ fn command_fields_read_both_files_and_default_to_the_agent() {
         "Default: codex"
     );
     assert_eq!(
+        source_of(Field::CopilotCommand, &cfg, &ui).text,
+        "Default: copilot"
+    );
+    assert_eq!(Field::CopilotCommand.key_path(), "[resume.copilot] command");
+    assert_eq!(
+        Field::CopilotResumeArgs.key_path(),
+        "[resume.copilot] default_args"
+    );
+    assert_eq!(Field::CopilotPath.key_path(), "[gui] copilot_path");
+    assert_eq!(Field::CopilotPath.label(), "copilot program");
+    assert_eq!(Field::CopilotCommand.label(), "Copilot command");
+    assert_eq!(
+        Field::CopilotResumeArgs.label(),
+        "Copilot default arguments"
+    );
+    assert_eq!(Field::CopilotCommand.qa_name(), "resume.copilot.command");
+    assert_eq!(
         get(Field::ClaudeCommand, &cfg.gui_file),
         Value::List(vec!["my-claude".into()])
     );
@@ -321,6 +340,20 @@ fn program_status_names_the_launcher_that_applies() {
         program_status_for(&env, &cli, &draft, Field::CodexCommand, Agent::Codex),
         format!(
             "runs {}; from `codex_path` under [gui] in gui.toml · not an executable file",
+            missing.display()
+        )
+    );
+    let missing = tmp.path().join("bin").join("copilot.exe");
+    let draft = gui_from(&format!(
+        "[gui]
+copilot_path = '{}'
+",
+        missing.display()
+    ));
+    assert_eq!(
+        program_status_for(&env, &cli, &draft, Field::CopilotCommand, Agent::Copilot),
+        format!(
+            "runs {}; from `copilot_path` under [gui] in gui.toml · not an executable file",
             missing.display()
         )
     );

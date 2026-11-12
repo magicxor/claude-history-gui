@@ -200,6 +200,31 @@ fn codex_candidate_handles_expand_through_discovered_keys() {
     );
 }
 
+/// Fork: a Copilot candidate (file `<session id>.jsonl`, see
+/// `AgentConversationKey::from_conversation_in`) expands through its key.
+#[test]
+fn copilot_candidate_handles_expand_through_discovered_keys() {
+    let id = "0c0a0000-0000-4000-8000-000000000001";
+    let file = format!("{id}.jsonl");
+    let detail = format!(
+        "ambiguous conversation ref; retry with one of these ch_ handles; candidates: ch_cccccccccccc project=pr_3 source=copilot directory=/work/x file={file}"
+    );
+    assert_eq!(expand_handles(&detail, &[]), detail);
+    let mut key = claude_history_core::agent::refs::AgentConversationKey::new(
+        "/work/x",
+        &file,
+        std::path::PathBuf::from(format!("session-state/{id}/events.jsonl")),
+    );
+    key.source = claude_history_core::history::model::SourceKind::Copilot;
+    key.session_id = id.to_string();
+    let expanded = expand_handles(&detail, std::slice::from_ref(&key));
+    let full = key.conversation_ref().full_ref();
+    assert!(
+        expanded.contains(&format!("candidates: {full} project=pr_3")),
+        "{expanded}"
+    );
+}
+
 /// D-014: the real ambiguity of one UUID in two projects offers full refs.
 #[gpui_kit::test]
 fn ambiguous_candidates_are_full_refs(cx: &mut TestAppContext) {

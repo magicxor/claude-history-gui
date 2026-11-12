@@ -11,7 +11,7 @@
 //!   GUI has no meaningful process cwd, so core never calls
 //!   `std::env::current_dir()`);
 //! * tests build one with [`HistoryEnv::sandbox`], which keeps every path
-//!   (Claude data, Pi/OMP sessions, the Codex home, caches, config, logs)
+//!   (Claude data, Pi/OMP sessions, the Codex and Copilot homes, caches, config, logs)
 //!   under a temporary
 //!   directory. `from_process_env` panics under `cfg(test)` so a test can
 //!   never reach the real home directory by accident.
@@ -23,6 +23,7 @@
 //! |---|---|
 //! | Claude data | `$CLAUDE_CONFIG_DIR` (absolute only) or `~/.claude` |
 //! | Codex home (read-only) | `$CODEX_HOME` or `~/.codex`; its state database in `config.toml`'s `sqlite_home`, else `$CODEX_SQLITE_HOME`, else the home |
+//! | Copilot home (read-only, fork) | `$COPILOT_HOME` or `~/.copilot`; its sessions in `session-state` |
 //! | caches (the list's store, semantic embeddings, fastembed model) | `~/.cache/claude-history-gui` |
 //! | CLI config (read-only, shared settings) | `~/.config/claude-history/config.toml` |
 //! | GUI config (GUI settings and overrides) | `~/.config/claude-history/gui.toml` |
@@ -84,6 +85,9 @@ pub struct HistoryEnv {
     /// `CODEX_SQLITE_HOME`: the directory of Codex's state database when the
     /// home's `config.toml` names none ([`HistoryEnv::codex_sqlite_home`]).
     pub codex_sqlite_home: Option<PathBuf>,
+    /// `COPILOT_HOME` (fork): the Copilot home ([`HistoryEnv::copilot_home`]).
+    /// A relative value resolves like the `PI_*` paths.
+    pub copilot_home: Option<PathBuf>,
     /// `XDG_DATA_HOME` (OMP only). A relative value resolves like the
     /// `PI_*` paths ([`HistoryEnv::env_value_base_dir`]: the launch
     /// directory, as upstream resolved it against its cwd, else the
@@ -147,6 +151,9 @@ impl HistoryEnv {
             codex_sqlite_home: std::env::var_os("CODEX_SQLITE_HOME")
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from),
+            copilot_home: std::env::var_os("COPILOT_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
             xdg_data_home: std::env::var_os("XDG_DATA_HOME")
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from),
@@ -173,7 +180,7 @@ impl HistoryEnv {
     ///
     /// `root` acts as the home directory, so Claude data lives in
     /// `root/.claude`, Pi in `root/.pi`, OMP in `root/.omp`, Codex in
-    /// `root/.codex`, caches in
+    /// `root/.codex`, Copilot in `root/.copilot`, caches in
     /// `root/.cache/claude-history-gui`, config in `root/.config/...` and the
     /// debug log in `root/.local/state/...`. No process environment variable
     /// is consulted. Override individual fields (or use the `with_*`
@@ -236,6 +243,32 @@ impl HistoryEnv {
     /// no `sqlite_home` (`None`: in the home).
     pub fn codex_sqlite_home(&self) -> Option<PathBuf> {
         self.env_value_path(self.codex_sqlite_home.as_deref())
+    }
+
+    /// Set `COPILOT_HOME` (fork).
+    pub fn with_copilot_home(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.copilot_home = Some(dir.into());
+        self
+    }
+
+    /// The Copilot home (fork): `COPILOT_HOME`, else `<home>/.copilot`,
+    /// resolved like [`HistoryEnv::codex_home`]. An empty value counts as
+    /// unset.
+    pub fn copilot_home(&self) -> Option<PathBuf> {
+        self.env_value_path(self.copilot_home.as_deref())
+            .or_else(|| self.default_copilot_home())
+    }
+
+    /// The Copilot home `COPILOT_HOME` selects when it is not the default
+    /// one (fork): such a home has a store of its own
+    /// ([`crate::store::default_root`]).
+    pub fn selected_copilot_home(&self) -> Option<PathBuf> {
+        self.env_value_path(self.copilot_home.as_deref())
+            .filter(|home| Some(home) != self.default_copilot_home().as_ref())
+    }
+
+    fn default_copilot_home(&self) -> Option<PathBuf> {
+        self.home_dir.as_ref().map(|home| home.join(".copilot"))
     }
 
     /// An environment-variable path: as is when absolute, else against
@@ -915,6 +948,34 @@ mod tests {
             Some(Path::new(launch).join("db"))
         );
         assert_eq!(HistoryEnv::default().codex_home(), None);
+    }
+
+    #[test]
+    fn copilot_home_defaults_to_the_home_and_resolves_like_pi_paths() {
+        let (home, launch, copilot) = if cfg!(windows) {
+            (r"C:\home", r"C:\launch", r"D:\copilot")
+        } else {
+            ("/home", "/launch", "/copilot")
+        };
+        let env = HistoryEnv {
+            home_dir: Some(PathBuf::from(home)),
+            ..HistoryEnv::default()
+        };
+        assert_eq!(env.copilot_home(), Some(Path::new(home).join(".copilot")));
+        let absolute = env.clone().with_copilot_home(copilot);
+        assert_eq!(absolute.copilot_home(), Some(PathBuf::from(copilot)));
+        assert_eq!(
+            env.clone().with_copilot_home("").copilot_home(),
+            Some(Path::new(home).join(".copilot"))
+        );
+        let relative = env.clone().with_copilot_home("rel");
+        assert_eq!(
+            relative.copilot_home(),
+            Some(Path::new(home).join(".copilot"))
+        );
+        let launched = relative.with_env_path_base(launch);
+        assert_eq!(launched.copilot_home(), Some(Path::new(launch).join("rel")));
+        assert_eq!(HistoryEnv::default().copilot_home(), None);
     }
 
     #[test]

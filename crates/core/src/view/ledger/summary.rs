@@ -40,16 +40,18 @@ pub(crate) struct ToolActivitySummary {
 }
 
 impl ToolActivitySummary {
-    fn add_call(&mut self, name: &str) {
+    fn add_call(&mut self, name: &str, input: &serde_json::Value) {
         match name {
-            "Bash" | "bash" => self.shell_commands += 1,
-            "Read" | "read" => self.read_files += 1,
-            "Grep" | "grep" => self.searched_patterns += 1,
-            "Glob" | "find" => self.searched_file_patterns += 1,
+            // Fork: with GitHub Copilot CLI's names (`powershell`, `view`, ...).
+            "Bash" | "bash" | "powershell" => self.shell_commands += 1,
+            "Read" | "read" | "view" => self.read_files += 1,
+            "Grep" | "grep" | "rg" => self.searched_patterns += 1,
+            "Glob" | "find" | "glob" => self.searched_file_patterns += 1,
             "Edit" | "edit" => self.edited_files += 1,
-            "Write" | "write" => self.wrote_files += 1,
+            "Write" | "write" | "create" => self.wrote_files += 1,
             "Task" => self.agents += 1,
-            "WebFetch" | "fetch_content" => self.fetched_urls += 1,
+            "task" if crate::tool_format::starts_copilot_agent(input) => self.agents += 1,
+            "WebFetch" | "fetch_content" | "web_fetch" => self.fetched_urls += 1,
             "WebSearch" | "web_search" => self.web_searches += 1,
             _ => self.add_other_tool(name, 1),
         }
@@ -195,8 +197,8 @@ pub(super) fn render_tool_activity_summary(
 pub(crate) fn summarize_tool_calls(parts: &[Part]) -> ToolActivitySummary {
     let mut summary = ToolActivitySummary::default();
     for part in parts {
-        if let Part::ToolCall { name, .. } = part {
-            summary.add_call(name);
+        if let Part::ToolCall { name, input, .. } = part {
+            summary.add_call(name, input);
         }
     }
     summary
@@ -721,5 +723,59 @@ pub(super) fn flush_tool_summary(
             end_line,
         });
         lines.push(RenderedLine::new(vec![]));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn call(name: &str, input: serde_json::Value) -> Part {
+        Part::ToolCall {
+            id: String::new(),
+            name: name.to_owned(),
+            input,
+        }
+    }
+
+    /// Fork: Copilot's tools count under the activities they are.
+    #[test]
+    fn copilot_tools_are_summarized_by_their_activity() {
+        let summary = summarize_tool_calls(&[
+            call("powershell", json!({ "command": "cargo test" })),
+            call("view", json!({ "path": "a.rs" })),
+            call("create", json!({ "path": "b.rs", "file_text": "" })),
+            call("rg", json!({ "pattern": "fn a" })),
+            call("glob", json!({ "pattern": "*.rs" })),
+            call("web_fetch", json!({ "url": "https://example.com" })),
+            call(
+                "task",
+                json!({ "agent_type": "explore", "prompt": "Survey" }),
+            ),
+        ]);
+        assert_eq!(summary.shell_commands, 1);
+        assert_eq!(summary.read_files, 1);
+        assert_eq!(summary.wrote_files, 1);
+        assert_eq!(summary.searched_patterns, 1);
+        assert_eq!(summary.searched_file_patterns, 1);
+        assert_eq!(summary.fetched_urls, 1);
+        assert_eq!(summary.agents, 1);
+        assert!(summary.other_tools.is_empty());
+    }
+
+    /// Only Copilot's `task` starts an agent: another agent's tool of that
+    /// name is summarized like any tool without wording of its own.
+    #[test]
+    fn a_task_call_without_an_agent_type_is_just_a_tool() {
+        let summary = summarize_tool_calls(&[
+            call("task", json!({ "title": "Ship it" })),
+            call(
+                "Task",
+                json!({ "subagent_type": "Explore", "prompt": "Survey" }),
+            ),
+        ]);
+        assert_eq!(summary.agents, 1);
+        assert_eq!(summary.other_tools, [("task".to_owned(), 1)]);
     }
 }

@@ -387,6 +387,7 @@ fn diff(base: Option<&Generation>, scan: &Scan) -> Plan {
                 SourceKind::Pi,
                 SourceKind::Omp,
                 SourceKind::Codex,
+                SourceKind::Copilot,
             ]
             .into_iter()
             .any(|source| scan.misses(Path::new(path), source))
@@ -1048,6 +1049,65 @@ mod tests {
         assert_eq!(locked.publish, Publish::Unchanged);
         assert_eq!(fixture.current().rows().len(), generation.rows().len());
         db.execute_batch("COMMIT;").unwrap();
+    }
+
+    /// Fork: the sessions of a Copilot `session-state` with an event log are
+    /// indexed as Copilot conversations, titled from `workspace.yaml`.
+    #[test]
+    fn copilot_sessions_are_indexed() {
+        use crate::store::card::{self, card_flags};
+        let fixture = Fixture::new();
+        let copilot = crate::history::sources::copilot::tests::root_copy(
+            &fixture._dir.path().join(".copilot"),
+        );
+        settle_all(fixture._dir.path());
+        let sources = Registry::with_roots(
+            Some(fixture.projects.clone()),
+            Some(fixture.pi.clone()),
+            Some(fixture.omp.clone()),
+        )
+        .with_copilot(Some(copilot));
+        reconcile(&fixture.root, &sources).unwrap();
+
+        let generation = fixture.current();
+        let rows: Vec<_> = generation
+            .rows()
+            .iter()
+            .filter(|row| row.source == card::source_to_u8(SourceKind::Copilot))
+            .collect();
+        // Sessions 1, 2, 3 and 5 have a log; the other directories are skipped.
+        assert_eq!(rows.len(), 4);
+        let row_of = |id: &str| {
+            *rows
+                .iter()
+                .find(|row| generation.str(row.session_id) == id)
+                .unwrap_or_else(|| panic!("no card for {id}"))
+        };
+        let plain = row_of("0c0a0000-0000-4000-8000-000000000001");
+        assert_eq!(generation.str(plain.custom_title), "Ocelot cache eviction");
+        assert_eq!(
+            generation.str(row_of("0c0a0000-0000-4000-8000-000000000002").summary),
+            "Survey the lemur parser with subagents"
+        );
+        assert_eq!(
+            generation.str(row_of("0c0a0000-0000-4000-8000-000000000003").summary),
+            "Refactor the heron scheduler: \"queue\" first"
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.flags & card_flags::PROVENANCE == 0)
+        );
+        let snapshot =
+            crate::store::Snapshot::open(&fixture.root, false, Default::default()).unwrap();
+        assert_eq!(
+            snapshot.head(usize::MAX, false, &[], None, |_| true).len(),
+            generation.rows().len()
+        );
+
+        let unchanged = reconcile(&fixture.root, &sources).unwrap();
+        assert_eq!(unchanged.publish, Publish::Unchanged);
+        assert_eq!(unchanged.parsed, 0);
+        assert_eq!(unchanged.written.bytes, 0);
     }
 
     #[test]

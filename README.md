@@ -1,7 +1,7 @@
 # claude-history-gui
 
 A cross-platform desktop app (Windows, macOS, Linux) for browsing, searching and resuming your
-**Claude Code, Codex, Pi and OMP conversation history**. It is a GUI port of the terminal app
+**Claude Code, Codex, Copilot, Pi and OMP conversation history**. It is a GUI port of the terminal app
 [claude-history](https://github.com/raine/claude-history) and aims to cover every feature of the original,
 built on [gpui-kit](https://crates.io/crates/gpui-kit) (GPUI) and a UI-agnostic core (`crates/core`).
 
@@ -29,7 +29,7 @@ All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-h
 ## Features
 
 **Conversation list**
-* Claude Code, Codex, Pi and OMP conversations in one virtualized list, listed and searched from an on-disk index that is
+* Claude Code, Codex, GitHub Copilot CLI, Pi and OMP conversations in one virtualized list, listed and searched from an on-disk index that is
   kept up to date in the background (reading only the conversation files that changed, at start, on refresh and
   after a rename or delete): the newest ones are shown at once and the full history is never loaded into memory
   for the list. The first run indexes the history in the background, newest first.
@@ -41,6 +41,12 @@ All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-h
   (a forked thread shows the history it continues from, then a `Fork` marker where its own records begin), resume
   and fork through the Codex CLI and delete through `codex delete`; they cannot be renamed, and a thread whose current rollout Codex no longer
   has is read-only.
+* GitHub Copilot CLI sessions (`~/.copilot` or `COPILOT_HOME`, the `session-state/<session-id>/events.jsonl` logs
+  with their `workspace.yaml` titles; sessions written by the CLI, VS Code or JetBrains alike) are listed and searched
+  too, marked `CP`. This source is a fork addition: the original claude-history does not read Copilot sessions. They
+  open in the viewer with messages, reasoning, tool calls and results; subagent work Copilot records inline shows as
+  subagent messages (`↳ <agent name>`), hidden until subagents are shown and left out of the list's text and
+  previews. They can be resumed; they cannot be forked, renamed or deleted.
 * Claude Code's subagent transcripts and `/btw` side questions (kept beside their session, in
   `<session-id>/subagents/`) are indexed too. A `/btw` fork is listed and searched as a conversation of its own,
   tagged `fork`, with your question as its first message; the question is also searchable in the session you asked
@@ -68,7 +74,7 @@ All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-h
   when any working directory it recorded is that folder or a folder below it: a session started in `~/code` that
   moved into `~/code/repo` is in `~/code/repo`'s scope, and a workspace at `~/code` takes in the sessions of every
   repo below it. Folders match whole path components (`~/code/repo` does not include `~/code/repo-old`). This holds
-  for Claude Code, Pi, OMP and Codex, in the list, Deep search's Workspace scope and the Tools. While the scope is
+  for Claude Code, Pi, OMP, Codex and Copilot, in the list, Deep search's Workspace scope and the Tools. While the scope is
   on, the search prompt shows the folder (`~/code/repo ❯`, cut from the start when it is long).
 * Paste a session UUID to jump to that conversation. Preview shows the first or last messages.
 * Row context menu, F5/Ctrl+L refresh, command palette (Ctrl+Shift+P or F10) with every menu command.
@@ -108,6 +114,11 @@ All screenshots show a synthetic fixture corpus (`crates/gui/tests/fixtures/qa-h
   whose current rollout, as recorded by Codex, no longer exists allows no action. Arguments for every Codex
   resume and fork go in `[resume.codex] default_args` (for example `["--yolo"]`, giving `codex --yolo resume
   <thread-id>`); `[resume] default_args` are Claude's only.
+* Copilot sessions: Resume runs `copilot --resume=<session-id>` in the session's project directory, with
+  `COPILOT_HOME` set to the home that holds the session. Fork, Rename and Delete are not offered (the Copilot CLI
+  has no fork flag and no delete command): the menu items are disabled and the keys show `Forking CP sessions is not
+  supported` and the like. Arguments for every Copilot resume go in `[resume.copilot] default_args` (for example
+  `["--allow-all-tools"]`, giving `copilot --allow-all-tools --resume=<session-id>`).
 * Claude subagents and `/btw` forks: Resume resumes the session they belong to (refused once that session is
   gone), Delete removes only the subagent's or fork's transcript and its `.meta.json`, and Fork and Rename are not
   supported.
@@ -404,10 +415,11 @@ is not remembered. An invalid file shows a dialog naming it (Quit / Continue wit
 
 `[gui]` keys in `gui.toml`: `theme` (`system`, `light`, `dark`), `terminal` (`auto`, `wt`, `cmd`, `terminal`,
 `osascript`, a Linux emulator name, or a template with `{cwd}`, `{args}`, `{cmd}`), `claude_path`, `pi_path`,
-`omp_path`, `codex_path`, `default_workspace`, `restore_session`. `[resume] default_args` (Claude) and
-`[resume.codex] default_args` (Codex) hold extra arguments for Resume and Fork.
+`omp_path`, `codex_path`, `copilot_path`, `default_workspace`, `restore_session`. `[resume] default_args` (Claude),
+`[resume.codex] default_args` (Codex) and `[resume.copilot] default_args` (Copilot) hold extra arguments for Resume
+and Fork.
 
-Resume and Fork run `claude`, `pi`, `omp` or `codex`, and the Codex delete runs `codex`. To start an agent another
+Resume and Fork run `claude`, `pi`, `omp`, `codex` or `copilot`, and the Codex delete runs `codex`. To start an agent another
 way (a mise or nix wrapper, a script that sets environment variables first, a binary with another name), set
 `command` for it, in `gui.toml` (Settings > Resume, one word per line) or `config.toml`:
 
@@ -423,7 +435,15 @@ command = ["mise", "exec", "--", "omp"]
 
 [resume.codex]
 command = ["nix", "run", "nixpkgs#codex", "--"]
+
+[resume.copilot]                          # gui.toml only
+command = ["mise", "exec", "--", "copilot"]
+default_args = ["--allow-all-tools"]
 ```
+
+`[resume.copilot]` and `[gui] copilot_path` exist in `gui.toml` only. `config.toml` is shared with the original CLI,
+which aborts on keys it does not know, so a `[resume.copilot]` table there is rejected as an unknown field (the error
+says the table belongs in `gui.toml`).
 
 A string is one program and is never split on spaces; an array is a program followed by the arguments that always
 come first. The agent's own arguments follow (`mise exec -- omp --resume <path>`), and `default_args` come after the
@@ -455,13 +475,16 @@ conversations stay on disk: a pasted session ID or a file path still opens them,
 * `OMP_PROFILE`: OMP profile; `XDG_DATA_HOME` is honored for Pi/OMP data.
 * `CODEX_HOME`: the Codex home (default `~/.codex`); `CODEX_SQLITE_HOME`: where Codex keeps its state database
   when the home's `config.toml` sets no `sqlite_home` (default: the home).
-  Relative values of the Pi, OMP and Codex variables resolve against the directory the app was started in.
-* `TERMINAL`: preferred terminal emulator on Linux. `PATH`/`PATHEXT` locate `claude`, `pi`, `omp` and `codex`.
+* `COPILOT_HOME`: the GitHub Copilot CLI home (default `~/.copilot`; empty counts as unset); its sessions are
+  `<home>/session-state/<session-id>/events.jsonl`.
+  Relative values of the Pi, OMP, Codex and Copilot variables resolve against the directory the app was started in.
+* `TERMINAL`: preferred terminal emulator on Linux. `PATH`/`PATHEXT` locate `claude`, `pi`, `omp`, `codex` and `copilot`.
 * Development only: `CHG_ALLOW_REAL_HOME`, `CHG_ALLOW_REAL_LAUNCH` (see below).
 
 ## Safety
 
-The app reads your Claude Code, Pi, OMP and Codex history (Codex's state database is opened read-only) and writes
+The app reads your Claude Code, Pi, OMP, Codex and Copilot history (Codex's state database is opened read-only;
+Copilot's `session-state` is only read, no Copilot session is ever written or deleted) and writes
 to it only through these actions, each of which names the conversation and asks for confirmation:
 
 * **Rename**: writes the custom title into the conversation.
@@ -475,7 +498,7 @@ to it only through these actions, each of which names the conversation and asks 
   in `~/.claude/projects`, listing every file and any existing target that would be overwritten.
 
 Export asks before replacing an existing file. Resume and Fork only open a terminal running `claude`, `pi`,
-`omp` or `codex`. `config.toml` is never written; the GUI keeps its own settings, state and caches in separate
+`omp`, `codex` or `copilot`. `config.toml` is never written; the GUI keeps its own settings, state and caches in separate
 files.
 
 ## Development
@@ -510,15 +533,18 @@ Debug builds and `--features qa` builds refuse to start (exit 3, `Refusing to ru
 directory is a QA sandbox: it contains a `.qa-sandbox` marker, is not your real profile directory, and every data
 path variable stays inside it (an empty `PI_*` path variable is refused: the app reads it as a relative path), as
 do the data folders the app reads wherever the variables move them and the data locations that config files inside
-the sandbox name (the Codex `config.toml` `sqlite_home`, the `sessionDir` of Pi's `settings.json`). A workspace is
+the sandbox name (the Codex `config.toml` `sqlite_home`, the `sessionDir` of Pi's `settings.json`); `COPILOT_HOME`
+and the default `~/.copilot` count too. A workspace is
 checked whenever it is applied, since Pi also reads `<workspace>/.pi/settings.json`: at startup a refusal exits 3,
 a later workspace change is refused with an error toast. A file opened by path (`FILE`, `--render FILE`, Open JSONL
 file) may lie anywhere, but a Codex rollout is read through its own Codex home and state database, which must stay
-inside the sandbox: refused at startup with exit 3, from the dialog with an error toast. Set
+inside the sandbox, and a Copilot `events.jsonl` is read together with its sibling `workspace.yaml`, which must stay
+inside the sandbox too: refused at startup with exit 3, from the dialog with an error toast. Set
 `CHG_ALLOW_REAL_HOME=1` to use your real history in a debug build (qa builds
-never skip the gate). Debug builds also refuse to start a real `claude`, `pi`, `omp` or `codex` from Resume (or a
-Codex delete) unless `CHG_ALLOW_REAL_LAUNCH=1`, or `[gui] claude_path/pi_path/omp_path/codex_path` point at a
-harmless program inside the sandbox.
+never skip the gate). Debug builds also refuse to start a real `claude`, `pi`, `omp`, `codex` or `copilot` from Resume (or a
+Codex delete) unless `CHG_ALLOW_REAL_LAUNCH=1`, or `[gui] claude_path/pi_path/omp_path/codex_path/copilot_path`
+point at a harmless program inside the sandbox. `-WithCopilot` adds a Copilot session to the sandbox
+(`<Dest>\.copilot\session-state`) for the `copilot.qa` scenario.
 
 ```powershell
 tools\qa\new-sandbox.ps1 -Source crates\gui\tests\fixtures\qa-home -Dest $env:TEMP\chg-sbx

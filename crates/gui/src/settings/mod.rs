@@ -50,12 +50,13 @@ pub const DIALOG_WIDTH_REM: f32 = 56.0;
 pub const CONTENT_HEIGHT_REM: f32 = 34.0;
 
 /// Fields edited with a single-line input.
-pub const TEXT_FIELDS: [Field; 17] = [
+pub const TEXT_FIELDS: [Field; 18] = [
     Field::Terminal,
     Field::ClaudePath,
     Field::PiPath,
     Field::OmpPath,
     Field::CodexPath,
+    Field::CopilotPath,
     Field::DefaultWorkspace,
     Field::Key(KeyAction::Resume),
     Field::Key(KeyAction::Fork),
@@ -71,7 +72,7 @@ pub const TEXT_FIELDS: [Field; 17] = [
 ];
 
 /// Fields edited as one item per line.
-pub const LIST_FIELDS: [Field; 9] = [
+pub const LIST_FIELDS: [Field; 11] = [
     Field::ExcludeProjects,
     Field::ExcludePaths,
     Field::ClaudeCommand,
@@ -80,6 +81,8 @@ pub const LIST_FIELDS: [Field; 9] = [
     Field::OmpCommand,
     Field::CodexCommand,
     Field::CodexResumeArgs,
+    Field::CopilotCommand,
+    Field::CopilotResumeArgs,
     Field::AgentExclude,
 ];
 
@@ -515,6 +518,7 @@ impl SettingsDialog {
             | Field::PiPath
             | Field::OmpPath
             | Field::CodexPath
+            | Field::CopilotPath
             | Field::DefaultWorkspace => {
                 if text.trim().is_empty() {
                     self.pending_paths.remove(&field);
@@ -547,6 +551,8 @@ impl SettingsDialog {
             | Field::OmpCommand
             | Field::CodexCommand
             | Field::CodexResumeArgs
+            | Field::CopilotCommand
+            | Field::CopilotResumeArgs
             | Field::AgentExclude => {
                 let list = lines_to_list(text);
                 if list.is_empty() {

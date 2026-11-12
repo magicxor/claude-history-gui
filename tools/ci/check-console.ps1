@@ -49,6 +49,7 @@ $sandboxEnv = [ordered]@{
     'CLAUDE_CONFIG_DIR'   = (Join-Path $ProfileDir '.claude')
     'PI_CODING_AGENT_DIR' = (Join-Path $ProfileDir ".pi${sep}agent")
     'CODEX_HOME'          = (Join-Path $ProfileDir '.codex')
+    'COPILOT_HOME'        = (Join-Path $ProfileDir '.copilot')
     'XDG_DATA_HOME'       = (Join-Path $ProfileDir ".local${sep}share")
     'XDG_CONFIG_HOME'     = (Join-Path $ProfileDir '.config')
     'XDG_CACHE_HOME'      = (Join-Path $ProfileDir '.cache')

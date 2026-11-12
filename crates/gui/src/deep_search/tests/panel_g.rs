@@ -556,7 +556,7 @@ fn a_file_outside_the_roots_disables_the_panel(cx: &mut TestAppContext) {
     render(cx, handle);
     assert_eq!(
         OUT_OF_ROOT_TEXT,
-        "Outline, Within and Read work only for conversations inside the Claude, Pi or OMP history folders."
+        "Outline, Within and Read work only for conversations inside the Claude, Codex, Copilot, Pi or OMP history folders."
     );
 
     // The original file inside the roots works.

@@ -48,9 +48,11 @@ const LABEL_REM: f32 = 12.0;
 pub fn placeholder(field: Field, config: &LayeredConfig) -> SharedString {
     match field {
         Field::Terminal => "auto".into(),
-        Field::ClaudePath | Field::PiPath | Field::OmpPath | Field::CodexPath => {
-            "resolved from PATH".into()
-        }
+        Field::ClaudePath
+        | Field::PiPath
+        | Field::OmpPath
+        | Field::CodexPath
+        | Field::CopilotPath => "resolved from PATH".into(),
         Field::DefaultWorkspace => "none".into(),
         Field::Key(action) => {
             let effective = draft::effective_keys(&config.cli, &Default::default());
@@ -517,6 +519,7 @@ impl SettingsDialog {
             (Field::PiPath, "pi"),
             (Field::OmpPath, "omp"),
             (Field::CodexPath, "codex"),
+            (Field::CopilotPath, "copilot"),
         ] {
             let status = self.note_one_line(self.program_status_text(field), cx);
             let control = self.input_with_browse(field, cx);
@@ -677,6 +680,18 @@ impl SettingsDialog {
             )),
             cx,
         );
+        let copilot_command = self.command_row(Field::CopilotCommand, cx);
+        let copilot_args = self.list_input(Field::CopilotResumeArgs, 4.0);
+        let copilot_row = self.row(
+            Field::CopilotResumeArgs,
+            copilot_args,
+            Some(self.note(
+                "One argument per line; passed to copilot before --resume, for example \
+                 --allow-all-tools.",
+                cx,
+            )),
+            cx,
+        );
         v_flex()
             .id("settings-resume")
             .child(div().pb_2().child(self.note(
@@ -693,6 +708,8 @@ impl SettingsDialog {
             .child(omp_command)
             .child(codex_command)
             .child(codex_row)
+            .child(copilot_command)
+            .child(copilot_row)
             .into_any_element()
     }
 

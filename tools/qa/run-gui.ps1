@@ -8,6 +8,7 @@
     CLAUDE_CONFIG_DIR            = <Sandbox>\.claude
     PI_CODING_AGENT_DIR          = <Sandbox>\.pi\agent
     CODEX_HOME                   = <Sandbox>\.codex
+    COPILOT_HOME                 = <Sandbox>\.copilot
     XDG_DATA_HOME / XDG_CONFIG_HOME / XDG_CACHE_HOME / XDG_STATE_HOME = <Sandbox>\.local\share / .config / .cache / .local\state
     PI_CODING_AGENT_SESSION_DIR, PI_CONFIG_DIR, CODEX_SQLITE_HOME, OMP_PROFILE, PI_PROFILE, TERMINAL,
     CHG_ALLOW_REAL_HOME, CHG_ALLOW_REAL_LAUNCH = removed
@@ -69,6 +70,7 @@ $set = @{
     'CLAUDE_CONFIG_DIR'   = (Join-Path $sandbox '.claude')
     'PI_CODING_AGENT_DIR' = (Join-Path $sandbox ".pi${sep}agent")
     'CODEX_HOME'          = (Join-Path $sandbox '.codex')
+    'COPILOT_HOME'        = (Join-Path $sandbox '.copilot')
     'XDG_DATA_HOME'       = (Join-Path $sandbox ".local${sep}share")
     'XDG_CONFIG_HOME'     = (Join-Path $sandbox '.config')
     'XDG_CACHE_HOME'      = (Join-Path $sandbox '.cache')

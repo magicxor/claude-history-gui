@@ -26,9 +26,14 @@
 //!   (upstream's adapters read it from the process environment, see
 //!   `codex::view`); [`decode_path`] and [`decode_path_cancellable`] have no
 //!   env.
+//! * **GitHub Copilot CLI sessions.** A fifth source that upstream does not
+//!   have ([`copilot`]): its adapter is last in a registry built from an
+//!   env, and a Copilot event log opened by path decodes as one
+//!   (`copilot::view`).
 
 pub mod claude;
 pub mod codex;
+pub mod copilot;
 pub mod pi;
 
 use super::adapter::{Adapter, FileId, Located, Stamp};
@@ -41,6 +46,7 @@ use crate::env::HistoryEnv;
 use crate::error::Result;
 use chrono::{DateTime, Utc};
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -48,7 +54,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 /// The adapters of every configured history root, in a fixed order: Claude,
-/// Pi, OMP, Codex.
+/// Pi, OMP, Codex, Copilot.
 #[derive(Clone, Default)]
 pub struct Registry {
     adapters: Vec<Arc<dyn Adapter>>,
@@ -58,7 +64,8 @@ pub struct Registry {
 
 impl Registry {
     /// The roots `env` selects (`CLAUDE_CONFIG_DIR`, the Pi and OMP
-    /// settings, `CODEX_HOME`), whether or not they exist (fork: from the
+    /// settings, `CODEX_HOME`, and for the fork's Copilot source
+    /// `COPILOT_HOME`), whether or not they exist (fork: from the
     /// [`HistoryEnv`], not the process environment), and the CLI's cache
     /// root.
     pub fn from_env(env: &HistoryEnv) -> Self {
@@ -70,6 +77,9 @@ impl Registry {
         .with_cli_cache(env.cli_cache_root());
         if let Some(codex) = codex::CodexAdapter::from_env(env) {
             registry.adapters.push(Arc::new(codex));
+        }
+        if let Some(copilot) = copilot::CopilotAdapter::from_env(env) {
+            registry.adapters.push(Arc::new(copilot));
         }
         registry
     }
@@ -116,6 +126,15 @@ impl Registry {
     pub fn with_codex(mut self, home: Option<PathBuf>) -> Self {
         if let Some(home) = home {
             self.adapters.push(Arc::new(codex::CodexAdapter::new(home)));
+        }
+        self
+    }
+
+    /// Fork: adds the adapter of a Copilot `session-state` directory.
+    pub fn with_copilot(mut self, root: Option<PathBuf>) -> Self {
+        if let Some(root) = root {
+            self.adapters
+                .push(Arc::new(copilot::CopilotAdapter::new(root)));
         }
         self
     }
@@ -177,6 +196,7 @@ impl Registry {
                 PathBuf::new(),
                 PathBuf::new(),
             )),
+            SourceKind::Copilot => Arc::new(copilot::CopilotAdapter::new(PathBuf::new())),
         }
     }
 
@@ -257,6 +277,19 @@ fn located(
     }
 }
 
+/// The session id a session file's name stands for (fork): the file stem,
+/// except for a Copilot event log, which is always named `events.jsonl` and
+/// so gives the name of its session directory. `None` when the path has no
+/// name; a name that is not UTF-8 is converted lossily.
+pub fn session_stem(path: &Path) -> Option<Cow<'_, str>> {
+    let name = if copilot::session_of(path).is_some() {
+        path.parent()?.file_name()
+    } else {
+        path.file_stem()
+    };
+    name.map(|name| name.to_string_lossy())
+}
+
 /// Native id of a session file: its path relative to the instance root.
 fn native_id(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
@@ -266,9 +299,10 @@ fn native_id(root: &Path, path: &Path) -> String {
 }
 
 /// Decodes a session file outside any configured root: a Codex rollout as
-/// the thread of the Codex home holding it, else recognizing its source
-/// from its contents (as OMP when it starts with a session header and
-/// `omp` is set). `modified` dates a session that records no activity time.
+/// the thread of the Codex home holding it, a Copilot event log as the
+/// session of its directory (fork), else recognizing its source from its
+/// contents (as OMP when it starts with a session header and `omp` is set).
+/// `modified` dates a session that records no activity time.
 pub fn decode_path(path: &Path, modified: Option<SystemTime>, omp: bool) -> Result<Transcript> {
     decode_path_collected(None, path, modified, omp)
 }
@@ -354,6 +388,10 @@ fn decode_path_into_cancellable(
             Ok(_) if cancelled() => Err(super::adapter::cancelled_error()),
             transcript => transcript,
         };
+    }
+    // Fork: a Copilot event log, which a Claude decode would read as empty.
+    if let Some(transcript) = copilot::view::decode_path_into(path, modified, events, cancelled) {
+        return transcript;
     }
     let instance = SourceInstance {
         kind: SourceKind::Claude,
@@ -547,6 +585,21 @@ mod tests {
             visibility,
             kind,
         }
+    }
+
+    #[test]
+    fn session_stem_names_a_copilot_session_by_its_directory() {
+        let id = "0c0a0000-0000-4000-8000-000000000001";
+        let log = Path::new("/h/.copilot/session-state")
+            .join(id)
+            .join("events.jsonl");
+        assert_eq!(session_stem(&log).as_deref(), Some(id));
+        // Not in a session directory: the file stem, as for every source.
+        let loose = Path::new("/tmp/not-a-uuid/events.jsonl");
+        assert_eq!(session_stem(loose).as_deref(), Some("events"));
+        let claude = Path::new("/h/.claude/projects/p/abc-123.jsonl");
+        assert_eq!(session_stem(claude).as_deref(), Some("abc-123"));
+        assert_eq!(session_stem(Path::new("")), None);
     }
 
     #[test]

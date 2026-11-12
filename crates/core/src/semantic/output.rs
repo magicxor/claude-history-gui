@@ -13,7 +13,7 @@ pub fn format_hit(rank: usize, hit: &SemanticHit, conversations: &[&Conversation
         && conversations
             .iter()
             .filter(|conversation| {
-                conversation.path.file_stem().and_then(|stem| stem.to_str())
+                crate::history::sources::session_stem(&conversation.path).as_deref()
                     == Some(hit.session.as_str())
             })
             .take(2)

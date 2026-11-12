@@ -173,14 +173,21 @@ impl AgentConversationKey {
                 })?
                 .to_string()
         };
-        let session_filename = conversation
-            .path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| {
-                AppError::ConfigError("conversation path has no session filename".to_string())
-            })?
-            .to_string();
+        // Fork: every Copilot log is `events.jsonl`; the session's directory
+        // name keeps the filename unique per session (and a valid ref).
+        let session_filename = if conversation.source == SourceKind::Copilot {
+            crate::history::sources::session_stem(&conversation.path)
+                .map(|stem| format!("{stem}.jsonl"))
+        } else {
+            conversation
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+        }
+        .ok_or_else(|| {
+            AppError::ConfigError("conversation path has no session filename".to_string())
+        })?;
         let (root, native_id) = match registry.key_of(&conversation.path) {
             Some(key) => (canonical_root(&key.instance.root), key.native_id),
             None => (
@@ -238,6 +245,8 @@ impl AgentConversationKey {
             SourceKind::Codex => {
                 digest_parts(["agent-codex-v1", self.source.label(), &self.session_id])
             }
+            // Fork: there never was a legacy Copilot ref.
+            SourceKind::Copilot => return self.conversation_ref(),
         };
         AgentConversationRef::new(self.uuid(), digest)
     }
@@ -258,6 +267,7 @@ impl AgentConversationKey {
             SourceKind::Pi => format!("agent-pi-project-v1\0{}", self.project_dir_name),
             SourceKind::Omp => format!("agent-omp-project-v1\0{}", self.project_dir_name),
             SourceKind::Codex => format!("agent-codex-project-v1\0{}", self.project_dir_name),
+            SourceKind::Copilot => format!("agent-copilot-project-v1\0{}", self.project_dir_name),
         };
         format!(
             "pr_{}",
@@ -568,11 +578,13 @@ pub fn full_ref_for_candidate(
 }
 
 /// The agent key of the transcript at `path` (K8): among every Claude, Pi,
-/// OMP and Codex transcript the agent commands discover for `env` (all roots,
+/// OMP, Codex and Copilot transcript the agent commands discover for `env` (all roots,
 /// no workspace scope, automated and child Codex threads included, as `agent
 /// read`/`outline`/`within` resolve them), the one whose canonical path equals
 /// `path`'s. A Codex rollout inside the env's Codex home maps by thread id
 /// instead, so an older or archived rollout resolves to its thread's key.
+/// Fork: an event log inside the env's own Copilot home likewise maps by its
+/// session id (the key comes from the store's cards).
 /// `None` for a file outside the session roots (an export, an attachment, a copy)
 /// or one that does not exist: a file with the same name elsewhere never
 /// resolves to another transcript. Use [`AgentConversationKey::conversation_ref`]
@@ -604,6 +616,19 @@ pub fn conversation_key_for_path(
     });
     let rollout =
         crate::history::sources::codex::discover::rollout_of(path, false).filter(|_| in_codex_home);
+    // Fork: a Copilot event log inside the env's own Copilot home is keyed
+    // from its card by session id, like a rollout.
+    let copilot = crate::history::sources::copilot::session_of(&target)
+        .filter(|(root, _)| {
+            env.copilot_home()
+                .and_then(|home| {
+                    home.join(crate::history::sources::copilot::SESSION_STATE_DIR)
+                        .canonicalize()
+                        .ok()
+                })
+                .is_some_and(|home| *root == home)
+        })
+        .map(|(_, id)| id);
     // A Claude sidecar (a subagent or `/btw` fork, upstream 3c2ffeb) is
     // keyed from its card as well.
     let sidecar = crate::history::sources::claude::sidecar(path).is_some();
@@ -613,9 +638,16 @@ pub fn conversation_key_for_path(
     let (keys, _) = crate::agent::service::discover_agent_keys(
         env,
         None,
-        (rollout.is_none() && !sidecar).then_some(no_cards),
+        (rollout.is_none() && copilot.is_none() && !sidecar).then_some(no_cards),
         true,
     )?;
+    if let Some(id) = copilot
+        && let Some(key) = keys.iter().find(|key| {
+            key.source == SourceKind::Copilot && key.session_id.eq_ignore_ascii_case(&id)
+        })
+    {
+        return Ok(Some(key.clone()));
+    }
     if let Some(rollout) = rollout
         && let Some(key) = keys.iter().find(|key| {
             key.source == SourceKind::Codex
@@ -840,6 +872,68 @@ mod tests {
         assert_eq!(
             resolved.key.path.canonicalize().unwrap(),
             rollout.path.canonicalize().unwrap()
+        );
+    }
+
+    const COPILOT_A: &str = "0c0a0000-0000-4000-8000-000000000001";
+    const COPILOT_B: &str = "0c0a0000-0000-4000-8000-000000000002";
+
+    #[test]
+    fn copilot_sessions_of_one_project_have_distinct_refs() {
+        let home = tempfile::tempdir().unwrap();
+        crate::history::sources::copilot::tests::root_copy(&home.path().join(".copilot"));
+        let env = crate::env::HistoryEnv::sandbox(home.path());
+        let (keys, _) = crate::agent::service::discover_agent_keys(&env, None, None, true).unwrap();
+        let find = |id: &str| {
+            keys.iter()
+                .find(|key| key.source == SourceKind::Copilot && key.session_id == id)
+                .unwrap_or_else(|| panic!("no key for {id}"))
+        };
+        let (a, b) = (find(COPILOT_A), find(COPILOT_B));
+        assert_eq!(a.session_filename, format!("{COPILOT_A}.jsonl"));
+        assert_eq!(b.session_filename, format!("{COPILOT_B}.jsonl"));
+        assert_eq!(a.project_dir_name, b.project_dir_name);
+        assert_ne!(a.conversation_ref(), b.conversation_ref());
+        for key in [a, b] {
+            assert_eq!(
+                full_ref_for_candidate(
+                    &keys,
+                    "copilot",
+                    &key.project_dir_name,
+                    &key.session_filename
+                ),
+                Some(key.conversation_ref().full_ref())
+            );
+            for reference in [key.session_id.clone(), key.session_filename.clone()] {
+                let resolved = resolve_conversation_ref(&keys, &reference).unwrap();
+                assert_eq!(resolved.key.path, key.path, "{reference}");
+            }
+        }
+    }
+
+    #[test]
+    fn conversation_key_for_path_resolves_copilot_sessions_in_the_home_only() {
+        let home = tempfile::tempdir().unwrap();
+        let root =
+            crate::history::sources::copilot::tests::root_copy(&home.path().join(".copilot"));
+        let env = crate::env::HistoryEnv::sandbox(home.path());
+        // Without a Claude projects root an empty key set is an error.
+        std::fs::create_dir_all(env.claude_projects_root().unwrap()).unwrap();
+        let config = crate::config::ConfigFile::default();
+        let log = root.join(COPILOT_A).join("events.jsonl");
+        let key = conversation_key_for_path(&env, &config, &log)
+            .unwrap()
+            .expect("a Copilot log has a key");
+        assert_eq!(key.source, SourceKind::Copilot);
+        assert_eq!(key.session_id, COPILOT_A);
+        // A copy elsewhere is not a session of the home.
+        let outside = home.path().join("elsewhere").join(COPILOT_A);
+        std::fs::create_dir_all(&outside).unwrap();
+        let copy = outside.join("events.jsonl");
+        std::fs::copy(&log, &copy).unwrap();
+        assert_eq!(
+            conversation_key_for_path(&env, &config, &copy).unwrap(),
+            None
         );
     }
 

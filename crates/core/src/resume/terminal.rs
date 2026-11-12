@@ -3222,6 +3222,60 @@ mod tests {
         assert_eq!(command.display(), "xterm -e 'a b'");
     }
 
+    /// Fork: Copilot's single `--resume=<id>` argument and its `COPILOT_HOME`
+    /// survive the cmd and POSIX quoting.
+    #[test]
+    fn copilot_resume_argument_survives_the_quoting() {
+        let resume = "--resume=0f8e7d6c-5b4a-4932-8170-a1b2c3d4e5f6";
+        let home = r"C:\Users\John Doe\.copilot";
+        let mut win = spec(
+            WIN_PROGRAM,
+            ProgramKind::BatchScript,
+            &[resume],
+            Some(WIN_CWD),
+        );
+        win.env = vec![(OsString::from("COPILOT_HOME"), OsString::from(home))];
+        let command = build_terminal_command(
+            &TerminalLauncher::WindowsTerminal {
+                program: PathBuf::from("wt.exe"),
+            },
+            &win,
+            &options(Platform::Windows),
+        )
+        .unwrap();
+        let (_, child) = wt_child_command_line(raw(&command));
+        let prefix = format!("{} /S /K ", sys_cmd());
+        let inner = cmd_s_strip(&child[prefix.len()..]);
+        let set = format!("set \"COPILOT_HOME={home}\" && ");
+        let rest = inner.strip_prefix(&set).expect(&inner);
+        assert_eq!(
+            parse_windows_command_line(&cmd_phase2(rest)),
+            [WIN_PROGRAM, resume].map(str::to_string).to_vec()
+        );
+
+        let mut unix = spec(
+            "/home/me/bin/copilot",
+            ProgramKind::Executable,
+            &[resume],
+            Some("/home/me/a b"),
+        );
+        unix.env = vec![(
+            OsString::from("COPILOT_HOME"),
+            OsString::from("/home/me/.copilot dir"),
+        )];
+        let command = build_terminal_command(
+            &TerminalLauncher::Linux {
+                terminal: LinuxTerminal::Xterm,
+                program: PathBuf::from("/usr/bin/xterm"),
+            },
+            &unix,
+            &options(Platform::Linux),
+        )
+        .unwrap();
+        let run = format!("env 'COPILOT_HOME=/home/me/.copilot dir' /home/me/bin/copilot {resume}");
+        assert!(argv(&command)[3].contains(&run), "{}", argv(&command)[3]);
+    }
+
     /// The environment of a [`LaunchSpec`] (Codex: `CODEX_HOME`, upstream
     /// eea6d37) reaches the program through every kind of launcher, and the
     /// launcher process gets it too.

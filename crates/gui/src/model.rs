@@ -6,6 +6,7 @@
 //! `TerminalCommand`, `LaunchSpec`, `UpdateStatus`, `ListHit`); this module
 //! never mirrors them.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Local};
@@ -15,6 +16,7 @@ use claude_history_core::display_format::{conversation_label, sanitize_preview};
 use claude_history_core::export::ExportFormat;
 use claude_history_core::history::actions::{Capabilities, capabilities_of, refusal};
 use claude_history_core::history::model::SourceKind;
+use claude_history_core::history::sources::session_stem;
 use claude_history_core::history::{Conversation, Provenance};
 use claude_history_core::settings::{GuiLaunchArgs, PickerAction};
 use claude_history_core::time_filter::TimeFilter;
@@ -789,11 +791,11 @@ pub enum RowMenuItem {
     Delete,
 }
 
-/// The file stem of `path` (lossy UTF-8), empty when there is none.
+/// The file stem of `path` (lossy UTF-8), empty when there is none. Fork: for
+/// a Copilot event log the session id, see
+/// [`claude_history_core::history::sources::session_stem`].
 pub fn file_stem_lossy(path: &Path) -> String {
-    path.file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or_default()
+    session_stem(path).map(Cow::into_owned).unwrap_or_default()
 }
 
 /// A session ID shortened for display: a UUID keeps its first group
@@ -861,6 +863,26 @@ mod tests {
         assert_eq!(target.title.as_ref(), "abc");
         assert!(!target.header_id_differs());
         assert_eq!(target.describe(), "abc");
+    }
+
+    /// Fork: every Copilot log is `events.jsonl`; the target's stem (what
+    /// "Copy session ID" copies) and fallback title are the session id.
+    #[test]
+    fn copilot_target_is_named_by_its_session_directory() {
+        let id = "0c0a0000-0000-4000-8000-000000000001";
+        let path = Path::new("/home/u/.copilot/session-state")
+            .join(id)
+            .join("events.jsonl");
+        let mut target = ConversationTarget::from_parsed_file(&path, None);
+        target.source = Some(SourceKind::Copilot);
+        assert_eq!(target.file_stem, id);
+        assert_eq!(target.session_id, id);
+        assert_eq!(target.title.as_ref(), id);
+        assert!(!target.header_id_differs());
+        assert!(target.allows(SessionAct::Resume));
+        for act in [SessionAct::Fork, SessionAct::Rename, SessionAct::Delete] {
+            assert!(!target.allows(act), "{act:?}");
+        }
     }
 
     /// Upstream eea6d37: Codex threads cannot be renamed, orphaned ones

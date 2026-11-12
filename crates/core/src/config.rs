@@ -4,7 +4,9 @@
 //! * `config.toml` keeps upstream's exact schema, including
 //!   `#[serde(deny_unknown_fields)]` on every table: the installed CLI aborts
 //!   on any key it does not know, so core never writes to it and never adds
-//!   GUI keys to its schema ([`ConfigFile`]).
+//!   GUI keys to its schema ([`ConfigFile`]). Fork: the Copilot table
+//!   `[resume.copilot]` is GUI-only, so [`load_config_from`] rejects it in
+//!   `config.toml` like an unknown key; `gui.toml` accepts it.
 //! * `gui.toml` ([`GuiConfigFile`]) may override any shared section
 //!   (`[display]`, `[resume]`, `[keys]`, `[tui]`, `[search]`, `[agent]`) and
 //!   holds the GUI-only `[gui]` table ([`GuiSettings`]). It is the only file
@@ -13,7 +15,7 @@
 //!   file's comments and formatting).
 //! * Precedence for every setting: `gui.toml` > `config.toml` > defaults
 //!   ([`load_layered_config`]). The program that starts an agent (upstream
-//!   8a99ccc's `[resume] command`, `[resume.pi|omp|codex] command`) also
+//!   8a99ccc's `[resume] command`, `[resume.pi|omp|codex] command`, fork: `[resume.copilot] command`) also
 //!   weighs the GUI-only `[gui] claude_path`, ...: `gui.toml`'s `command` >
 //!   `[gui] <agent>_path` > `config.toml`'s `command` > `PATH`
 //!   ([`agent_launcher`], [`LayeredConfig::launcher`]); upstream's
@@ -207,6 +209,10 @@ pub struct ResumeConfig {
     pub omp: Option<LauncherConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codex: Option<AgentResumeConfig>,
+    /// Fork: GUI-only, so `config.toml` may not hold it
+    /// ([`load_config_from`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub copilot: Option<AgentResumeConfig>,
 }
 
 /// How the conversations of another agent are resumed.
@@ -305,6 +311,10 @@ impl ResumeConfig {
                 .codex
                 .as_ref()
                 .and_then(|codex| codex.default_args.as_ref()),
+            SourceKind::Copilot => self
+                .copilot
+                .as_ref()
+                .and_then(|copilot| copilot.default_args.as_ref()),
             SourceKind::Pi | SourceKind::Omp => None,
         };
         args.map(Vec::as_slice).unwrap_or(&[])
@@ -320,6 +330,10 @@ impl ResumeConfig {
             SourceKind::Pi => self.pi.as_ref().and_then(|pi| pi.command.as_ref()),
             SourceKind::Omp => self.omp.as_ref().and_then(|omp| omp.command.as_ref()),
             SourceKind::Codex => self.codex.as_ref().and_then(|codex| codex.command.as_ref()),
+            SourceKind::Copilot => self
+                .copilot
+                .as_ref()
+                .and_then(|copilot| copilot.command.as_ref()),
         }
     }
 }
@@ -329,9 +343,9 @@ impl ResumeConfig {
 /// (`gui`). Fork (decision 17), first that is set:
 ///
 /// 1. `command` under the agent's table (`[resume]`, `[resume.pi]`,
-///    `[resume.omp]`, `[resume.codex]`) of `gui.toml`;
+///    `[resume.omp]`, `[resume.codex]`, `[resume.copilot]`) of `gui.toml`;
 /// 2. the agent's program path under `[gui]` of `gui.toml` (`claude_path`,
-///    `pi_path`, `omp_path`, `codex_path`);
+///    `pi_path`, `omp_path`, `codex_path`, `copilot_path`);
 /// 3. `command` under the agent's table of `config.toml`;
 /// 4. the agent's own binary on `PATH`.
 ///
@@ -706,6 +720,10 @@ pub struct GuiSettings {
     /// Explicit path of the `codex` executable (else resolved via PATH).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codex_path: Option<PathBuf>,
+    /// Fork: explicit path of the `copilot` executable (else resolved via
+    /// PATH).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub copilot_path: Option<PathBuf>,
     /// Workspace directory to start with. It must be an absolute path; see
     /// [`GuiSettings::default_workspace_scope`].
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -742,6 +760,7 @@ impl GuiSettings {
             SourceKind::Pi => self.pi_path.as_deref(),
             SourceKind::Omp => self.omp_path.as_deref(),
             SourceKind::Codex => self.codex_path.as_deref(),
+            SourceKind::Copilot => self.copilot_path.as_deref(),
         }
     }
 
@@ -753,6 +772,7 @@ impl GuiSettings {
             SourceKind::Pi => "pi_path",
             SourceKind::Omp => "omp_path",
             SourceKind::Codex => "codex_path",
+            SourceKind::Copilot => "copilot_path",
         }
     }
 
@@ -895,16 +915,17 @@ impl ConfigFile {
             None => resume,
             Some(top) => {
                 let base = resume.unwrap_or_default();
-                let codex = match &top.codex {
-                    None => base.codex,
-                    Some(top_codex) => {
-                        let base_codex = base.codex.unwrap_or_default();
-                        Some(AgentResumeConfig {
-                            command: overlay(base_codex.command, &top_codex.command),
-                            default_args: overlay(base_codex.default_args, &top_codex.default_args),
-                        })
-                    }
-                };
+                let agent =
+                    |base: Option<AgentResumeConfig>, top: &Option<AgentResumeConfig>| match top {
+                        None => base,
+                        Some(top) => {
+                            let base = base.unwrap_or_default();
+                            Some(AgentResumeConfig {
+                                command: overlay(base.command, &top.command),
+                                default_args: overlay(base.default_args, &top.default_args),
+                            })
+                        }
+                    };
                 let launcher =
                     |base: Option<LauncherConfig>, top: &Option<LauncherConfig>| match top {
                         None => base,
@@ -917,7 +938,8 @@ impl ConfigFile {
                     default_args: overlay(base.default_args, &top.default_args),
                     pi: launcher(base.pi, &top.pi),
                     omp: launcher(base.omp, &top.omp),
-                    codex,
+                    codex: agent(base.codex, &top.codex),
+                    copilot: agent(base.copilot, &top.copilot),
                 })
             }
         };
@@ -1097,7 +1119,19 @@ pub fn load_config_from(path: Option<&Path>) -> Result<ConfigFile> {
     };
     match read_optional_file(path)? {
         None => Ok(ConfigFile::default()),
-        Some(content) => toml::from_str(&content).map_err(|e| parse_error(path, e)),
+        Some(content) => {
+            let config: ConfigFile = toml::from_str(&content).map_err(|e| parse_error(path, e))?;
+            // Fork: `[resume.copilot]` is GUI-only; the installed CLI aborts
+            // on keys it does not know, so it is refused like one.
+            if config.resume.as_ref().is_some_and(|r| r.copilot.is_some()) {
+                return Err(parse_error(
+                    path,
+                    "unknown field `copilot` in [resume], expected one of `command`, \
+                     `default_args`, `pi`, `omp`, `codex`; `[resume.copilot]` belongs in gui.toml",
+                ));
+            }
+            Ok(config)
+        }
     }
 }
 
@@ -1544,6 +1578,65 @@ default_args = ["--yolo"]
         );
     }
 
+    /// Fork: Copilot's `[resume.copilot]` is GUI-only: `config.toml` refuses
+    /// it like an unknown key, `gui.toml` takes it and layers it like Codex's.
+    #[test]
+    fn copilot_resume_table_is_gui_only() {
+        use crate::history::model::SourceKind;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[resume.copilot]\ndefault_args = [\"--yolo\"]\n").unwrap();
+        let error = load_config_from(Some(&path)).unwrap_err().to_string();
+        assert!(error.contains("unknown field `copilot`"), "{error}");
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        // The other tables still load from the same file.
+        std::fs::write(&path, "[resume.codex]\ndefault_args = [\"--yolo\"]\n").unwrap();
+        assert!(load_config_from(Some(&path)).is_ok());
+
+        let gui_path = dir.path().join("gui.toml");
+        std::fs::write(
+            &gui_path,
+            "[resume.copilot]\ncommand = [\"mise\", \"x\"]\ndefault_args = [\"--yolo\"]\n\n\
+             [gui]\ncopilot_path = \"/opt/copilot\"\n",
+        )
+        .unwrap();
+        let gui = load_gui_config_from(Some(&gui_path)).unwrap();
+        let resume = gui.resume.as_ref().unwrap();
+        assert_eq!(resume.default_args(SourceKind::Copilot), ["--yolo"]);
+        assert_eq!(
+            resume.command(SourceKind::Copilot).unwrap().words(),
+            ["mise", "x"]
+        );
+        assert_eq!(
+            gui.gui_settings().program_path(SourceKind::Copilot),
+            Some(Path::new("/opt/copilot"))
+        );
+        assert_eq!(
+            GuiSettings::program_path_key(SourceKind::Copilot),
+            "copilot_path"
+        );
+
+        // The overlay merges key by key, like Codex's table.
+        let cli = ConfigFile::default().overlaid_with(&gui);
+        let overlaid = cli.resume.unwrap();
+        assert_eq!(overlaid.default_args(SourceKind::Copilot), ["--yolo"]);
+        let top: GuiConfigFile =
+            toml::from_str("[resume.copilot]\ndefault_args = [\"--other\"]\n").unwrap();
+        let merged = ConfigFile {
+            resume: Some(overlaid),
+            ..ConfigFile::default()
+        }
+        .overlaid_with(&top)
+        .resume
+        .unwrap();
+        assert_eq!(merged.default_args(SourceKind::Copilot), ["--other"]);
+        assert_eq!(
+            merged.command(SourceKind::Copilot).unwrap().words(),
+            ["mise", "x"]
+        );
+        assert!(merged.default_args(SourceKind::Codex).is_empty());
+    }
+
     /// Fork: `gui.toml` overrides `[resume.codex] default_args` on its own,
     /// and `[gui] codex_path` is a GUI key.
     #[test]
@@ -1628,6 +1721,7 @@ daemon = false
             SourceKind::Pi,
             SourceKind::Omp,
             SourceKind::Codex,
+            SourceKind::Copilot,
         ] {
             assert_eq!(config.launcher(&env, source), Launcher::default_for(source));
             assert_eq!(
@@ -1735,6 +1829,28 @@ default_args = ["--yolo"]
         )
         .unwrap();
         let launcher = |source| agent_launcher(&env, &cli, &gui, source);
+        let with_command: GuiConfigFile = toml::from_str(
+            "[resume.copilot]\ncommand = \"copilot-wrapper\"\n\n[gui]\ncopilot_path = \"/opt/copilot\"\n",
+        )
+        .unwrap();
+        // `[resume.copilot] command` > `[gui] copilot_path` > the binary.
+        let command = agent_launcher(&env, &cli, &with_command, SourceKind::Copilot);
+        assert_eq!(command.program, Path::new("copilot-wrapper"));
+        assert_eq!(
+            command.configured_at,
+            Some(ConfiguredAt::Gui("[resume.copilot]"))
+        );
+        let path_only: GuiConfigFile =
+            toml::from_str("[gui]\ncopilot_path = \"/opt/copilot\"\n").unwrap();
+        let path = agent_launcher(&env, &cli, &path_only, SourceKind::Copilot);
+        assert_eq!(path.program, Path::new("/opt/copilot"));
+        assert_eq!(
+            path.configured_at,
+            Some(ConfiguredAt::GuiPath("copilot_path"))
+        );
+        let default = launcher(SourceKind::Copilot);
+        assert_eq!(default, Launcher::default_for(SourceKind::Copilot));
+        assert_eq!(default.program, Path::new("copilot"));
 
         let claude = launcher(SourceKind::Claude);
         assert_eq!(claude.program, Path::new("gui-claude"));

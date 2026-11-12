@@ -17,7 +17,7 @@ use crate::services::services;
 /// The QA id of the dialog.
 pub const DIALOG_ID: &str = "about";
 /// The one-line description.
-pub const TAGLINE: &str = "A desktop browser for Claude Code, Codex, Pi and OMP history.";
+pub const TAGLINE: &str = "A desktop browser for Claude Code, Codex, Copilot, Pi and OMP history.";
 /// The license line.
 pub const LICENSE_LINE: &str =
     "License: Unlicense. Core derived from claude-history (MIT, © 2024 Raine).";
@@ -200,8 +200,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tagline_names_codex() {
+    fn tagline_names_codex_and_copilot() {
         assert!(TAGLINE.contains("Codex"));
+        assert!(TAGLINE.contains("Copilot"));
     }
 
     #[test]

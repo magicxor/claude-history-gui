@@ -273,11 +273,7 @@ pub fn build_row_model(browser: &Browser, pos: usize, ctx: &RowContext<'_>) -> O
     let preview_input = browser.row_preview_input(pos, ctx.query, ctx.preview_chars())?;
     let preview = build_row_preview(&preview_input);
 
-    let stem = conversation
-        .path
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let stem = crate::model::file_stem_lossy(&conversation.path);
     let (timestamp, recency) = format_row_time(conversation.timestamp, ctx.now);
     let project_text = header.project.clone();
     let (title, title_kind, project, summary_tail) = match (header.custom_title, header.summary) {

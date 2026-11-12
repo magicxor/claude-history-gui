@@ -9,9 +9,9 @@
     * <Dest>\.qa-sandbox       the marker the sandbox gate requires (debug and qa builds)
     * <Dest>\.config\claude-history\, <Dest>\.local\state\
     * <Dest>\bin\fake-agent.*  a harmless recorder script (appends its arguments to <Dest>\launches.log)
-    * <Dest>\.config\claude-history\gui.toml  with [gui] claude_path / pi_path / omp_path / codex_path
-      pointing at it, so a Resume (or a Codex delete) in the sandbox can never start a real claude,
-      pi, omp or codex.
+    * <Dest>\.config\claude-history\gui.toml  with [gui] claude_path / pi_path / omp_path / codex_path /
+      copilot_path pointing at it, so a Resume (or a Codex delete) in the sandbox can never start a
+      real claude, pi, omp, codex or copilot.
   Never use the template in place and never point -Dest at a real profile: the script refuses
   the current user's profile directory, anything inside it that already exists, and an existing
   -Dest that is not a previous sandbox.
@@ -27,6 +27,10 @@
   "Explain the walrus operator") into <Dest>\.codex\sessions, the Codex home run-gui.ps1 selects
   (codex.qa).
 
+  -WithCopilot additionally copies one GitHub Copilot CLI session (the core fixture named "Ocelot
+  cache eviction") into <Dest>\.copilot\session-state, the Copilot home run-gui.ps1 selects
+  (copilot.qa).
+
 .EXAMPLE
   .\tools\qa\new-sandbox.ps1 -Source crates\gui\tests\fixtures\qa-home -Dest $env:TEMP\chg-sbx-1
 #>
@@ -38,7 +42,9 @@ param(
     # Add a conversation whose project folder exists inside the sandbox (see .DESCRIPTION).
     [switch]$WithWorkspace,
     # Add a Codex thread to the sandbox's Codex home (see .DESCRIPTION).
-    [switch]$WithCodex
+    [switch]$WithCodex,
+    # Add a Copilot CLI session to the sandbox's Copilot home (see .DESCRIPTION).
+    [switch]$WithCopilot
 )
 $ErrorActionPreference = 'Stop'
 
@@ -106,6 +112,7 @@ claude_path = '$agent'
 pi_path = '$agent'
 omp_path = '$agent'
 codex_path = '$agent'
+copilot_path = '$agent'
 "@
 Set-Content -LiteralPath (Join-Path $configDir 'gui.toml') -Value $gui -Encoding utf8
 
@@ -135,6 +142,16 @@ if ($WithCodex) {
     $day = Join-Path $dest '.codex/sessions/2026/09/01'
     New-Item -ItemType Directory -Force -Path $day | Out-Null
     Copy-Item -LiteralPath $fixture -Destination (Join-Path $day $rollout)
+}
+
+if ($WithCopilot) {
+    $session = '0c0a0000-0000-4000-8000-000000000001'
+    $fixture = Join-Path $PSScriptRoot "../../crates/core/tests/fixtures/copilot/session-state/$session"
+    # The home is `.copilot`, with the dot: the debug launch guard reads a path word whose last
+    # component is `copilot` as the program.
+    $sessions = Join-Path $dest '.copilot/session-state'
+    New-Item -ItemType Directory -Force -Path $sessions | Out-Null
+    Copy-Item -LiteralPath $fixture -Destination (Join-Path $sessions $session) -Recurse
 }
 
 Write-Output $dest

@@ -44,10 +44,8 @@ where
         } else {
             group_turns(&semantic_turns, config)
         };
-        let session = conversation
-            .path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
+        let session = crate::history::sources::session_stem(&conversation.path)
+            .as_deref()
             .unwrap_or("?")
             .to_owned();
         for (chunk_index, chunk) in grouped.into_iter().enumerate() {
